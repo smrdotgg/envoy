@@ -1,0 +1,126 @@
+# Envoy
+
+A fast, native, configurable email client in Rust, built on [Rune](https://github.com/anomalyco/rune)
+(GPU-rendered native UI). Gmail-like layout, offline-first, everything configurable from a
+VS Code–style settings screen backed by a plain `settings.json`.
+
+## Try it
+
+```sh
+# Sample mail, no account, nothing sent anywhere:
+cargo run --release -p envoy -- --demo
+
+# The real thing:
+cargo run --release -p envoy
+
+# A double-clickable macOS app in dist/Envoy.app:
+scripts/bundle-macos.sh && open dist/Envoy.app
+```
+
+First build takes a few minutes (Rune's renderer); after that it's incremental.
+
+### Linux
+
+Build-time packages (Ubuntu/Debian): `sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev`.
+Running needs a desktop session (X11 or Wayland). On a machine with no GPU, add
+`mesa-vulkan-drivers` and run with `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+
+### Windows
+
+`cargo build --release -p envoy` → `target\release\envoy.exe`. No extra setup.
+
+## Signing in to Gmail
+
+Two ways, chosen on the "Add account" screen:
+
+1. **Gmail app password** (quickest). Needs 2-Step Verification on your Google account.
+   Create a password named "Envoy" at <https://myaccount.google.com/apppasswords> and paste
+   the 16 letters. That's it.
+2. **Google sign-in (OAuth)**. Google requires every app to have its own OAuth client, so
+   this needs a one-time setup in Google Cloud Console (create project → enable Gmail API →
+   OAuth consent screen "External" with yourself as a test user → Clients → *Desktop app*).
+   Paste the client ID and secret into the form, or set `ENVOY_GOOGLE_CLIENT_ID` /
+   `ENVOY_GOOGLE_CLIENT_SECRET` (at build time to bake them in, or at run time).
+
+Any other IMAP/SMTP provider works through "Other email (IMAP)"; common providers
+(Outlook, iCloud, Yahoo, Fastmail…) fill in their servers automatically.
+
+Passwords and tokens live in the macOS Keychain / Windows Credential Manager. On Linux
+(or with `ENVOY_SECRETS=file`) they go to `secrets.json` in the data folder with 0600
+permissions.
+
+## Settings
+
+Everything is in **Settings** (⌘, / Ctrl+,): search, filter to "Modified only", reset any
+value. Each change is written to `settings.json`, which holds *only your overrides* as flat
+VS Code–style keys:
+
+```jsonc
+{
+  "appearance.theme": "dark",
+  "appearance.accent": "violet",
+  "inbox.readingPane": "bottom",
+  "keys.archive": "e, y",
+  "sync.intervalSeconds": 60
+}
+```
+
+Edit it by hand and Envoy reloads it live (comments and trailing commas are fine).
+"Edit settings.json" also writes `settings.defaults.jsonc` next to it: every setting with
+its description and default, to copy from. Back the file up, sync it, copy it to another
+machine — it contains no secrets.
+
+| | macOS | Windows | Linux |
+|---|---|---|---|
+| Settings & accounts | `~/Library/Application Support/dev.envoy.Envoy/` | `%APPDATA%\envoy\Envoy\config\` | `~/.config/envoy/` |
+| Mail cache | same folder, `mail.sqlite` | `%APPDATA%\envoy\Envoy\data\` | `~/.local/share/envoy/` |
+
+`ENVOY_HOME=/some/folder` puts everything in one folder (portable installs).
+
+## Keyboard
+
+All rebindable under Settings → Keyboard (`mod` = ⌘ on macOS, Ctrl elsewhere).
+
+| Key | Action | Key | Action |
+|---|---|---|---|
+| `j` / `k` | next / previous | `c` | compose |
+| `e` | archive | `r` / `a` / `f` | reply / reply all / forward |
+| `#` | delete | `mod+enter` | send |
+| `s` | star | `/` | search |
+| `u` | toggle read | `esc` | close |
+| `mod+1/2/3` | inbox / starred / sent | `mod+shift+b` | toggle sidebar |
+
+Search understands `from:`, `to:`, `subject:`, `is:unread`, `is:read`, `is:starred`,
+`has:attachment`, plus free text over subject, people and body (SQLite FTS5, instant,
+offline).
+
+## How it's built
+
+- `crates/envoy-core` — no UI. Settings schema, accounts, secrets, OAuth (loopback + PKCE),
+  the SQLite store (WAL, FTS5), IMAP sync (async-imap over rustls), SMTP (lettre), and the
+  engine: a background thread with one sync worker per account.
+- `crates/envoy` — the Rune app: sidebar, virtualized message list, conversation reader
+  (HTML mail rendered natively as Markdown — no web view, no remote images, no tracking
+  pixels), floating composer, settings and account screens.
+- `vendor/rune` — the Rune crates, vendored (Rune's repo is large). Refresh with
+  `scripts/vendor-rune.py <path-to-rune-checkout>`.
+
+**Reliability model.** The UI only ever reads the local cache, so it never waits on the
+network. Every action (read, star, archive, delete, send) is applied locally first and
+queued in the database; the worker replays the queue on the server and retries with backoff
+until it succeeds, across restarts and offline periods. Sending waits `compose.undoSendSeconds`
+in that queue so it can be undone. The worker uses IMAP IDLE for push, reconnects with
+backoff, and times out dead connections in 30 s.
+
+## Testing
+
+```sh
+cargo test                                      # unit tests
+cargo run -p envoy-core --example e2e           # engine against a local GreenMail server (see the file header)
+ENVOY_DEMO=1 target/debug/envoy --snap out.png --scene open     # headless screenshot
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/flow.json --snap out.png --at 3.6
+```
+
+Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent`.
+
+`RUST_LOG=envoy_core=debug` shows what the sync workers are doing.

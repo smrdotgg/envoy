@@ -1,0 +1,24 @@
+[package]
+name = "rune-kit"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Generic, themable components for Rune. Components read only semantic tokens (`Kit`); a theme crate supplies them."
+
+[dependencies]
+rune = { path = "../rune", default-features = false }
+rune-mermaid = { path = "../rune-mermaid", optional = true }
+rune-motion = { path = "../rune-motion" }
+unicode-segmentation = "1.13"
+pulldown-cmark = { version = "0.13", default-features = false, optional = true }
+
+[features]
+# `Markdown` and `MarkdownStyle`.
+markdown = ["dep:pulldown-cmark"]
+# Native ```mermaid diagrams in `Markdown` (flowcharts, sequence and state diagrams), and `mermaid`.
+mermaid = ["markdown", "dep:rune-mermaid"]
+# Phase timings for the headless benches (`markdown_resize`).
+frame-profile = ["rune/frame-profile"]
+
+[lints]
+workspace = true

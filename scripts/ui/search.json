@@ -1,0 +1,6 @@
+{"events": [
+  {"t": 0.2, "type": "key", "name": "/"},
+  {"t": 0.4, "type": "type", "text": "from:sam"},
+  {"t": 0.8, "type": "key", "name": "Enter"},
+  {"t": 1.0, "type": "key", "name": "j"}
+]}

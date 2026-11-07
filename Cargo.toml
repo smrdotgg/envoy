@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/envoy-core", "crates/envoy"]
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+rune = { path = "vendor/rune/crates/rune" }
+rune-kit = { path = "vendor/rune/crates/rune-kit", features = ["markdown"] }
+envoy-core = { path = "crates/envoy-core" }
+
+# Rune's own deps compile without debug info in dev, as upstream does.
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
+[profile.release]
+codegen-units = 16
+incremental = true
+
+# What we ship: smaller and a little faster.
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+lto = "thin"
+incremental = false
+strip = true

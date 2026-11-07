@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Vendor the Rune crates Envoy needs into vendor/rune.
+
+Rune's repository is large (demo videos), so Cargo git dependencies are slow and
+fragile. This copies only the crates we build, strips their tests, examples and
+dev-dependencies, and writes a tiny workspace manifest so `*.workspace = true`
+keys keep resolving.
+
+Usage: scripts/vendor-rune.py <path-to-rune-checkout>
+"""
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+CRATES = ["rune", "rune-kit", "rune-motion", "rune-staging", "rune-taffy", "procwatch"]
+DROP_DIRS = {"tests", "examples", "benches"}
+
+
+def strip_manifest(text: str) -> str:
+    out, skip = [], False
+    for line in text.splitlines():
+        header = re.match(r"^\s*\[\[?([^\]]+)\]\]?\s*$", line)
+        if header:
+            name = header.group(1)
+            skip = (
+                name in ("test", "example", "bench")
+                or name.endswith("dev-dependencies")
+            )
+        if not skip:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def main() -> None:
+    src = pathlib.Path(sys.argv[1]).resolve()
+    dst = pathlib.Path(__file__).resolve().parent.parent / "vendor" / "rune"
+    if dst.exists():
+        shutil.rmtree(dst)
+    (dst / "crates").mkdir(parents=True)
+    for crate in CRATES:
+        shutil.copytree(
+            src / "crates" / crate,
+            dst / "crates" / crate,
+            ignore=lambda d, names: [n for n in names if n in DROP_DIRS and pathlib.Path(d).name == crate],
+        )
+        manifest = dst / "crates" / crate / "Cargo.toml"
+        manifest.write_text(strip_manifest(manifest.read_text()))
+    root = (src / "Cargo.toml").read_text()
+    lints = root[root.index("[workspace.lints.rust]"):]
+    members = ",\n".join(f'    "crates/{c}"' for c in CRATES)
+    (dst / "Cargo.toml").write_text(
+        "# Vendored subset of github.com/anomalyco/rune. Regenerate with scripts/vendor-rune.py.\n"
+        f"[workspace]\nresolver = \"3\"\nmembers = [\n{members},\n]\n\n"
+        "[workspace.package]\nedition = \"2024\"\nlicense = \"MIT\"\n\n" + lints
+    )
+    shutil.copy(src / "LICENSE", dst / "LICENSE")
+    rev = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (dst / "REV").write_text(rev + "\n")
+    print(f"vendored rune {rev} into {dst}")
+
+
+if __name__ == "__main__":
+    main()
