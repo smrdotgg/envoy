@@ -1303,6 +1303,7 @@ mod tests {
         assert_eq!(st.pending_count().unwrap(), 0, "nothing reaches the server");
         let thread = st.thread(reply, true).unwrap();
         assert_eq!(thread.len(), 2, "the conversation opens whole again");
+        assert!(thread.iter().all(|m| m.body.as_ref().is_some_and(|b| b.text.as_deref().is_some_and(|t| t.contains("hi")))), "bodies kept");
     }
 
     #[test]

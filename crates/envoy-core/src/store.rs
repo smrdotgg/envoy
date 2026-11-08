@@ -6,7 +6,9 @@
 //!
 //! Undoable actions (sending, moves) wait in `ops` until `not_before`. A message being moved
 //! is hidden (`held_op`) rather than deleted until its move replays, so undo can show it again
-//! untouched and a sync meanwhile doesn't download it a second time.
+//! untouched and a sync meanwhile doesn't download it a second time. The worker claims ops
+//! before running them on the server; undo and cancel only touch unclaimed ones. Op ids are
+//! never reused, so a stale id can't reach a newer op.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1003,12 +1005,15 @@ mod tests {
         assert_eq!(s.ops("a", 31).unwrap().len(), 1);
     }
 
-    /// One unread inbox message moved away under undo key 7, held until t=100.
+    /// One unread, starred inbox message with its body downloaded, moved away under undo
+    /// key 7, held until t=100.
     fn held_move(s: &Store) -> (MessageId, i64) {
         s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
         s.upsert_mailbox("a", "Archive", "Archive", Role::Archive, "/", true).unwrap();
         s.set_counts("a", "INBOX", 1, 1).unwrap();
-        let id = s.upsert_header("a", "INBOX", 9, 0, 10, 100, &parsed("Hi", "<9@x>", "", "Ana <ana@x.com>", 1)).unwrap();
+        let p = parsed("Hi", "<9@x>", "", "Ana <ana@x.com>", 1);
+        let id = s.upsert_header("a", "INBOX", 9, flags::FLAGGED, 10, 100, &p).unwrap();
+        s.set_body(id, b"raw", &p).unwrap();
         let op = s.enqueue_held("a", &Op::Move { mailbox: "INBOX".into(), uid: 9, dest: "Archive".into() }, 100, 7).unwrap();
         s.hide_local(id, op).unwrap();
         s.bump_unread("a", "INBOX", -1).unwrap();
@@ -1175,7 +1180,7 @@ mod tests {
         let (id, _) = held_move(&s);
         assert!(inbox(&s).is_empty(), "gone from the list");
         assert!(s.thread_ids(id, true).unwrap().is_empty(), "not moved again with its conversation");
-        assert_eq!(s.local_uids("a", "INBOX").unwrap(), vec![(9, 0)], "sync still sees it, so it isn't re-downloaded");
+        assert_eq!(s.local_uids("a", "INBOX").unwrap(), vec![(9, flags::FLAGGED)], "sync still sees it, so it isn't re-downloaded");
         // A sync during the window refreshes flags without showing it again.
         s.upsert_header("a", "INBOX", 9, flags::SEEN, 10, 100, &parsed("Hi", "<9@x>", "", "Ana <ana@x.com>", 1)).unwrap();
         assert!(inbox(&s).is_empty());
@@ -1199,7 +1204,12 @@ mod tests {
         assert!(s.ops("a", i64::MAX).unwrap().is_empty(), "the server never sees it");
         let back = inbox(&s);
         assert_eq!(back.len(), 1);
-        assert_eq!(back[0].id, id, "same row: flags, body and open state intact");
+        assert_eq!(back[0].id, id, "the same row, so the app can reopen it by id");
+        assert_eq!(back[0].flags, flags::FLAGGED, "flags intact: still unread and starred");
+        assert!(back[0].preview.contains("pancakes"));
+        let opened = s.thread(id, false).unwrap();
+        let body = opened[0].body.as_ref().expect("the downloaded body is still there");
+        assert_eq!(body.text.as_deref(), Some("body text about pancakes\r\n"), "no re-download needed");
         assert_eq!(unread(&s), 1, "unread count back");
         assert_eq!(s.undo_batch(7).unwrap(), Undone::default(), "nothing left to undo");
         assert_eq!(s.undo_batch(0).unwrap(), Undone::default(), "key 0 is never an undo key");
