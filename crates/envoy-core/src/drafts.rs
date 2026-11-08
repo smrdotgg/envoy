@@ -225,7 +225,8 @@ pub fn merge(st: &Store, view: &View, query: &Query, limit: u32, mut items: Vec<
         show(&mut row, d);
         items.push(row);
     }
-    items.sort_by_key(|r| std::cmp::Reverse(r.date));
+    // Ordered like every list (store/list.rs): newest first, then the higher id.
+    items.sort_by_key(|r| std::cmp::Reverse((r.date, r.id)));
     items.truncate(limit as usize);
     Ok(items)
 }
@@ -341,6 +342,18 @@ mod tests {
         // The texts that couldn't go where they were written are kept as new drafts.
         assert_eq!(subjects, vec!["newer", "older", "typed after the late undo"], "{subjects:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_drafts_list_in_the_stores_order() {
+        let st = Store::memory();
+        for id in 1..=8 {
+            st.save_draft(id, &Draft { account: "a".into(), subject: format!("d{id}"), ..Draft::default() }, true, DraftRev { lifecycle: 0, rev: 1 }, 100).unwrap();
+        }
+        let view = View::Role { account: None, role: Role::Drafts };
+        let rows = merge(&st, &view, &Query::default(), 100, vec![], |_| Address { name: String::new(), email: String::new() }).unwrap();
+        // Same second: newest id first, as every list is ordered (store/list.rs).
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), (1..=8).map(list_id).collect::<Vec<_>>());
     }
 
     #[test]

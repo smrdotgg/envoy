@@ -529,7 +529,10 @@ fn rows_env(s: &App, t: &Theme) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (t.compact, t.dark, s.settings.str("appearance.accent"), s.settings.bool("inbox.showPreview"), s.settings.bool("inbox.showAvatars")).hash(&mut h);
-    (matches!(&s.view, View::Role { role: Role::Sent, .. }), s.settings.str("inbox.dateFormat"), chrono::Local::now().date_naive()).hash(&mut h);
+    // A Sent or Drafts list (a role view or the mailbox itself) shows recipients, and a draft
+    // only Discard: list_row reads the view's role.
+    let role = s.view_role();
+    (role == Some(Role::Sent), role == Some(Role::Drafts), s.settings.str("inbox.dateFormat"), chrono::Local::now().date_naive()).hash(&mut h);
     h.finish()
 }
 
@@ -648,4 +651,24 @@ pub fn mail_screen(s: &App, t: &Theme, cx: &mut Cx<App>, layer: &mut Vec<El>) ->
         .pane_motion(PaneMotion::new().spring(rune::Spring::new(0.3, 0.0)).scale_with_width(480.0, 0.15, 0.3).fade_tail(0.15))
         .reduced_motion(cx.is_reduced_motion())
         .build(k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_are_built_again_when_the_view_changes_how_they_show() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let t = crate::theme::build(&app.settings, true);
+        app.view = View::Starred { account: None };
+        let starred = rows_env(&app, &t);
+        // A draft row shows its recipient and only Discard; a sent one its recipient.
+        app.view = View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() };
+        let drafts = rows_env(&app, &t);
+        app.view = View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Sent Mail".into() };
+        let sent = rows_env(&app, &t);
+        assert!(drafts != starred && sent != starred && drafts != sent);
+    }
 }
