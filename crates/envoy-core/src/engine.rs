@@ -207,11 +207,12 @@ impl Engine {
         drafts::save(&st, id, draft, open, rev, now()).map(|_| ())
     }
 
-    /// Keeps a message the composer sent as a draft, on the calling thread, unless its send
-    /// was queued (or went out): for when the window closes before the engine confirmed it.
-    pub fn keep_unsent_now(&self, id: i64, draft: &Draft) -> Result<()> {
+    /// Keeps a message the composer sent (stamped `stamp`) as a draft, on the calling thread,
+    /// unless its send was queued (or went out): for when the window closes before the engine
+    /// confirmed it.
+    pub fn keep_unsent_now(&self, id: i64, draft: &Draft, stamp: i64) -> Result<()> {
         let st = self.writer.lock().map_err(|_| anyhow!("store poisoned"))?;
-        st.draft_unsent(id, draft, now()).map(|_| ())
+        st.draft_unsent(id, draft, stamp, now()).map(|_| ())
     }
 
     pub fn drain(&self) -> Vec<Event> {
@@ -491,7 +492,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 // Not sent: kept as a draft here, and back in the composer, so nothing written is
                 // lost.
                 if let Some(id) = draft_id
-                    && let Err(e) = shared.with_writer(|st| st.draft_unsent(id, &draft, now()))
+                    && let Err(e) = shared.with_writer(|st| st.draft_unsent(id, &draft, chrono::Utc::now().timestamp_micros(), now()))
                 {
                     log::warn!("couldn't keep an unsent draft: {e:#}");
                 }
