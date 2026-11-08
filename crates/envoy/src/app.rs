@@ -48,8 +48,14 @@ pub struct Compose {
     pub notice: Option<String>,
     /// The local draft this composer saves to: an id picked here, unique across runs.
     pub draft_id: i64,
-    /// The draft is in the store: saved at least once, or opened from there.
+    /// The draft is in the store, or a save of it is on its way: opened from there, or saved.
     pub saved: bool,
+    /// The newest save handed to the engine, and the newest it confirmed written (stamps): the
+    /// composer says "Draft saved" only once they meet.
+    pub submitted: i64,
+    pub acked: i64,
+    /// The last save failed (it's tried again).
+    pub save_error: Option<String>,
     /// Edited since the last save.
     pub dirty: bool,
     /// Edits made, and how many of them [`App::tick`] has timed: a field reports an edit
@@ -87,12 +93,20 @@ impl Compose {
             notice: None,
             draft_id,
             saved: false,
+            submitted: 0,
+            acked: 0,
+            save_error: None,
             dirty: false,
             edits: 0,
             timed: 0,
             dirty_since: None,
             edited_at: 0.0,
         }
+    }
+
+    /// "Draft saved": the store has exactly what the composer shows.
+    pub fn shows_saved(&self) -> bool {
+        self.saved && !self.dirty && self.save_error.is_none() && self.acked >= self.submitted
     }
 
     pub fn draft(&self) -> Draft {
@@ -109,6 +123,31 @@ impl Compose {
             attachments: self.attachments.clone(),
         }
     }
+}
+
+/// A draft save handed to the engine and not yet confirmed written: kept to try again, and to
+/// write on the spot if the window closes first.
+pub struct PendingSave {
+    pub id: i64,
+    pub rev: i64,
+    pub draft: Draft,
+    pub open: bool,
+    /// Failures so far; after one, it's tried again at `retry_at` (app clock).
+    pub failures: u32,
+    pub retry_at: Option<f64>,
+}
+
+/// Seconds before a failed draft save is tried again.
+const SAVE_RETRY: f64 = 5.0;
+
+/// What closing the window must still write ([`App::unsaved`]).
+#[derive(Debug, PartialEq)]
+pub enum Unsaved {
+    /// A draft save, under its stamp (so it never overwrites a newer one).
+    Save { id: i64, draft: Draft, open: bool, rev: i64 },
+    /// A message sent from the composer but not confirmed queued: kept as a draft unless its
+    /// send was queued after all.
+    Unsent { id: i64, draft: Draft },
 }
 
 pub struct Toast {
@@ -287,6 +326,9 @@ pub struct App {
     pub search: TextEdit,
     pub applied_query: String,
     pub compose: Option<Compose>,
+    /// Draft saves, and sends, not yet confirmed by the engine.
+    pub pending_saves: Vec<PendingSave>,
+    pub pending_sends: Vec<(i64, Draft)>,
     pub toasts: Vec<Toast>,
     pub toast_seq: u64,
     /// The last stamp handed out ([`App::next_stamp`]).
@@ -354,6 +396,8 @@ impl App {
             search: TextEdit::new(""),
             applied_query: String::new(),
             compose: None,
+            pending_saves: Vec::new(),
+            pending_sends: Vec::new(),
             toasts: Vec::new(),
             toast_seq: 0,
             last_stamp: 0,
@@ -498,7 +542,12 @@ impl App {
             }
             Event::Toast(t) => self.toast(t, false),
             Event::Error(e) => self.toast(e, true),
-            Event::Sent { op, undo_secs } => {
+            Event::Sent { op, undo_secs, draft_id } => {
+                // Queued with the draft: the send's copy of it is no longer needed.
+                if let Some(d) = draft_id {
+                    self.pending_sends.retain(|(id, _)| *id != d);
+                    self.pending_saves.retain(|p| p.id != d);
+                }
                 self.toast_seq += 1;
                 let id = self.toast_seq;
                 let text = if undo_secs > 0 { "Sending…".to_owned() } else { "Sending".to_owned() };
@@ -553,6 +602,9 @@ impl App {
             Event::Held { .. } => {}
             Event::DraftOpened { id, draft, restored, notice } => self.show_draft(id, draft, restored, notice),
             Event::DraftDiscarded { id, undo } => self.draft_discarded(id, undo),
+            Event::DraftSaved { id, rev } => self.draft_saved(id, rev),
+            Event::DraftSaveFailed { id, rev, error } => self.draft_save_failed(id, rev, error),
+            Event::SendFailed { draft_id } => self.send_failed(draft_id),
         }
         reload
     }
@@ -836,11 +888,12 @@ impl App {
         tx.instant();
     }
 
-    /// Ticks timers from `poll`: draft autosave, delayed mark-read, toast expiry, settings file
-    /// changes.
+    /// Ticks timers from `poll`: draft autosave and retries, delayed mark-read, toast expiry,
+    /// settings file changes.
     pub fn tick(&mut self, clock: f64, tx: &mut Tx) -> bool {
         self.clock = clock;
         let mut changed = self.autosave(clock, tx);
+        self.retry_saves(clock, tx);
         if let Some((id, at)) = self.mark_read_at {
             if clock >= at {
                 if self.open == Some(id) {
@@ -1123,6 +1176,8 @@ impl App {
     /// A draft was discarded from the Drafts list while open in the composer: the composer
     /// closes, and the discard's Undo brings it back.
     fn draft_discarded(&mut self, id: i64, undo: Option<i64>) {
+        // Discarded: a save still waiting mustn't bring it back when the window closes.
+        self.pending_saves.retain(|p| p.id != id);
         if self.compose.as_ref().is_none_or(|c| c.draft_id != id) {
             return;
         }
@@ -1318,17 +1373,90 @@ impl App {
     }
 
     /// Saves the composer's content as its draft; `open`: it stays in the composer (and opens
-    /// again after a restart).
+    /// again after a restart). Until the engine confirms it, the save is kept (pending_saves).
     fn save_compose(&mut self, open: bool) {
         let rev = self.next_stamp();
         let Some(c) = &mut self.compose else { return };
         c.dirty = false;
         c.dirty_since = None;
         c.saved = true;
+        c.submitted = rev;
         let (id, draft) = (c.draft_id, c.draft());
-        self.send(Command::SaveDraft { id, draft, open, rev });
+        self.submit_save(id, draft, open, rev);
         if self.view_role() == Some(Role::Drafts) {
             self.request_list();
+        }
+    }
+
+    fn submit_save(&mut self, id: i64, draft: Draft, open: bool, rev: i64) {
+        // A newer save of the same draft supersedes one still waiting.
+        let failures = self.pending_saves.iter().find(|p| p.id == id).map_or(0, |p| p.failures);
+        self.pending_saves.retain(|p| p.id != id);
+        self.pending_saves.push(PendingSave { id, rev, draft: draft.clone(), open, failures, retry_at: None });
+        self.send(Command::SaveDraft { id, draft, open, rev });
+    }
+
+    /// The engine wrote save `rev` of draft `id`.
+    fn draft_saved(&mut self, id: i64, rev: i64) {
+        self.pending_saves.retain(|p| !(p.id == id && p.rev <= rev));
+        if let Some(c) = &mut self.compose
+            && c.draft_id == id
+        {
+            c.acked = c.acked.max(rev);
+            if rev >= c.submitted {
+                c.save_error = None;
+            }
+        }
+    }
+
+    /// The engine couldn't write save `rev` of draft `id`: it isn't saved. The composer says so
+    /// (a draft put away gets a toast, once); it's tried again in a few seconds.
+    fn draft_save_failed(&mut self, id: i64, rev: i64, error: String) {
+        let clock = self.clock;
+        let Some(p) = self.pending_saves.iter_mut().find(|p| p.id == id && p.rev == rev) else { return };
+        p.failures += 1;
+        p.retry_at = Some(clock + SAVE_RETRY);
+        let first = p.failures == 1;
+        if let Some(c) = self.compose.as_mut().filter(|c| c.draft_id == id) {
+            c.save_error = Some(format!("Not saved: {error}"));
+        } else if first {
+            self.toast(format!("Couldn't save a draft on this computer ({error}). Envoy keeps trying."), true);
+        }
+    }
+
+    /// Hands failed saves to the engine again once their wait is over.
+    fn retry_saves(&mut self, clock: f64, tx: &mut Tx) {
+        let due: Vec<i64> = self.pending_saves.iter().filter(|p| p.retry_at.is_some_and(|t| t <= clock)).map(|p| p.id).collect();
+        for id in due {
+            let rev = self.next_stamp();
+            let Some(p) = self.pending_saves.iter_mut().find(|p| p.id == id) else { continue };
+            p.rev = rev;
+            p.retry_at = None;
+            let (draft, open) = (p.draft.clone(), p.open);
+            if let Some(c) = &mut self.compose
+                && c.draft_id == id
+            {
+                c.submitted = rev;
+            }
+            self.send(Command::SaveDraft { id, draft, open, rev });
+        }
+        if let Some(next) = self.pending_saves.iter().filter_map(|p| p.retry_at).reduce(f64::min) {
+            tx.wake_after(std::time::Duration::from_secs_f64((next - clock).max(0.05)));
+        }
+    }
+
+    /// A send couldn't be queued: the message goes back in the composer, from the copy kept
+    /// for that, and is saved again.
+    fn send_failed(&mut self, draft_id: Option<i64>) {
+        let Some(id) = draft_id else { return };
+        let Some(i) = self.pending_sends.iter().position(|(d, _)| *d == id) else { return };
+        let (_, draft) = self.pending_sends.remove(i);
+        self.show_draft(id, draft, false, None);
+        if let Some(c) = &mut self.compose
+            && c.draft_id == id
+        {
+            c.dirty = true;
+            c.edits += 1;
         }
     }
 
@@ -1343,18 +1471,39 @@ impl App {
         self.compose = None;
     }
 
-    /// The window is closing: the composer's unsaved edits are written before the process can
-    /// exit, and it opens again on the next start.
+    /// The window is closing: everything not confirmed written is written now, before the
+    /// process can exit ([`App::unsaved`]). The composer opens again on the next start.
     pub fn on_close(&mut self) {
+        let unsaved = self.unsaved();
+        let Some(engine) = &self.engine else { return };
+        for u in unsaved {
+            let done = match &u {
+                Unsaved::Save { id, draft, open, rev } => engine.save_draft_now(*id, draft, *open, *rev),
+                Unsaved::Unsent { id, draft } => engine.keep_unsent_now(*id, draft),
+            };
+            if let Err(e) = done {
+                eprintln!("couldn't save a draft: {e:#}");
+            }
+        }
+    }
+
+    /// What isn't confirmed written, oldest first, taken for writing on the spot: saves handed
+    /// to the engine (each under its stamp, so one the engine already applied, or overtook,
+    /// changes nothing), the composer's unsaved edits, and messages sent but not confirmed
+    /// queued.
+    pub fn unsaved(&mut self) -> Vec<Unsaved> {
+        let mut saves = std::mem::take(&mut self.pending_saves);
+        saves.sort_by_key(|p| p.rev);
+        let mut out: Vec<Unsaved> = saves.into_iter().map(|p| Unsaved::Save { id: p.id, draft: p.draft, open: p.open, rev: p.rev }).collect();
         let rev = self.next_stamp();
-        let (Some(c), Some(engine)) = (&mut self.compose, &self.engine) else { return };
-        if !c.dirty {
-            return;
+        if let Some(c) = &mut self.compose
+            && c.dirty
+        {
+            c.dirty = false;
+            out.push(Unsaved::Save { id: c.draft_id, draft: c.draft(), open: true, rev });
         }
-        c.dirty = false;
-        if let Err(e) = engine.save_draft_now(c.draft_id, &c.draft(), true, rev) {
-            eprintln!("couldn't save the draft: {e:#}");
-        }
+        out.extend(std::mem::take(&mut self.pending_sends).into_iter().map(|(id, draft)| Unsaved::Unsent { id, draft }));
+        out
     }
 
     /// Discards the composer and its draft. What was written stays in the toast's Undo, which
@@ -1362,6 +1511,8 @@ impl App {
     /// toast does. An untouched composer just closes.
     pub fn discard_compose(&mut self, tx: &mut Tx) {
         let Some(c) = self.compose.take() else { return };
+        // Discarded: a save still waiting mustn't bring it back when the window closes.
+        self.pending_saves.retain(|p| p.id != c.draft_id);
         if !c.dirty && !c.saved {
             return;
         }
@@ -1481,6 +1632,9 @@ impl App {
             self.toast("Sent (demo mode — nothing left your computer)", false);
             return;
         }
+        // Kept until the engine confirms it queued the message (Event::Sent), or gives it back
+        // (Event::SendFailed), and written as a draft if the window closes first.
+        self.pending_sends.push((draft_id, draft.clone()));
         // The draft goes with it; undoing the send brings it back (Event::DraftOpened).
         self.send(Command::Send { draft, draft_id: Some(draft_id) });
         if self.view_role() == Some(Role::Drafts) {
@@ -1968,6 +2122,93 @@ mod tests {
         assert!(dirty(&app), "still typing, as far as it knows");
         app.tick(t + 0.1 + SAVE_WHEN_IDLE, &mut tx);
         assert!(!dirty(&app), "saved after the pause");
+    }
+
+    /// Types into a new composer and lets the autosave hand it to the engine.
+    fn typed_and_saved(app: &mut App, text: &str) -> (i64, i64) {
+        app.compose_new();
+        type_into_body(app, text);
+        let t = app.clock + 1.0;
+        app.tick(t, &mut Tx::default());
+        app.tick(t + SAVE_WHEN_IDLE + 0.1, &mut Tx::default());
+        let c = app.compose.as_ref().unwrap();
+        assert!(!c.dirty, "handed to the engine");
+        (c.draft_id, c.submitted)
+    }
+
+    #[test]
+    fn draft_saved_shows_only_once_the_engine_confirms() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let (id, rev) = typed_and_saved(&mut app, "Dear Ana,");
+        assert!(!app.compose.as_ref().unwrap().shows_saved(), "handed over isn't saved");
+        app.apply(Event::DraftSaved { id, rev }, &mut Tx::default());
+        assert!(app.compose.as_ref().unwrap().shows_saved());
+        assert!(app.pending_saves.is_empty(), "nothing left to write on close");
+    }
+
+    #[test]
+    fn a_failed_save_says_so_and_is_tried_again() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let (id, rev) = typed_and_saved(&mut app, "Dear Ana,");
+        app.apply(Event::DraftSaveFailed { id, rev, error: "disk full".into() }, &mut Tx::default());
+        let c = app.compose.as_ref().unwrap();
+        assert!(!c.shows_saved() && c.save_error.as_deref() == Some("Not saved: disk full"));
+        let t = app.clock;
+        app.tick(t + SAVE_RETRY / 2.0, &mut Tx::default());
+        assert_eq!(app.compose.as_ref().unwrap().submitted, rev, "waits a little");
+        app.tick(t + SAVE_RETRY, &mut Tx::default());
+        let again = app.compose.as_ref().unwrap().submitted;
+        assert!(again > rev && app.pending_saves[0].rev == again, "tried again");
+        app.apply(Event::DraftSaved { id, rev: again }, &mut Tx::default());
+        let c = app.compose.as_ref().unwrap();
+        assert!(c.shows_saved() && c.save_error.is_none());
+    }
+
+    #[test]
+    fn closing_writes_everything_not_confirmed() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false; // sends go to the engine (there is none: nothing confirms)
+        // A saved before B took the composer; the engine hasn't confirmed either save.
+        let (a, a_rev) = typed_and_saved(&mut app, "Draft A");
+        app.compose_new();
+        let b = app.compose.as_ref().unwrap().draft_id;
+        type_into_body(&mut app, "Draft B, not saved yet");
+        // C was sent, not confirmed queued.
+        let (c, _) = typed_and_saved(&mut app, "Draft C");
+        app.compose.as_mut().unwrap().to = TextEdit::new("ana@x.com");
+        app.send_compose();
+        let unsaved = app.unsaved();
+        let has = |u: &Unsaved, want: i64| match u {
+            Unsaved::Save { id, .. } | Unsaved::Unsent { id, .. } => *id == want,
+        };
+        // Parking saved it again (no longer open), superseding its autosave.
+        assert!(matches!(unsaved.iter().find(|u| has(u, a)), Some(Unsaved::Save { open: false, rev, draft, .. }) if *rev > a_rev && draft.body.starts_with("Draft A")), "A: {unsaved:?}");
+        assert!(unsaved.iter().any(|u| has(u, b)), "B, parked with its edits: {unsaved:?}");
+        assert!(unsaved.iter().any(|u| matches!(u, Unsaved::Unsent { id, draft } if *id == c && draft.to == "ana@x.com")), "C, as sent: {unsaved:?}");
+        assert!(matches!(unsaved.last(), Some(Unsaved::Unsent { .. })), "after C's own earlier save, so the sent version wins");
+        assert!(app.unsaved().is_empty(), "taken");
+        // Confirmed, none of it is written again.
+        let (d, d_rev) = typed_and_saved(&mut app, "Draft D");
+        app.apply(Event::DraftSaved { id: d, rev: d_rev }, &mut Tx::default());
+        assert!(app.unsaved().is_empty());
+    }
+
+    #[test]
+    fn a_send_that_fails_brings_the_message_back() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let (id, _) = typed_and_saved(&mut app, "Hello");
+        app.compose.as_mut().unwrap().to = TextEdit::new("ana@x.com");
+        app.send_compose();
+        assert!(app.compose.is_none());
+        app.apply(Event::SendFailed { draft_id: Some(id) }, &mut Tx::default());
+        let c = app.compose.as_ref().expect("back in the composer");
+        assert!(c.draft_id == id && c.body.text.starts_with("Hello") && c.to.text == "ana@x.com");
+        assert!(c.dirty, "and saved again");
     }
 
     #[test]
