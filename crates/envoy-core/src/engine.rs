@@ -1590,10 +1590,11 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
                 let gone = runner.purge_draft(&mailbox, message_id, known, !*exact).await?;
                 shared.with_writer(|st| {
                     st.delete_uids(id, &mailbox, &gone)?;
-                    // A cleanup's search may have taken the copy of a newer upload here.
+                    // A cleanup's search may have taken the copy of a newer upload here: on this
+                    // try, or on one whose answer was lost (this one then finds nothing), so
+                    // whatever it found.
                     if let Some((d, generation)) = left_by
                         && !*exact
-                        && !gone.is_empty()
                         && st.draft_cleaned_up(*d, id, *generation, now())?
                     {
                         log::info!("{}: an old cleanup may have taken a draft's newest copy; it goes up again", account.email);
@@ -1697,6 +1698,9 @@ mod tests {
         /// Saves can't tell the new copy from the old ones (no APPENDUID, a search that misses):
         /// older copies are kept.
         unsure: bool,
+        /// The next purge goes through on the server, but its answer is lost (the connection
+        /// drops).
+        cut_off: bool,
     }
 
     impl FakeServer {
@@ -1713,6 +1717,7 @@ mod tests {
                 appends: 0,
                 previous: vec![],
                 unsure: false,
+                cut_off: false,
             }
         }
 
@@ -1766,6 +1771,10 @@ mod tests {
                 self.drafts.retain(|(u, m, _)| !goes(*u, m));
                 gone
             });
+            let r = match r {
+                Ok(_) if std::mem::take(&mut self.cut_off) => Err(anyhow!("connection lost")),
+                r => r,
+            };
             async move { r }
         }
     }
@@ -2128,6 +2137,35 @@ mod tests {
         replay_times(&shared, &mut a, 2).await;
         assert_eq!(a.drafts().into_iter().map(|(_, s)| s).collect::<Vec<_>>(), vec!["v3".to_owned()], "a ends up with the draft");
         assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty(), "and nothing left to do on a");
+    }
+
+    #[tokio::test]
+    async fn an_old_cleanup_whose_answer_is_lost_still_gets_the_copy_put_back() {
+        let (shared, _rx) = drafts_engine();
+        let mut a = FakeServer { unsure: true, ..FakeServer::new(&shared, |_: &Shared| {}) };
+        type_draft(&shared, 7, 1, "v1");
+        replay_with(&shared, &account("a"), &mut a).await.unwrap();
+        a.unsure = false;
+        // Moved to b, a's cleanup failing for now; back to a, with new text uploaded.
+        let to_b = Draft { account: "b".into(), ..draft("v2") };
+        shared.with_writer(|st| drafts::save(st, 7, &to_b, true, at(2), now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+        a.fail = true;
+        replay_with(&shared, &account("a"), &mut a).await.unwrap();
+        a.fail = false;
+        type_draft(&shared, 7, 3, "v3");
+        replay_with(&shared, &account("a"), &mut a).await.unwrap();
+        // The cleanup's retry takes v3 too, and its answer is lost; the next finds nothing.
+        a.cut_off = true;
+        shared.with_writer(|st| {
+            st.ops_due_now("a");
+            Ok(())
+        })
+        .unwrap();
+        assert!(replay_with(&shared, &account("a"), &mut a).await.is_err(), "the connection dropped");
+        assert!(a.drafts.is_empty(), "{:?}", a.drafts());
+        replay_times(&shared, &mut a, 3).await;
+        assert_eq!(a.drafts().into_iter().map(|(_, s)| s).collect::<Vec<_>>(), vec!["v3".to_owned()], "a ends up with the draft");
+        assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty());
     }
 
     #[tokio::test]
