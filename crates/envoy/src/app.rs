@@ -1425,7 +1425,8 @@ impl App {
         let (id, draft, lifecycle) = (c.draft_id, c.draft(), c.lifecycle);
         self.submit_save(id, draft, open, rev, lifecycle);
         if self.view_role() == Some(Role::Drafts) {
-            self.request_list();
+            // The list on screen, read again.
+            self.request_list_as(false);
         }
     }
 
@@ -1757,7 +1758,8 @@ impl App {
         // The draft goes with it; undoing the send brings it back (Event::DraftOpened).
         self.send(Command::Send { draft, draft_id: Some(draft_id) });
         if self.view_role() == Some(Role::Drafts) {
-            self.request_list();
+            // The list on screen, read again.
+            self.request_list_as(false);
         }
     }
 
@@ -2071,6 +2073,17 @@ mod tests {
 
     fn last_list_request(app: &App) -> String {
         app.sent.borrow().iter().rev().find(|c| c.starts_with("List")).cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn saving_in_the_drafts_view_refreshes_its_list() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.go(View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() });
+        app.demo = false;
+        typed_and_saved(&mut app, "Dear Ana,");
+        // The list on screen read again: whole, its changes animating, the open row kept.
+        assert!(last_list_request(&app).contains("stream: false"), "{}", last_list_request(&app));
     }
 
     #[test]

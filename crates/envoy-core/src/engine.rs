@@ -210,7 +210,7 @@ impl Engine {
     /// for the store; the upload goes out on the next start if not before.
     /// False when the store refused it ([`Store::save_draft`]): it isn't saved.
     pub fn save_draft_now(&self, id: i64, draft: &Draft, open: bool, at: DraftRev) -> Result<bool> {
-        let st = self.writer.lock().map_err(|_| anyhow!("store poisoned"))?;
+        let st = self.writer.lock()?;
         Ok(drafts::save(&st, id, draft, open, at, now())?.is_some())
     }
 
@@ -218,7 +218,7 @@ impl Engine {
     /// its send was queued (or went out): for when the window closes before the engine
     /// confirmed it. False when the store refused it ([`Store::draft_unsent`]).
     pub fn keep_unsent_now(&self, id: i64, draft: &Draft, at: DraftRev) -> Result<bool> {
-        let st = self.writer.lock().map_err(|_| anyhow!("store poisoned"))?;
+        let st = self.writer.lock()?;
         st.draft_unsent(id, draft, Some(at), now())
     }
 
