@@ -321,8 +321,17 @@ impl Store {
         Ok(())
     }
 
+    /// Applies the server's counts. Messages waiting for a move to replay are still on the
+    /// server, so they're in its counts, but they've already left this mailbox locally (and
+    /// undo adds them back): they're taken out here so nothing is counted twice.
     pub fn set_counts(&self, account: &str, name: &str, unread: u32, total: u32) -> Result<()> {
-        self.conn.execute("UPDATE mailboxes SET unread = ?3, total = ?4 WHERE account = ?1 AND name = ?2", params![account, name, unread, total])?;
+        self.conn.execute(
+            "UPDATE mailboxes SET
+                unread = MAX(0, ?3 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0 AND flags & 1 = 0)),
+                total = MAX(0, ?4 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0))
+             WHERE account = ?1 AND name = ?2",
+            params![account, name, unread, total],
+        )?;
         Ok(())
     }
 
@@ -1130,6 +1139,19 @@ mod tests {
             let searches = plan.iter().any(|d| d.starts_with("SEARCH") && d.contains(&format!("INDEX {index} ")));
             assert!(searches && !plan.iter().any(|d| d.starts_with("SCAN")), "{sql}\n  plan: {plan:?}");
         }
+    }
+
+    #[test]
+    fn server_counts_dont_count_held_messages_twice() {
+        let s = Store::memory();
+        held_move(&s);
+        assert_eq!(unread(&s), 0);
+        // A sync during the window: the server still has the message in INBOX.
+        s.set_counts("a", "INBOX", 1, 1).unwrap();
+        let inbox_box = || s.mailboxes("a").unwrap().into_iter().find(|m| m.name == "INBOX").unwrap();
+        assert_eq!((inbox_box().unread, inbox_box().total), (0, 0), "the held message isn't counted");
+        s.undo_batch(7).unwrap();
+        assert_eq!(unread(&s), 1, "one unread message, one unread");
     }
 
     #[test]
