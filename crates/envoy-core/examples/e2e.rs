@@ -481,6 +481,51 @@ fn scenario(pass: Pass) {
     d.until("an empty queue", 30, |d| d.events.iter().rev().find_map(|e| if let Event::Pending(n) = e { Some(*n) } else { None }).filter(|n| *n == 0));
     println!("✓ nothing left queued");
 
+    // ── Attachments: read from disk into a draft, in its Drafts copy, sent; a forward takes them ──
+    let name = "Plán — 2026.pdf";
+    let pdf: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+    let path = home.join(name);
+    std::fs::write(&path, &pdf).unwrap();
+    let has_file = |mailbox: &str, subject: &str| probe.files(mailbox, subject) == [(name.to_owned(), pdf.clone())];
+    let mut with_file = Draft { account: ACCOUNT.into(), to: format!("Me <{user}>"), subject: "With a file".into(), body: "Attached.".into(), ..Draft::default() };
+    // Saved first: a file is kept with its draft.
+    d.send(Command::SaveDraft { id: 3, draft: with_file.clone(), open: true, rev: 1, lifecycle: 0 });
+    let mark = d.mark();
+    d.send(Command::AttachFiles { draft: 3, files: vec![(0, path)] });
+    let attached = d.wait(mark, "the file attached", 10, |e| match e {
+        Event::FileAttached { draft: 3, file } => Some(file.clone()),
+        Event::AttachFailed { error, .. } => panic!("not attached: {error}"),
+        _ => None,
+    });
+    assert_eq!((attached.filename.as_str(), attached.mime.as_str(), attached.size), (name, "application/pdf", pdf.len()));
+    with_file.attachments = vec![attached];
+    d.send(Command::SaveDraft { id: 3, draft: with_file.clone(), open: false, rev: 2, lifecycle: 0 });
+    d.until("the draft in Drafts with its file", 30, |_| has_file("Drafts", "With a file").then_some(()));
+    println!("✓ a file read into a draft, and in its Drafts copy: name and bytes");
+    let mark = d.mark();
+    d.send(Command::Send { draft: with_file, draft_id: Some(3) });
+    d.wait(mark, "the send queued", 10, |e| matches!(e, Event::Sent { draft_id: Some(3), .. }).then_some(()));
+    d.until("the message received with its file", 30, |_| has_file("INBOX", "With a file").then_some(()));
+    d.until("the sent draft gone from Drafts", 20, |_| probe.drafts().is_empty().then_some(()));
+    println!("✓ sent with the file: received, name and bytes intact; the draft gone from Drafts");
+    // Forwarded: the original's file goes along, fetched from the server if it isn't here yet.
+    let received = d.until("the message synced", 30, |d| d.list(&inbox, "", false).into_iter().find(|s| s.subject == "With a file"));
+    let mut fwd = Draft { account: ACCOUNT.into(), to: format!("Me <{user}>"), subject: "Fwd: With a file".into(), body: "See below.".into(), ..Draft::default() };
+    d.send(Command::SaveDraft { id: 4, draft: fwd.clone(), open: true, rev: 1, lifecycle: 0 });
+    let mark = d.mark();
+    d.send(Command::AttachForwarded { draft: 4, message: received.id, files: vec![(0, 0)] });
+    let forwarded = d.wait(mark, "the original's file attached", 30, |e| match e {
+        Event::FileAttached { draft: 4, file } => Some(file.clone()),
+        Event::AttachFailed { error, .. } => panic!("not attached: {error}"),
+        _ => None,
+    });
+    fwd.attachments = vec![forwarded];
+    d.send(Command::SaveDraft { id: 4, draft: fwd.clone(), open: true, rev: 2, lifecycle: 0 });
+    d.send(Command::Send { draft: fwd, draft_id: Some(4) });
+    d.until("the forward received with the file", 30, |_| has_file("INBOX", "Fwd: With a file").then_some(()));
+    println!("✓ forwarded with the original's file");
+    d.until("an empty queue", 30, |d| d.events.iter().rev().find_map(|e| if let Event::Pending(n) = e { Some(*n) } else { None }).filter(|n| *n == 0));
+
     // ── What Envoy must never have touched ──
     for (mailbox, flags, subject) in BYSTANDERS {
         let found = probe.messages(mailbox).into_iter().find(|m| m.subject == *subject);
@@ -747,6 +792,7 @@ struct ServerMessage {
     subject: String,
     text: String,
     flags: u32,
+    raw: Vec<u8>,
 }
 
 /// A plain IMAP session straight to GreenMail (never through the proxy), for setting up and for
@@ -840,7 +886,7 @@ impl Probe {
                 // FETCH responses without a body, in among the answer's.
                 .filter_map(|m| {
                     let p = envoy_core::mime::parse(m.body()?, false).expect("a message");
-                    Some(ServerMessage { subject: p.subject, text: p.text.unwrap_or_default(), flags: envoy_core::imap::flag_bits(m.flags()) })
+                    Some(ServerMessage { subject: p.subject, text: p.text.unwrap_or_default(), flags: envoy_core::imap::flag_bits(m.flags()), raw: m.body()?.to_vec() })
                 })
                 .collect()
         })
@@ -859,6 +905,13 @@ impl Probe {
     /// Flags of the message with this subject, if it's there and not flagged \Deleted.
     fn flags(&self, mailbox: &str, subject: &str) -> Option<u32> {
         self.messages(mailbox).into_iter().find(|m| m.subject == subject && m.flags & flags::DELETED == 0).map(|m| m.flags)
+    }
+
+    /// The files of the message with this subject, not flagged \Deleted: name and bytes.
+    fn files(&self, mailbox: &str, subject: &str) -> Vec<(String, Vec<u8>)> {
+        let Some(m) = self.messages(mailbox).into_iter().find(|m| m.subject == subject && m.flags & flags::DELETED == 0) else { return vec![] };
+        let d = envoy_core::mime::server_draft(&m.raw).expect("a message");
+        d.draft.attachments.into_iter().map(|a| a.filename).zip(d.files).collect()
     }
 
     /// Envoy's drafts in Drafts (subject, text): not flagged \Deleted, other devices' left out.
