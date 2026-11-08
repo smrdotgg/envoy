@@ -493,6 +493,50 @@ pub async fn append(session: &mut Session, mailbox: &str, raw: &[u8], seen: bool
     Ok(())
 }
 
+/// Saves a draft: APPENDs it to `mailbox` (flagged \Draft and \Seen), then deletes every other
+/// copy there with its Message-ID: the version it replaces, or one an interrupted save left
+/// behind. Found by Message-ID, this needs no UIDPLUS, and an old copy that's already gone
+/// (deleted elsewhere) is no matter. Returns the UIDs deleted.
+pub async fn replace_draft(session: &mut Session, caps: Caps, mailbox: &str, raw: &[u8], message_id: &str) -> Result<Vec<u32>> {
+    timed("APPEND", session.append(mailbox, Some("(\\Draft \\Seen)"), None, raw)).await??;
+    select(session, mailbox).await?;
+    let mut uids = uids_with_message_id(session, message_id).await?;
+    // UIDs only grow: the highest is the copy just appended.
+    uids.sort_unstable();
+    uids.pop();
+    delete_uids(session, caps, &uids).await?;
+    Ok(uids)
+}
+
+/// Deletes every message with this Message-ID from `mailbox` (a draft's copies). Returns their
+/// UIDs.
+pub async fn purge_message_id(session: &mut Session, caps: Caps, mailbox: &str, message_id: &str) -> Result<Vec<u32>> {
+    select(session, mailbox).await?;
+    let uids = uids_with_message_id(session, message_id).await?;
+    delete_uids(session, caps, &uids).await?;
+    Ok(uids)
+}
+
+/// UIDs of the messages in the selected mailbox with exactly this Message-ID. SEARCH matches
+/// substrings, and some servers match loosely, so each hit's header is checked: a draft's save
+/// must never delete anything else.
+async fn uids_with_message_id(session: &mut Session, message_id: &str) -> Result<Vec<u32>> {
+    let query = format!("HEADER Message-ID \"{}\"", message_id.replace('\\', "\\\\").replace('"', "\\\""));
+    let hits = timed("SEARCH", session.uid_search(query)).await??;
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let set = hits.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let fetched: Vec<Fetch> =
+        timed("FETCH ids", async { session.uid_fetch(set, "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])").await?.try_collect::<Vec<_>>().await }).await??;
+    Ok(fetched
+        .iter()
+        .filter(|f| f.header().and_then(|h| mime::parse(h, true)).is_some_and(|p| p.message_id == message_id))
+        .filter_map(|f| f.uid)
+        .filter(|u| hits.contains(u))
+        .collect())
+}
+
 /// What the server supports, of what Envoy uses.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Caps {

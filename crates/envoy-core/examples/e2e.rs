@@ -109,7 +109,7 @@ fn main() {
 
     // Folders the test needs (GreenMail starts with INBOX only).
     let probe = Probe::new();
-    for name in ["Trash", "Sent", "Archive", "Junk"] {
+    for name in ["Trash", "Sent", "Archive", "Junk", "Drafts"] {
         probe.create(name);
     }
     for i in 0..3 {
@@ -261,7 +261,7 @@ fn main() {
         ..Draft::default()
     };
     let t_send = Instant::now();
-    engine.send(Command::Send { draft });
+    engine.send(Command::Send { draft, draft_id: None });
     wait(&engine, "sent toast", 90, |e| {
         if !matches!(e, Event::List { .. } | Event::Mailboxes { .. } | Event::Changed { .. }) {
             println!("  event: {e:?}");
@@ -284,6 +284,63 @@ fn main() {
         assert_eq!(n, 1, "copy saved to Sent (non-Gmail)");
         println!("✓ copy appended to Sent");
     }
+
+    // Drafts: saved as they're typed, on the server in Drafts, one copy however many edits.
+    let t_draft = Instant::now();
+    let mut d = Draft { account: "alice".into(), to: "Alice <alice@localhost>".into(), bcc: "bob@localhost".into(), subject: "Draft one".into(), ..Draft::default() };
+    for (rev, words) in [(1, "First words."), (2, "First words, more."), (3, "First words, more, and the last.")] {
+        d.body = words.into();
+        engine.send(Command::SaveDraft { id: 1, draft: d.clone(), open: true, rev });
+    }
+    let on_server = |want: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let found = probe.drafts();
+            if found.len() == 1 && found[0].0 == want {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "Drafts never showed only {want:?}: {found:?}");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    let found = on_server("Draft one");
+    assert!(found[0].1.contains("the last"), "the newest version: {found:?}");
+    println!("✓ three quick saves: one copy in Drafts, the newest ({:?})", t_draft.elapsed());
+    // Edited and put away: replaced, not added, and at once.
+    d.subject = "Draft one, edited".into();
+    engine.send(Command::SaveDraft { id: 1, draft: d.clone(), open: false, rev: 4 });
+    on_server("Draft one, edited");
+    println!("✓ an edit replaces the copy in Drafts");
+    let drafts_view = View::Role { account: Some("alice".into()), role: Role::Drafts };
+    req += 1;
+    let rows = list(&engine, req, &drafts_view, "", false);
+    assert_eq!(rows.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>(), vec!["Draft one, edited"], "listed once");
+    engine.send(Command::OpenDraft { id: rows[0].id });
+    let opened = wait(&engine, "draft opened", 10, |e| match e {
+        Event::DraftOpened { id, draft, .. } => Some((*id, draft.clone())),
+        _ => None,
+    });
+    assert_eq!((opened.0, opened.1.bcc.as_str()), (1, "bob@localhost"), "opens as the local draft, Bcc and all");
+    // Sent (to Alice only: GreenMail has no Bob): the message goes out and the draft leaves Drafts.
+    d.bcc.clear();
+    engine.send(Command::Send { draft: d.clone(), draft_id: Some(1) });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while probe.count("Drafts") > 0 {
+        assert!(Instant::now() < deadline, "the sent draft stayed in Drafts");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    println!("✓ sending the draft removed it from Drafts");
+    // Discarded: gone from the server too.
+    let other = Draft { account: "alice".into(), subject: "Never mind".into(), body: "Scratch that.".into(), ..Draft::default() };
+    engine.send(Command::SaveDraft { id: 2, draft: other, open: false, rev: 1 });
+    on_server("Never mind");
+    engine.send(Command::DiscardDraft { id: 2, undo: None });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while probe.count("Drafts") > 0 {
+        assert!(Instant::now() < deadline, "the discarded draft stayed in Drafts");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    println!("✓ discarding a draft removed it from Drafts");
 
     // Delete → Trash.
     engine.send(Command::Move { ids: vec![digest.id], to: MoveTarget::Trash, thread: false, undo: None });
@@ -350,6 +407,22 @@ impl Probe {
     fn count(&self, mailbox: &str) -> u32 {
         let m = mailbox.to_owned();
         self.run(async move |s| s.select(&m).await.unwrap().exists)
+    }
+
+    /// What's in Drafts: (subject, text) of each message not flagged \Deleted.
+    fn drafts(&self) -> Vec<(String, String)> {
+        use futures::TryStreamExt;
+        self.run(async move |s| {
+            if s.select("Drafts").await.unwrap().exists == 0 {
+                return vec![];
+            }
+            let f: Vec<_> = s.fetch("1:*", "(FLAGS BODY.PEEK[])").await.unwrap().try_collect().await.unwrap();
+            f.iter()
+                .filter(|m| !m.flags().any(|x| matches!(x, async_imap::types::Flag::Deleted)))
+                .filter_map(|m| m.body().and_then(|raw| envoy_core::mime::parse(raw, false)))
+                .map(|p| (p.subject, p.text.unwrap_or_default()))
+                .collect()
+        })
     }
 
     fn flags(&self, uid: u32) -> Vec<String> {

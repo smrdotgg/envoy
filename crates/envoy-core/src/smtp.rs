@@ -49,11 +49,58 @@ pub struct Built {
     pub to: Vec<String>,
 }
 
-pub fn build(account: &Account, draft: &Draft) -> Result<Built> {
-    let from: LMailbox = LMailbox::new(
+fn sender(account: &Account) -> Result<LMailbox> {
+    Ok(LMailbox::new(
         if account.display_name.is_empty() { None } else { Some(account.display_name.clone()) },
         account.email.parse().map_err(|_| anyhow!("account address {} is invalid", account.email))?,
-    );
+    ))
+}
+
+/// A draft's copy for the Drafts mailbox, with the draft's own Message-ID (see
+/// `store/drafts.rs`). Unlike a message being sent it may have no recipients, or half-typed
+/// ones (kept as typed), and it keeps Bcc, so it opens again as it was written.
+pub fn build_draft(account: &Account, draft: &Draft, message_id: &str) -> Result<Vec<u8>> {
+    use lettre::address::Envelope;
+    use lettre::message::header::{HeaderName, HeaderValue};
+    let from = sender(account)?;
+    let mut b = Message::builder()
+        .from(from.clone())
+        .subject(draft.subject.clone())
+        .date_now()
+        .message_id(Some(message_id.to_owned()))
+        .user_agent("Envoy".into())
+        .keep_bcc()
+        // Never sent: the envelope only satisfies the builder.
+        .envelope(Envelope::new(Some(from.email.clone()), vec![from.email.clone()])?);
+    for (name, field) in [("To", &draft.to), ("Cc", &draft.cc), ("Bcc", &draft.bcc)] {
+        let field = field.trim();
+        if field.is_empty() {
+            continue;
+        }
+        b = match parse_recipients(field) {
+            Ok(list) if !list.is_empty() => {
+                let list: Mailboxes = list.into_iter().collect();
+                match name {
+                    "To" => b.mailbox(header::To::from(list)),
+                    "Cc" => b.mailbox(header::Cc::from(list)),
+                    _ => b.mailbox(header::Bcc::from(list)),
+                }
+            }
+            _ => b.raw_header(HeaderValue::new(HeaderName::new_from_ascii_str(name), field.to_owned())),
+        };
+    }
+    if !draft.in_reply_to.is_empty() {
+        b = b.in_reply_to(draft.in_reply_to.clone());
+    }
+    if !draft.references.is_empty() {
+        b = b.references(draft.references.clone());
+    }
+    let msg = b.header(header::ContentType::TEXT_PLAIN).body(draft.body.replace("\r\n", "\n").replace('\n', "\r\n")).context("couldn't build the draft")?;
+    Ok(msg.formatted())
+}
+
+pub fn build(account: &Account, draft: &Draft) -> Result<Built> {
+    let from = sender(account)?;
     let to = parse_recipients(&draft.to)?;
     let cc = parse_recipients(&draft.cc)?;
     let bcc = parse_recipients(&draft.bcc)?;
@@ -121,6 +168,53 @@ pub async fn send(account: &Account, cred: &Credential, from: &str, to: &[String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account() -> Account {
+        Account {
+            id: "a".into(),
+            email: "me@x.com".into(),
+            display_name: "Me".into(),
+            auth: crate::accounts::AuthKind::Password,
+            username: String::new(),
+            imap_host: String::new(),
+            imap_port: 993,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            hue: 0.0,
+            signature: String::new(),
+            oauth_client_id: String::new(),
+            oauth_client_secret: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_draft_copy_opens_again_as_it_was_written() {
+        let draft = Draft {
+            account: "a".into(),
+            to: "\"Lima, Ana\" <ana@x.com>, bo@y.com".into(),
+            cc: String::new(),
+            bcc: "secret@z.com".into(),
+            subject: "Café plans — Thursday".into(),
+            body: "Hi Ana,\n\nThursday works. Bring the plans for the café, the long ones with all the numbers in them, so we can go through every page.\n\n-- \nMe".into(),
+            in_reply_to: "<orig@x>".into(),
+            references: "<root@x> <orig@x>".into(),
+            reply_of: None,
+        };
+        let raw = build_draft(&account(), &draft, "<7.abc.draft@envoy>").unwrap();
+        let back = crate::mime::draft_from_raw(&raw).unwrap();
+        assert_eq!(Draft { account: "a".into(), ..back }, draft, "{}", String::from_utf8_lossy(&raw));
+        let p = crate::mime::parse(&raw, true).unwrap();
+        assert_eq!(p.message_id, "<7.abc.draft@envoy>");
+    }
+
+    #[test]
+    fn a_draft_copy_keeps_half_typed_recipients() {
+        let draft = Draft { to: "ana@x.com, bo@".into(), subject: "Hi".into(), ..Draft::default() };
+        let raw = String::from_utf8(build_draft(&account(), &draft, "<1.a.draft@envoy>").unwrap()).unwrap();
+        assert!(raw.contains("To: ana@x.com, bo@"), "{raw}");
+        let empty = build_draft(&account(), &Draft::default(), "<2.a.draft@envoy>").unwrap();
+        assert!(crate::mime::draft_from_raw(&empty).is_some(), "no recipients, subject or text: still a draft");
+    }
 
     #[test]
     fn recipients_split_outside_quotes() {

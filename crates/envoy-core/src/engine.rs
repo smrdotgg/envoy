@@ -17,8 +17,8 @@ use crate::accounts::{self, Account, AuthKind};
 use crate::imap::{self, Credential, Session};
 use crate::model::{Draft, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use crate::settings::Settings;
-use crate::store::{Op, Query, Store};
-use crate::{oauth, paths, secrets, smtp};
+use crate::store::{LocalDraft, Op, Query, Store};
+use crate::{drafts, oauth, paths, secrets, smtp};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MoveTarget {
@@ -46,10 +46,21 @@ pub enum Command {
     /// [`Command::UndoMove`]; the move then waits `behavior.undoSeconds` before reaching the
     /// server. `None` sends it at once.
     Move { ids: Vec<MessageId>, to: MoveTarget, thread: bool, undo: Option<i64> },
-    /// Takes back a [`Command::Move`] that hasn't reached the server yet.
+    /// Takes back a [`Command::Move`] (or [`Command::DiscardDraft`]) that hasn't reached the
+    /// server yet.
     UndoMove { undo: i64 },
-    Send { draft: Draft },
+    /// Sends after `compose.undoSendSeconds`. `draft_id`: the composer's draft, which goes once
+    /// the message is out, and comes back in the composer if the send is undone.
+    Send { draft: Draft, draft_id: Option<i64> },
     UndoSend { op: i64 },
+    /// Saves the composer's content as draft `id` (an id the app picks, unique across runs) and
+    /// queues its upload to the Drafts mailbox. `rev` orders saves ([`Store::save_draft`]);
+    /// `open`: it's still in the composer.
+    SaveDraft { id: i64, draft: Draft, open: bool, rev: i64 },
+    /// Opens a row of a Drafts list in the composer: answered with [`Event::DraftOpened`].
+    OpenDraft { id: MessageId },
+    /// Discards draft `id`, here and on the server. `undo` as in [`Command::Move`].
+    DiscardDraft { id: i64, undo: Option<i64> },
     SyncNow,
     /// The mailbox the user is looking at: synced first and kept fresh.
     Watch { view: View },
@@ -92,6 +103,9 @@ pub enum Event {
     /// A decoded image: straight-alpha sRGB RGBA.
     Image { url: String, width: u32, height: u32, rgba: Arc<[u8]> },
     ImageFailed { url: String },
+    /// A draft for the composer: opened from Drafts, or back from an undone send, or, with
+    /// `restored`, the one left in the composer when the app last closed.
+    DraftOpened { id: i64, draft: Draft, restored: bool },
 }
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -103,6 +117,19 @@ pub const FIRST_PAGE: u32 = 100;
 pub struct Engine {
     tx: mpsc::UnboundedSender<Command>,
     rx: std::sync::mpsc::Receiver<Event>,
+    writer: OpenedStore,
+}
+
+/// The store's writer, once the engine thread has opened it ([`Engine::start`]): for writes
+/// that can't wait for the engine ([`Engine::save_draft_now`]).
+#[derive(Clone, Default)]
+struct OpenedStore(Arc<std::sync::OnceLock<Arc<Mutex<Store>>>>);
+
+impl OpenedStore {
+    /// The store, locked: an error if it isn't open (not yet, or it couldn't be).
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
+        self.0.get().ok_or_else(|| anyhow!("the mail cache isn't open"))?.lock().map_err(|_| anyhow!("store poisoned"))
+    }
 }
 
 impl Engine {
@@ -114,6 +141,8 @@ impl Engine {
         let (tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, rx) = std::sync::mpsc::channel();
         let waker: Waker = Arc::new(waker);
+        let writer = OpenedStore::default();
+        let opened = writer.clone();
         std::thread::Builder::new().name("envoy-engine".into()).spawn(move || {
             let db = paths::database_file();
             let stores = Store::open(&db).and_then(|writer| Ok((writer, Store::open(&db)?)));
@@ -125,8 +154,10 @@ impl Engine {
                     return;
                 }
             };
+            let writer = Arc::new(Mutex::new(writer));
+            let _ = opened.0.set(writer.clone());
             let shared = Arc::new(Shared {
-                writer: Arc::new(Mutex::new(writer)),
+                writer,
                 reader: Arc::new(Mutex::new(reader)),
                 events: Mutex::new(ev_tx),
                 waker,
@@ -145,11 +176,19 @@ impl Engine {
             };
             rt.block_on(run(shared, cmd_rx));
         })?;
-        Ok(Engine { tx, rx })
+        Ok(Engine { tx, rx, writer })
     }
 
     pub fn send(&self, c: Command) {
         let _ = self.tx.send(c);
+    }
+
+    /// [`Command::SaveDraft`], done on the calling thread before returning: for when the window
+    /// closes, since the process may exit before the engine gets to a queued command. Waits only
+    /// for the store; the upload goes out on the next start if not before.
+    pub fn save_draft_now(&self, id: i64, draft: &Draft, open: bool, rev: i64) -> Result<()> {
+        let st = self.writer.lock().map_err(|_| anyhow!("store poisoned"))?;
+        drafts::save(&st, id, draft, open, rev, now()).map(|_| ())
     }
 
     pub fn drain(&self) -> Vec<Event> {
@@ -194,6 +233,12 @@ impl Shared {
 
     fn me(&self) -> HashSet<String> {
         self.accounts.read().map(|a| a.iter().map(|a| a.email.to_lowercase()).collect()).unwrap_or_default()
+    }
+
+    /// Who an account's mail is from, for rows that have no message to take it from.
+    fn sender(&self, account: &str) -> crate::model::Address {
+        let a = self.account(account);
+        crate::model::Address { name: a.as_ref().map(|a| a.display_name.clone()).unwrap_or_default(), email: a.map(|a| a.email).unwrap_or_default() }
     }
 
     fn with_writer<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
@@ -256,10 +301,35 @@ struct Worker {
 
 #[derive(Debug)]
 enum Job {
-    /// Download these messages now (someone opened them), then re-send the thread.
-    Bodies { mailbox: String, uids: Vec<u32>, reply: Option<(u64, MessageId, bool)> },
+    /// Download these messages now (someone opened them), then answer.
+    Bodies { mailbox: String, uids: Vec<u32>, reply: Option<Reply> },
     SyncMailbox(String),
     Sync,
+}
+
+/// What to send the UI once [`Job::Bodies`] has the messages.
+#[derive(Debug)]
+enum Reply {
+    /// The open conversation again: `(req, id, conversations)` as in [`Command::Open`].
+    Thread(u64, MessageId, bool),
+    /// A Drafts row, now readable, in the composer ([`Command::OpenDraft`]).
+    Draft(MessageId),
+}
+
+/// Answers a [`Job::Bodies`] once its messages are downloaded.
+fn reply(shared: &Shared, reply: &Reply) -> Result<()> {
+    match *reply {
+        Reply::Thread(req, id, conversations) => {
+            let messages = shared.reader.lock().map_err(|_| anyhow!("store poisoned"))?.thread(id, conversations)?;
+            shared.emit(Event::Thread { req, id, messages });
+        }
+        Reply::Draft(id) => {
+            if let Opening::Ready(d) = open_draft(shared, id, now())? {
+                shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false });
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
@@ -269,6 +339,12 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
     for a in &accounts {
         shared.emit_mailboxes(&a.id);
         workers.insert(a.id.clone(), spawn_worker(shared.clone(), a.id.clone()));
+    }
+    // What was being written when the app last closed (or crashed) goes back in the composer.
+    match shared.with_writer(|st| st.draft_to_restore()) {
+        Ok(Some(d)) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: true }),
+        Ok(None) => {}
+        Err(e) => log::warn!("couldn't read drafts: {e:#}"),
     }
     shared.emit_pending();
     tokio::spawn(upgrade_search(shared.clone()));
@@ -312,6 +388,14 @@ fn poke(workers: &HashMap<String, Worker>, account: &str, job: Job) {
     }
 }
 
+/// Wakes an account's worker to plan its wait again (an op was queued or brought forward),
+/// without the inbox check a [`Job::Sync`] brings.
+fn wake(workers: &HashMap<String, Worker>, account: &str) {
+    if let Some(w) = workers.get(account) {
+        w.notify.notify_one();
+    }
+}
+
 async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd: Command) -> Result<()> {
     match cmd {
         Command::List { req, view, query, conversations, limit, stream } => {
@@ -319,10 +403,14 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             tokio::task::spawn_blocking(move || {
                 let me = shared.me();
                 let q = Query::parse(&query);
-                // The top of a long list goes out first, and the rest when it's read.
-                let mut first = |items| shared.emit(Event::List { req, items, more: true });
-                let page = if stream { FIRST_PAGE } else { 0 };
-                let items = shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| st.list_paged(&view, &q, conversations, limit, &me, page, &mut first));
+                let items = shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| {
+                    // The top of a long list goes out first, and the rest when it's read. A
+                    // Drafts list goes in one piece: its rows are merged with the local drafts.
+                    let mut first = |items| shared.emit(Event::List { req, items, more: true });
+                    let page = if stream && !drafts::lists_drafts(&st, &view) { FIRST_PAGE } else { 0 };
+                    let items = st.list_paged(&view, &q, conversations, limit, &me, page, &mut first)?;
+                    drafts::merge(&st, &view, &q, limit, items, |a| shared.sender(a))
+                });
                 match items {
                     Ok(items) => shared.emit(Event::List { req, items, more: false }),
                     Err(e) => shared.emit(Event::Error(format!("search failed: {e}"))),
@@ -341,7 +429,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             }
             shared.emit(Event::Thread { req, id, messages });
             for ((account, mailbox), uids) in missing {
-                poke(workers, &account, Job::Bodies { mailbox, uids, reply: Some((req, id, conversations)) });
+                poke(workers, &account, Job::Bodies { mailbox, uids, reply: Some(Reply::Thread(req, id, conversations)) });
             }
         }
         Command::Prefetch { id, conversations } => {
@@ -375,34 +463,60 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             shared.emit_pending();
         }
         Command::UndoMove { undo } => undo_move(shared, undo)?,
-        Command::Send { draft } => {
-            let account = shared.account(&draft.account).ok_or_else(|| anyhow!("Choose an account to send from"))?;
-            let built = smtp::build(&account, &draft)?;
-            let undo = shared.setting_u32("compose.undoSendSeconds");
-            let (sent_mailbox, reply_of) = shared.with_writer(|st| {
-                let sent = if account.is_gmail() { None } else { st.mailbox_for_role(&account.id, Role::Sent)? };
-                let reply = match draft.reply_of {
-                    Some(id) => st.location(id)?.map(|(_, m, u)| (m, u)),
-                    None => None,
-                };
-                Ok((sent, reply))
-            })?;
-            let op = Op::Send {
-                raw_b64: base64::engine::general_purpose::STANDARD.encode(&built.raw),
-                from: built.from,
-                to: built.to,
-                sent_mailbox,
-                reply_of,
-            };
-            let id = shared.with_writer(|st| st.enqueue_at(&account.id, &op, now() + undo as i64))?;
-            shared.emit(Event::Sent { op: id, undo_secs: undo });
-            shared.emit_pending();
-            poke(workers, &account.id, Job::Sync);
+        Command::Send { draft, draft_id } => {
+            if let Err(e) = queue_send(shared, workers, &draft, draft_id) {
+                // Not sent: back in the composer, so nothing written is lost.
+                if let Some(id) = draft_id
+                    && let Ok(Some(d)) = shared.with_writer(|st| st.draft_unsent(id, &draft, now()))
+                {
+                    shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false });
+                }
+                return Err(e);
+            }
         }
         Command::UndoSend { op } => {
-            let cancelled = shared.with_writer(|st| st.cancel_send(op))?;
+            // The draft comes back in the composer, the same one: Drafts doesn't get a second.
+            let (cancelled, back) = shared.with_writer(|st| {
+                st.transaction(|st| {
+                    let cancelled = st.cancel_send(op)?;
+                    Ok((cancelled, if cancelled { st.unsend_draft(op, now())? } else { None }))
+                })
+            })?;
             shared.emit(Event::Toast(if cancelled { "Sending undone".into() } else { "Too late — it was already sent".into() }));
+            if let Some(d) = back {
+                let account = d.account.clone();
+                shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false });
+                shared.emit(Event::Changed { account: account.clone() });
+                wake(workers, &account);
+            }
             shared.emit_pending();
+        }
+        Command::SaveDraft { id, draft, open, rev } => {
+            if shared.with_writer(|st| drafts::save(st, id, &draft, open, rev, now()))? {
+                shared.emit_pending();
+                wake(workers, &draft.account);
+            }
+        }
+        Command::OpenDraft { id } => match open_draft(shared, id, now())? {
+            Opening::Ready(d) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false }),
+            Opening::Download { account, mailbox, uid } => poke(workers, &account, Job::Bodies { mailbox, uids: vec![uid], reply: Some(Reply::Draft(id)) }),
+            // Sent or discarded meanwhile: the list catches up.
+            Opening::Gone => shared.emit(Event::Changed { account: String::new() }),
+        },
+        Command::DiscardDraft { id, undo } => {
+            let window = shared.setting_u32("behavior.undoSeconds");
+            // Held like a move, with its second of grace (see move_and_hold).
+            let hold = undo.filter(|_| window > 0).map(|key| (now() + window as i64 + 1, key));
+            if let Some(account) = shared.with_writer(|st| st.discard_draft(id, hold))? {
+                if let Some((_, key)) = hold
+                    && let Ok(mut keys) = shared.undo_keys.lock()
+                {
+                    keys.insert(key, 1);
+                }
+                shared.emit(Event::Changed { account: account.clone() });
+                shared.emit_pending();
+                wake(workers, &account);
+            }
         }
         Command::SyncNow => {
             for (id, w) in workers.iter() {
@@ -558,6 +672,46 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
     Ok(())
 }
 
+/// [`Command::Send`]: builds the message and queues it for `compose.undoSendSeconds`, with the
+/// composer's draft waiting alongside it (hidden from Drafts) until it's out.
+fn queue_send(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, draft: &Draft, draft_id: Option<i64>) -> Result<()> {
+    let account = shared.account(&draft.account).ok_or_else(|| anyhow!("Choose an account to send from"))?;
+    let built = smtp::build(&account, draft)?;
+    let undo = shared.setting_u32("compose.undoSendSeconds");
+    let (sent_mailbox, reply_of) = shared.with_writer(|st| {
+        let sent = if account.is_gmail() { None } else { st.mailbox_for_role(&account.id, Role::Sent)? };
+        let reply = match draft.reply_of {
+            Some(id) => st.location(id)?.map(|(_, m, u)| (m, u)),
+            None => None,
+        };
+        Ok((sent, reply))
+    })?;
+    let op = Op::Send {
+        raw_b64: base64::engine::general_purpose::STANDARD.encode(&built.raw),
+        from: built.from,
+        to: built.to,
+        sent_mailbox,
+        reply_of,
+    };
+    // The draft waits with the message (hidden from Drafts) and goes once it's out.
+    let id = shared.with_writer(|st| {
+        st.transaction(|st| {
+            let id = st.enqueue_at(&account.id, &op, now() + undo as i64)?;
+            if let Some(d) = draft_id {
+                st.draft_sending(d, draft, id, now())?;
+            }
+            Ok(id)
+        })
+    })?;
+    shared.emit(Event::Sent { op: id, undo_secs: undo });
+    if draft_id.is_some() {
+        shared.emit(Event::Changed { account: account.id.clone() });
+    }
+    shared.emit_pending();
+    poke(workers, &account.id, Job::Sync);
+    Ok(())
+}
+
 /// [`Command::SetFlags`]'s local part: changes the flags, adjusts unread counts and queues the
 /// change. Returns the accounts touched.
 fn set_flags(shared: &Shared, ids: Vec<MessageId>, add: u32, remove: u32, thread: bool) -> Result<HashSet<String>> {
@@ -650,6 +804,44 @@ fn undo_move(shared: &Shared, undo: i64) -> Result<()> {
     }
     shared.emit_pending();
     Ok(())
+}
+
+/// Where [`open_draft`] got.
+enum Opening {
+    Ready(Box<LocalDraft>),
+    /// A server draft not downloaded yet: fetch it, then try again.
+    Download { account: String, mailbox: String, uid: u32 },
+    /// Nothing to open (sent, discarded, or deleted meanwhile).
+    Gone,
+}
+
+/// [`Command::OpenDraft`]: the local draft a Drafts row stands for. A server copy of a local
+/// draft opens that draft (its content may be newer); a draft only the server has (written
+/// elsewhere) becomes a local draft, so editing it replaces it there.
+fn open_draft(shared: &Shared, id: MessageId, now: i64) -> Result<Opening> {
+    shared.with_writer(|st| {
+        let local = match drafts::draft_of_list_id(id) {
+            Some(d) => st.draft(d)?,
+            None => st.draft_of_message(id)?,
+        };
+        let opening = match local {
+            Some(d) if d.visible => Opening::Ready(Box::new(d)),
+            Some(_) => Opening::Gone,
+            None if id < 0 => Opening::Gone,
+            None => match (st.summary(id)?, st.raw(id)?) {
+                (None, _) => Opening::Gone,
+                (Some(s), None) => Opening::Download { account: s.account, mailbox: s.mailbox, uid: s.uid },
+                (Some(_), Some(raw)) => match crate::mime::draft_from_raw(&raw) {
+                    Some(draft) => st.adopt_draft(id, &draft, now)?.map_or(Opening::Gone, |d| Opening::Ready(Box::new(d))),
+                    None => Opening::Gone,
+                },
+            },
+        };
+        if let Opening::Ready(d) = &opening {
+            st.set_draft_open(d.id, true)?;
+        }
+        Ok(opening)
+    })
 }
 
 fn expand(shared: &Shared, ids: Vec<MessageId>, thread: bool, same_mailbox: bool) -> Result<Vec<MessageId>> {
@@ -839,12 +1031,11 @@ async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedRece
 async fn foreground_job(shared: &Arc<Shared>, account: &Account, session: &mut Session, job: &Job) -> Result<()> {
     let id = &account.id;
     match job {
-        Job::Bodies { mailbox, uids, reply } => {
+        Job::Bodies { mailbox, uids, reply: then } => {
             imap::select(session, mailbox).await?;
             imap::fetch_bodies(session, &shared.writer, id, mailbox, uids).await?;
-            if let Some((req, mid, conv)) = reply {
-                let messages = shared.reader.lock().map_err(|_| anyhow!("store poisoned"))?.thread(*mid, *conv)?;
-                shared.emit(Event::Thread { req: *req, id: *mid, messages });
+            if let Some(then) = then {
+                reply(shared, then)?;
             }
             shared.emit(Event::Changed { account: id.clone() });
         }
@@ -942,12 +1133,11 @@ async fn session_loop(
         // Opened messages first: someone is waiting.
         let (bodies, rest): (Vec<Job>, Vec<Job>) = pending.drain(..).partition(|j| matches!(j, Job::Bodies { .. }));
         for job in bodies {
-            if let Job::Bodies { mailbox, uids, reply } = job {
+            if let Job::Bodies { mailbox, uids, reply: then } = job {
                 imap::select(&mut session, &mailbox).await?;
                 imap::fetch_bodies(&mut session, &shared.writer, &id, &mailbox, &uids).await?;
-                if let Some((req, mid, conv)) = reply {
-                    let messages = shared.reader.lock().map_err(|_| anyhow!("store poisoned"))?.thread(mid, conv)?;
-                    shared.emit(Event::Thread { req, id: mid, messages });
+                if let Some(then) = &then {
+                    reply(shared, then)?;
                 }
                 shared.emit(Event::Changed { account: id.clone() });
             }
@@ -1107,11 +1297,17 @@ async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut Sessi
     replay_with(shared, account, &mut ImapRunner { shared, account, session, caps }).await
 }
 
-/// Carries out one queued op on the server. A seam so replay can be tested without a server.
+/// Carries out queued ops on the server. A seam so replay can be tested without a server.
 trait OpRunner {
+    /// Every op but the draft ones, which replay through the two calls below.
     fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send;
     /// The server's (unread, total) for a mailbox.
     fn status(&mut self, mailbox: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send;
+    /// Puts a draft in `mailbox` and deletes every other copy there with its Message-ID
+    /// ([`imap::replace_draft`]). Returns the UIDs deleted.
+    fn replace_draft(&mut self, mailbox: &str, raw: &[u8], message_id: &str) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send;
+    /// Deletes every copy with this Message-ID from `mailbox`. Returns their UIDs.
+    fn purge_draft(&mut self, mailbox: &str, message_id: &str) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send;
 }
 
 struct ImapRunner<'a> {
@@ -1126,12 +1322,21 @@ impl OpRunner for ImapRunner<'_> {
         imap::status(self.session, mailbox).await
     }
 
+    async fn replace_draft(&mut self, mailbox: &str, raw: &[u8], message_id: &str) -> Result<Vec<u32>> {
+        imap::replace_draft(self.session, self.caps, mailbox, raw, message_id).await
+    }
+
+    async fn purge_draft(&mut self, mailbox: &str, message_id: &str) -> Result<Vec<u32>> {
+        imap::purge_message_id(self.session, self.caps, mailbox, message_id).await
+    }
+
     async fn run(&mut self, op: &Op) -> Result<()> {
         let (shared, account, session) = (self.shared, self.account, &mut *self.session);
         match op {
             Op::SetFlags { mailbox, uid, add, remove } => imap::store_flags(session, mailbox, *uid, *add, *remove).await,
             Op::Move { mailbox, uid, dest } => imap::move_message(session, self.caps, mailbox, *uid, dest).await,
             Op::Expunge { mailbox, uid } => imap::expunge(session, self.caps, mailbox, *uid, true).await,
+            Op::SaveDraft { .. } | Op::PurgeDraft { .. } => Err(anyhow!("draft ops replay through replay_draft")),
             Op::Send { raw_b64, from, to, sent_mailbox, reply_of } => {
                 let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
                 let cred = shared.credential(account).await?;
@@ -1171,7 +1376,10 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
     // Mailboxes moved out of: their counts get re-read once the pass is done.
     let mut recount: Vec<String> = Vec::new();
     for q in ops {
-        let r = runner.run(&q.op).await;
+        let r = match &q.op {
+            Op::SaveDraft { .. } | Op::PurgeDraft { .. } => replay_draft(shared, account, runner, &q.op).await,
+            op => runner.run(op).await,
+        };
         match r {
             Ok(()) => {
                 shared.with_writer(|st| st.op_done(q.id))?;
@@ -1225,6 +1433,52 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
     Ok(any)
 }
 
+/// Where an account's drafts go. An error while its folders aren't known yet (the op is
+/// retried); None when it has no Drafts mailbox, and drafts stay on this computer.
+fn drafts_mailbox(shared: &Shared, account: &str) -> Result<Option<String>> {
+    shared.with_writer(|st| {
+        let boxes = st.mailboxes(account)?;
+        anyhow::ensure!(!boxes.is_empty(), "the folder list isn't loaded yet");
+        Ok(boxes.into_iter().find(|m| m.role == Role::Drafts && m.selectable).map(|m| m.name))
+    })
+}
+
+/// Replays a draft op, reading and updating the local draft around the server work.
+///
+/// [`Op::SaveDraft`] uploads the draft's newest version, if the server's copy is behind and the
+/// draft is staying (not being sent or discarded), replacing every older copy. [`Op::PurgeDraft`]
+/// deletes the copies (none to look for if no upload was ever started), then the draft.
+async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl OpRunner, op: &Op) -> Result<()> {
+    let id = &account.id;
+    match op {
+        Op::SaveDraft { draft } => {
+            let Some(mailbox) = drafts_mailbox(shared, id)? else { return Ok(()) };
+            let Some(up) = shared.with_writer(|st| st.draft_upload(id, *draft))? else { return Ok(()) };
+            let raw = smtp::build_draft(account, &up.draft, &up.message_id)?;
+            let replaced = runner.replace_draft(&mailbox, &raw, &up.message_id).await?;
+            shared.with_writer(|st| {
+                st.draft_uploaded(*draft, up.version)?;
+                st.delete_uids(id, &mailbox, &replaced)
+            })?;
+        }
+        Op::PurgeDraft { message_id, draft } => {
+            let on_server = match draft {
+                Some(d) => shared.with_writer(|st| st.draft_appended(*d))?,
+                None => true,
+            };
+            if on_server && let Some(mailbox) = drafts_mailbox(shared, id)? {
+                let gone = runner.purge_draft(&mailbox, message_id).await?;
+                shared.with_writer(|st| st.delete_uids(id, &mailbox, &gone))?;
+            }
+            if let Some(d) = draft {
+                shared.with_writer(|st| st.draft_purged(*d, now()))?;
+            }
+        }
+        op => return runner.run(op).await,
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1244,7 +1498,7 @@ mod tests {
     fn setup() -> Store {
         let st = Store::memory();
         for account in ["a", "b"] {
-            for (name, role) in [("INBOX", Role::Inbox), ("Archive", Role::Archive), ("Trash", Role::Trash), ("Junk", Role::Junk)] {
+            for (name, role) in [("INBOX", Role::Inbox), ("Archive", Role::Archive), ("Trash", Role::Trash), ("Junk", Role::Junk), ("Drafts", Role::Drafts)] {
                 st.upsert_mailbox(account, name, name, role, "/", true).unwrap();
             }
         }
@@ -1300,27 +1554,63 @@ mod tests {
         fail: bool,
         ran: Vec<Op>,
         counts: (u32, u32),
+        /// The Drafts mailbox: `(uid, Message-ID, raw)`.
+        drafts: Vec<(u32, String, Vec<u8>)>,
+        next_uid: u32,
+        appends: usize,
     }
 
     impl FakeServer {
         fn new(shared: &Arc<Shared>, during: impl FnOnce(&Shared) + Send + 'static) -> FakeServer {
-            FakeServer { shared: shared.clone(), during: Some(Box::new(during)), fail: false, ran: vec![], counts: (0, 0) }
+            FakeServer { shared: shared.clone(), during: Some(Box::new(during)), fail: false, ran: vec![], counts: (0, 0), drafts: vec![], next_uid: 1, appends: 0 }
+        }
+
+        /// Runs `during` if this is the first op on the wire; the error a failing server gives.
+        fn on_the_wire(&mut self) -> Result<()> {
+            if let Some(during) = self.during.take() {
+                during(&self.shared);
+            }
+            if self.fail { Err(anyhow!("NO [UNAVAILABLE] try again later")) } else { Ok(()) }
+        }
+
+        /// The drafts on the server, `(uid, subject)`.
+        fn drafts(&self) -> Vec<(u32, String)> {
+            self.drafts.iter().map(|(uid, _, raw)| (*uid, crate::mime::parse(raw, true).unwrap().subject)).collect()
         }
     }
 
     impl OpRunner for FakeServer {
         fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send {
-            if let Some(during) = self.during.take() {
-                during(&self.shared);
-            }
             self.ran.push(op.clone());
-            let fail = self.fail;
-            async move { if fail { Err(anyhow!("NO [UNAVAILABLE] try again later")) } else { Ok(()) } }
+            let r = self.on_the_wire();
+            async move { r }
         }
 
         fn status(&mut self, _: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send {
             let counts = self.counts;
             async move { Ok(counts) }
+        }
+
+        fn replace_draft(&mut self, _: &str, raw: &[u8], message_id: &str) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send {
+            let r = self.on_the_wire().map(|()| {
+                self.appends += 1;
+                let uid = self.next_uid;
+                self.next_uid += 1;
+                let old: Vec<u32> = self.drafts.iter().filter(|(_, m, _)| m == message_id).map(|(u, _, _)| *u).collect();
+                self.drafts.retain(|(_, m, _)| m != message_id);
+                self.drafts.push((uid, message_id.to_owned(), raw.to_vec()));
+                old
+            });
+            async move { r }
+        }
+
+        fn purge_draft(&mut self, _: &str, message_id: &str) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send {
+            let r = self.on_the_wire().map(|()| {
+                let gone: Vec<u32> = self.drafts.iter().filter(|(_, m, _)| m == message_id).map(|(u, _, _)| *u).collect();
+                self.drafts.retain(|(_, m, _)| m != message_id);
+                gone
+            });
+            async move { r }
         }
     }
 
@@ -1546,6 +1836,262 @@ mod tests {
         assert!(visible(&st, "INBOX").is_empty());
         st.op_done(due[0].id).unwrap();
         assert!(st.summary(a).unwrap().is_none(), "the local copy goes once the server has it");
+    }
+
+    // ── drafts ──
+
+    fn draft(subject: &str) -> Draft {
+        Draft { account: "a".into(), to: "Bo <bo@x.com>".into(), subject: subject.into(), body: format!("About {subject}."), ..Draft::default() }
+    }
+
+    /// Saves the composer's content as the app does while typing, `rev` ordering the saves.
+    /// The save is dated in the past, so its upload is due now.
+    fn type_draft(shared: &Shared, id: i64, rev: i64, subject: &str) {
+        shared.with_writer(|st| drafts::save(st, id, &draft(subject), true, rev, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+    }
+
+    fn drafts_engine() -> (Arc<Shared>, std::sync::mpsc::Receiver<Event>) {
+        let (shared, rx) = engine_with(setup());
+        *shared.accounts.write().unwrap() = vec![account("a"), account("b")];
+        (shared, rx)
+    }
+
+    fn drafts_list(shared: &Shared, query: &str) -> Vec<Summary> {
+        let view = View::Role { account: None, role: Role::Drafts };
+        let q = Query::parse(query);
+        shared.with_writer(|st| drafts::merge(st, &view, &q, 100, st.list(&view, &q, false, 100, &HashSet::new())?, |a| shared.sender(a))).unwrap()
+    }
+
+    /// Caches the server's copy of a draft, as a sync of the Drafts mailbox would.
+    fn sync_copy(shared: &Shared, server: &FakeServer, uid: u32) -> MessageId {
+        let (_, _, raw) = server.drafts.iter().find(|(u, _, _)| *u == uid).unwrap();
+        let p = crate::mime::parse(raw, false).unwrap();
+        shared.with_writer(|st| {
+            let id = st.upsert_header("a", "Drafts", uid, flags::DRAFT | flags::SEEN, 10, 0, &p)?;
+            st.set_body(id, raw, &p)?;
+            Ok(id)
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rapid_edits_make_one_server_update() {
+        let (shared, _rx) = drafts_engine();
+        for (rev, subject) in [(1, "v1"), (2, "v2"), (3, "v3")] {
+            type_draft(&shared, 7, rev, subject);
+        }
+        assert_eq!(shared.with_writer(|st| st.pending_count()).unwrap(), 1, "one upload queued for three saves");
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.appends, 1);
+        assert_eq!(server.drafts(), vec![(1, "v3".to_owned())], "the newest version, once");
+        assert!(!shared.with_writer(|st| st.draft_needs_upload(7)).unwrap());
+        assert_eq!(shared.with_writer(|st| st.pending_count()).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_edit_replaces_the_server_copy() {
+        let (shared, _rx) = drafts_engine();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        type_draft(&shared, 7, 1, "first");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        let old = sync_copy(&shared, &server, 1);
+        type_draft(&shared, 7, 2, "second");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts(), vec![(2, "second".to_owned())], "appended anew, the old copy deleted");
+        assert!(shared.with_writer(|st| st.summary(old)).unwrap().is_none(), "and gone from the cache");
+    }
+
+    #[tokio::test]
+    async fn a_save_copes_with_the_old_copy_already_gone() {
+        let (shared, _rx) = drafts_engine();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        type_draft(&shared, 7, 1, "first");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        server.drafts.clear(); // deleted from another computer
+        type_draft(&shared, 7, 2, "second");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts(), vec![(2, "second".to_owned())]);
+        assert_eq!(shared.with_writer(|st| st.pending_count()).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn offline_saves_wait_in_the_queue() {
+        let (shared, _rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "written offline");
+        let mut server = FakeServer { fail: true, ..FakeServer::new(&shared, |_: &Shared| {}) };
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert!(server.drafts.is_empty());
+        shared
+            .with_writer(|st| {
+                let q = st.ops("a", i64::MAX)?;
+                assert_eq!((q.len(), q[0].attempts), (1, 1), "kept for a retry");
+                assert_eq!(st.draft(7)?.unwrap().draft.subject, "written offline", "safe here meanwhile");
+                st.queue_draft_upload("a", 7, 0) // the retry comes due
+            })
+            .unwrap();
+        server.fail = false;
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts(), vec![(1, "written offline".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn an_edit_during_the_upload_goes_up_next() {
+        let (shared, _rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "v1");
+        let mut server = FakeServer::new(&shared, |s: &Shared| type_draft(s, 7, 2, "v2"));
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts(), vec![(1, "v1".to_owned())]);
+        assert!(shared.with_writer(|st| st.draft_needs_upload(7)).unwrap(), "v2 still to go");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts(), vec![(2, "v2".to_owned())], "one copy, the newest");
+    }
+
+    #[tokio::test]
+    async fn discarding_during_the_upload_leaves_nothing_behind() {
+        let (shared, _rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "v1");
+        let mut server = FakeServer::new(&shared, |s: &Shared| {
+            s.with_writer(|st| st.discard_draft(7, Some((now() - 1, 3)))).unwrap();
+        });
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts.len(), 1, "the upload landed");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert!(server.drafts.is_empty(), "then the discard took it");
+        assert_eq!(shared.with_writer(|st| st.draft(7)).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sending_removes_the_draft_here_and_on_the_server() {
+        let (shared, _rx) = drafts_engine();
+        shared.settings.write().unwrap().set("compose.undoSendSeconds", serde_json::json!(0)).unwrap();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        type_draft(&shared, 7, 1, "hello");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        let copy = sync_copy(&shared, &server, 1);
+        assert_eq!(drafts_list(&shared, "").iter().map(|s| s.id).collect::<Vec<_>>(), vec![copy]);
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("hello"), draft_id: Some(7) }).await.unwrap();
+        assert!(drafts_list(&shared, "").is_empty(), "off the Drafts list at once");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap(); // sends
+        assert!(matches!(server.ran.last(), Some(Op::Send { .. })));
+        replay_with(&shared, &account("a"), &mut server).await.unwrap(); // then purges
+        assert!(server.drafts.is_empty(), "off the server");
+        shared
+            .with_writer(|st| {
+                assert_eq!(st.draft(7)?, None, "and gone here");
+                assert!(st.summary(copy)?.is_none(), "cached copy too");
+                assert_eq!(st.pending_count()?, 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn undo_send_brings_the_draft_back_without_a_copy() {
+        let (shared, rx) = drafts_engine();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        type_draft(&shared, 7, 1, "hello");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("hello, edited"), draft_id: Some(7) }).await.unwrap();
+        let op = rx.try_iter().find_map(|e| if let Event::Sent { op, .. } = e { Some(op) } else { None }).expect("queued");
+        handle(&shared, &mut HashMap::new(), Command::UndoSend { op }).await.unwrap();
+        let events: Vec<Event> = rx.try_iter().collect();
+        let opened = events.iter().find_map(|e| if let Event::DraftOpened { id, draft, restored } = e { Some((*id, draft.subject.clone(), *restored)) } else { None });
+        assert_eq!(opened, Some((7, "hello, edited".to_owned(), false)), "the composer gets it back as it was sent");
+        let list = drafts_list(&shared, "");
+        assert_eq!(list.len(), 1, "one draft, not two");
+        assert_eq!(list[0].subject, "hello, edited");
+        // The edit made just before sending reaches the server, replacing the old copy.
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts(), vec![(2, "hello, edited".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn a_send_that_cant_be_queued_goes_back_to_the_composer() {
+        let (shared, rx) = drafts_engine();
+        let unsendable = Draft { account: "removed".into(), ..draft("unsendable") };
+        assert!(handle(&shared, &mut HashMap::new(), Command::Send { draft: unsendable, draft_id: Some(9) }).await.is_err());
+        let opened = rx.try_iter().find_map(|e| if let Event::DraftOpened { id, draft, .. } = e { Some((id, draft.subject)) } else { None });
+        assert_eq!(opened, Some((9, "unsendable".to_owned())), "nothing written is lost");
+        assert!(shared.with_writer(|st| st.draft(9)).unwrap().unwrap().visible, "and it's in Drafts");
+    }
+
+    #[tokio::test]
+    async fn undoing_a_discard_keeps_the_draft() {
+        let (shared, _rx) = drafts_engine();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        type_draft(&shared, 7, 1, "hello");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        handle(&shared, &mut HashMap::new(), Command::DiscardDraft { id: 7, undo: Some(11) }).await.unwrap();
+        assert!(drafts_list(&shared, "").is_empty());
+        undo_move(&shared, 11).unwrap();
+        assert_eq!(drafts_list(&shared, "").len(), 1, "back");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts.len(), 1, "the server never lost it");
+    }
+
+    #[test]
+    fn the_drafts_list_shows_local_drafts_newest_content() {
+        let (shared, _rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "only here");
+        let rows = drafts_list(&shared, "");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!((row.id, row.subject.as_str(), row.preview.as_str()), (drafts::list_id(7), "only here", "About only here."));
+        assert_eq!(row.to, vec![crate::model::Address { name: "Bo".into(), email: "bo@x.com".into() }]);
+        assert_eq!((row.from.email.as_str(), row.mailbox.as_str()), ("a@x.com", "Drafts"));
+        assert!(row.flags & flags::DRAFT != 0 && row.seen());
+        assert_eq!(drafts_list(&shared, "only").len(), 1, "search finds it");
+        assert!(drafts_list(&shared, "elsewhere").is_empty());
+        assert!(drafts_list(&shared, "is:unread").is_empty());
+        // Not on other lists.
+        let inbox = View::Role { account: None, role: Role::Inbox };
+        let q = Query::default();
+        assert!(shared.with_writer(|st| drafts::merge(st, &inbox, &q, 10, vec![], |a| shared.sender(a))).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cached_copy_shows_the_local_draft() {
+        let (shared, _rx) = drafts_engine();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        type_draft(&shared, 7, 1, "uploaded");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        let copy = sync_copy(&shared, &server, 1);
+        type_draft(&shared, 7, 2, "edited since"); // the server is behind
+        let rows = drafts_list(&shared, "");
+        assert_eq!(rows.iter().map(|r| (r.id, r.subject.as_str())).collect::<Vec<_>>(), vec![(copy, "edited since")], "one row, the newest content");
+        // Opening the copy opens the local draft, not the stale server version.
+        match open_draft(&shared, copy, now()).unwrap() {
+            Opening::Ready(d) => assert_eq!((d.id, d.draft.subject.as_str()), (7, "edited since")),
+            _ => panic!("should open"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_draft_only_the_server_has_becomes_editable() {
+        let (shared, _rx) = drafts_engine();
+        // Written on another computer: in Drafts, not downloaded yet.
+        let raw = b"From: a@x.com\r\nTo: \"Lima, Ana\" <ana@x.com>\r\nBcc: bo@x.com\r\nSubject: From the laptop\r\nMessage-ID: <laptop@x>\r\nIn-Reply-To: <orig@x>\r\nReferences: <root@x> <orig@x>\r\n\r\nHalf written.\r\n";
+        let p = crate::mime::parse(raw, true).unwrap();
+        let id = shared.with_writer(|st| st.upsert_header("a", "Drafts", 5, flags::DRAFT, 10, 0, &p)).unwrap();
+        assert!(matches!(open_draft(&shared, id, now()).unwrap(), Opening::Download { uid: 5, .. }));
+        shared.with_writer(|st| st.set_body(id, raw, &crate::mime::parse(raw, false).unwrap())).unwrap();
+        let Opening::Ready(d) = open_draft(&shared, id, now()).unwrap() else { panic!("should open") };
+        assert_eq!(d.message_id, "<laptop@x>", "keeps its Message-ID, so a save replaces it");
+        assert_eq!(d.draft.to, "\"Lima, Ana\" <ana@x.com>");
+        assert_eq!(d.draft.bcc, "bo@x.com");
+        assert_eq!((d.draft.in_reply_to.as_str(), d.draft.references.as_str()), ("<orig@x>", "<root@x> <orig@x>"));
+        assert_eq!(d.draft.body, "Half written.\n");
+        assert_eq!(drafts_list(&shared, "").len(), 1, "one row for it");
+        // Edited here: the save replaces the laptop's copy.
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        server.drafts.push((5, "<laptop@x>".into(), raw.to_vec()));
+        server.next_uid = 6;
+        let edited = Draft { body: "Finished.".into(), ..d.draft.clone() };
+        shared.with_writer(|st| drafts::save(st, d.id, &edited, true, 1, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts(), vec![(6, "From the laptop".to_owned())]);
+        assert!(shared.with_writer(|st| st.summary(id)).unwrap().is_none(), "the laptop's copy is gone from the cache too");
     }
 
     #[test]
