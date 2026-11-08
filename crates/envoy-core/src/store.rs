@@ -125,6 +125,14 @@ ALTER TABLE ops_new RENAME TO ops;
 COMMIT;
 ";
 
+// Undo bookkeeping. Every successful op runs DELETE_HELD, so these must hit the partial
+// indexes above, not scan the cache. SQLite only uses a partial index when the query
+// itself implies the index's WHERE: hence the redundant `!= 0` terms.
+const DELETE_HELD: &str = "DELETE FROM messages WHERE held_op = ?1 AND held_op != 0";
+const HELD_UNREAD: &str = "SELECT account, mailbox FROM messages WHERE held_op = ?1 AND held_op != 0 AND flags & 1 = 0";
+const UNHIDE: &str = "UPDATE messages SET held_op = 0 WHERE held_op = ?1 AND held_op != 0";
+const BATCH_OPS: &str = "SELECT id, claimed FROM ops WHERE batch = ?1 AND batch != 0";
+
 fn migrate(conn: &Connection) -> Result<()> {
     for (table, column, sql) in MIGRATIONS {
         let has: bool = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), params![column], |r| r.get::<_, i64>(0))? > 0;
@@ -835,7 +843,7 @@ impl Store {
     /// The op reached the server. A message it was moving away now leaves the local copy too.
     pub fn op_done(&self, id: i64) -> Result<()> {
         self.transaction(|st| {
-            st.conn.execute("DELETE FROM messages WHERE held_op = ?1", params![id])?;
+            st.conn.execute(DELETE_HELD, params![id])?;
             st.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])?;
             Ok(())
         })
@@ -868,7 +876,7 @@ impl Store {
         self.transaction(|st| {
             let ops: Vec<(i64, bool)> = st
                 .conn
-                .prepare_cached("SELECT id, claimed FROM ops WHERE batch = ?1")?
+                .prepare_cached(BATCH_OPS)?
                 .query_map(params![batch], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)))?
                 .collect::<rusqlite::Result<_>>()?;
             let unclaimed: Vec<i64> = ops.iter().filter(|(_, c)| !c).map(|(id, _)| *id).collect();
@@ -883,13 +891,13 @@ impl Store {
             let account: Option<String> = self.conn.query_row("SELECT account FROM ops WHERE id = ?1", params![op], |r| r.get(0)).optional()?;
             let unread: Vec<(String, String)> = self
                 .conn
-                .prepare_cached("SELECT account, mailbox FROM messages WHERE held_op = ?1 AND flags & 1 = 0")?
+                .prepare_cached(HELD_UNREAD)?
                 .query_map(params![op], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             for (a, m) in unread {
                 self.bump_unread(&a, &m, 1)?;
             }
-            self.conn.execute("UPDATE messages SET held_op = 0 WHERE held_op = ?1", params![op])?;
+            self.conn.execute(UNHIDE, params![op])?;
             self.conn.execute("DELETE FROM ops WHERE id = ?1", params![op])?;
             if let Some(a) = account
                 && !accounts.contains(&a)
@@ -1111,6 +1119,17 @@ mod tests {
         let local = s.local_uids("a", "INBOX").unwrap();
         assert!(s.reconcile("a", "INBOX", &local, &server, 3).unwrap());
         assert_eq!(s.local_uids("a", "INBOX").unwrap().iter().map(|(u, _)| *u).collect::<Vec<_>>(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn undo_bookkeeping_uses_its_indexes() {
+        let s = Store::memory();
+        for (sql, index) in [(DELETE_HELD, "messages_held"), (HELD_UNREAD, "messages_held"), (UNHIDE, "messages_held"), (BATCH_OPS, "ops_batch")] {
+            let plan: Vec<String> =
+                s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap().query_map(params![5], |r| r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            let searches = plan.iter().any(|d| d.starts_with("SEARCH") && d.contains(&format!("INDEX {index} ")));
+            assert!(searches && !plan.iter().any(|d| d.starts_with("SCAN")), "{sql}\n  plan: {plan:?}");
+        }
     }
 
     #[test]
