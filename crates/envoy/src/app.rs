@@ -193,6 +193,8 @@ pub struct App {
     /// The pending list request is the user's (a search, another view): its rows show at once
     /// rather than animate in like a reload's.
     pub list_at_once: bool,
+    /// j/k pressed while the open row was below the first page of a list still coming in.
+    pub pending_step: isize,
     /// The opened row (its newest message in conversation view).
     pub open: Option<MessageId>,
     pub thread: Vec<ThreadMessage>,
@@ -226,6 +228,9 @@ pub struct App {
     pub confirm_delete: Option<Vec<MessageId>>,
     pub images: HashMap<String, ImageState>,
     pub image_cache: Option<rune::ImageCache>,
+    /// What `send` was asked to send, for tests.
+    #[cfg(test)]
+    pub sent: std::cell::RefCell<Vec<String>>,
 }
 
 pub fn parse_keys(s: &Settings) -> Vec<(Action, Keybind)> {
@@ -259,6 +264,7 @@ impl App {
             list_complete: true,
             list_gen: 0,
             list_at_once: true,
+            pending_step: 0,
             open: None,
             thread: Vec::new(),
             thread_req: 0,
@@ -294,10 +300,14 @@ impl App {
             confirm_delete: None,
             images: HashMap::new(),
             image_cache: None,
+            #[cfg(test)]
+            sent: Default::default(),
         }
     }
 
     pub fn send(&self, c: Command) {
+        #[cfg(test)]
+        self.sent.borrow_mut().push(format!("{c:?}"));
         if let Some(e) = &self.engine {
             e.send(c);
         }
@@ -363,14 +373,19 @@ impl App {
             Event::Mailboxes { account, mailboxes } => {
                 self.mailboxes.insert(account, mailboxes);
             }
-            Event::List { req, items, more } => {
-                if req == self.list_req {
-                    self.list = items;
-                    self.list_loaded = true;
-                    self.list_complete = !more;
-                    self.list_gen += 1;
+            // A refresh only ever shows whole lists: a first page would drop the rows below it,
+            // the open one included, from under the reader.
+            Event::List { req, items, more } if req == self.list_req && !(more && !self.list_at_once) => {
+                self.list = items;
+                self.list_loaded = true;
+                self.list_complete = !more;
+                self.list_gen += 1;
+                if !more && self.pending_step != 0 {
+                    let delta = std::mem::take(&mut self.pending_step);
+                    self.step(delta, tx);
                 }
             }
+            Event::List { .. } => {}
             Event::Thread { req, id, messages } if req == self.thread_req && messages.is_empty() => {
                 // The open message is gone (moved, deleted, or an undo that came too late):
                 // close it rather than show an empty reader or mark it read later.
@@ -541,15 +556,22 @@ impl App {
 
     /// Re-reads the list and the open conversation after the store changed.
     pub fn reload(&mut self) {
-        self.request_list();
-        self.list_at_once = false;
+        self.request_list_as(false);
         if let Some(id) = self.thread_for.or(self.open) {
             self.thread_req += 1;
             self.send(Command::Open { req: self.thread_req, id, conversations: self.conversations() });
         }
     }
 
+    /// Asks for the list the user wants to see now (a new view, a search, startup): its top is
+    /// shown as soon as it's read, without animating in.
     pub fn request_list(&mut self) {
+        self.request_list_as(true);
+    }
+
+    /// `at_once`: the user is waiting on a new list ([`App::request_list`]); otherwise the list
+    /// on screen is read again ([`App::reload`]) and comes whole, changes animating.
+    fn request_list_as(&mut self, at_once: bool) {
         if self.demo {
             let q = envoy_core::store::Query::parse(&self.applied_query);
             let words: Vec<String> = q.text.iter().map(|w| w.to_lowercase()).collect();
@@ -568,13 +590,14 @@ impl App {
             return;
         }
         self.list_req += 1;
-        self.list_at_once = true;
+        self.list_at_once = at_once;
         self.send(Command::List {
             req: self.list_req,
             view: self.view.clone(),
             query: self.applied_query.clone(),
             conversations: self.conversations(),
             limit: 3000,
+            stream: at_once,
         });
     }
 
@@ -627,6 +650,7 @@ impl App {
         if self.open == Some(id) && !self.thread.is_empty() {
             return;
         }
+        self.pending_step = 0;
         self.open = Some(id);
         self.thread.clear();
         self.thread_for = None;
@@ -683,6 +707,7 @@ impl App {
     }
 
     pub fn close_message(&mut self) {
+        self.pending_step = 0;
         self.open = None;
         self.thread.clear();
         self.thread_for = None;
@@ -697,6 +722,12 @@ impl App {
     }
 
     pub fn step(&mut self, delta: isize, tx: &mut Tx) {
+        // The open row is below a first page whose rest is still coming: move on from it once
+        // the rest is here, rather than from the top.
+        if self.open.is_some() && self.index_of_open().is_none() && !self.list_complete {
+            self.pending_step += delta;
+            return;
+        }
         if self.list.is_empty() {
             return;
         }
@@ -1436,6 +1467,74 @@ mod tests {
         let far = app.list[app.list.len() - 1].id;
         app.apply(Event::Prefetched { id: far, messages: crate::demo::thread_for(far) }, &mut tx);
         assert!(!app.prefetched.contains_key(&far));
+    }
+
+    /// A list of `n` rows, newest first, made from one of the demo's.
+    fn long_list(app: &App, n: i64) -> Vec<Summary> {
+        let row = app.list[0].clone();
+        (1..=n).map(|id| Summary { id, date: 1_000_000 - id, thread: format!("t{id}"), ..row.clone() }).collect()
+    }
+
+    fn last_list_request(app: &App) -> String {
+        app.sent.borrow().iter().rev().find(|c| c.starts_with("List")).cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_whole_list_and_the_open_row() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false; // lists come from the engine
+        let mut tx = Tx::default();
+        app.list = long_list(&app, 3000);
+        app.open = Some(500);
+        // New mail or a sync: the list on screen is read again, whole, in one go.
+        app.reload();
+        assert!(last_list_request(&app).contains("stream: false"), "{}", last_list_request(&app));
+        // Even a first page sent ahead for it wouldn't cut the list down under the reader.
+        let req = app.list_req;
+        let page = app.list[..100].to_vec();
+        app.apply(Event::List { req, items: page, more: true }, &mut tx);
+        assert_eq!(app.list.len(), 3000, "the list keeps its rows");
+        app.step(1, &mut tx);
+        assert_eq!(app.open, Some(501), "j moves on from the open row, not back to the top");
+        // The whole list arrives with a new message on top: the open row is still there.
+        let mut fresh = long_list(&app, 3000);
+        fresh.insert(0, Summary { id: 9999, date: 2_000_000, thread: "new".into(), ..fresh[0].clone() });
+        app.apply(Event::List { req, items: fresh, more: false }, &mut tx);
+        assert_eq!(app.list.len(), 3001);
+        assert_eq!(app.list.iter().position(|m| Some(m.id) == app.open), Some(501));
+    }
+
+    #[test]
+    fn a_new_list_shows_its_first_page_and_j_waits_for_the_rest() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let mut tx = Tx::default();
+        app.list = long_list(&app, 3000);
+        app.open = Some(500);
+        // A search: its first page is sent ahead and shown at once.
+        app.applied_query = "x".into();
+        app.request_list();
+        assert!(last_list_request(&app).contains("stream: true"), "{}", last_list_request(&app));
+        let req = app.list_req;
+        let all = long_list(&app, 2000);
+        app.apply(Event::List { req, items: all[..100].to_vec(), more: true }, &mut tx);
+        assert_eq!((app.list.len(), app.list_complete), (100, false));
+        // The open row isn't in the first page yet: j waits for the rest instead of jumping to
+        // the top, then moves on from it.
+        app.step(1, &mut tx);
+        assert_eq!(app.open, Some(500));
+        app.apply(Event::List { req, items: all.clone(), more: false }, &mut tx);
+        assert_eq!(app.open, Some(501));
+        // A j waiting like that is dropped if the message is closed meanwhile.
+        app.request_list();
+        let req = app.list_req;
+        app.apply(Event::List { req, items: all[..100].to_vec(), more: true }, &mut tx);
+        app.step(1, &mut tx);
+        app.close_message();
+        app.apply(Event::List { req, items: all, more: false }, &mut tx);
+        assert_eq!(app.open, None, "nothing opens by itself");
     }
 
     fn move_key(app: &App) -> i64 {

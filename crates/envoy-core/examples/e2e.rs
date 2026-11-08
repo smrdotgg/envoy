@@ -48,7 +48,7 @@ fn wait<T>(engine: &Engine, what: &str, secs: u64, mut f: impl FnMut(&Event) -> 
 }
 
 fn list(engine: &Engine, req: u64, view: &View, query: &str, conv: bool) -> Vec<envoy_core::model::Summary> {
-    engine.send(Command::List { req, view: view.clone(), query: query.into(), conversations: conv, limit: 500 });
+    engine.send(Command::List { req, view: view.clone(), query: query.into(), conversations: conv, limit: 500, stream: true });
     wait(engine, "list", 10, |e| match e {
         // The whole list, not the first page sent ahead of it.
         Event::List { req: r, items, more: false } if *r == req => Some(items.clone()),
