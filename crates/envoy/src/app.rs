@@ -299,114 +299,127 @@ impl App {
             Some(e) => e.drain(),
             None => return false,
         };
-        let mut changed = false;
+        let changed = !events.is_empty();
         let mut reload = false;
         for ev in events {
-            changed = true;
-            match ev {
-                Event::Accounts(a) => {
-                    let had = !self.accounts.is_empty();
-                    self.accounts = a;
-                    if self.accounts.is_empty() && self.screen == Screen::Mail {
-                        self.screen = Screen::AddAccount;
-                    } else if !had && !self.accounts.is_empty() && self.screen == Screen::AddAccount {
-                        self.screen = Screen::Mail;
-                    }
-                    if let View::Mailbox { account, .. } = &self.view
-                        && !self.accounts.iter().any(|a| &a.id == account)
-                    {
-                        self.view = View::Role { account: None, role: Role::Inbox };
-                    }
-                    reload = true;
-                }
-                Event::Mailboxes { account, mailboxes } => {
-                    self.mailboxes.insert(account, mailboxes);
-                }
-                Event::List { req, items } => {
-                    if req == self.list_req {
-                        self.list = items;
-                        self.list_loaded = true;
-                    }
-                }
-                Event::Thread { req, id, messages } => {
-                    if req == self.thread_req {
-                        let first = self.thread_for != Some(id) || self.thread.is_empty();
-                        self.thread_for = Some(id);
-                        if first {
-                            self.expanded.clear();
-                            // Unread messages and the newest start open, as Gmail does.
-                            for (i, m) in messages.iter().enumerate() {
-                                if !m.summary.seen() || i + 1 == messages.len() {
-                                    self.expanded.insert(m.summary.id);
-                                }
-                            }
-                        }
-                        self.thread = messages;
-                        self.request_images();
-                    }
-                }
-                Event::Image { url, width, height, rgba } => {
-                    if let Some(cache) = &self.image_cache {
-                        self.images.insert(url, ImageState::Ready(cache.rgba(width, height, rgba)));
-                    }
-                }
-                Event::ImageFailed { url } => {
-                    self.images.insert(url, ImageState::Failed);
-                }
-                Event::Changed { .. } => reload = true,
-                Event::Sync { account, state } => {
-                    self.sync.insert(account, state);
-                }
-                Event::Toast(t) => self.toast(t, false),
-                Event::Error(e) => self.toast(e, true),
-                Event::Sent { op, undo_secs } => {
-                    self.toast_seq += 1;
-                    let id = self.toast_seq;
-                    let text = if undo_secs > 0 { "Sending…".to_owned() } else { "Sending".to_owned() };
-                    self.toasts.push(Toast {
-                        id,
-                        text,
-                        undo: (undo_secs > 0).then_some(Undo::Send(op)),
-                        until: self.clock + undo_secs.max(3) as f64,
-                        error: false,
-                        open_path: None,
-                    });
-                    tx.wake_after(std::time::Duration::from_secs_f64(undo_secs.max(3) as f64 + 0.05));
-                }
-                Event::AccountAdded(a) => {
-                    self.add = AddForm::new();
-                    self.screen = Screen::Mail;
-                    self.toast(format!("Added {}. Syncing…", a.email), false);
-                    self.view = View::Role { account: None, role: Role::Inbox };
-                    reload = true;
-                }
-                Event::AccountFailed(e) => {
-                    self.add.busy = false;
-                    self.add.error = Some(e);
-                }
-                Event::GoogleSignedIn { email, name, refresh_token } => {
-                    let account = self.google_account(&email, &name);
-                    self.add.error = None;
-                    self.send(Command::AddAccount { account, secret: refresh_token });
-                }
-                Event::GoogleFailed(e) => {
-                    self.add.busy = false;
-                    self.add.error = Some(e);
-                }
-                Event::Saved(path) => {
-                    self.toast_seq += 1;
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    self.toasts.push(Toast { id: self.toast_seq, text: format!("Saved {name}"), undo: None, until: self.clock + 6.0, error: false, open_path: Some(path.clone()) });
-                    let _ = open::that_detached(&path);
-                    tx.wake_after(std::time::Duration::from_secs_f64(6.05));
-                }
-                Event::Pending(n) => self.pending_ops = n,
-            }
+            reload |= self.apply(ev, tx);
         }
         if reload {
             self.reload();
         }
         changed
+    }
+
+    /// Applies one engine event. True when what's on screen should be re-read.
+    fn apply(&mut self, ev: Event, tx: &mut Tx) -> bool {
+        let mut reload = false;
+        match ev {
+            Event::Accounts(a) => {
+                let had = !self.accounts.is_empty();
+                self.accounts = a;
+                if self.accounts.is_empty() && self.screen == Screen::Mail {
+                    self.screen = Screen::AddAccount;
+                } else if !had && !self.accounts.is_empty() && self.screen == Screen::AddAccount {
+                    self.screen = Screen::Mail;
+                }
+                if let View::Mailbox { account, .. } = &self.view
+                    && !self.accounts.iter().any(|a| &a.id == account)
+                {
+                    self.view = View::Role { account: None, role: Role::Inbox };
+                }
+                reload = true;
+            }
+            Event::Mailboxes { account, mailboxes } => {
+                self.mailboxes.insert(account, mailboxes);
+            }
+            Event::List { req, items } => {
+                if req == self.list_req {
+                    self.list = items;
+                    self.list_loaded = true;
+                }
+            }
+            Event::Thread { req, id, messages } if req == self.thread_req && messages.is_empty() => {
+                // The open message is gone (moved, deleted, or an undo that came too late):
+                // close it rather than show an empty reader or mark it read later.
+                if self.open == Some(id) || self.thread_for == Some(id) {
+                    self.close_message();
+                }
+            }
+            Event::Thread { req, id, messages } => {
+                if req == self.thread_req {
+                    let first = self.thread_for != Some(id) || self.thread.is_empty();
+                    self.thread_for = Some(id);
+                    if first {
+                        self.expanded.clear();
+                        // Unread messages and the newest start open, as Gmail does.
+                        for (i, m) in messages.iter().enumerate() {
+                            if !m.summary.seen() || i + 1 == messages.len() {
+                                self.expanded.insert(m.summary.id);
+                            }
+                        }
+                    }
+                    self.thread = messages;
+                    self.request_images();
+                }
+            }
+            Event::Image { url, width, height, rgba } => {
+                if let Some(cache) = &self.image_cache {
+                    self.images.insert(url, ImageState::Ready(cache.rgba(width, height, rgba)));
+                }
+            }
+            Event::ImageFailed { url } => {
+                self.images.insert(url, ImageState::Failed);
+            }
+            Event::Changed { .. } => reload = true,
+            Event::Sync { account, state } => {
+                self.sync.insert(account, state);
+            }
+            Event::Toast(t) => self.toast(t, false),
+            Event::Error(e) => self.toast(e, true),
+            Event::Sent { op, undo_secs } => {
+                self.toast_seq += 1;
+                let id = self.toast_seq;
+                let text = if undo_secs > 0 { "Sending…".to_owned() } else { "Sending".to_owned() };
+                self.toasts.push(Toast {
+                    id,
+                    text,
+                    undo: (undo_secs > 0).then_some(Undo::Send(op)),
+                    until: self.clock + undo_secs.max(3) as f64,
+                    error: false,
+                    open_path: None,
+                });
+                tx.wake_after(std::time::Duration::from_secs_f64(undo_secs.max(3) as f64 + 0.05));
+            }
+            Event::AccountAdded(a) => {
+                self.add = AddForm::new();
+                self.screen = Screen::Mail;
+                self.toast(format!("Added {}. Syncing…", a.email), false);
+                self.view = View::Role { account: None, role: Role::Inbox };
+                reload = true;
+            }
+            Event::AccountFailed(e) => {
+                self.add.busy = false;
+                self.add.error = Some(e);
+            }
+            Event::GoogleSignedIn { email, name, refresh_token } => {
+                let account = self.google_account(&email, &name);
+                self.add.error = None;
+                self.send(Command::AddAccount { account, secret: refresh_token });
+            }
+            Event::GoogleFailed(e) => {
+                self.add.busy = false;
+                self.add.error = Some(e);
+            }
+            Event::Saved(path) => {
+                self.toast_seq += 1;
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.toasts.push(Toast { id: self.toast_seq, text: format!("Saved {name}"), undo: None, until: self.clock + 6.0, error: false, open_path: Some(path.clone()) });
+                let _ = open::that_detached(&path);
+                tx.wake_after(std::time::Duration::from_secs_f64(6.05));
+            }
+            Event::Pending(n) => self.pending_ops = n,
+        }
+        reload
     }
 
     /// Starts downloading the open conversation's images (once per URL per session).
@@ -1266,6 +1279,22 @@ mod tests {
         app.list.retain(|s| s.id != row.id);
         assert!(app.restore_rows(&m));
         assert_eq!(app.list.first(), Some(&row));
+    }
+
+    #[test]
+    fn a_message_that_comes_back_empty_closes_and_isnt_marked_read() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let _ = app.settings.set("reading.markAsRead", serde_json::json!("delay"));
+        let id = app.list.iter().find(|s| s.thread_unread).unwrap().id;
+        app.open_message(id);
+        assert!(app.mark_read_at.is_some());
+        // The engine reloads the open message and finds nothing: it was moved or deleted
+        // (say, undo came too late and the move went through).
+        let req = app.thread_req;
+        app.apply(Event::Thread { req, id, messages: vec![] }, &mut Tx::default());
+        assert_eq!(app.open, None, "the reader closes");
+        assert_eq!(app.mark_read_at, None, "and nothing gets marked read later");
     }
 
     #[test]
