@@ -655,8 +655,11 @@ impl Store {
     }
 
     /// Applies a flag change locally; returns the message's location for queuing the op.
+    /// None, and nothing changes, for a message that's gone or hidden for a move.
     pub fn change_flags(&self, id: MessageId, add: u32, remove: u32) -> Result<Option<(String, String, u32)>> {
-        self.conn.execute("UPDATE messages SET flags = (flags | ?2) & ~?3 WHERE id = ?1", params![id, add, remove])?;
+        if self.conn.execute("UPDATE messages SET flags = (flags | ?2) & ~?3 WHERE id = ?1 AND held_op = 0", params![id, add, remove])? == 0 {
+            return Ok(None);
+        }
         self.location(id)
     }
 

@@ -206,6 +206,8 @@ pub struct App {
     pub settings_ui: SettingsUi,
     pub add: AddForm,
     pub mark_read_at: Option<(MessageId, f64)>,
+    /// The open message, while it waits to show before the mark-as-read setting applies.
+    pub mark_read_when_shown: Option<MessageId>,
     pub clock: f64,
     pub list_drag_start: Option<f32>,
     pub list_width: f32,
@@ -269,6 +271,7 @@ impl App {
             },
             add: AddForm::new(),
             mark_read_at: None,
+            mark_read_when_shown: None,
             clock: 0.0,
             list_drag_start: None,
             list_width,
@@ -360,6 +363,7 @@ impl App {
                     }
                     self.thread = messages;
                     self.request_images();
+                    self.shown(id);
                 }
             }
             Event::Image { url, width, height, rgba } => {
@@ -575,13 +579,25 @@ impl App {
             }
             self.request_images();
         }
+        // Marked read once it actually shows: the engine may find nothing (it was moved, or a
+        // late undo reopened a message that's still on its way out).
         let unread = self.list.iter().find(|s| s.id == id).is_some_and(|s| s.thread_unread);
-        if unread {
-            match self.settings.str("reading.markAsRead").as_str() {
-                "immediately" => self.mark_read(id),
-                "delay" => self.mark_read_at = Some((id, self.clock + self.settings.f64("reading.markAsReadDelay"))),
-                _ => {}
-            }
+        self.mark_read_when_shown = unread.then_some(id);
+        if !self.thread.is_empty() {
+            self.shown(id);
+        }
+    }
+
+    /// The open message's content arrived: apply the mark-as-read setting, once per open.
+    fn shown(&mut self, id: MessageId) {
+        if self.open != Some(id) || self.mark_read_when_shown != Some(id) {
+            return;
+        }
+        self.mark_read_when_shown = None;
+        match self.settings.str("reading.markAsRead").as_str() {
+            "immediately" => self.mark_read(id),
+            "delay" => self.mark_read_at = Some((id, self.clock + self.settings.f64("reading.markAsReadDelay"))),
+            _ => {}
         }
     }
 
@@ -604,6 +620,7 @@ impl App {
         self.thread.clear();
         self.thread_for = None;
         self.mark_read_at = None;
+        self.mark_read_when_shown = None;
     }
 
     fn index_of_open(&self) -> Option<usize> {
@@ -1304,6 +1321,29 @@ mod tests {
         app.apply(Event::Thread { req, id, messages: vec![] }, &mut Tx::default());
         assert_eq!(app.open, None, "the reader closes");
         assert_eq!(app.mark_read_at, None, "and nothing gets marked read later");
+    }
+
+    #[test]
+    fn auto_mark_read_waits_for_the_message_to_load() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false; // threads come from the engine, later
+        let _ = app.settings.set("reading.markAsRead", serde_json::json!("immediately"));
+        let id = app.list.iter().find(|s| s.thread_unread).unwrap().id;
+        let unread = |app: &App| app.list.iter().find(|s| s.id == id).unwrap().thread_unread;
+        let mut tx = Tx::default();
+        // Opened (say, by a late Undo) but the engine finds nothing to show: not marked read.
+        app.open_message(id);
+        assert!(unread(&app), "nothing is marked read before it loads");
+        let req = app.thread_req;
+        app.apply(Event::Thread { req, id, messages: vec![] }, &mut tx);
+        assert_eq!(app.open, None);
+        assert!(unread(&app), "a message that never showed stays unread");
+        // Opened and loaded: marked read as usual, once.
+        app.open_message(id);
+        let req = app.thread_req;
+        app.apply(Event::Thread { req, id, messages: crate::demo::thread_for(id) }, &mut tx);
+        assert!(!unread(&app), "marked read when it shows");
     }
 
     fn move_key(app: &App) -> i64 {

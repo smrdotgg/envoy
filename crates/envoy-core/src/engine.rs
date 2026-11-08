@@ -296,25 +296,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             }
         }
         Command::SetFlags { ids, add, remove, thread } => {
-            let mut touched = HashSet::new();
-            let ids = expand(shared, ids, thread, false)?;
-            shared.with_writer(|st| {
-                for id in &ids {
-                    let before = st.summary(*id)?.map(|s| s.flags).unwrap_or(0);
-                    if let Some((account, mailbox, uid)) = st.change_flags(*id, add, remove)? {
-                        let after = (before | add) & !remove;
-                        if after == before {
-                            continue;
-                        }
-                        if (before ^ after) & flags::SEEN != 0 {
-                            st.bump_unread(&account, &mailbox, if after & flags::SEEN != 0 { -1 } else { 1 })?;
-                        }
-                        st.enqueue(&account, &Op::SetFlags { mailbox, uid, add: add & !before, remove: remove & before })?;
-                        touched.insert(account);
-                    }
-                }
-                Ok(())
-            })?;
+            let touched = set_flags(shared, ids, add, remove, thread)?;
             for a in touched {
                 shared.emit_mailboxes(&a);
                 shared.emit(Event::Changed { account: a.clone() });
@@ -514,6 +496,35 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
         }
     }
     Ok(())
+}
+
+/// [`Command::SetFlags`]'s local part: changes the flags, adjusts unread counts and queues the
+/// change. Returns the accounts touched.
+fn set_flags(shared: &Shared, ids: Vec<MessageId>, add: u32, remove: u32, thread: bool) -> Result<HashSet<String>> {
+    let mut touched = HashSet::new();
+    // Messages hidden for a move aren't on screen and are about to leave: a late Undo can
+    // reopen one for a moment, but it must not be marked read (or counted down) meanwhile.
+    // Expansion only adds visible messages.
+    let ids = shared.with_writer(|st| Ok(ids.into_iter().filter(|id| st.movable(*id).ok().flatten().is_some()).collect()))?;
+    let ids = expand(shared, ids, thread, false)?;
+    shared.with_writer(|st| {
+        for id in &ids {
+            let before = st.summary(*id)?.map(|s| s.flags).unwrap_or(0);
+            if let Some((account, mailbox, uid)) = st.change_flags(*id, add, remove)? {
+                let after = (before | add) & !remove;
+                if after == before {
+                    continue;
+                }
+                if (before ^ after) & flags::SEEN != 0 {
+                    st.bump_unread(&account, &mailbox, if after & flags::SEEN != 0 { -1 } else { 1 })?;
+                }
+                st.enqueue(&account, &Op::SetFlags { mailbox, uid, add: add & !before, remove: remove & before })?;
+                touched.insert(account);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(touched)
 }
 
 /// [`Command::Move`]'s local part: applies the move, queues it (held for the undo window when
@@ -1260,6 +1271,33 @@ mod tests {
     // The undo window has just run out (the op is due) while the toast is still up.
     fn due_move(shared: &Shared, ids: Vec<MessageId>, key: i64) {
         move_and_hold(shared, ids, &MoveTarget::Archive, false, Some(key), now() - 10).unwrap();
+    }
+
+    #[test]
+    fn flags_of_a_hidden_message_dont_change() {
+        let st = setup();
+        let a = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        let b = message(&st, "INBOX", 2, "<2@x>", "", 0);
+        st.set_counts("a", "INBOX", 2, 2).unwrap();
+        let (shared, _rx) = engine_with(st);
+        due_move(&shared, vec![a], 7);
+        shared.with_writer(|st| st.claim_due("a", i64::MAX)).unwrap(); // on the wire
+        undo_move(&shared, 7).unwrap(); // too late: A stays hidden
+        // The UI reopened A optimistically and marked it read before learning that.
+        for thread in [false, true] {
+            assert!(set_flags(&shared, vec![a], flags::SEEN, 0, thread).unwrap().is_empty(), "thread: {thread}");
+        }
+        shared.with_writer(|st| {
+            assert_eq!(st.summary(a)?.unwrap().flags & flags::SEEN, 0, "hidden A untouched");
+            assert_eq!(st.pending_count()?, 1, "only the move is queued");
+            let inbox = st.mailboxes("a")?.remove(0);
+            assert_eq!((inbox.unread, inbox.total), (1, 1), "B is still unread and counted");
+            assert!(st.summary(b)?.is_some());
+            Ok(())
+        })
+        .unwrap();
+        // Visible messages still change.
+        assert_eq!(set_flags(&shared, vec![b], flags::SEEN, 0, false).unwrap(), HashSet::from(["a".to_owned()]));
     }
 
     #[tokio::test]
