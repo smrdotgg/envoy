@@ -1199,12 +1199,16 @@ impl Store {
         Ok(accounts)
     }
 
+    /// The op failed: back in the queue, for a retry in `retry_in` seconds. A draft upload
+    /// absorbs another of the same draft waiting meanwhile ([`Store::coalesce_uploads`]).
     pub fn op_failed(&self, id: i64, error: &str, retry_in: i64, now: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE ops SET attempts = attempts + 1, last_error = ?2, not_before = ?3, claimed = 0 WHERE id = ?1",
-            params![id, error, now + retry_in],
-        )?;
-        Ok(())
+        self.transaction(|st| {
+            st.conn.execute(
+                "UPDATE ops SET attempts = attempts + 1, last_error = ?2, not_before = ?3, claimed = 0 WHERE id = ?1",
+                params![id, error, now + retry_in],
+            )?;
+            st.coalesce_uploads(id)
+        })
     }
 
     pub fn pending_count(&self) -> Result<u32> {
