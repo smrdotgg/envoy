@@ -1472,11 +1472,109 @@ mod tests {
         }
     }
 
+    /// A mailbox built to break `list`: `n` messages over two accounts, dates that tie (within a
+    /// conversation and across conversations), conversations of up to eight messages, the same
+    /// message stored in two or three mailboxes (Gmail labels, including a second folder with the
+    /// inbox role) with the same date and flags that disagree, real attachments, held and
+    /// deleted messages, bodies for some, and words for full-text search.
+    fn oracle_store(seed: u64, n: u32) -> Store {
+        let s = Store::memory();
+        for a in ["a", "b"] {
+            for (name, role) in [("INBOX", Role::Inbox), ("Archive", Role::Archive), ("Sent", Role::Sent), ("Trash", Role::Trash), ("Junk", Role::Junk), ("Label", Role::Other)] {
+                s.upsert_mailbox(a, name, name, role, "/", true).unwrap();
+            }
+        }
+        s.upsert_mailbox("a", "Priority", "Priority", Role::Inbox, "/", true).unwrap();
+        let people = ["Ana Lima <ana@x.com>", "Bo Chen <bo@y.org>", "Cy <cy@x.com>", "me@me.test", "Dee Okafor <dee@z.net>", "Émile Zola <emile@w.fr>"];
+        let words = ["pancakes", "plans", "invoice", "meeting", "parcel", "budget", "photos", "picnic", "pizza", "quarterly"];
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move |k: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % k.max(1)
+        };
+        let boxes = ["INBOX", "INBOX", "INBOX", "Archive", "Archive", "Sent", "Trash", "Junk", "Label", "Priority"];
+        let mut threads: Vec<(String, String)> = Vec::new(); // (account, root Message-ID)
+        let mut uid = 0u32;
+        let mut date = 1_700_000_000i64;
+        for i in 0..n {
+            // Mostly a new second, often the same one again: ties within and across conversations.
+            if next(3) != 0 {
+                date += 1 + next(90) as i64;
+            }
+            let reply = !threads.is_empty() && next(5) < 2;
+            let (account, root, refs) = if reply {
+                let (a, r) = threads[next(threads.len() as u64) as usize].clone();
+                (a, r.clone(), r)
+            } else {
+                let a = if next(4) == 0 { "b" } else { "a" }.to_owned();
+                let r = format!("<m{seed}.{i}@x>");
+                threads.push((a.clone(), r.clone()));
+                (a, r, String::new())
+            };
+            let _ = root;
+            let from = people[next(people.len() as u64) as usize];
+            let to = people[next(people.len() as u64) as usize];
+            let (w1, w2) = (words[next(words.len() as u64) as usize], words[next(words.len() as u64) as usize]);
+            let mid = format!("<m{seed}.{i}@x>");
+            let stamp = chrono::DateTime::from_timestamp(date, 0).unwrap().to_rfc2822();
+            let subject = format!("{}{w1} {i}", if reply { "Re: " } else { "" });
+            let raw = if next(6) == 0 {
+                format!(
+                    "From: {from}\r\nTo: {to}\r\nSubject: {subject}\r\nMessage-ID: {mid}\r\nReferences: {refs}\r\nDate: {stamp}\r\nMIME-Version: 1.0\r\n\
+                     Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nabout the {w2}\r\n\
+                     --b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"{w2}.pdf\"\r\n\r\n%PDF-1.4\r\n--b--\r\n"
+                )
+            } else {
+                format!("From: {from}\r\nTo: {to}\r\nSubject: {subject}\r\nMessage-ID: {mid}\r\nReferences: {refs}\r\nDate: {stamp}\r\n\r\nabout the {w2}\r\n")
+            };
+            let p = mime::parse(raw.as_bytes(), false).unwrap();
+            // One copy, sometimes two or three, each with flags of its own.
+            let copies = match next(10) {
+                0 => 3,
+                1..=2 => 2,
+                _ => 1,
+            };
+            let first = boxes[next(boxes.len() as u64) as usize];
+            let mut used = Vec::new();
+            for c in 0..copies {
+                let mailbox = if c == 0 { first } else { ["Label", "Priority", "Archive", "INBOX"][next(4) as usize] };
+                if used.contains(&mailbox) || (mailbox == "Priority" && account != "a") {
+                    continue;
+                }
+                used.push(mailbox);
+                let mut fl = 0;
+                if next(3) != 0 {
+                    fl |= flags::SEEN;
+                }
+                if next(5) == 0 {
+                    fl |= flags::FLAGGED;
+                }
+                if next(30) == 0 {
+                    fl |= flags::DELETED;
+                }
+                uid += 1;
+                let id = s.upsert_header(&account, mailbox, uid, fl, 10, 0, &p).unwrap();
+                if next(3) != 0 {
+                    s.set_body(id, raw.as_bytes(), &p).unwrap();
+                }
+                if next(25) == 0 {
+                    s.hide_local(id, 1_000_000 + id).unwrap();
+                }
+            }
+        }
+        s
+    }
+
+    /// The new list against the old algorithm, read without a limit (so its 4 × limit window
+    /// never cuts a conversation short) and cut to `limit`: on several seeds, and on a mailbox
+    /// past the old 2000-row minimum fetch. Paged lists must be the same list, their first
+    /// page its top.
     #[test]
-    fn list_matches_the_reference_for_every_view_and_query() {
-        let s = varied_store();
+    fn list_matches_the_reference_on_varied_mailboxes() {
         let me: HashSet<String> = ["me@me.test".to_owned()].into();
-        let views = [
+        let all_views = [
             View::Role { account: None, role: Role::Inbox },
             View::Role { account: Some("b".into()), role: Role::Inbox },
             View::Role { account: None, role: Role::Archive },
@@ -1485,46 +1583,59 @@ mod tests {
             View::Mailbox { account: "a".into(), mailbox: "Trash".into() },
             View::Starred { account: None },
             View::Starred { account: Some("b".into()) },
-            View::Role { account: None, role: Role::Junk },
+            View::Role { account: None, role: Role::Drafts },
         ];
-        let queries = [
-            "", "p", "pa", "pancakes", "plans p", "meeting", "zzz", "from:", "from:a", "from:ana", "from:LIMA", "to:bo", "subject:re", "subject:", "is:unread",
-            "is:read", "is:starred", "has:attachment", "from:ana is:unread", "re picnic", "to: from:c",
+        let all_queries = [
+            "", "p", "pa", "pancakes", "plans p", "meeting", "zzz", "from:", "from:a", "from:ana", "from:LIMA", "from:émile", "to:bo", "subject:re", "subject:",
+            "is:unread", "is:read", "is:starred", "has:attachment", "has:attachment is:unread", "from:ana is:unread", "re picnic", "to: from:c", "q",
         ];
-        let mut compared = 0;
-        for view in &views {
-            for q in queries {
-                let query = Query::parse(q);
-                for conversations in [true, false] {
-                    for limit in [1, 7, 40, 1000] {
-                        let got = s.list(view, &query, conversations, limit, &me).unwrap();
-                        // Without conversations the reference read `limit` rows and then dropped
-                        // duplicates, coming up short when a labelled message was among them;
-                        // list() fills `limit` with distinct messages.
-                        let want = if conversations {
-                            s.list_reference(view, &query, true, limit, &me).unwrap()
-                        } else {
-                            let mut all = s.list_reference(view, &query, false, 100_000, &me).unwrap();
-                            all.truncate(limit as usize);
-                            all
-                        };
-                        assert_eq!(got, want, "{view:?} {q:?} conversations={conversations} limit={limit}");
-                        // Paged: the first page comes first, and is the list's top.
-                        let mut firsts = Vec::new();
-                        let paged = s.list_paged(view, &query, conversations, limit, &me, 3, &mut |rows| firsts.push(rows)).unwrap();
-                        assert_eq!(paged, want, "paged {view:?} {q:?} conversations={conversations} limit={limit}");
-                        assert!(firsts.len() <= 1);
-                        if let Some(first) = firsts.first() {
-                            assert_eq!(first[..], want[..3], "first page {view:?} {q:?} conversations={conversations} limit={limit}");
-                        } else {
-                            assert!(limit <= 3 || want.len() <= 3, "a long list hands out its first page: {view:?} {q:?} {limit}");
+        let mut compared = 0usize;
+        for (seed, n, views, queries, limits) in [
+            (1u64, 600u32, &all_views[..], &all_queries[..], &[1u32, 7, 40, 3000][..]),
+            (2, 600, &all_views[..], &all_queries[..], &[1, 7, 40, 3000][..]),
+            (3, 600, &all_views[..], &all_queries[..], &[1, 7, 40, 3000][..]),
+            (4, 600, &all_views[..], &all_queries[..], &[1, 7, 40, 3000][..]),
+            (5, 2600, &all_views[..5], &["", "p", "from:a", "is:unread", "has:attachment", "meeting"][..], &[1, 150, 3000][..]),
+        ] {
+            let s = oracle_store(seed, n);
+            for view in views {
+                for q in queries {
+                    let query = Query::parse(q);
+                    for conversations in [true, false] {
+                        let all = s.list_reference(view, &query, conversations, 100_000, &me).unwrap();
+                        for &limit in limits {
+                            let case = format!("seed {seed} ({n}) {view:?} {q:?} conversations={conversations} limit={limit}");
+                            let want = &all[..all.len().min(limit as usize)];
+                            let got = s.list(view, &query, conversations, limit, &me).unwrap();
+                            assert_eq!(got, want, "{case}");
+                            let page = if n > 2000 { 100 } else { 3 };
+                            let mut firsts = Vec::new();
+                            let paged = s.list_paged(view, &query, conversations, limit, &me, page, &mut |rows| firsts.push(rows)).unwrap();
+                            assert_eq!(paged, want, "paged: {case}");
+                            if let Some(first) = firsts.first() {
+                                assert_eq!(first[..], want[..page as usize], "first page: {case}");
+                            }
+                            compared += got.len();
                         }
-                        compared += got.len();
                     }
                 }
             }
         }
-        assert!(compared > 10_000, "the cases cover real lists ({compared} rows)");
+        assert!(compared > 100_000, "the cases cover long lists ({compared} rows)");
+    }
+
+    #[test]
+    fn a_stale_undo_send_cant_cancel_a_later_move() {
+        let s = Store::memory();
+        let sent = s.enqueue_at("a", &send_op(), 50).unwrap();
+        assert!(s.cancel_send(sent).unwrap(), "undo send");
+        let (_, moved) = held_move(&s);
+        assert_ne!(moved, sent, "op ids are never reused");
+        // The old "Sending…" toast's Undo once more (say, a double click that raced it).
+        assert!(!s.cancel_send(sent).unwrap());
+        assert!(!s.cancel_send(moved).unwrap(), "only sends are cancelled this way");
+        assert_eq!(s.ops("a", 100).unwrap().len(), 1, "the move is still queued");
+        assert_eq!(orphaned_holds(&s), 0);
     }
 
     #[test]
