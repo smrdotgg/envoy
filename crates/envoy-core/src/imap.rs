@@ -453,23 +453,38 @@ pub async fn store_flags(session: &mut Session, mailbox: &str, uid: u32, add: u3
     Ok(())
 }
 
-pub async fn move_message(session: &mut Session, has_move: bool, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
+pub async fn move_message(session: &mut Session, caps: Caps, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
     select(session, mailbox).await?;
-    if has_move {
+    if caps.moves {
         timed("MOVE", session.uid_mv(uid.to_string(), dest)).await??;
     } else {
         timed("COPY", session.uid_copy(uid.to_string(), dest)).await??;
-        expunge(session, mailbox, uid, false).await?;
+        expunge(session, caps, mailbox, uid, false).await?;
     }
     Ok(())
 }
 
-pub async fn expunge(session: &mut Session, mailbox: &str, uid: u32, select_first: bool) -> Result<()> {
+pub async fn expunge(session: &mut Session, caps: Caps, mailbox: &str, uid: u32, select_first: bool) -> Result<()> {
     if select_first {
         select(session, mailbox).await?;
     }
-    timed("STORE", async { session.uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await }).await??;
-    timed("EXPUNGE", async { session.uid_expunge(uid.to_string()).await?.try_collect::<Vec<_>>().await }).await??;
+    delete_uids(session, caps, &[uid]).await
+}
+
+/// Deletes messages from the selected mailbox: flags them \Deleted and expunges them, by UID
+/// with UIDPLUS, else with a plain EXPUNGE (which also takes anything else already flagged
+/// \Deleted there, as other clients do on such servers).
+async fn delete_uids(session: &mut Session, caps: Caps, uids: &[u32]) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    timed("STORE", async { session.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await }).await??;
+    if caps.uidplus {
+        timed("EXPUNGE", async { session.uid_expunge(&set).await?.try_collect::<Vec<_>>().await }).await??;
+    } else {
+        timed("EXPUNGE", async { session.expunge().await?.try_collect::<Vec<_>>().await }).await??;
+    }
     Ok(())
 }
 
@@ -478,9 +493,18 @@ pub async fn append(session: &mut Session, mailbox: &str, raw: &[u8], seen: bool
     Ok(())
 }
 
-pub async fn capabilities(session: &mut Session) -> Result<(bool, bool)> {
+/// What the server supports, of what Envoy uses.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Caps {
+    pub moves: bool,
+    pub idle: bool,
+    /// UID EXPUNGE: expunge only the given messages.
+    pub uidplus: bool,
+}
+
+pub async fn capabilities(session: &mut Session) -> Result<Caps> {
     let caps = timed("CAPABILITY", session.capabilities()).await??;
-    Ok((caps.has_str("MOVE"), caps.has_str("IDLE")))
+    Ok(Caps { moves: caps.has_str("MOVE"), idle: caps.has_str("IDLE"), uidplus: caps.has_str("UIDPLUS") })
 }
 
 /// Waits on IDLE for up to `wait`, returning early when the server reports a change or
