@@ -1035,6 +1035,8 @@ async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut Sessi
 /// Carries out one queued op on the server. A seam so replay can be tested without a server.
 trait OpRunner {
     fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send;
+    /// The server's (unread, total) for a mailbox.
+    fn status(&mut self, mailbox: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send;
 }
 
 struct ImapRunner<'a> {
@@ -1045,6 +1047,10 @@ struct ImapRunner<'a> {
 }
 
 impl OpRunner for ImapRunner<'_> {
+    async fn status(&mut self, mailbox: &str) -> Result<(u32, u32)> {
+        imap::status(self.session, mailbox).await
+    }
+
     async fn run(&mut self, op: &Op) -> Result<()> {
         let (shared, account, session) = (self.shared, self.account, &mut *self.session);
         match op {
@@ -1087,12 +1093,19 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
     // Claimed: an undo from here on can't cancel these, since the server may be doing them.
     let ops = shared.with_writer(|st| st.claim_due(&account.id, now()))?;
     let mut any = false;
+    // Mailboxes moved out of: their counts get re-read once the pass is done.
+    let mut recount: Vec<String> = Vec::new();
     for q in ops {
         let r = runner.run(&q.op).await;
         match r {
             Ok(()) => {
                 shared.with_writer(|st| st.op_done(q.id))?;
                 any = true;
+                if let Op::Move { mailbox, .. } | Op::Expunge { mailbox, .. } = &q.op
+                    && !recount.contains(mailbox)
+                {
+                    recount.push(mailbox.clone());
+                }
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -1117,6 +1130,19 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
                 }
             }
         }
+    }
+    // A STATUS from the foreground connection can land between the server carrying out a
+    // move and op_done recording it, and then counts the message out twice (it's gone on the
+    // server, and still held here). Re-reading the counts now, with nothing in flight, puts
+    // the badge right whichever way that raced.
+    for mailbox in &recount {
+        match runner.status(mailbox).await {
+            Ok((unread, total)) => shared.with_writer(|st| st.set_counts(&account.id, mailbox, unread, total))?,
+            Err(e) => log::debug!("{}: couldn't recount {mailbox}: {e:#}", account.email),
+        }
+    }
+    if !recount.is_empty() {
+        shared.emit_mailboxes(&account.id);
     }
     if any {
         shared.emit_pending();
@@ -1188,24 +1214,43 @@ mod tests {
         rx.try_iter().filter_map(|e| if let Event::Toast(t) = e { Some(t) } else { None }).collect()
     }
 
-    /// Stands in for the server. The first op to go "on the wire" runs `during` (an undo
-    /// arriving mid-flight), then every op succeeds, or fails with `fail`.
+    /// Stands in for the server. The first op to go "on the wire" runs `during` (something
+    /// arriving mid-flight: an undo, a STATUS from the other connection), then every op
+    /// succeeds, or fails with `fail`. STATUS answers `counts`.
+    type MidFlight = Box<dyn FnOnce(&Shared) + Send>;
+
     struct FakeServer {
         shared: Arc<Shared>,
-        during: Option<i64>,
+        during: Option<MidFlight>,
         fail: bool,
         ran: Vec<Op>,
+        counts: (u32, u32),
+    }
+
+    impl FakeServer {
+        fn new(shared: &Arc<Shared>, during: impl FnOnce(&Shared) + Send + 'static) -> FakeServer {
+            FakeServer { shared: shared.clone(), during: Some(Box::new(during)), fail: false, ran: vec![], counts: (0, 0) }
+        }
     }
 
     impl OpRunner for FakeServer {
         fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send {
-            if let Some(key) = self.during.take() {
-                undo_move(&self.shared, key).unwrap();
+            if let Some(during) = self.during.take() {
+                during(&self.shared);
             }
             self.ran.push(op.clone());
             let fail = self.fail;
             async move { if fail { Err(anyhow!("NO [UNAVAILABLE] try again later")) } else { Ok(()) } }
         }
+
+        fn status(&mut self, _: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send {
+            let counts = self.counts;
+            async move { Ok(counts) }
+        }
+    }
+
+    fn undo_during(key: i64) -> impl FnOnce(&Shared) + Send + 'static {
+        move |s: &Shared| undo_move(s, key).unwrap()
     }
 
     fn unread(shared: &Shared, account: &str) -> u32 {
@@ -1215,6 +1260,23 @@ mod tests {
     // The undo window has just run out (the op is due) while the toast is still up.
     fn due_move(shared: &Shared, ids: Vec<MessageId>, key: i64) {
         move_and_hold(shared, ids, &MoveTarget::Archive, false, Some(key), now() - 10).unwrap();
+    }
+
+    #[tokio::test]
+    async fn counts_are_right_after_a_status_races_the_replay() {
+        let st = setup();
+        let a = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        message(&st, "INBOX", 2, "<2@x>", "", 0);
+        st.set_counts("a", "INBOX", 2, 2).unwrap();
+        let (shared, _rx) = engine_with(st);
+        due_move(&shared, vec![a], 7); // two unread, one archived: the badge says 1
+        // While the move is on the wire the server carries it out, and a STATUS from the
+        // foreground connection already reflects that, before op_done is recorded.
+        let mut server = FakeServer::new(&shared, |s: &Shared| s.with_writer(|st| st.set_counts("a", "INBOX", 1, 1)).unwrap());
+        server.counts = (1, 1);
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        let inbox = shared.with_writer(|st| st.mailboxes("a")).unwrap().remove(0);
+        assert_eq!((inbox.unread, inbox.total), (1, 1), "one unread message left, and the badge says so");
     }
 
     #[test]
@@ -1250,7 +1312,7 @@ mod tests {
         st.set_counts("a", "INBOX", 1, 1).unwrap();
         let (shared, rx) = engine_with(st);
         due_move(&shared, vec![id], 7);
-        let mut server = FakeServer { shared: shared.clone(), during: Some(7), fail: false, ran: vec![] };
+        let mut server = FakeServer::new(&shared, undo_during(7));
         assert!(replay_with(&shared, &account("a"), &mut server).await.unwrap());
         assert_eq!(server.ran.len(), 1, "the server moved it");
         shared.with_writer(|st| {
@@ -1269,7 +1331,7 @@ mod tests {
         let id = message(&st, "INBOX", 1, "<1@x>", "", 0);
         let (shared, rx) = engine_with(st);
         due_move(&shared, vec![id], 7);
-        let mut server = FakeServer { shared: shared.clone(), during: Some(7), fail: true, ran: vec![] };
+        let mut server = FakeServer { fail: true, ..FakeServer::new(&shared, undo_during(7)) };
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         shared.with_writer(|st| {
             let queued = st.ops("a", i64::MAX)?;
@@ -1289,7 +1351,7 @@ mod tests {
         let b = message_in(&st, "b", "INBOX", 1, "<2@x>", "", 0);
         let (shared, rx) = engine_with(st);
         due_move(&shared, vec![a, b], 7); // multi-select in the unified inbox
-        let mut server = FakeServer { shared: shared.clone(), during: Some(7), fail: false, ran: vec![] };
+        let mut server = FakeServer::new(&shared, undo_during(7));
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         shared.with_writer(|st| {
             assert!(st.summary(a)?.is_none(), "a's move was on the wire: done");
