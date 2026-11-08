@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS bodies (
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5 (subject, people, body, tokenize = 'unicode61 remove_diacritics 2');
 CREATE TABLE IF NOT EXISTS ops (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     account TEXT NOT NULL,
     op TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -100,12 +100,37 @@ CREATE INDEX IF NOT EXISTS messages_held ON messages (held_op) WHERE held_op != 
 CREATE INDEX IF NOT EXISTS ops_batch ON ops (batch) WHERE batch != 0;
 ";
 
+/// Op ids must never be reused: a toast's Undo or a replay in flight holds one, and a reused
+/// id would let it cancel or complete a newer op. Caches from before AUTOINCREMENT get the
+/// table rebuilt (same rows, same ids).
+const OPS_AUTOINCREMENT: &str = "
+BEGIN;
+CREATE TABLE ops_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT NOT NULL,
+    op TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    not_before INTEGER NOT NULL DEFAULT 0,
+    batch INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO ops_new (id, account, op, attempts, last_error, not_before, batch)
+    SELECT id, account, op, attempts, last_error, not_before, batch FROM ops;
+DROP TABLE ops;
+ALTER TABLE ops_new RENAME TO ops;
+COMMIT;
+";
+
 fn migrate(conn: &Connection) -> Result<()> {
     for (table, column, sql) in MIGRATIONS {
         let has: bool = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), params![column], |r| r.get::<_, i64>(0))? > 0;
         if !has {
             conn.execute_batch(sql)?;
         }
+    }
+    let ops_sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ops'", [], |r| r.get(0))?;
+    if !ops_sql.contains("AUTOINCREMENT") {
+        conn.execute_batch(OPS_AUTOINCREMENT)?;
     }
     conn.execute_batch(POST_MIGRATION)?;
     Ok(())
@@ -728,14 +753,17 @@ impl Store {
         let mut stmt = self.conn.prepare_cached("SELECT id, op, attempts FROM ops WHERE account = ?1 AND not_before <= ?2 ORDER BY id")?;
         let rows = stmt.query_map(params![account, now], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?)))?;
         let mut out = Vec::new();
+        let mut unreadable = Vec::new();
         for row in rows {
             let (id, op, attempts) = row?;
             match serde_json::from_str(&op) {
                 Ok(op) => out.push(QueuedOp { id, op, attempts }),
-                Err(_) => {
-                    self.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])?;
-                }
+                Err(_) => unreadable.push(id),
             }
+        }
+        drop(stmt);
+        if !unreadable.is_empty() {
+            self.transaction(|st| st.release(&unreadable))?;
         }
         Ok(out)
     }
@@ -774,7 +802,12 @@ impl Store {
     }
 
     /// Cancels a queued send if it hasn't run (undo send). True when it was still queued.
+    /// Refuses any other kind of op, so a confused caller can't strand a moved message.
     pub fn cancel_send(&self, id: i64) -> Result<bool> {
+        let op: Option<String> = self.conn.query_row("SELECT op FROM ops WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+        if !op.is_some_and(|o| matches!(serde_json::from_str(&o), Ok(Op::Send { .. }))) {
+            return Ok(false);
+        }
         Ok(self.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])? > 0)
     }
 
@@ -917,6 +950,56 @@ mod tests {
         s.mailboxes("a").unwrap().iter().find(|m| m.name == "INBOX").unwrap().unread
     }
 
+    /// Messages hidden for an op that no longer exists: they would stay hidden forever.
+    fn orphaned_holds(s: &Store) -> i64 {
+        s.conn.query_row("SELECT COUNT(*) FROM messages WHERE held_op != 0 AND held_op NOT IN (SELECT id FROM ops)", [], |r| r.get(0)).unwrap()
+    }
+
+    fn send_op() -> Op {
+        Op::Send { raw_b64: String::new(), from: "me@x.com".into(), to: vec!["you@x.com".into()], sent_mailbox: None, reply_of: None }
+    }
+
+    #[test]
+    fn a_stale_undo_send_cant_cancel_a_later_move() {
+        let s = Store::memory();
+        let sent = s.enqueue_at("a", &send_op(), 50).unwrap();
+        assert!(s.cancel_send(sent).unwrap(), "undo send");
+        let (_, moved) = held_move(&s);
+        assert_ne!(moved, sent, "op ids are never reused");
+        // The old "Sending…" toast's Undo once more (say, a double click that raced it).
+        assert!(!s.cancel_send(sent).unwrap());
+        assert!(!s.cancel_send(moved).unwrap(), "only sends are cancelled this way");
+        assert_eq!(s.ops("a", 100).unwrap().len(), 1, "the move is still queued");
+        assert_eq!(orphaned_holds(&s), 0);
+    }
+
+    #[test]
+    fn op_ids_stay_unique_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("envoy-store-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mail.sqlite");
+        let first = {
+            let s = Store::open(&db).unwrap();
+            let id = s.enqueue("a", &send_op()).unwrap();
+            assert!(s.cancel_send(id).unwrap());
+            id
+        };
+        let s = Store::open(&db).unwrap();
+        assert!(s.enqueue("a", &send_op()).unwrap() > first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_move_op_lets_go_of_its_message() {
+        let s = Store::memory();
+        let (id, op) = held_move(&s);
+        s.conn.execute("UPDATE ops SET op = 'not json' WHERE id = ?1", params![op]).unwrap();
+        assert!(s.ops("a", 100).unwrap().is_empty(), "dropped");
+        assert_eq!(orphaned_holds(&s), 0);
+        assert_eq!(inbox(&s)[0].id, id, "shows again");
+    }
+
     #[test]
     fn held_move_hides_but_keeps_the_row() {
         let s = Store::memory();
@@ -998,14 +1081,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("mail.sqlite");
         {
-            let old = SCHEMA.replace("    held_op INTEGER NOT NULL DEFAULT 0,\n", "").replace(",\n    batch INTEGER NOT NULL DEFAULT 0", "");
-            assert!(!old.contains("held_op") && !old.contains("batch"));
+            let old = SCHEMA
+                .replace("    held_op INTEGER NOT NULL DEFAULT 0,\n", "")
+                .replace(",\n    batch INTEGER NOT NULL DEFAULT 0", "")
+                .replace(" AUTOINCREMENT", "");
+            assert!(!old.contains("held_op") && !old.contains("batch") && !old.contains("AUTOINCREMENT"));
             let conn = Connection::open(&db).unwrap();
             conn.execute_batch(&old).unwrap();
-            conn.execute("INSERT INTO ops (account, op) VALUES ('a', '{}')", []).unwrap();
+            conn.execute("INSERT INTO ops (id, account, op) VALUES (41, 'a', ?1)", params![json(&send_op())]).unwrap();
         }
         let s = Store::open(&db).unwrap();
-        held_move(&s);
+        assert_eq!(s.ops("a", 0).unwrap()[0].id, 41, "queued ops kept, same ids");
+        let (_, op) = held_move(&s);
+        assert!(op > 41);
         assert_eq!(s.undo_batch(7).unwrap(), vec!["a".to_owned()]);
         drop(s);
         Store::open(&db).unwrap();
