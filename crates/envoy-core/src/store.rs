@@ -102,6 +102,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
 /// Indexes on migrated columns (they must exist first).
 const POST_MIGRATION: &str = "
 CREATE INDEX IF NOT EXISTS messages_held ON messages (held_op) WHERE held_op != 0;
+CREATE INDEX IF NOT EXISTS messages_held_box ON messages (account, mailbox, flags, held_op) WHERE held_op != 0;
 CREATE INDEX IF NOT EXISTS ops_batch ON ops (batch) WHERE batch != 0;
 ";
 
@@ -175,6 +176,14 @@ CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
 END;
 COMMIT;
 ";
+
+/// The server's counts minus messages waiting for a move (see [`Store::set_counts`]). Runs
+/// under the writer lock after every STATUS, so the subqueries must not scan the mailbox:
+/// they read only the few held rows, from messages_held_box.
+const SET_COUNTS: &str = "UPDATE mailboxes SET
+    unread = MAX(0, ?3 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0 AND flags & 1 = 0)),
+    total = MAX(0, ?4 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0))
+ WHERE account = ?1 AND name = ?2";
 
 fn has_autoincrement(conn: &Connection, table: &str) -> Result<bool> {
     let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1", params![table], |r| r.get(0))?;
@@ -382,13 +391,7 @@ impl Store {
     /// server, so they're in its counts, but they've already left this mailbox locally (and
     /// undo adds them back): they're taken out here so nothing is counted twice.
     pub fn set_counts(&self, account: &str, name: &str, unread: u32, total: u32) -> Result<()> {
-        self.conn.execute(
-            "UPDATE mailboxes SET
-                unread = MAX(0, ?3 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0 AND flags & 1 = 0)),
-                total = MAX(0, ?4 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0))
-             WHERE account = ?1 AND name = ?2",
-            params![account, name, unread, total],
-        )?;
+        self.conn.execute(SET_COUNTS, params![account, name, unread, total])?;
         Ok(())
     }
 
@@ -1332,6 +1335,43 @@ mod tests {
         s.undo_batch(8).unwrap();
         s.op_done(op).unwrap();
         assert!(s.summary(id).unwrap().is_none(), "the first move still owns it");
+    }
+
+    #[test]
+    fn server_counts_dont_scan_a_big_mailbox() {
+        let s = Store::memory();
+        s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        s.transaction(|st| {
+            for uid in 1..=5_000u32 {
+                st.conn.execute(
+                    "INSERT INTO messages (account, mailbox, uid, date, flags, held_op) VALUES ('a', 'INBOX', ?1, ?1, ?2, ?3)",
+                    params![uid, uid % 2, if uid % 1000 == 0 { uid as i64 } else { 0 }],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let plan = || -> Vec<String> {
+            s.conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {SET_COUNTS}"))
+                .unwrap()
+                .query_map(params!["a", "INBOX", 1, 1], |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        for stats in ["without statistics", "after ANALYZE"] {
+            if stats == "after ANALYZE" {
+                s.conn.execute_batch("ANALYZE").unwrap();
+            }
+            let plan = plan();
+            let on_messages: Vec<&String> = plan.iter().filter(|d| d.contains(" messages ")).collect();
+            assert_eq!(on_messages.len(), 2, "{stats}: {plan:?}");
+            assert!(on_messages.iter().all(|d| d.starts_with("SEARCH") && d.contains("COVERING INDEX messages_held_box ")), "{stats}: {plan:?}");
+        }
+        s.set_counts("a", "INBOX", 2_500, 5_000).unwrap();
+        let m = s.mailboxes("a").unwrap().remove(0);
+        assert_eq!((m.unread, m.total), (2_495, 4_995), "five held, all unread");
     }
 
     #[test]
