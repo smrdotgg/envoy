@@ -333,7 +333,7 @@ impl Builder {
     fn new(root: &Handle) -> Builder {
         let mut b = Builder { doc: Doc::default(), depth: 0, sheet: Sheet::new(), els: Vec::new(), index: HashMap::new(), styles: Vec::new(), blank_hint: 0, too_deep: false };
         let mut sheets: Vec<(String, Option<String>)> = Vec::new();
-        b.index_children(root, NONE, &mut sheets, 0);
+        b.index_children(root, NONE, [0; 8], &mut sheets, 0);
         for (css, media) in sheets {
             b.sheet.add(&css, media.as_deref());
         }
@@ -341,7 +341,7 @@ impl Builder {
         b
     }
 
-    fn index_children(&mut self, h: &Handle, parent: u32, sheets: &mut Vec<(String, Option<String>)>, depth: usize) {
+    fn index_children(&mut self, h: &Handle, parent: u32, ancestors: css::Bloom, sheets: &mut Vec<(String, Option<String>)>, depth: usize) {
         let mut prev = NONE;
         let mut index = 0;
         let kids = h.children.borrow();
@@ -361,13 +361,20 @@ impl Builder {
             index += 1;
             let attrs: Vec<(String, String)> = attrs.borrow().iter().map(|a| (a.name.local.as_ref().to_ascii_lowercase(), a.value.to_string())).collect();
             let id = attrs.iter().find(|(k, _)| k == "id").map(|(_, v)| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty());
-            let classes = attrs.iter().find(|(k, _)| k == "class").map(|(_, v)| v.split_whitespace().map(|c| c.to_ascii_lowercase()).collect()).unwrap_or_default();
+            let classes: Vec<String> = attrs.iter().find(|(k, _)| k == "class").map(|(_, v)| v.split_whitespace().map(|c| c.to_ascii_lowercase()).collect()).unwrap_or_default();
             let i = self.els.len() as u32;
-            self.els.push(Elem { tag: t, id, classes, attrs, parent, prev, index, last: Some(k) == last_el });
+            let mut inner = ancestors;
+            for cl in &classes {
+                css::bloom_add(&mut inner, '.', cl);
+            }
+            if let Some(id) = &id {
+                css::bloom_add(&mut inner, '#', id);
+            }
+            self.els.push(Elem { tag: t, id, classes, attrs, parent, prev, index, last: Some(k) == last_el, ancestors });
             self.index.insert(key(c), i);
             prev = i;
             if depth < MAX_DEPTH + 50 {
-                self.index_children(c, i, sheets, depth + 1);
+                self.index_children(c, i, inner, sheets, depth + 1);
             }
         }
     }
