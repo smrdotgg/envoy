@@ -24,7 +24,7 @@ use crate::model::{Address, Attachment, Body, Mailbox, MessageId, Role, Summary,
 
 mod drafts;
 mod list;
-pub use drafts::{DraftUpload, LocalDraft};
+pub use drafts::{DraftRev, DraftUpload, LocalDraft};
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -109,7 +109,8 @@ CREATE TABLE IF NOT EXISTS drafts (
     unconfirmed INTEGER NOT NULL DEFAULT 0,
     sent INTEGER NOT NULL DEFAULT 0,
     server_account TEXT NOT NULL DEFAULT '',
-    upload_gen INTEGER NOT NULL DEFAULT 0
+    upload_gen INTEGER NOT NULL DEFAULT 0,
+    lifecycle INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS draft_files (
     draft INTEGER NOT NULL,
@@ -120,14 +121,11 @@ CREATE TABLE IF NOT EXISTS draft_files (
 CREATE TRIGGER IF NOT EXISTS drafts_files_delete AFTER DELETE ON drafts BEGIN
     DELETE FROM draft_files WHERE draft = old.id;
 END;
-CREATE TABLE IF NOT EXISTS draft_tombstones (
+CREATE TABLE IF NOT EXISTS draft_ends (
     id INTEGER PRIMARY KEY,
-    gone INTEGER NOT NULL
+    lifecycle INTEGER NOT NULL,
+    sent INTEGER NOT NULL
 );
-CREATE TRIGGER IF NOT EXISTS drafts_tombstone AFTER DELETE ON drafts BEGIN
-    INSERT OR REPLACE INTO draft_tombstones (id, gone) VALUES (old.id, CAST(unixepoch('subsec') * 1000000 AS INTEGER));
-    DELETE FROM draft_tombstones WHERE gone < CAST(unixepoch('subsec') * 1000000 AS INTEGER) - 7776000000000;
-END;
 "#;
 
 /// Columns added after the first release, for caches created before them. Each runs once,
@@ -152,19 +150,31 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     // upload that finishes after the draft moved to another account is fenced off.
     ("drafts", "server_account", "ALTER TABLE drafts ADD COLUMN server_account TEXT NOT NULL DEFAULT ''"),
     ("drafts", "upload_gen", "ALTER TABLE drafts ADD COLUMN upload_gen INTEGER NOT NULL DEFAULT 0"),
+    // Bumped by send and Undo send: a write made before can't touch what came after.
+    ("drafts", "lifecycle", "ALTER TABLE drafts ADD COLUMN lifecycle INTEGER NOT NULL DEFAULT 0"),
 ];
 
-/// Indexes on migrated columns (they must exist first).
+/// Indexes and triggers on migrated columns (they must exist first).
 ///
 /// `messages_by_date` is what [`Store::list`] scans: a mailbox newest first (then newest id,
 /// which never changes, so a flag change can't reorder messages of the same second), with every
 /// column grouping and the common filters read, so a scan never touches the table (whose rows
 /// carry recipients and previews). It replaces `messages_box_date`, its first three columns.
 /// Building it takes 0.2 s for a 100k-message cache on an M4 Pro, once, on the engine's thread.
+///
+/// A draft deleted (sent, purged, discarded, its account removed) is remembered in draft_ends,
+/// so no write from its life brings it back. Ids are never reused, so the newest 10,000 are
+/// plenty. They replace the clock-stamped tombstones of an earlier build.
 const POST_MIGRATION: &str = "
 DROP INDEX IF EXISTS messages_box_date;
 DROP INDEX IF EXISTS messages_list;
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages (account, mailbox, date DESC, id DESC, flags, held_op, has_attachments, thread, message_id, from_email, from_name);
+DROP TRIGGER IF EXISTS drafts_tombstone;
+DROP TABLE IF EXISTS draft_tombstones;
+CREATE TRIGGER IF NOT EXISTS drafts_end AFTER DELETE ON drafts BEGIN
+    INSERT OR REPLACE INTO draft_ends (id, lifecycle, sent) VALUES (old.id, old.lifecycle, old.sending != 0 OR old.sent != 0);
+    DELETE FROM draft_ends WHERE id < (SELECT id FROM draft_ends ORDER BY id DESC LIMIT 1 OFFSET 9999);
+END;
 CREATE INDEX IF NOT EXISTS messages_held ON messages (held_op) WHERE held_op != 0;
 CREATE INDEX IF NOT EXISTS messages_held_box ON messages (account, mailbox, flags, held_op) WHERE held_op != 0;
 CREATE INDEX IF NOT EXISTS messages_deleted_box ON messages (account, mailbox, flags, held_op) WHERE flags & 16 != 0;

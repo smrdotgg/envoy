@@ -10,6 +10,7 @@ use envoy_core::accounts::{Account, AuthKind};
 use envoy_core::engine::{Command, Engine, Event, MoveTarget};
 use envoy_core::model::{Draft, DraftAttachment, DraftNotice, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use envoy_core::settings::Settings;
+use envoy_core::store::DraftRev;
 
 use crate::fmt;
 
@@ -48,6 +49,9 @@ pub struct Compose {
     pub notice: Option<String>,
     /// The local draft this composer saves to: an id picked here, unique across runs.
     pub draft_id: i64,
+    /// The draft's lifecycle, as the engine last said ([`Event::DraftOpened`]): its saves carry
+    /// it, and the store refuses them once the draft has moved on (sent, or gone for good).
+    pub lifecycle: i64,
     /// The draft is in the store, or a save of it is on its way: opened from there, or saved.
     pub saved: bool,
     /// The newest save handed to the engine, and the newest it confirmed written (stamps): the
@@ -92,6 +96,7 @@ impl Compose {
             attachments: Vec::new(),
             notice: None,
             draft_id,
+            lifecycle: 0,
             saved: false,
             submitted: 0,
             acked: 0,
@@ -130,11 +135,22 @@ impl Compose {
 pub struct PendingSave {
     pub id: i64,
     pub rev: i64,
+    pub lifecycle: i64,
     pub draft: Draft,
     pub open: bool,
     /// Failures so far; after one, it's tried again at `retry_at` (app clock).
     pub failures: u32,
     pub retry_at: Option<f64>,
+}
+
+/// A message sent from the composer and not yet confirmed queued: kept to give back if the send
+/// fails, and to write as a draft if the window closes first.
+pub struct PendingSend {
+    pub id: i64,
+    pub draft: Draft,
+    /// The composer's stamp and lifecycle when it sent.
+    pub rev: i64,
+    pub lifecycle: i64,
 }
 
 /// Seconds before a failed draft save is tried again.
@@ -143,20 +159,33 @@ const SAVE_RETRY: f64 = 5.0;
 /// What closing the window must still write ([`App::unsaved`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Unsaved {
-    /// A draft save, under its stamp (so it never overwrites a newer one).
-    Save { id: i64, draft: Draft, open: bool, rev: i64 },
-    /// A message sent from the composer (at `stamp`) but not confirmed queued: kept as a draft
-    /// unless its send was queued, or went out, after all.
-    Unsent { id: i64, draft: Draft, stamp: i64 },
+    /// A draft save, under its stamp and lifecycle (so it never overwrites a newer one, nor
+    /// brings back a draft that moved on).
+    Save { id: i64, draft: Draft, open: bool, rev: i64, lifecycle: i64 },
+    /// A message sent from the composer (at `rev`, in `lifecycle`) but not confirmed queued:
+    /// kept as a draft unless its send was queued, or went out, after all.
+    Unsent { id: i64, draft: Draft, rev: i64, lifecycle: i64 },
 }
 
 impl Unsaved {
     /// For the recovery file.
     fn recovered(&self) -> envoy_core::drafts::Recovered {
         match self {
-            Unsaved::Save { id, draft, open, rev } => envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: *open, stamp: *rev, unsent: false },
-            Unsaved::Unsent { id, draft, stamp } => envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: true, stamp: *stamp, unsent: true },
+            Unsaved::Save { id, draft, open, rev, lifecycle } => {
+                envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: *open, stamp: *rev, lifecycle: *lifecycle, unsent: false }
+            }
+            Unsaved::Unsent { id, draft, rev, lifecycle } => envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: true, stamp: *rev, lifecycle: *lifecycle, unsent: true },
         }
+    }
+
+    /// Its text as a new draft, `id`, saved at `rev`: for one the store refused (its draft
+    /// moved on without it).
+    fn as_new_draft(&self, id: i64, rev: i64) -> Unsaved {
+        let (draft, open) = match self {
+            Unsaved::Save { draft, open, .. } => (draft.clone(), *open),
+            Unsaved::Unsent { draft, .. } => (draft.clone(), true),
+        };
+        Unsaved::Save { id, draft, open, rev, lifecycle: 0 }
     }
 }
 
@@ -339,7 +368,7 @@ pub struct App {
     /// Draft saves, and sends, not yet confirmed by the engine.
     pub pending_saves: Vec<PendingSave>,
     /// `(draft id, what was sent, when)`.
-    pub pending_sends: Vec<(i64, Draft, i64)>,
+    pub pending_sends: Vec<PendingSend>,
     pub toasts: Vec<Toast>,
     pub toast_seq: u64,
     /// The last stamp handed out ([`App::next_stamp`]).
@@ -556,7 +585,7 @@ impl App {
             Event::Sent { op, undo_secs, draft_id } => {
                 // Queued with the draft: the send's copy of it is no longer needed.
                 if let Some(d) = draft_id {
-                    self.pending_sends.retain(|(id, ..)| *id != d);
+                    self.pending_sends.retain(|p| p.id != d);
                     self.pending_saves.retain(|p| p.id != d);
                 }
                 self.toast_seq += 1;
@@ -611,10 +640,11 @@ impl App {
                 reload = true;
             }
             Event::Held { .. } => {}
-            Event::DraftOpened { id, draft, restored, notice } => self.show_draft(id, draft, restored, notice),
+            Event::DraftOpened { id, draft, at, restored, notice } => self.show_draft(id, draft, at, restored, notice),
             Event::DraftDiscarded { id, undo } => self.draft_discarded(id, undo),
             Event::DraftSaved { id, rev } => self.draft_saved(id, rev),
             Event::DraftSaveFailed { id, rev, error } => self.draft_save_failed(id, rev, error),
+            Event::DraftSaveRefused { id, rev } => self.draft_save_refused(id, rev),
             Event::SendFailed { draft_id } => self.send_failed(draft_id),
         }
         reload
@@ -1392,19 +1422,19 @@ impl App {
         c.dirty_since = None;
         c.saved = true;
         c.submitted = rev;
-        let (id, draft) = (c.draft_id, c.draft());
-        self.submit_save(id, draft, open, rev);
+        let (id, draft, lifecycle) = (c.draft_id, c.draft(), c.lifecycle);
+        self.submit_save(id, draft, open, rev, lifecycle);
         if self.view_role() == Some(Role::Drafts) {
             self.request_list();
         }
     }
 
-    fn submit_save(&mut self, id: i64, draft: Draft, open: bool, rev: i64) {
+    fn submit_save(&mut self, id: i64, draft: Draft, open: bool, rev: i64, lifecycle: i64) {
         // A newer save of the same draft supersedes one still waiting.
         let failures = self.pending_saves.iter().find(|p| p.id == id).map_or(0, |p| p.failures);
         self.pending_saves.retain(|p| p.id != id);
-        self.pending_saves.push(PendingSave { id, rev, draft: draft.clone(), open, failures, retry_at: None });
-        self.send(Command::SaveDraft { id, draft, open, rev });
+        self.pending_saves.push(PendingSave { id, rev, lifecycle, draft: draft.clone(), open, failures, retry_at: None });
+        self.send(Command::SaveDraft { id, draft, open, rev, lifecycle });
     }
 
     /// The engine wrote save `rev` of draft `id`.
@@ -1435,6 +1465,26 @@ impl App {
         }
     }
 
+    /// The engine refused save `rev` of draft `id`: the draft moved on without it (gone for
+    /// good, or sent, since the save was made; say, a too-late Undo put a discarded draft back
+    /// in the composer after it was deleted). It isn't saved, and never will be under that id,
+    /// so what it holds becomes a new draft: a composer with that draft carries on as the new
+    /// one, with whatever it shows now.
+    fn draft_save_refused(&mut self, id: i64, rev: i64) {
+        let Some(i) = self.pending_saves.iter().position(|p| p.id == id && p.rev == rev) else { return };
+        let p = self.pending_saves.remove(i);
+        let new_id = self.next_stamp();
+        if let Some(c) = self.compose.as_mut().filter(|c| c.draft_id == id) {
+            c.draft_id = new_id;
+            c.lifecycle = 0;
+            self.save_compose(true);
+        } else {
+            let rev = self.next_stamp();
+            self.submit_save(new_id, p.draft, p.open, rev, 0);
+        }
+        self.toast("Saved as a new draft: the one it was saved to had already been sent or deleted", false);
+    }
+
     /// Hands failed saves to the engine again once their wait is over.
     fn retry_saves(&mut self, clock: f64, tx: &mut Tx) {
         let due: Vec<i64> = self.pending_saves.iter().filter(|p| p.retry_at.is_some_and(|t| t <= clock)).map(|p| p.id).collect();
@@ -1443,13 +1493,13 @@ impl App {
             let Some(p) = self.pending_saves.iter_mut().find(|p| p.id == id) else { continue };
             p.rev = rev;
             p.retry_at = None;
-            let (draft, open) = (p.draft.clone(), p.open);
+            let (draft, open, lifecycle) = (p.draft.clone(), p.open, p.lifecycle);
             if let Some(c) = &mut self.compose
                 && c.draft_id == id
             {
                 c.submitted = rev;
             }
-            self.send(Command::SaveDraft { id, draft, open, rev });
+            self.send(Command::SaveDraft { id, draft, open, rev, lifecycle });
         }
         if let Some(next) = self.pending_saves.iter().filter_map(|p| p.retry_at).reduce(f64::min) {
             tx.wake_after(std::time::Duration::from_secs_f64((next - clock).max(0.05)));
@@ -1460,9 +1510,9 @@ impl App {
     /// for that, and is saved again.
     fn send_failed(&mut self, draft_id: Option<i64>) {
         let Some(id) = draft_id else { return };
-        let Some(i) = self.pending_sends.iter().position(|(d, ..)| *d == id) else { return };
-        let (_, draft, _) = self.pending_sends.remove(i);
-        self.show_draft(id, draft, false, None);
+        let Some(i) = self.pending_sends.iter().position(|p| p.id == id) else { return };
+        let sent = self.pending_sends.remove(i);
+        self.show_draft(id, sent.draft, DraftRev { lifecycle: sent.lifecycle, rev: sent.rev }, false, None);
         if let Some(c) = &mut self.compose
             && c.draft_id == id
         {
@@ -1493,8 +1543,8 @@ impl App {
             |u| {
                 let Some(engine) = &engine else { return Err("the mail database isn't open".into()) };
                 match u {
-                    Unsaved::Save { id, draft, open, rev } => engine.save_draft_now(*id, draft, *open, *rev),
-                    Unsaved::Unsent { id, draft, stamp } => engine.keep_unsent_now(*id, draft, *stamp),
+                    Unsaved::Save { id, draft, open, rev, lifecycle } => engine.save_draft_now(*id, draft, *open, DraftRev { lifecycle: *lifecycle, rev: *rev }),
+                    Unsaved::Unsent { id, draft, rev, lifecycle } => engine.keep_unsent_now(*id, draft, DraftRev { lifecycle: *lifecycle, rev: *rev }),
                 }
                 .map_err(|e| format!("{e:#}"))
             },
@@ -1506,15 +1556,33 @@ impl App {
         self.engine = engine;
     }
 
-    /// [`App::on_close`]'s work: everything unsaved goes through `write`, and what fails to
-    /// `recover` (the recovery file, imported on the next start). A snapshot is dropped only
-    /// once one of them holds it; if neither can, its text goes to the log, the last place left.
-    fn close_with(&mut self, mut write: impl FnMut(&Unsaved) -> Result<(), String>, recover: impl FnOnce(Vec<Unsaved>) -> Result<(), String>) {
+    /// [`App::on_close`]'s work: everything unsaved goes through `write` (false: the store
+    /// refused it, its draft having moved on, so it's written again as a new draft), and what
+    /// fails to `recover` (the recovery file, imported on the next start). A snapshot is
+    /// dropped only once one of them holds it; if neither can, its text goes to the log, the
+    /// last place left.
+    fn close_with(&mut self, mut write: impl FnMut(&Unsaved) -> Result<bool, String>, recover: impl FnOnce(Vec<Unsaved>) -> Result<(), String>) {
         let mut failed = Vec::new();
         for u in self.unsaved() {
-            if let Err(e) = write(&u) {
-                eprintln!("couldn't save a draft ({e}): keeping it in the recovery file");
-                failed.push(u);
+            let u = match write(&u) {
+                Ok(true) => continue,
+                Ok(false) => {
+                    let (id, rev) = (self.next_stamp(), self.next_stamp());
+                    u.as_new_draft(id, rev)
+                }
+                Err(e) => {
+                    eprintln!("couldn't save a draft ({e}): keeping it in the recovery file");
+                    failed.push(u);
+                    continue;
+                }
+            };
+            match write(&u) {
+                Ok(true) => {}
+                Ok(false) => failed.push(u),
+                Err(e) => {
+                    eprintln!("couldn't save a draft ({e}): keeping it in the recovery file");
+                    failed.push(u);
+                }
             }
         }
         if failed.is_empty() {
@@ -1536,15 +1604,15 @@ impl App {
     pub fn unsaved(&mut self) -> Vec<Unsaved> {
         let mut saves = std::mem::take(&mut self.pending_saves);
         saves.sort_by_key(|p| p.rev);
-        let mut out: Vec<Unsaved> = saves.into_iter().map(|p| Unsaved::Save { id: p.id, draft: p.draft, open: p.open, rev: p.rev }).collect();
+        let mut out: Vec<Unsaved> = saves.into_iter().map(|p| Unsaved::Save { id: p.id, draft: p.draft, open: p.open, rev: p.rev, lifecycle: p.lifecycle }).collect();
         let rev = self.next_stamp();
         if let Some(c) = &mut self.compose
             && c.dirty
         {
             c.dirty = false;
-            out.push(Unsaved::Save { id: c.draft_id, draft: c.draft(), open: true, rev });
+            out.push(Unsaved::Save { id: c.draft_id, draft: c.draft(), open: true, rev, lifecycle: c.lifecycle });
         }
-        out.extend(std::mem::take(&mut self.pending_sends).into_iter().map(|(id, draft, stamp)| Unsaved::Unsent { id, draft, stamp }));
+        out.extend(std::mem::take(&mut self.pending_sends).into_iter().map(|p| Unsaved::Unsent { id: p.id, draft: p.draft, rev: p.rev, lifecycle: p.lifecycle }));
         out
     }
 
@@ -1600,7 +1668,7 @@ impl App {
     fn open_draft(&mut self, id: MessageId) {
         if self.demo {
             if let Some(draft) = crate::demo::draft_for(id) {
-                self.show_draft(id, draft, false, None);
+                self.show_draft(id, draft, DraftRev::default(), false, None);
             }
             return;
         }
@@ -1611,13 +1679,17 @@ impl App {
     /// (`restored`, minimized) left there when the app last closed. The composer it replaces is
     /// put away in Drafts, unless it's this same draft (it may have newer edits), or this is a
     /// restore and the user already started another. With [`DraftNotice::Copy`] it's an unsaved
-    /// copy of a server draft that stays as it is, and gets an id of its own here.
-    pub fn show_draft(&mut self, id: i64, draft: Draft, restored: bool, notice: Option<DraftNotice>) {
+    /// copy of a server draft that stays as it is, and gets an id of its own here. `at`: the
+    /// draft's lifecycle, for its saves to carry, and its newest save's stamp, which the
+    /// composer's stamps go on from (whatever the clock says).
+    pub fn show_draft(&mut self, id: i64, draft: Draft, at: DraftRev, restored: bool, notice: Option<DraftNotice>) {
+        self.last_stamp = self.last_stamp.max(at.rev);
         let copy = matches!(notice, Some(DraftNotice::Copy(_)));
-        let id = if copy { self.next_stamp() } else { id };
+        let (id, lifecycle) = if copy { (self.next_stamp(), 0) } else { (id, at.lifecycle) };
         if let Some(c) = &mut self.compose {
             if c.draft_id == id {
                 c.minimized &= restored;
+                c.lifecycle = lifecycle;
                 return;
             }
             if restored {
@@ -1626,6 +1698,7 @@ impl App {
         }
         self.park_compose();
         let mut c = Compose::new(draft.account.clone(), id);
+        c.lifecycle = lifecycle;
         c.title = if draft.subject.trim().is_empty() { "Draft".into() } else { draft.subject.clone() };
         c.show_cc = !draft.cc.trim().is_empty() || !draft.bcc.trim().is_empty();
         c.to = TextEdit::new(draft.to);
@@ -1668,7 +1741,7 @@ impl App {
                 return;
             }
         }
-        let (draft, draft_id) = (c.draft(), c.draft_id);
+        let (draft, draft_id, lifecycle) = (c.draft(), c.draft_id, c.lifecycle);
         self.compose = None;
         if self.demo {
             self.toast("Sent (demo mode — nothing left your computer)", false);
@@ -1676,8 +1749,8 @@ impl App {
         }
         // Kept until the engine confirms it queued the message (Event::Sent), or gives it back
         // (Event::SendFailed), and written as a draft if the window closes first.
-        let stamp = self.next_stamp();
-        self.pending_sends.push((draft_id, draft.clone(), stamp));
+        let rev = self.next_stamp();
+        self.pending_sends.push(PendingSend { id: draft_id, draft: draft.clone(), rev, lifecycle });
         // What was sent supersedes saves still waiting (a failed one's retry would write older
         // text over the draft kept for Undo send).
         self.pending_saves.retain(|p| p.id != draft_id);
@@ -2238,11 +2311,63 @@ mod tests {
         type_into_body(&mut app, "Draft B");
         let mut recovered = Vec::new();
         // The database refuses A (disk full, say); B goes in.
-        app.close_with(|u| if matches!(u, Unsaved::Save { id, .. } if *id == a) { Err("disk I/O error".to_owned()) } else { Ok(()) }, |failed| {
+        app.close_with(|u| if matches!(u, Unsaved::Save { id, .. } if *id == a) { Err("disk I/O error".to_owned()) } else { Ok(true) }, |failed| {
             recovered = failed;
             Ok(())
         });
         assert!(matches!(&recovered[..], [Unsaved::Save { id, draft, .. }] if *id == a && draft.body == "Draft A"), "{recovered:?}");
+    }
+
+    #[test]
+    fn a_refused_save_carries_on_as_a_new_draft() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        // Say a too-late Undo put a discarded draft back in the composer after it was deleted.
+        let (id, rev) = typed_and_saved(&mut app, "Typed after the undo");
+        app.apply(Event::DraftSaveRefused { id, rev }, &mut Tx::default());
+        let c = app.compose.as_ref().unwrap();
+        assert!(c.draft_id != id && c.lifecycle == 0, "a new draft");
+        assert!(!c.shows_saved(), "not saved until the engine says so");
+        let p = app.pending_saves.iter().find(|p| p.id == c.draft_id).expect("its save handed over");
+        assert!(p.draft.body.starts_with("Typed after the undo") && p.lifecycle == 0 && p.rev == c.submitted);
+        assert!(app.pending_saves.iter().all(|p| p.id != id), "nothing more for the old one");
+    }
+
+    #[test]
+    fn a_write_refused_on_close_is_kept_as_a_new_draft() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let (a, _) = typed_and_saved(&mut app, "Draft A");
+        let mut written = Vec::new();
+        app.close_with(
+            |u| match u {
+                Unsaved::Save { id, .. } if *id == a => Ok(false),
+                _ => {
+                    written.push(u.clone());
+                    Ok(true)
+                }
+            },
+            |failed| panic!("nothing for the recovery file: {failed:?}"),
+        );
+        assert!(matches!(&written[..], [Unsaved::Save { id, draft, lifecycle: 0, .. }] if *id != a && draft.body.starts_with("Draft A")), "{written:?}");
+    }
+
+    #[test]
+    fn an_opened_draft_saves_in_its_lifecycle_and_after_its_last_save() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        // Back from an undone send: a later lifecycle, saved last by a clock far ahead.
+        let back = Draft { account: "demo".into(), subject: "Back".into(), body: "Sent text".into(), ..Draft::default() };
+        let far = chrono::Utc::now().timestamp_micros() + 3_600_000_000;
+        app.apply(Event::DraftOpened { id: 5, draft: back, at: DraftRev { lifecycle: 2, rev: far }, restored: false, notice: None }, &mut Tx::default());
+        type_into_body(&mut app, "More: ");
+        let t = app.clock + 1.0;
+        app.tick(t, &mut Tx::default());
+        app.tick(t + SAVE_WHEN_IDLE + 0.1, &mut Tx::default());
+        let p = app.pending_saves.iter().find(|p| p.id == 5).expect("saved");
+        assert!(p.lifecycle == 2 && p.rev > far, "lifecycle {}, rev {} after {far}", p.lifecycle, p.rev);
     }
 
     #[test]
@@ -2320,13 +2445,13 @@ mod tests {
         type_into_body(&mut app, "Unfinished");
         let first = app.compose.as_ref().unwrap().draft_id;
         let other = Draft { account: "demo".into(), subject: "Other".into(), body: "Other text".into(), ..Draft::default() };
-        app.show_draft(first + 1, other.clone(), false, None);
+        app.show_draft(first + 1, other.clone(), DraftRev::default(), false, None);
         assert_eq!(app.toasts.last().map(|t| t.text.as_str()), Some("Saved to Drafts"));
         let c = app.compose.as_ref().unwrap();
         assert_eq!((c.draft_id, c.subject.text.as_str(), c.saved, c.minimized), (first + 1, "Other", true, false));
         // The same draft again (say, Undo send while it's open): the composer keeps its edits.
         type_into_body(&mut app, "More ");
-        app.show_draft(first + 1, other, false, None);
+        app.show_draft(first + 1, other, DraftRev::default(), false, None);
         assert!(app.compose.as_ref().unwrap().body.text.starts_with("More "));
     }
 
@@ -2379,14 +2504,14 @@ mod tests {
         crate::demo::populate(&mut app);
         let files = vec![DraftAttachment { id: 0, filename: "plan.pdf".into(), mime: "application/pdf".into(), size: 10 }];
         let formatted = Draft { account: "demo".into(), subject: "Plan".into(), attachments: files.clone(), ..Draft::default() };
-        app.show_draft(5, formatted, false, Some(DraftNotice::PlainText));
+        app.show_draft(5, formatted, DraftRev::default(), false, Some(DraftNotice::PlainText));
         let c = app.compose.as_ref().unwrap();
         assert_eq!(c.draft().attachments, files, "saved and sent with its files");
         assert!(c.notice.as_deref().is_some_and(|n| n.contains("formatting")) && c.saved);
         // One Envoy can't edit in place: a copy, nothing in the store until it's edited.
         app.compose = None;
         let signed = Draft { account: "demo".into(), subject: "Signed".into(), ..Draft::default() };
-        app.show_draft(0, signed, false, Some(DraftNotice::Copy("it's signed or encrypted".into())));
+        app.show_draft(0, signed, DraftRev::default(), false, Some(DraftNotice::Copy("it's signed or encrypted".into())));
         let c = app.compose.as_ref().unwrap();
         assert!(c.draft_id != 0 && !c.saved);
         assert!(c.notice.as_deref().is_some_and(|n| n.contains("stays in Drafts as it is")));
@@ -2397,13 +2522,13 @@ mod tests {
         let mut app = App::new(true);
         crate::demo::populate(&mut app);
         let left = Draft { account: "demo".into(), subject: "Left open".into(), ..Draft::default() };
-        app.apply(Event::DraftOpened { id: 5, draft: left.clone(), restored: true, notice: None }, &mut Tx::default());
+        app.apply(Event::DraftOpened { id: 5, draft: left.clone(), at: DraftRev::default(), restored: true, notice: None }, &mut Tx::default());
         let c = app.compose.as_ref().unwrap();
         assert_eq!((c.draft_id, c.minimized), (5, true));
         // Already writing something else: that stays; the restored one waits in Drafts.
         app.compose_new();
         let writing = app.compose.as_ref().unwrap().draft_id;
-        app.apply(Event::DraftOpened { id: 6, draft: left, restored: true, notice: None }, &mut Tx::default());
+        app.apply(Event::DraftOpened { id: 6, draft: left, at: DraftRev::default(), restored: true, notice: None }, &mut Tx::default());
         assert_eq!(app.compose.as_ref().unwrap().draft_id, writing);
     }
 

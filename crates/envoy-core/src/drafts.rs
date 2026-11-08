@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{Address, Draft, MessageId, Role, Summary, View, flags};
 #[cfg(doc)]
 use crate::store::Op;
-use crate::store::{LocalDraft, Query, Store};
+use crate::store::{DraftRev, LocalDraft, Query, Store};
 
 /// Seconds a draft being written waits before its upload, so typing makes an upload every few
 /// seconds rather than one per save. A draft put away (another one took the composer) goes now.
@@ -20,13 +20,13 @@ pub const UPLOAD_DELAY: i64 = 5;
 
 /// Saves the composer's content ([`Store::save_draft`]) and, if the server's copy is now
 /// behind, queues its upload. True when the queue changed, so the account's worker should
-/// plan its wait again.
-pub fn save(st: &Store, id: i64, draft: &Draft, open: bool, rev: i64, now: i64) -> Result<bool> {
-    let changed = st.save_draft(id, draft, open, rev, now)?;
+/// plan its wait again; None when the store refused the save.
+pub fn save(st: &Store, id: i64, draft: &Draft, open: bool, at: DraftRev, now: i64) -> Result<Option<bool>> {
+    let Some(changed) = st.save_draft(id, draft, open, at, now)? else { return Ok(None) };
     if (changed || !open) && st.draft_needs_upload(id)? {
-        return st.queue_draft_upload(&draft.account, id, if open { now + UPLOAD_DELAY } else { now });
+        return st.queue_draft_upload(&draft.account, id, if open { now + UPLOAD_DELAY } else { now }).map(Some);
     }
-    Ok(false)
+    Ok(Some(false))
 }
 
 /// A draft the app couldn't write to the store as the window closed: kept in a plain file
@@ -37,9 +37,12 @@ pub struct Recovered {
     pub draft: Draft,
     /// It was in the composer.
     pub open: bool,
-    /// When it was written (or sent): imported like a save made then, so it neither
-    /// overwrites anything newer nor brings back a draft that's gone since.
+    /// The app's stamp when it was written (or sent): imported like a save made then, so it
+    /// doesn't overwrite anything newer.
     pub stamp: i64,
+    /// The draft's lifecycle it was written in: it brings back nothing that ended since.
+    #[serde(default)]
+    pub lifecycle: i64,
     /// A message sent but not confirmed queued: kept as a draft unless its send went through.
     pub unsent: bool,
 }
@@ -69,7 +72,8 @@ pub fn save_recovery(path: &Path, drafts: &[Recovered]) -> Result<()> {
 }
 
 /// Imports the drafts waiting in the recovery file at `path` (none if there's no file), each
-/// like a save made when it was written, then removes the file. On any failure the file stays,
+/// like a save made when it was written, then removes the file. One the store refuses (its
+/// draft ended or moved on since) becomes a draft of its own. On any failure the file stays,
 /// for the next start. Returns how many there were.
 pub fn import_recovery(path: &Path, st: &Store, now: i64) -> Result<usize> {
     let bytes = match std::fs::read(path) {
@@ -79,10 +83,11 @@ pub fn import_recovery(path: &Path, st: &Store, now: i64) -> Result<usize> {
     };
     let waiting: Vec<Recovered> = serde_json::from_slice(&bytes)?;
     for r in &waiting {
-        if r.unsent {
-            st.draft_unsent(r.id, &r.draft, r.stamp, now)?;
-        } else {
-            save(st, r.id, &r.draft, r.open, r.stamp, now)?;
+        let at = DraftRev { lifecycle: r.lifecycle, rev: r.stamp };
+        let kept = if r.unsent { st.draft_unsent(r.id, &r.draft, Some(at), now)? } else { save(st, r.id, &r.draft, r.open, at, now)?.is_some() };
+        if !kept {
+            let id = st.fresh_draft_id(now)?;
+            save(st, id, &r.draft, r.open, DraftRev { lifecycle: 0, rev: r.stamp }, now)?;
         }
     }
     std::fs::remove_file(path)?;
@@ -210,7 +215,7 @@ mod tests {
     }
 
     fn recovered(id: i64, subject: &str, stamp: i64, unsent: bool) -> Recovered {
-        Recovered { id, draft: Draft { account: "a".into(), subject: subject.into(), ..Draft::default() }, open: true, stamp, unsent }
+        Recovered { id, draft: Draft { account: "a".into(), subject: subject.into(), ..Draft::default() }, open: true, stamp, lifecycle: 0, unsent }
     }
 
     #[test]
@@ -229,18 +234,26 @@ mod tests {
     }
 
     #[test]
-    fn recovered_drafts_overwrite_nothing_newer_and_revive_nothing_gone() {
+    fn recovered_drafts_overwrite_nothing_newer_and_revive_nothing_ended() {
         let dir = temp("rules");
         let file = dir.join("drafts-recovery.json");
         let st = Store::memory();
-        st.save_draft(1, &Draft { account: "a".into(), subject: "newer".into(), ..Draft::default() }, true, 50, 100).unwrap();
-        // Draft 2 was discarded for good after its snapshot was taken.
-        st.save_draft(2, &Draft { account: "a".into(), subject: "discarded".into(), ..Draft::default() }, true, 5, 100).unwrap();
+        let draft = |subject: &str| Draft { account: "a".into(), subject: subject.into(), ..Draft::default() };
+        st.save_draft(1, &draft("newer"), true, DraftRev { lifecycle: 0, rev: 50 }, 100).unwrap();
+        // Draft 2 ended (discarded for good), and 3 was sent, before their snapshots were
+        // written (a too-late Undo had put 2 back in the composer).
+        st.save_draft(2, &draft("discarded"), true, DraftRev { lifecycle: 0, rev: 5 }, 100).unwrap();
         st.discard_draft(2, None).unwrap();
-        save_recovery(&file, &[recovered(1, "older", 40, false), recovered(2, "discarded", 6, false)]).unwrap();
+        let send = st.enqueue_at("a", &crate::store::Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 100).unwrap();
+        st.transaction(|s| s.draft_sending(3, &draft("sent"), send, 100)).unwrap();
+        st.op_done(send).unwrap();
+        save_recovery(&file, &[recovered(1, "older", 40, false), recovered(2, "typed after the late undo", 6, false), recovered(3, "sent", 7, true)]).unwrap();
         import_recovery(&file, &st, 101).unwrap();
         assert_eq!(st.draft(1).unwrap().unwrap().draft.subject, "newer");
-        assert_eq!(st.draft(2).unwrap(), None);
+        assert_eq!((st.draft(2).unwrap(), st.draft(3).unwrap()), (None, None), "neither comes back");
+        let subjects: Vec<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
+        assert_eq!(subjects.len(), 2, "{subjects:?}");
+        assert!(subjects.contains(&"typed after the late undo".to_owned()), "its text is kept, as a new draft: {subjects:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
