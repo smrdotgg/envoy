@@ -389,7 +389,7 @@ fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[
 
 /// Brings one mailbox's local copy up to date (see the module docs). `progress` runs after
 /// each chunk of a first download lands, so the UI can show it.
-pub async fn sync_mailbox(session: &mut Session, store: &Mutex<Store>, account: &str, mailbox: &str, window: u32, progress: &(dyn Fn() + Send + Sync)) -> Result<SyncOutcome> {
+pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, window: u32, progress: &(dyn Fn() + Send + Sync)) -> Result<SyncOutcome> {
     let mb = timed("SELECT", session.select(mailbox)).await??;
     let uidvalidity = mb.uid_validity.unwrap_or(0);
     let mut changed = false;
@@ -414,13 +414,17 @@ pub async fn sync_mailbox(session: &mut Session, store: &Mutex<Store>, account: 
     }
 
     if local.is_empty() {
-        // First download: newest first, a chunk at a time, so the list fills in as it goes.
-        let lowest = mb.exists.saturating_sub(window.max(1)) + 1;
+        // First download: newest first, a chunk at a time, so the list fills in as it goes,
+        // until the window holds `window` messages to show. Ones flagged \Deleted (removed
+        // elsewhere, not expunged yet) are kept, hidden, but don't count.
+        let mut wanted = window.max(1);
         let mut hi = mb.exists;
-        while hi >= lowest {
-            let lo = hi.saturating_sub(HEADER_CHUNK - 1).max(lowest);
+        while hi >= 1 && wanted > 0 {
+            let lo = hi.saturating_sub(HEADER_CHUNK.min(wanted) - 1).max(1);
             let fetched: Vec<Fetch> =
                 timed("FETCH headers", async { session.fetch(format!("{lo}:{hi}"), HEADER_QUERY).await?.try_collect::<Vec<_>>().await }).await??;
+            let shown = fetched.iter().filter(|f| f.uid.is_some() && flag_bits(f.flags()) & flags::DELETED == 0).count() as u32;
+            wanted = wanted.saturating_sub(shown);
             let n = store_fetched(store, account, mailbox, &fetched, 0)?;
             if n > 0 {
                 new_messages += n;
@@ -814,6 +818,48 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mailbox of `n` messages (UID = sequence number + 100), the ones in `deleted` flagged
+    /// \Deleted, answering SELECT and header FETCHes by sequence range.
+    fn mailbox_server(n: u32, deleted: std::ops::RangeInclusive<u32>) -> impl Fn(&str) -> Option<String> + Send + 'static {
+        move |c: &str| {
+            if c.starts_with("SELECT") {
+                return Some(format!("* {n} EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT {}] ok\r\nTAG OK [READ-WRITE] done\r\n", n + 101));
+            }
+            let range = c.strip_prefix("FETCH ")?.split(' ').next()?;
+            let (lo, hi) = range.split_once(':')?;
+            let (lo, hi): (u32, u32) = (lo.parse().ok()?, hi.parse().ok()?);
+            let mut out = String::new();
+            for seq in lo..=hi.min(n) {
+                let uid = seq + 100;
+                let flags = if deleted.contains(&seq) { "\\Deleted" } else { "" };
+                let header = format!("From: a@x.com\r\nSubject: m{uid}\r\nMessage-ID: <{uid}@x>\r\n\r\n");
+                out.push_str(&format!(
+                    "* {seq} FETCH (UID {uid} FLAGS ({flags}) INTERNALDATE \"03-Mar-2026 10:00:00 +0000\" RFC822.SIZE 100 BODY[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)] {{{}}}\r\n{header})\r\n",
+                    header.len()
+                ));
+            }
+            Some(out + "TAG OK done\r\n")
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_flagged_deleted_dont_fill_the_first_download() {
+        // The newest four of ten are flagged \Deleted (removed elsewhere, not expunged yet).
+        let (mut s, _log) = fake::session(mailbox_server(10, 7..=10)).await;
+        let store = Mutex::new(Store::memory());
+        store.lock().unwrap().upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        sync_mailbox(&mut s, &store, "a", "INBOX", 5, &|| {}).await.unwrap();
+        let st = store.lock().unwrap();
+        let mut shown: Vec<u32> = st
+            .list(&crate::model::View::Mailbox { account: "a".into(), mailbox: "INBOX".into() }, &crate::store::Query::default(), false, 100, &HashSet::new())
+            .unwrap()
+            .iter()
+            .map(|m| m.uid)
+            .collect();
+        shown.sort_unstable();
+        assert_eq!(shown, vec![102, 103, 104, 105, 106], "five messages to show, not one");
+    }
 
     fn caps(uidplus: bool) -> Caps {
         Caps { moves: false, idle: false, uidplus }
