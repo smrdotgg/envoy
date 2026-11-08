@@ -185,13 +185,30 @@ fn main() {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    // Archive the conversation: both messages leave the inbox, on the server too.
-    engine.send(Command::Move { ids: vec![plans.id], to: MoveTarget::Archive, thread: true });
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Mark as spam, then undo within the window: back in the inbox, and the server never moves it.
+    engine.send(Command::Move { ids: vec![digest.id], to: MoveTarget::Junk, thread: false, undo: Some(1) });
+    std::thread::sleep(Duration::from_millis(300));
+    req += 1;
+    assert!(!list(&engine, req, &inbox, "", false).iter().any(|s| s.id == digest.id), "gone from the inbox at once");
+    engine.send(Command::UndoMove { undo: 1 });
+    std::thread::sleep(Duration::from_millis(300));
+    req += 1;
+    assert!(list(&engine, req, &inbox, "", false).iter().any(|s| s.id == digest.id), "back after undo");
+    std::thread::sleep(Duration::from_secs(7)); // past the 5 s window
+    assert_eq!(probe.count("Junk"), 3, "the server never saw the undone move");
+    assert_eq!(probe.count("INBOX"), 3);
+    println!("✓ spam undone: message back, server untouched");
+
+    // Archive the conversation, undoable: it waits out the window, then reaches the server.
+    let t_archive = Instant::now();
+    engine.send(Command::Move { ids: vec![plans.id], to: MoveTarget::Archive, thread: true, undo: Some(2) });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(probe.count("Archive"), 0, "held during the undo window");
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let n = probe.count("Archive");
         if n == 2 {
-            println!("✓ archived conversation: 2 messages in Archive");
+            println!("✓ archived conversation: 2 messages in Archive after the window ({:?})", t_archive.elapsed());
             break;
         }
         assert!(Instant::now() < deadline, "archive never reached the server ({n})");
@@ -199,6 +216,9 @@ fn main() {
     }
     req += 1;
     assert_eq!(list(&engine, req, &inbox, "", false).len(), 1, "inbox shows one message locally");
+    engine.send(Command::UndoMove { undo: 2 });
+    wait(&engine, "too-late toast", 5, |e| matches!(e, Event::Toast(t) if t.starts_with("Too late")).then_some(()));
+    println!("✓ undo after the window says it's too late");
 
     // Opening a folder that isn't synced yet: the foreground connection brings it in at once.
     let junk = View::Mailbox { account: "alice".into(), mailbox: "Junk".into() };
@@ -265,7 +285,7 @@ fn main() {
     }
 
     // Delete → Trash.
-    engine.send(Command::Move { ids: vec![digest.id], to: MoveTarget::Trash, thread: false });
+    engine.send(Command::Move { ids: vec![digest.id], to: MoveTarget::Trash, thread: false, undo: None });
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let n = probe.count("Trash");

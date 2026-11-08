@@ -36,7 +36,12 @@ pub enum Command {
     /// `thread`: apply to every message of each id's conversation.
     SetFlags { ids: Vec<MessageId>, add: u32, remove: u32, thread: bool },
     /// `thread`: move each id's whole conversation (the part in the same mailbox).
-    Move { ids: Vec<MessageId>, to: MoveTarget, thread: bool },
+    /// `undo`: a key the caller picks, unique across runs, to undo this action with
+    /// [`Command::UndoMove`]; the move then waits `behavior.undoSeconds` before reaching the
+    /// server. `None` sends it at once.
+    Move { ids: Vec<MessageId>, to: MoveTarget, thread: bool, undo: Option<i64> },
+    /// Takes back a [`Command::Move`] that hasn't reached the server yet.
+    UndoMove { undo: i64 },
     Send { draft: Draft },
     UndoSend { op: i64 },
     SyncNow,
@@ -99,6 +104,7 @@ impl Engine {
             tokens: Mutex::new(HashMap::new()),
             accounts: RwLock::new(accounts::load()),
             watched: Mutex::new(HashSet::new()),
+            undo_keys: Mutex::new(HashSet::new()),
         });
         std::thread::Builder::new().name("envoy-engine".into()).spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("envoy-io").build() {
@@ -132,6 +138,8 @@ struct Shared {
     accounts: RwLock<Vec<Account>>,
     /// Mailboxes being looked at, `(account, name)`: synced every cycle.
     watched: Mutex<HashSet<(String, String)>>,
+    /// Undo keys of moves this run held ops for (to tell "too late" from "nothing to undo").
+    undo_keys: Mutex<HashSet<i64>>,
 }
 
 impl Shared {
@@ -310,45 +318,23 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             }
             shared.emit_pending();
         }
-        Command::Move { ids, to, thread } => {
-            let mut touched = HashSet::new();
+        Command::Move { ids, to, thread, undo } => {
             let ids = expand(shared, ids, thread, true)?;
-            let mut problems = Vec::new();
-            shared.with_writer(|st| {
-                for id in &ids {
-                    let Some((account, mailbox, uid)) = st.location(*id)? else { continue };
-                    let here = st.role_of(&account, &mailbox);
-                    let dest = match &to {
-                        MoveTarget::Archive => st.mailbox_for_role(&account, Role::Archive)?.or(st.mailbox_for_role(&account, Role::All)?),
-                        MoveTarget::Trash => st.mailbox_for_role(&account, Role::Trash)?,
-                        MoveTarget::Junk => st.mailbox_for_role(&account, Role::Junk)?,
-                        MoveTarget::Inbox => st.mailbox_for_role(&account, Role::Inbox)?,
-                        MoveTarget::Mailbox(m) => Some(m.clone()),
-                    };
-                    let unread = st.summary(*id)?.is_some_and(|s| !s.seen());
-                    if to == MoveTarget::Trash && here == Role::Trash {
-                        st.remove_local(*id)?;
-                        st.enqueue(&account, &Op::Expunge { mailbox: mailbox.clone(), uid })?;
-                    } else if to == MoveTarget::Archive && matches!(here, Role::All | Role::Archive) {
-                        continue;
-                    } else {
-                        let Some(dest) = dest else {
-                            problems.push(format!("No {} folder found for this account", match to { MoveTarget::Archive => "archive", MoveTarget::Trash => "trash", MoveTarget::Junk => "spam", _ => "destination" }));
-                            continue;
-                        };
-                        if dest == mailbox {
-                            continue;
-                        }
-                        st.remove_local(*id)?;
-                        st.enqueue(&account, &Op::Move { mailbox: mailbox.clone(), uid, dest })?;
-                    }
-                    if unread {
-                        st.bump_unread(&account, &mailbox, -1)?;
-                    }
-                    touched.insert(account);
+            let window = shared.setting_u32("behavior.undoSeconds");
+            // A second of grace on top of the window, so the toast's Undo button (shown for
+            // exactly the window) never outlives the hold, whatever the clocks' rounding.
+            let hold = undo.filter(|_| window > 0).map(|key| (now() + window as i64 + 1, key));
+            let (touched, mut problems) = shared.with_writer(|st| st.transaction(|st| move_local(st, &ids, &to, hold)))?;
+            if let Some((_, key)) = hold
+                && !touched.is_empty()
+                && let Ok(mut keys) = shared.undo_keys.lock()
+            {
+                // Only the last few can still be undone; keep the set small.
+                if keys.len() >= 256 {
+                    keys.clear();
                 }
-                Ok(())
-            })?;
+                keys.insert(key);
+            }
             problems.dedup();
             for p in problems {
                 shared.emit(Event::Error(p));
@@ -356,7 +342,26 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             for a in touched {
                 shared.emit_mailboxes(&a);
                 shared.emit(Event::Changed { account: a.clone() });
+                // Wakes the worker: it replays at once, or re-plans its wait around the hold.
                 poke(workers, &a, Job::Sync);
+            }
+            shared.emit_pending();
+        }
+        Command::UndoMove { undo } => {
+            let touched = shared.with_writer(|st| st.undo_batch(undo))?;
+            let queued = shared.undo_keys.lock().is_ok_and(|mut k| k.remove(&undo));
+            if touched.is_empty() {
+                // Nothing was held: it already replayed, or the move had nothing to do (say,
+                // archiving in All Mail). The UI already put the rows back; a reload shows
+                // where the messages really are.
+                if queued {
+                    shared.emit(Event::Toast("Too late to undo — it already reached the server".into()));
+                }
+                shared.emit(Event::Changed { account: String::new() });
+            }
+            for a in touched {
+                shared.emit_mailboxes(&a);
+                shared.emit(Event::Changed { account: a });
             }
             shared.emit_pending();
         }
@@ -561,6 +566,53 @@ fn expand(shared: &Shared, ids: Vec<MessageId>, thread: bool, same_mailbox: bool
         }
         Ok(out)
     })
+}
+
+/// Applies a move locally and queues it for the server. Moved messages are hidden, not
+/// deleted, until their op replays ([`Store::op_done`]); with `hold = Some((not_before, key))`
+/// the ops wait until `not_before` under undo key `key` ([`Store::undo_batch`]). Deleting
+/// from Trash expunges at once and can't be undone. Returns the accounts touched and any
+/// problems to show.
+fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64, i64)>) -> Result<(HashSet<String>, Vec<String>)> {
+    let mut touched = HashSet::new();
+    let mut problems = Vec::new();
+    for id in ids {
+        let Some((account, mailbox, uid)) = st.location(*id)? else { continue };
+        let here = st.role_of(&account, &mailbox);
+        let dest = match to {
+            MoveTarget::Archive => st.mailbox_for_role(&account, Role::Archive)?.or(st.mailbox_for_role(&account, Role::All)?),
+            MoveTarget::Trash => st.mailbox_for_role(&account, Role::Trash)?,
+            MoveTarget::Junk => st.mailbox_for_role(&account, Role::Junk)?,
+            MoveTarget::Inbox => st.mailbox_for_role(&account, Role::Inbox)?,
+            MoveTarget::Mailbox(m) => Some(m.clone()),
+        };
+        let unread = st.summary(*id)?.is_some_and(|s| !s.seen());
+        if *to == MoveTarget::Trash && here == Role::Trash {
+            st.remove_local(*id)?;
+            st.enqueue(&account, &Op::Expunge { mailbox: mailbox.clone(), uid })?;
+        } else if *to == MoveTarget::Archive && matches!(here, Role::All | Role::Archive) {
+            continue;
+        } else {
+            let Some(dest) = dest else {
+                problems.push(format!("No {} folder found for this account", match to { MoveTarget::Archive => "archive", MoveTarget::Trash => "trash", MoveTarget::Junk => "spam", _ => "destination" }));
+                continue;
+            };
+            if dest == mailbox {
+                continue;
+            }
+            let op = Op::Move { mailbox: mailbox.clone(), uid, dest };
+            let op_id = match hold {
+                Some((not_before, key)) => st.enqueue_held(&account, &op, not_before, key)?,
+                None => st.enqueue(&account, &op)?,
+            };
+            st.hide_local(*id, op_id)?;
+        }
+        if unread {
+            st.bump_unread(&account, &mailbox, -1)?;
+        }
+        touched.insert(account);
+    }
+    Ok((touched, problems))
 }
 
 static IMAGE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(6);
@@ -975,7 +1027,10 @@ async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut Sessi
                 // A message the server rejects for good (gone, no such mailbox) is dropped
                 // after a few tries; network trouble keeps it queued.
                 if q.attempts >= 5 && !connection_lost && !matches!(q.op, Op::Send { .. }) {
-                    shared.with_writer(|st| st.op_done(q.id))?;
+                    // A move that never happened: its message shows again where it still is.
+                    shared.with_writer(|st| st.op_dropped(q.id))?;
+                    any = true;
+                    shared.emit(Event::Changed { account: account.id.clone() });
                     shared.emit(Event::Error(format!("Gave up on a change for {}: {msg}", account.email)));
                 } else {
                     let retry = 15i64 << q.attempts.min(6);
@@ -994,4 +1049,99 @@ async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut Sessi
         shared.emit_pending();
     }
     Ok(any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(st: &Store, mailbox: &str, uid: u32, mid: &str, refs: &str, fl: u32) -> MessageId {
+        let raw = format!("From: Ana <ana@x.com>\r\nSubject: Plans\r\nMessage-ID: {mid}\r\nReferences: {refs}\r\nDate: Tue, 3 Mar 2026 0{uid}:00:00 +0000\r\n\r\nhi\r\n");
+        let p = crate::mime::parse(raw.as_bytes(), false).unwrap();
+        st.upsert_header("a", mailbox, uid, fl, 10, 0, &p).unwrap()
+    }
+
+    fn setup() -> Store {
+        let st = Store::memory();
+        for (name, role) in [("INBOX", Role::Inbox), ("Archive", Role::Archive), ("Trash", Role::Trash), ("Junk", Role::Junk)] {
+            st.upsert_mailbox("a", name, name, role, "/", true).unwrap();
+        }
+        st
+    }
+
+    fn visible(st: &Store, mailbox: &str) -> Vec<MessageId> {
+        let view = View::Mailbox { account: "a".into(), mailbox: mailbox.into() };
+        st.list(&view, &Query::default(), false, 100, &HashSet::new()).unwrap().into_iter().map(|s| s.id).collect()
+    }
+
+    #[test]
+    fn archiving_a_conversation_holds_one_undoable_batch() {
+        let st = setup();
+        let first = message(&st, "INBOX", 1, "<1@x>", "", flags::SEEN);
+        let reply = message(&st, "INBOX", 2, "<2@x>", "<1@x>", 0);
+        let other = message(&st, "INBOX", 3, "<3@x>", "", 0);
+        st.set_counts("a", "INBOX", 2, 3).unwrap();
+        let ids = {
+            let mut ids = st.thread_ids(reply, true).unwrap();
+            ids.push(other); // multi-select: the conversation plus another message
+            ids
+        };
+        let (touched, problems) = move_local(&st, &ids, &MoveTarget::Archive, Some((1_000, 42))).unwrap();
+        assert_eq!(touched, HashSet::from(["a".to_owned()]));
+        assert!(problems.is_empty());
+        assert!(visible(&st, "INBOX").is_empty());
+        assert_eq!(st.mailboxes("a").unwrap()[0].unread, 0);
+        assert!(st.ops("a", 999).unwrap().is_empty(), "held for the window");
+        assert_eq!(st.ops("a", 1_000).unwrap().len(), 3);
+
+        assert_eq!(st.undo_batch(42).unwrap(), vec!["a".to_owned()]);
+        let mut back = visible(&st, "INBOX");
+        back.sort();
+        assert_eq!(back, vec![first, reply, other], "every message back, same ids");
+        assert_eq!(st.mailboxes("a").unwrap()[0].unread, 2);
+        assert_eq!(st.pending_count().unwrap(), 0, "nothing reaches the server");
+        let thread = st.thread(reply, true).unwrap();
+        assert_eq!(thread.len(), 2, "the conversation opens whole again");
+    }
+
+    #[test]
+    fn spam_and_trash_are_undoable_but_deleting_from_trash_is_not() {
+        let st = setup();
+        let a = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        let b = message(&st, "INBOX", 2, "<2@x>", "", 0);
+        let gone = message(&st, "Trash", 3, "<3@x>", "", 0);
+        move_local(&st, &[a], &MoveTarget::Junk, Some((1_000, 1))).unwrap();
+        move_local(&st, &[b], &MoveTarget::Trash, Some((1_000, 2))).unwrap();
+        move_local(&st, &[gone], &MoveTarget::Trash, Some((1_000, 3))).unwrap();
+        let due: Vec<Op> = st.ops("a", 0).unwrap().into_iter().map(|q| q.op).collect();
+        assert_eq!(due, vec![Op::Expunge { mailbox: "Trash".into(), uid: 3 }], "expunge isn't held");
+        assert!(st.summary(gone).unwrap().is_none());
+        assert!(st.undo_batch(3).unwrap().is_empty());
+        st.undo_batch(1).unwrap();
+        st.undo_batch(2).unwrap();
+        let mut back = visible(&st, "INBOX");
+        back.sort();
+        assert_eq!(back, vec![a, b]);
+    }
+
+    #[test]
+    fn without_an_undo_key_moves_replay_at_once() {
+        let st = setup();
+        let a = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        move_local(&st, &[a], &MoveTarget::Archive, None).unwrap();
+        let due = st.ops("a", 0).unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(visible(&st, "INBOX").is_empty());
+        st.op_done(due[0].id).unwrap();
+        assert!(st.summary(a).unwrap().is_none(), "the local copy goes once the server has it");
+    }
+
+    #[test]
+    fn archiving_in_the_archive_queues_nothing() {
+        let st = setup();
+        let a = message(&st, "Archive", 1, "<1@x>", "", 0);
+        let (touched, _) = move_local(&st, &[a], &MoveTarget::Archive, Some((1_000, 5))).unwrap();
+        assert!(touched.is_empty());
+        assert_eq!(visible(&st, "Archive"), vec![a]);
+    }
 }

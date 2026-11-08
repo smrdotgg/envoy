@@ -46,10 +46,29 @@ pub struct Compose {
 pub struct Toast {
     pub id: u64,
     pub text: String,
-    pub undo: Option<i64>,
+    pub undo: Option<Undo>,
     pub until: f64,
     pub error: bool,
     pub open_path: Option<std::path::PathBuf>,
+}
+
+/// What a toast's Undo takes back.
+pub enum Undo {
+    /// A message waiting in the outbox (the op id).
+    Send(i64),
+    /// An archive, delete or move that hasn't reached the server.
+    Move(Box<MovedAway>),
+}
+
+/// Enough to put moved messages back on screen at once, before the engine confirms.
+pub struct MovedAway {
+    /// The key the engine holds the move's ops under.
+    pub key: i64,
+    /// The view they were removed from; they're put back only if it's still showing.
+    pub view: View,
+    pub rows: Vec<Summary>,
+    /// The open message, if it was one of them.
+    pub open: Option<MessageId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,6 +134,7 @@ pub enum Action {
     Forward,
     Archive,
     Delete,
+    Undo,
     Star,
     ToggleRead,
     Next,
@@ -136,6 +156,7 @@ const ACTIONS: &[(Action, &str)] = &[
     (Action::Forward, "keys.forward"),
     (Action::Archive, "keys.archive"),
     (Action::Delete, "keys.delete"),
+    (Action::Undo, "keys.undo"),
     (Action::Star, "keys.star"),
     (Action::ToggleRead, "keys.markUnread"),
     (Action::Next, "keys.next"),
@@ -176,6 +197,8 @@ pub struct App {
     pub compose: Option<Compose>,
     pub toasts: Vec<Toast>,
     pub toast_seq: u64,
+    /// The last undo key handed to the engine (keys must be unique across runs).
+    pub undo_key: i64,
     pub sidebar: PaneState,
     pub collapsed_sections: HashSet<String>,
     pub settings_ui: SettingsUi,
@@ -231,6 +254,7 @@ impl App {
             compose: None,
             toasts: Vec::new(),
             toast_seq: 0,
+            undo_key: 0,
             sidebar: PaneState::new(248.0).range(180.0, 420.0),
             collapsed_sections: HashSet::new(),
             settings_ui: SettingsUi {
@@ -340,7 +364,7 @@ impl App {
                     self.toasts.push(Toast {
                         id,
                         text,
-                        undo: (undo_secs > 0).then_some(op),
+                        undo: (undo_secs > 0).then_some(Undo::Send(op)),
                         until: self.clock + undo_secs.max(3) as f64,
                         error: false,
                         open_path: None,
@@ -682,9 +706,91 @@ impl App {
         if ids.is_empty() {
             return;
         }
-        self.send(Command::Move { ids: ids.clone(), to: MoveTarget::Archive, thread: self.conversations() });
+        let label = if ids.len() == 1 { "Archived".to_owned() } else { format!("Archived {}", ids.len()) };
+        self.move_away(ids, MoveTarget::Archive, label, tx);
+    }
+
+    fn role_of(&self, account: &str, mailbox: &str) -> Role {
+        self.mailboxes.get(account).and_then(|m| m.iter().find(|m| m.name == mailbox)).map_or(Role::Other, |m| m.role)
+    }
+
+    /// Moves messages off the list at once and tells the engine. While the undo window lasts,
+    /// the toast offers Undo; deleting from Trash is for good and offers none.
+    fn move_away(&mut self, ids: Vec<MessageId>, to: MoveTarget, label: String, tx: &mut Tx) {
+        let rows: Vec<Summary> = self.list.iter().filter(|s| ids.contains(&s.id)).cloned().collect();
+        let in_trash = match rows.first() {
+            Some(r) => self.role_of(&r.account, &r.mailbox) == Role::Trash,
+            None => matches!(self.view, View::Role { role: Role::Trash, .. }),
+        };
+        let forever = to == MoveTarget::Trash && in_trash;
+        let window = self.settings.u32("behavior.undoSeconds");
+        let key = (window > 0 && !forever).then(|| self.next_undo_key());
+        let open = self.open.filter(|o| ids.contains(o));
+        self.send(Command::Move { ids: ids.clone(), to, thread: self.conversations(), undo: key });
         self.after_remove(&ids, tx);
-        self.toast(if ids.len() == 1 { "Archived".to_owned() } else { format!("Archived {}", ids.len()) }, false);
+        let label = if forever { "Deleted forever".to_owned() } else { label };
+        let Some(key) = key else {
+            self.toast(label, false);
+            return;
+        };
+        self.toast_seq += 1;
+        let undo = Undo::Move(Box::new(MovedAway { key, view: self.view.clone(), rows, open }));
+        self.toasts.push(Toast { id: self.toast_seq, text: label, undo: Some(undo), until: self.clock + window as f64, error: false, open_path: None });
+        while self.toasts.len() > 3 {
+            self.toasts.remove(0);
+        }
+        tx.wake_after(std::time::Duration::from_secs_f64(window as f64 + 0.05));
+    }
+
+    /// A key for [`Command::Move`]'s undo: microseconds since the epoch, so keys of held ops
+    /// left from a previous run never collide with this run's.
+    fn next_undo_key(&mut self) -> i64 {
+        let now = chrono::Utc::now().timestamp_micros();
+        self.undo_key = now.max(self.undo_key + 1);
+        self.undo_key
+    }
+
+    /// Undoes the newest action whose toast still offers Undo. False when there is none.
+    pub fn undo_last(&mut self, tx: &mut Tx) -> bool {
+        match self.toasts.iter().rev().find(|t| t.undo.is_some()).map(|t| t.id) {
+            Some(id) => {
+                self.undo_toast(id, tx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Runs a toast's Undo and dismisses it.
+    pub fn undo_toast(&mut self, id: u64, tx: &mut Tx) {
+        let Some(i) = self.toasts.iter().position(|t| t.id == id) else { return };
+        let toast = self.toasts.remove(i);
+        match toast.undo {
+            Some(Undo::Send(op)) => self.send(Command::UndoSend { op }),
+            Some(Undo::Move(m)) => self.restore(*m, tx),
+            None => {}
+        }
+    }
+
+    /// Puts moved messages back where they were, right away; the engine restores its copy
+    /// and the reload that follows confirms it.
+    fn restore(&mut self, m: MovedAway, tx: &mut Tx) {
+        self.send(Command::UndoMove { undo: m.key });
+        if self.view != m.view || self.screen != Screen::Mail {
+            return;
+        }
+        for row in m.rows {
+            if self.list.iter().any(|s| s.id == row.id) {
+                continue;
+            }
+            // Newest first, like the list.
+            let at = self.list.iter().position(|s| s.date < row.date).unwrap_or(self.list.len());
+            self.list.insert(at, row);
+        }
+        if let Some(id) = m.open {
+            self.open_message(id);
+            tx.scroll_into_view(row_key(id));
+        }
     }
 
     pub fn delete(&mut self, ids: Vec<MessageId>, tx: &mut Tx) {
@@ -700,9 +806,7 @@ impl App {
 
     pub fn delete_now(&mut self, ids: Vec<MessageId>, tx: &mut Tx) {
         self.confirm_delete = None;
-        self.send(Command::Move { ids: ids.clone(), to: MoveTarget::Trash, thread: self.conversations() });
-        self.after_remove(&ids, tx);
-        self.toast("Moved to Trash", false);
+        self.move_away(ids, MoveTarget::Trash, "Moved to Trash".into(), tx);
     }
 
     pub fn move_to(&mut self, ids: Vec<MessageId>, to: MoveTarget, tx: &mut Tx) {
@@ -711,9 +815,7 @@ impl App {
             MoveTarget::Inbox => "Moved to Inbox",
             _ => "Moved",
         };
-        self.send(Command::Move { ids: ids.clone(), to, thread: self.conversations() });
-        self.after_remove(&ids, tx);
-        self.toast(label, false);
+        self.move_away(ids, to, label.into(), tx);
     }
 
     pub fn toggle_star(&mut self, id: MessageId) {
@@ -1029,6 +1131,11 @@ impl App {
                     self.delete(vec![id], tx);
                 }
             }
+            Action::Undo => {
+                if !self.undo_last(tx) {
+                    return false;
+                }
+            }
             Action::Star => {
                 if let Some(id) = self.thread.last().map(|m| m.summary.id).or(self.open) {
                     self.toggle_star(id);
@@ -1111,5 +1218,19 @@ mod tests {
                 assert!(part.trim().parse::<rune::Chord>().is_ok(), "{}: {part:?}", d.key);
             }
         }
+    }
+
+    #[test]
+    fn default_keybindings_dont_collide() {
+        let s = Settings::default();
+        let mut seen: HashMap<String, &str> = HashMap::new();
+        for (_, key) in ACTIONS {
+            for part in s.str(key).split(',').map(str::trim) {
+                if let Some(other) = seen.insert(part.to_owned(), key) {
+                    panic!("{part:?} is bound to both {other} and {key}");
+                }
+            }
+        }
+        assert_eq!(seen.get("z"), Some(&"keys.undo"));
     }
 }

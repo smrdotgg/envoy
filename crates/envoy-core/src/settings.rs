@@ -146,6 +146,8 @@ pub const SCHEMA: &[SettingDef] = &[
         Kind::Bool, B(false)),
     def("behavior.afterRemove", "Behavior", "After archive or delete", "What opens after you archive or delete the open message.",
         Kind::Enum(&[("next", "The next (older) message"), ("previous", "The previous (newer) message"), ("list", "Back to the list")]), S("next")),
+    def("behavior.undoSeconds", "Behavior", "Undo window", "Seconds an archive, delete, spam or move waits before it reaches the server, so you can take it back with Undo. 0 applies it at once, with no undo.",
+        Kind::Number { min: 0.0, max: 30.0, step: 1.0 }, N(5.0)),
     def("behavior.copyLinks", "Behavior", "Copy links instead of opening", "Clicking a link copies it rather than opening the browser.",
         Kind::Bool, B(false)),
     // Keyboard
@@ -155,6 +157,7 @@ pub const SCHEMA: &[SettingDef] = &[
     def("keys.forward", "Keyboard", "Forward", "Forward the open message.", Kind::Keybinding, S("f, mod+shift+f")),
     def("keys.archive", "Keyboard", "Archive", "Archive the open message.", Kind::Keybinding, S("e, y")),
     def("keys.delete", "Keyboard", "Delete", "Move the open message to the trash.", Kind::Keybinding, S("#, delete, backspace")),
+    def("keys.undo", "Keyboard", "Undo", "Take back the last archive, delete, move or send while its notice is showing.", Kind::Keybinding, S("z")),
     def("keys.star", "Keyboard", "Star", "Star or unstar the open message.", Kind::Keybinding, S("s")),
     def("keys.markUnread", "Keyboard", "Toggle read", "Mark the open message read or unread.", Kind::Keybinding, S("u, mod+shift+u")),
     def("keys.next", "Keyboard", "Next message", "Open the next (older) message.", Kind::Keybinding, S("j, down")),
