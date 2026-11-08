@@ -418,6 +418,15 @@ impl App {
                 tx.wake_after(std::time::Duration::from_secs_f64(6.05));
             }
             Event::Pending(n) => self.pending_ops = n,
+            Event::Held { undo, ops: 0 } => {
+                // The move had nothing to do (already moving, or already there): no Undo.
+                for t in &mut self.toasts {
+                    if matches!(&t.undo, Some(Undo::Move(m)) if m.key == undo) {
+                        t.undo = None;
+                    }
+                }
+            }
+            Event::Held { .. } => {}
         }
         reload
     }
@@ -1295,6 +1304,33 @@ mod tests {
         app.apply(Event::Thread { req, id, messages: vec![] }, &mut Tx::default());
         assert_eq!(app.open, None, "the reader closes");
         assert_eq!(app.mark_read_at, None, "and nothing gets marked read later");
+    }
+
+    fn move_key(app: &App) -> i64 {
+        match &app.toasts.last().expect("a toast").undo {
+            Some(Undo::Move(m)) => m.key,
+            _ => panic!("no Undo on the toast"),
+        }
+    }
+
+    #[test]
+    fn undo_is_withdrawn_when_the_move_had_nothing_to_do() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let first = app.list[0].id;
+        app.archive(vec![first], &mut tx);
+        let key = move_key(&app);
+        // The engine found the message already moving (or already archived): nothing held.
+        app.apply(Event::Held { undo: key, ops: 0 }, &mut tx);
+        assert!(app.toasts.last().unwrap().undo.is_none(), "no Undo button for a move that did nothing");
+        assert!(!app.undo_last(&mut tx), "and z has nothing to undo");
+        // A move that did hold its ops keeps its Undo.
+        let next = app.list[0].id;
+        app.archive(vec![next], &mut tx);
+        let key = move_key(&app);
+        app.apply(Event::Held { undo: key, ops: 1 }, &mut tx);
+        assert_eq!(move_key(&app), key);
     }
 
     #[test]
