@@ -11,8 +11,10 @@ version = "0.1.0"
 [workspace.dependencies]
 # Rune's default features less `svg` (SVG images and multicolour icons, rasterized by resvg:
 # Envoy's icons are single-colour and its mail images are decoded by envoy-core) and
-# `ogg-audio` (macOS Ogg/WebM playback): neither is used, both cost binary size.
-rune = { path = "vendor/rune/crates/rune", default-features = false, features = ["accessibility", "dbus", "embedded-fonts", "metal-backend"] }
+# `ogg-audio` (macOS Ogg/WebM playback): neither is used, both cost binary size. Plus
+# `native-file-dialog`, the system's file picker for attaching files: rfd on macOS and Windows,
+# the desktop portal (over the D-Bus connection `dbus` already brings) on Linux, no GTK.
+rune = { path = "vendor/rune/crates/rune", default-features = false, features = ["accessibility", "dbus", "embedded-fonts", "metal-backend", "native-file-dialog"] }
 rune-kit = { path = "vendor/rune/crates/rune-kit", features = ["markdown"] }
 envoy-core = { path = "crates/envoy-core" }
 envoy-html = { path = "crates/envoy-html" }
