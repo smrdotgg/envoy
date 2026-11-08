@@ -1124,6 +1124,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "envoy-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "envoy-core",
+ "libc",
+ "rusqlite",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "envoy-core"
 version = "0.1.0"
 dependencies = [
