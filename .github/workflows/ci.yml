@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: Build, test, clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux build packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal -c clippy -c rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+      - name: Test
+        run: cargo test --workspace --locked
+      # Lints Envoy's crates only: vendor/ is outside the workspace, so clippy never lints it.
+      - name: Clippy
+        run: cargo clippy -p envoy -p envoy-core -p envoy-bench --all-targets --locked -- -D warnings
+
+  # Latency budgets (docs/NORTH_STAR.md), against a generated 100k-message mailbox, on the
+  # binary we ship (--profile dist). Measure once, then gate each budget in its own step
+  # (tables in the job summary). A budget missed today sits in a step allowed to fail, marked
+  # KNOWN BUDGET MISS with today's numbers, gated at the real budget so it turns green the day
+  # it's fixed and never hides the budgets that pass. See crates/envoy-bench for the methods.
+  budgets:
+    name: Budgets (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # frame_margin multiplies the gate of the app's end-to-end open and search, and
+          # nothing else: on runners without a GPU those frames mostly measure a software
+          # rasterizer, and the macOS runner is a noisy VM. The store-side open is gated hard
+          # everywhere, and end-to-end open passes at ×1 on real hardware (M4 Pro p95 32 ms).
+          # Cold start and keypress→frame stay at ×1 (--wall-margin): they miss on real
+          # hardware today, and no margin may hide that.
+          - os: ubuntu-latest
+            bin: target/dist/envoy
+            # lavapipe under Xvfb: frame build p50 3–4 ms, encode+submit p50 23–37 ms; end-to-end
+            # open p95 92, 114 and 142 ms over three runs (EC2 155 ms). ×4 gates at 200 ms.
+            frame_margin: "4"
+          - os: macos-latest
+            bin: target/dist/envoy
+            # VM with a paravirtualized GPU, and noisy: end-to-end open p95 38, 39 and 57 ms over
+            # three runs (max up to 419 ms), against 50 ms. ×2 (100 ms) so noise doesn't flake it.
+            frame_margin: "2"
+          - os: windows-latest
+            bin: target/dist/envoy.exe
+            # No GPU: frame build p50 7.5–7.8 ms, yet key→frame p50 285–341 ms waiting on the
+            # software device and present; end-to-end open p95 368–402 ms (max 440) over three
+            # runs. ×12 gates at 600 ms.
+            frame_margin: "12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Where the mailbox goes
+        run: echo "MAILBOX=$RUNNER_TEMP/mailbox" >> "$GITHUB_ENV"
+      - name: Linux packages (build, Xvfb, software Vulkan)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libxkbcommon-x11-0 xvfb mesa-vulkan-drivers
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal -c clippy -c rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dist
+      - name: Build what we ship (--profile dist)
+        run: cargo build --profile dist -p envoy -p envoy-bench --locked
+      - name: Generate a 100k-message mailbox
+        run: target/dist/envoy-bench gen --home "$MAILBOX" --messages 100000
+
+      - name: "Measure: binary size"
+        run: target/dist/envoy-bench size --bin ${{ matrix.bin }} --measure-only --json "$MAILBOX/size.json" --markdown "$GITHUB_STEP_SUMMARY" --label "${{ matrix.os }}"
+      - name: "Measure: search and open on the engine's code path"
+        run: target/dist/envoy-bench store --home "$MAILBOX" --measure-only --json "$MAILBOX/store.json" --markdown "$GITHUB_STEP_SUMMARY" --label "${{ matrix.os }}"
+      - name: "Measure: the app in a real window (5 cold starts)"
+        run: |
+          args=(app --home "$MAILBOX" --bin ${{ matrix.bin }} --runs 5 --frame-margin ${{ matrix.frame_margin }} --measure-only --json "$MAILBOX/app.json" --markdown "$GITHUB_STEP_SUMMARY" --label "${{ matrix.os }}")
+          if [ "$RUNNER_OS" = Linux ]; then
+            VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json xvfb-run -a -s "-screen 0 1920x1080x24" target/dist/envoy-bench "${args[@]}"
+          else
+            target/dist/envoy-bench "${args[@]}"
+          fi
+
+      - name: "Budget: open a cached message < 50 ms"
+        run: target/dist/envoy-bench check --from "$MAILBOX/store.json" --from "$MAILBOX/app.json" --only "open · " --only "app · open message" --label "${{ matrix.os }}"
+      - name: "Budget: binary size < 30 MB"
+        # KNOWN BUDGET MISS on Linux and Windows: the stripped dist binary is 36.2 MB on Linux
+        # and 32.7 MB on Windows; macOS is 27.7 MB and gated hard.
+        continue-on-error: ${{ runner.os != 'macOS' }}
+        run: target/dist/envoy-bench check --from "$MAILBOX/size.json" --only "binary · " --label "${{ matrix.os }}"
+      - name: "Budget: local search < 50 ms (KNOWN BUDGET MISS)"
+        # KNOWN BUDGET MISS: queries matching thousands of messages, and the first keystrokes
+        # of search-as-you-type. Store::list over 100k messages, worst query: M4 Pro 107 ms
+        # (typing "f"; Archive "meeting" 66 ms); CI ubuntu 135–191 ms, macos 210–918 ms,
+        # windows 228–290 ms. End to end p95: M4 Pro 108 ms, macos runner 106–840 ms. Narrow
+        # queries and filters pass (M4 Pro 0.1–10 ms).
+        continue-on-error: true
+        run: target/dist/envoy-bench check --from "$MAILBOX/store.json" --from "$MAILBOX/app.json" --only "search · " --only "app · search, end to end" --label "${{ matrix.os }}"
+      - name: "Budget: cold start < 100 ms (KNOWN BUDGET MISS)"
+        # KNOWN BUDGET MISS: median of 5, spawn → first frame showing the list. M4 Pro 258 ms
+        # (first frame at 162 ms, the list 91 ms later: the first inbox query runs twice at
+        # startup). CI: ubuntu (lavapipe) 247–331 ms, macos 408–907 ms, windows (no GPU)
+        # 1078–1372 ms.
+        continue-on-error: true
+        run: target/dist/envoy-bench check --from "$MAILBOX/app.json" --only "app · cold start" --label "${{ matrix.os }}"
+      - name: "Budget: keypress → frame < 16 ms (KNOWN BUDGET MISS)"
+        # KNOWN BUDGET MISS: p95 of 125 presses of j. M4 Pro 30.6 ms (p50 23.1), of which
+        # Envoy's own frame build p95 16 ms (p50 10.5). CI: macos 28–29 ms, ubuntu (lavapipe)
+        # 56–87 ms, windows (no GPU) 368–402 ms; frame build p95 3.9–14.5 ms on all three.
+        continue-on-error: true
+        run: target/dist/envoy-bench check --from "$MAILBOX/app.json" --only "app · keypress → frame" --label "${{ matrix.os }}"
+      - name: "Budget: idle memory < 150 MB (KNOWN BUDGET MISS)"
+        # KNOWN BUDGET MISS: worst idle stretch (after startup / after 25 opens and 6 searches).
+        # M4 Pro physical footprint 329 / 366 MB. CI: ubuntu RSS 212 / 305–319 MB (lavapipe's
+        # memory included), windows working set 100 / 150–175 MB. The macOS runner reports
+        # 63–73 / 79–82 MB and passes: its paravirtualized GPU's memory isn't in the process
+        # footprint, so the MacBook's number is the one to trust.
+        continue-on-error: true
+        run: target/dist/envoy-bench check --from "$MAILBOX/app.json" --only "app · idle memory" --label "${{ matrix.os }}"
+
+      - name: Upload results and app logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: budgets-${{ matrix.os }}
+          path: |
+            ${{ env.MAILBOX }}/*.json
+            ${{ env.MAILBOX }}/bench-run-*
+          if-no-files-found: ignore

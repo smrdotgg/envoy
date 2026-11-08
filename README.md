@@ -126,4 +126,18 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/flow.json --snap out.png --a
 
 Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent`.
 
+**Latency budgets** ([`docs/NORTH_STAR.md`](docs/NORTH_STAR.md)) are checked in CI on all three OSes
+against a generated 100k-message mailbox; each check prints measured vs budget and fails over budget
+(budgets missed today run in CI steps labelled KNOWN BUDGET MISS). To run them locally:
+
+```sh
+cargo build --profile dist -p envoy -p envoy-bench
+target/dist/envoy-bench all --home /tmp/envoy-mailbox --bin target/dist/envoy   # generates the mailbox once (~900 MB)
+target/dist/envoy-bench search --home /tmp/envoy-mailbox                         # or just: open, store, app, size
+```
+
+`app` opens a real window five times; on a headless Linux box run it under `xvfb-run -a` with
+`libxkbcommon-x11-0` installed and the `VK_ICD_FILENAMES` above. `crates/envoy-bench/src/main.rs`
+says what each number measures.
+
 `RUST_LOG=envoy_core=debug` shows what the sync workers are doing.
