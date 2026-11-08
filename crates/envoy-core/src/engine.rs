@@ -104,7 +104,7 @@ impl Engine {
             tokens: Mutex::new(HashMap::new()),
             accounts: RwLock::new(accounts::load()),
             watched: Mutex::new(HashSet::new()),
-            undo_keys: Mutex::new(HashSet::new()),
+            undo_keys: Mutex::new(HashMap::new()),
         });
         std::thread::Builder::new().name("envoy-engine".into()).spawn(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("envoy-io").build() {
@@ -138,8 +138,9 @@ struct Shared {
     accounts: RwLock<Vec<Account>>,
     /// Mailboxes being looked at, `(account, name)`: synced every cycle.
     watched: Mutex<HashSet<(String, String)>>,
-    /// Undo keys of moves this run held ops for (to tell "too late" from "nothing to undo").
-    undo_keys: Mutex<HashSet<i64>>,
+    /// Undo keys of moves this run held ops for, with how many: to tell "too late" from
+    /// "nothing to undo", and a partial undo from a full one.
+    undo_keys: Mutex<HashMap<i64, usize>>,
 }
 
 impl Shared {
@@ -319,26 +320,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             shared.emit_pending();
         }
         Command::Move { ids, to, thread, undo } => {
-            let ids = expand(shared, ids, thread, true)?;
-            let window = shared.setting_u32("behavior.undoSeconds");
-            // A second of grace on top of the window, so the toast's Undo button (shown for
-            // exactly the window) never outlives the hold, whatever the clocks' rounding.
-            let hold = undo.filter(|_| window > 0).map(|key| (now() + window as i64 + 1, key));
-            let (touched, mut problems) = shared.with_writer(|st| st.transaction(|st| move_local(st, &ids, &to, hold)))?;
-            if let Some((_, key)) = hold
-                && !touched.is_empty()
-                && let Ok(mut keys) = shared.undo_keys.lock()
-            {
-                // Only the last few can still be undone; keep the set small.
-                if keys.len() >= 256 {
-                    keys.clear();
-                }
-                keys.insert(key);
-            }
-            problems.dedup();
-            for p in problems {
-                shared.emit(Event::Error(p));
-            }
+            let touched = move_and_hold(shared, ids, &to, thread, undo, now())?;
             for a in touched {
                 shared.emit_mailboxes(&a);
                 shared.emit(Event::Changed { account: a.clone() });
@@ -531,20 +513,57 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
     Ok(())
 }
 
-/// [`Command::UndoMove`]: takes back what's still queued of a move and tells the UI how it went.
-fn undo_move(shared: &Shared, undo: i64) -> Result<()> {
-    let touched = shared.with_writer(|st| st.undo_batch(undo))?;
-    let queued = shared.undo_keys.lock().is_ok_and(|mut k| k.remove(&undo));
-    if touched.is_empty() {
-        // Nothing was held: it already replayed, or the move had nothing to do (say,
-        // archiving in All Mail). The UI already put the rows back; a reload shows
-        // where the messages really are.
-        if queued {
-            shared.emit(Event::Toast("Too late to undo — it already reached the server".into()));
+/// [`Command::Move`]'s local part: applies the move, queues it (held for the undo window when
+/// `undo` is set) and remembers the undo key. Returns the accounts touched.
+fn move_and_hold(shared: &Shared, ids: Vec<MessageId>, to: &MoveTarget, thread: bool, undo: Option<i64>, now: i64) -> Result<HashSet<String>> {
+    let ids = expand(shared, ids, thread, true)?;
+    let window = shared.setting_u32("behavior.undoSeconds");
+    // A second of grace on top of the window, so the toast's Undo button (shown for
+    // exactly the window) never outlives the hold, whatever the clocks' rounding.
+    let hold = undo.filter(|_| window > 0).map(|key| (now + window as i64 + 1, key));
+    let mut moved = shared.with_writer(|st| st.transaction(|st| move_local(st, &ids, to, hold)))?;
+    if let Some((_, key)) = hold
+        && moved.held > 0
+        && let Ok(mut keys) = shared.undo_keys.lock()
+    {
+        // Only the last few can still be undone; keep the map small.
+        if keys.len() >= 256 {
+            keys.clear();
         }
+        keys.insert(key, moved.held);
+    }
+    moved.problems.dedup();
+    for p in moved.problems {
+        shared.emit(Event::Error(p));
+    }
+    Ok(moved.touched)
+}
+
+/// [`Command::UndoMove`]: takes back what's still queued of a move and tells the UI how it went.
+///
+/// Only ops that haven't been claimed for replay are cancelled. One that is on the wire, or
+/// already done, can't be called back: it's reported as too late and left to finish, and the
+/// reload shows where its messages really are (the UI put the rows back optimistically).
+/// Undo never queues a reverse move: Envoy doesn't learn a moved message's new UID, and a
+/// toast's Undo can only race a replay in the second of grace after the window.
+fn undo_move(shared: &Shared, undo: i64) -> Result<()> {
+    let done = shared.with_writer(|st| st.undo_batch(undo))?;
+    let queued = shared.undo_keys.lock().ok().and_then(|mut k| k.remove(&undo)).unwrap_or(0);
+    // Ops held for this action that weren't cancelled: on the wire, or already replayed.
+    let late = queued.saturating_sub(done.released).max(done.in_flight);
+    if late > 0 {
+        shared.emit(Event::Toast(if done.released == 0 {
+            "Too late to undo — it already went to the server".into()
+        } else {
+            format!("Partly undone — {late} already went to the server")
+        }));
+    }
+    if done.accounts.is_empty() {
+        // Nothing came back (too late, or the move had nothing to do, say archiving in All
+        // Mail): reload so the list shows where the messages really are.
         shared.emit(Event::Changed { account: String::new() });
     }
-    for a in touched {
+    for a in done.accounts {
         shared.emit_mailboxes(&a);
         shared.emit(Event::Changed { account: a });
     }
@@ -577,9 +596,10 @@ fn expand(shared: &Shared, ids: Vec<MessageId>, thread: bool, same_mailbox: bool
 /// the ops wait until `not_before` under undo key `key` ([`Store::undo_batch`]). Deleting
 /// from Trash expunges at once and can't be undone. Returns the accounts touched and any
 /// problems to show.
-fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64, i64)>) -> Result<(HashSet<String>, Vec<String>)> {
+fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64, i64)>) -> Result<Moved> {
     let mut touched = HashSet::new();
     let mut problems = Vec::new();
+    let mut held = 0;
     for id in ids {
         let Some((account, mailbox, uid)) = st.location(*id)? else { continue };
         let here = st.role_of(&account, &mailbox);
@@ -606,7 +626,10 @@ fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64,
             }
             let op = Op::Move { mailbox: mailbox.clone(), uid, dest };
             let op_id = match hold {
-                Some((not_before, key)) => st.enqueue_held(&account, &op, not_before, key)?,
+                Some((not_before, key)) => {
+                    held += 1;
+                    st.enqueue_held(&account, &op, not_before, key)?
+                }
                 None => st.enqueue(&account, &op)?,
             };
             st.hide_local(*id, op_id)?;
@@ -616,7 +639,15 @@ fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64,
         }
         touched.insert(account);
     }
-    Ok((touched, problems))
+    Ok(Moved { touched, problems, held })
+}
+
+/// What [`move_local`] did.
+struct Moved {
+    touched: HashSet<String>,
+    problems: Vec<String>,
+    /// Ops queued under the undo key.
+    held: usize,
 }
 
 static IMAGE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(6);
@@ -1038,7 +1069,16 @@ impl OpRunner for ImapRunner<'_> {
 /// Replays the account's due ops, in order, retrying failures with backoff. True when any
 /// op finished (or was given up on).
 async fn replay_with(shared: &Arc<Shared>, account: &Account, runner: &mut impl OpRunner) -> Result<bool> {
-    let ops = shared.with_writer(|st| st.ops(&account.id, now()))?;
+    let r = replay_claimed(shared, account, runner).await;
+    // Whatever didn't get its turn (connection lost, an error) goes back in the queue, where
+    // undo can reach it again.
+    shared.with_writer(|st| st.unclaim(&account.id))?;
+    r
+}
+
+async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut impl OpRunner) -> Result<bool> {
+    // Claimed: an undo from here on can't cancel these, since the server may be doing them.
+    let ops = shared.with_writer(|st| st.claim_due(&account.id, now()))?;
     let mut any = false;
     for q in ops {
         let r = runner.run(&q.op).await;
@@ -1082,17 +1122,151 @@ mod tests {
     use super::*;
 
     fn message(st: &Store, mailbox: &str, uid: u32, mid: &str, refs: &str, fl: u32) -> MessageId {
+        message_in(st, "a", mailbox, uid, mid, refs, fl)
+    }
+
+    fn message_in(st: &Store, account: &str, mailbox: &str, uid: u32, mid: &str, refs: &str, fl: u32) -> MessageId {
         let raw = format!("From: Ana <ana@x.com>\r\nSubject: Plans\r\nMessage-ID: {mid}\r\nReferences: {refs}\r\nDate: Tue, 3 Mar 2026 0{uid}:00:00 +0000\r\n\r\nhi\r\n");
         let p = crate::mime::parse(raw.as_bytes(), false).unwrap();
-        st.upsert_header("a", mailbox, uid, fl, 10, 0, &p).unwrap()
+        let id = st.upsert_header(account, mailbox, uid, fl, 10, 0, &p).unwrap();
+        st.set_body(id, raw.as_bytes(), &p).unwrap();
+        id
     }
 
     fn setup() -> Store {
         let st = Store::memory();
-        for (name, role) in [("INBOX", Role::Inbox), ("Archive", Role::Archive), ("Trash", Role::Trash), ("Junk", Role::Junk)] {
-            st.upsert_mailbox("a", name, name, role, "/", true).unwrap();
+        for account in ["a", "b"] {
+            for (name, role) in [("INBOX", Role::Inbox), ("Archive", Role::Archive), ("Trash", Role::Trash), ("Junk", Role::Junk)] {
+                st.upsert_mailbox(account, name, name, role, "/", true).unwrap();
+            }
         }
         st
+    }
+
+    fn engine_with(st: Store) -> (Arc<Shared>, std::sync::mpsc::Receiver<Event>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = Arc::new(Shared {
+            writer: Arc::new(Mutex::new(st)),
+            reader: Arc::new(Mutex::new(Store::memory())),
+            events: Mutex::new(tx),
+            waker: Arc::new(|| {}),
+            settings: RwLock::new(Settings::default()),
+            tokens: Mutex::new(HashMap::new()),
+            accounts: RwLock::new(vec![]),
+            watched: Mutex::new(HashSet::new()),
+            undo_keys: Default::default(),
+        });
+        (shared, rx)
+    }
+
+    fn account(id: &str) -> Account {
+        Account {
+            id: id.into(),
+            email: format!("{id}@x.com"),
+            display_name: String::new(),
+            auth: AuthKind::Password,
+            username: String::new(),
+            imap_host: String::new(),
+            imap_port: 993,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            hue: 0.0,
+            signature: String::new(),
+            oauth_client_id: String::new(),
+            oauth_client_secret: String::new(),
+        }
+    }
+
+    fn toasts(rx: &std::sync::mpsc::Receiver<Event>) -> Vec<String> {
+        rx.try_iter().filter_map(|e| if let Event::Toast(t) = e { Some(t) } else { None }).collect()
+    }
+
+    /// Stands in for the server. The first op to go "on the wire" runs `during` (an undo
+    /// arriving mid-flight), then every op succeeds, or fails with `fail`.
+    struct FakeServer {
+        shared: Arc<Shared>,
+        during: Option<i64>,
+        fail: bool,
+        ran: Vec<Op>,
+    }
+
+    impl OpRunner for FakeServer {
+        fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send {
+            if let Some(key) = self.during.take() {
+                undo_move(&self.shared, key).unwrap();
+            }
+            self.ran.push(op.clone());
+            let fail = self.fail;
+            async move { if fail { Err(anyhow!("NO [UNAVAILABLE] try again later")) } else { Ok(()) } }
+        }
+    }
+
+    fn unread(shared: &Shared, account: &str) -> u32 {
+        shared.with_writer(|st| st.mailboxes(account)).unwrap().iter().find(|m| m.role == Role::Inbox).unwrap().unread
+    }
+
+    // The undo window has just run out (the op is due) while the toast is still up.
+    fn due_move(shared: &Shared, ids: Vec<MessageId>, key: i64) {
+        move_and_hold(shared, ids, &MoveTarget::Archive, false, Some(key), now() - 10).unwrap();
+    }
+
+    #[tokio::test]
+    async fn undo_while_the_move_is_on_the_wire_is_too_late() {
+        let st = setup();
+        let id = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        st.set_counts("a", "INBOX", 1, 1).unwrap();
+        let (shared, rx) = engine_with(st);
+        due_move(&shared, vec![id], 7);
+        let mut server = FakeServer { shared: shared.clone(), during: Some(7), fail: false, ran: vec![] };
+        assert!(replay_with(&shared, &account("a"), &mut server).await.unwrap());
+        assert_eq!(server.ran.len(), 1, "the server moved it");
+        shared.with_writer(|st| {
+            assert!(st.summary(id)?.is_none(), "so it's gone locally too");
+            assert_eq!(st.pending_count()?, 0);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(unread(&shared, "a"), 0, "no phantom unread");
+        assert!(toasts(&rx).iter().any(|t| t.starts_with("Too late")), "and the user is told");
+    }
+
+    #[tokio::test]
+    async fn undo_mid_flight_then_failure_leaves_the_move_queued() {
+        let st = setup();
+        let id = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        let (shared, rx) = engine_with(st);
+        due_move(&shared, vec![id], 7);
+        let mut server = FakeServer { shared: shared.clone(), during: Some(7), fail: true, ran: vec![] };
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        shared.with_writer(|st| {
+            let queued = st.ops("a", i64::MAX)?;
+            assert_eq!(queued.len(), 1, "still on its way: retried later, not lost");
+            assert_eq!(queued[0].attempts, 1);
+            assert!(st.list(&View::Mailbox { account: "a".into(), mailbox: "INBOX".into() }, &Query::default(), false, 10, &HashSet::new())?.is_empty(), "still hidden");
+            Ok(())
+        })
+        .unwrap();
+        assert!(toasts(&rx).iter().any(|t| t.starts_with("Too late")));
+    }
+
+    #[tokio::test]
+    async fn undo_mid_replay_takes_back_only_what_hasnt_started() {
+        let st = setup();
+        let a = message_in(&st, "a", "INBOX", 1, "<1@x>", "", 0);
+        let b = message_in(&st, "b", "INBOX", 1, "<2@x>", "", 0);
+        let (shared, rx) = engine_with(st);
+        due_move(&shared, vec![a, b], 7); // multi-select in the unified inbox
+        let mut server = FakeServer { shared: shared.clone(), during: Some(7), fail: false, ran: vec![] };
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        shared.with_writer(|st| {
+            assert!(st.summary(a)?.is_none(), "a's move was on the wire: done");
+            let b_inbox = st.list(&View::Mailbox { account: "b".into(), mailbox: "INBOX".into() }, &Query::default(), false, 10, &HashSet::new())?;
+            assert_eq!(b_inbox.iter().map(|s| s.id).collect::<Vec<_>>(), vec![b], "b's hadn't started: undone");
+            assert!(st.ops("b", i64::MAX)?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert!(toasts(&rx).iter().any(|t| t.starts_with("Partly undone")));
     }
 
     fn visible(st: &Store, mailbox: &str) -> Vec<MessageId> {
@@ -1112,15 +1286,16 @@ mod tests {
             ids.push(other); // multi-select: the conversation plus another message
             ids
         };
-        let (touched, problems) = move_local(&st, &ids, &MoveTarget::Archive, Some((1_000, 42))).unwrap();
-        assert_eq!(touched, HashSet::from(["a".to_owned()]));
-        assert!(problems.is_empty());
+        let moved = move_local(&st, &ids, &MoveTarget::Archive, Some((1_000, 42))).unwrap();
+        assert_eq!(moved.touched, HashSet::from(["a".to_owned()]));
+        assert!(moved.problems.is_empty());
+        assert_eq!(moved.held, 3);
         assert!(visible(&st, "INBOX").is_empty());
         assert_eq!(st.mailboxes("a").unwrap()[0].unread, 0);
         assert!(st.ops("a", 999).unwrap().is_empty(), "held for the window");
         assert_eq!(st.ops("a", 1_000).unwrap().len(), 3);
 
-        assert_eq!(st.undo_batch(42).unwrap(), vec!["a".to_owned()]);
+        assert_eq!(st.undo_batch(42).unwrap().accounts, vec!["a".to_owned()]);
         let mut back = visible(&st, "INBOX");
         back.sort();
         assert_eq!(back, vec![first, reply, other], "every message back, same ids");
@@ -1142,7 +1317,7 @@ mod tests {
         let due: Vec<Op> = st.ops("a", 0).unwrap().into_iter().map(|q| q.op).collect();
         assert_eq!(due, vec![Op::Expunge { mailbox: "Trash".into(), uid: 3 }], "expunge isn't held");
         assert!(st.summary(gone).unwrap().is_none());
-        assert!(st.undo_batch(3).unwrap().is_empty());
+        assert_eq!(st.undo_batch(3).unwrap().released, 0);
         st.undo_batch(1).unwrap();
         st.undo_batch(2).unwrap();
         let mut back = visible(&st, "INBOX");
@@ -1166,8 +1341,8 @@ mod tests {
     fn archiving_in_the_archive_queues_nothing() {
         let st = setup();
         let a = message(&st, "Archive", 1, "<1@x>", "", 0);
-        let (touched, _) = move_local(&st, &[a], &MoveTarget::Archive, Some((1_000, 5))).unwrap();
-        assert!(touched.is_empty());
+        let moved = move_local(&st, &[a], &MoveTarget::Archive, Some((1_000, 5))).unwrap();
+        assert!(moved.touched.is_empty() && moved.held == 0);
         assert_eq!(visible(&st, "Archive"), vec![a]);
     }
 }
