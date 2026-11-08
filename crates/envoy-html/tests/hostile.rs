@@ -1,6 +1,7 @@
 //! Mail is attacker-controlled. The parser runs on the engine's threads (2 MiB stacks) while
-//! the store is locked, so no input may panic it, overflow its stack or make it take time
-//! out of proportion to its size.
+//! the store is locked, and the sanitizer behind "Open in browser" on the engine's thread, so
+//! no input may panic either, overflow its stack or make it take time out of proportion to
+//! its size; and nothing active may survive sanitizing.
 
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,10 @@ fn parse_bounded(name: &str, html: String) -> Duration {
             let doc = envoy_html::parse(&html);
             // The tree is usable afterwards too.
             let _ = envoy_html::plain(&doc);
+            let safe = envoy_html::export(&html, false, &mut |_| None);
+            if let Some(active) = active_content(&safe) {
+                panic!("{active} survived sanitizing:\n{safe}");
+            }
             t.elapsed()
         })
         .unwrap()
@@ -33,6 +38,41 @@ fn parse_bounded(name: &str, html: String) -> Duration {
     }
     assert!(t < BOUND, "{name} ({len} bytes) took {t:?}");
     t
+}
+
+/// Anything a browser would run or load in sanitized output, read back as a browser would.
+fn active_content(html: &str) -> Option<String> {
+    use html5ever::tendril::TendrilSink;
+    use markup5ever_rcdom::{NodeData, RcDom};
+    let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(html);
+    let mut stack = vec![dom.document.clone()];
+    let mut policy = false;
+    while let Some(n) = stack.pop() {
+        if let NodeData::Element { name, attrs, .. } = &n.data {
+            let tag = name.local.as_ref();
+            if ["script", "iframe", "frame", "object", "embed", "applet", "base", "link", "form", "input", "noscript"].contains(&tag) {
+                return Some(format!("<{tag}>"));
+            }
+            for a in attrs.borrow().iter() {
+                let k = a.name.local.as_ref().to_ascii_lowercase();
+                let v: String = a.value.chars().filter(|c| !c.is_ascii_whitespace() && !c.is_ascii_control()).collect::<String>().to_ascii_lowercase();
+                if k.starts_with("on") || k == "srcset" || k == "action" || k == "ping" {
+                    return Some(format!("{tag} {k}="));
+                }
+                if ["href", "src", "background"].contains(&k.as_str()) && (v.starts_with("javascript:") || v.starts_with("vbscript:") || v.starts_with("http") && k != "href") {
+                    return Some(format!("{tag} {k}={v}"));
+                }
+                if tag == "meta" && k == "http-equiv" {
+                    if v != "content-security-policy" {
+                        return Some(format!("meta http-equiv={v}"));
+                    }
+                    policy = true;
+                }
+            }
+        }
+        stack.extend(n.children.borrow().iter().cloned());
+    }
+    (!policy).then(|| "no Content-Security-Policy".to_owned())
 }
 
 fn page(css: &str, body: &str) -> String {

@@ -74,6 +74,9 @@ pub enum Command {
     GoogleSignIn { client_id: String, client_secret: String, hint: String },
     SaveAttachment { id: MessageId, index: usize },
     OpenOriginal { id: MessageId },
+    /// Open a message's HTML in the system browser, sanitized ([`crate::mime::browser_html`]):
+    /// nothing in it runs, and remote pictures load only with `remote_images`.
+    OpenInBrowser { id: MessageId, remote_images: bool },
     Settings(Box<Settings>),
     /// Download (or read from the message, for `cid:`) and decode an image in an HTML mail.
     FetchImage { url: String, message: MessageId },
@@ -699,6 +702,16 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 }
                 _ => return Err(anyhow!("This message has no body")),
             };
+            shared.emit(Event::Saved(path));
+        }
+        Command::OpenInBrowser { id, remote_images } => {
+            let (body, raw) = shared.with_writer(|st| Ok((st.body(id)?, st.raw(id)?)))?;
+            let html = body.and_then(|b| b.html).ok_or_else(|| anyhow!("This message has no HTML to open"))?;
+            let safe = crate::mime::browser_html(&html, raw.as_deref(), remote_images);
+            let dir = std::env::temp_dir().join("envoy");
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(format!("message-{id}-safe.html"));
+            std::fs::write(&path, safe)?;
             shared.emit(Event::Saved(path));
         }
         Command::FetchImage { url, message } => {
