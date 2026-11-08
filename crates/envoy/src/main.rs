@@ -29,7 +29,49 @@ fn is_demo() -> bool {
     std::env::var_os("ENVOY_DEMO").is_some() || std::env::args().any(|a| a == "--demo") || rune::extra_args().iter().any(|a| a == "demo" || a == "--demo")
 }
 
+thread_local! {
+    /// The app as `main` started it, before Rune opened the window (`start_early`); `init`,
+    /// which Rune calls on this thread, takes it.
+    static EARLY: std::cell::RefCell<Option<App>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The window's waker, once `setup` has it. The engine starts before the window exists: what it
+/// sends before then waits in its channel for the first frame's `poll`.
+static WAKER: std::sync::OnceLock<Waker> = std::sync::OnceLock::new();
+
+/// Starts the engine and asks for the first list at the top of `main`, so the cache opens and
+/// the list is read on the engine's thread while the OS and the GPU bring the window up: the
+/// first frame shows the list when it's in by then (it usually is), instead of a frame later.
+fn start_early() {
+    if is_demo() {
+        return;
+    }
+    let mut app = App::new(false);
+    start_engine(&mut app);
+    EARLY.with(|e| *e.borrow_mut() = Some(app));
+}
+
+fn start_engine(s: &mut App) {
+    let wake = || {
+        if let Some(w) = WAKER.get() {
+            w();
+        }
+    };
+    match Engine::start(wake, s.settings.clone()) {
+        Ok(engine) => {
+            s.engine = Some(engine);
+            let view = s.view.clone();
+            s.request_list();
+            s.send(Command::Watch { view });
+        }
+        Err(e) => s.toast(format!("Couldn't open the mail cache: {e:#}"), true),
+    }
+}
+
 fn init() -> App {
+    if let Some(app) = EARLY.with(|e| e.borrow_mut().take()) {
+        return app;
+    }
     let demo = is_demo();
     let mut app = App::new(demo);
     if demo {
@@ -43,14 +85,9 @@ fn setup(s: &mut App, waker: Waker) {
     if s.demo {
         return;
     }
-    match Engine::start(move || waker(), s.settings.clone()) {
-        Ok(engine) => {
-            s.engine = Some(engine);
-            let view = s.view.clone();
-            s.request_list();
-            s.send(Command::Watch { view });
-        }
-        Err(e) => s.toast(format!("Couldn't open the mail cache: {e:#}"), true),
+    let _ = WAKER.set(waker);
+    if s.engine.is_none() {
+        start_engine(s);
     }
 }
 
@@ -199,6 +236,7 @@ fn main() {
     bench::started();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("envoy_core=info")).init();
     rune::prewarm_gpu();
+    start_early();
     let spec = AppSpec {
         min_size: Some((760.0, 480.0)),
         scenes: SCENES,
