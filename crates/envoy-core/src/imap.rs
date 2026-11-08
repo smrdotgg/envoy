@@ -446,7 +446,9 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
             let lo = hi.saturating_sub(HEADER_CHUNK.min(wanted) - 1).max(1);
             let fetched: Vec<Fetch> =
                 timed("FETCH headers", async { session.fetch(format!("{lo}:{hi}"), HEADER_QUERY).await?.try_collect::<Vec<_>>().await }).await??;
-            let shown = fetched.iter().filter(|f| f.uid.is_some() && flag_bits(f.flags()) & flags::DELETED == 0).count() as u32;
+            // Messages, not the flag updates a server may send in among them (another client's
+            // changes, as FETCH responses without a header).
+            let shown = fetched.iter().filter(|f| f.uid.is_some() && f.header().is_some() && flag_bits(f.flags()) & flags::DELETED == 0).count() as u32;
             wanted = wanted.saturating_sub(shown);
             let n = store_fetched(store, account, mailbox, &fetched, 0)?;
             if n > 0 {
@@ -882,6 +884,25 @@ mod tests {
             .collect();
         shown.sort_unstable();
         assert_eq!(shown, vec![102, 103, 104, 105, 106], "five messages to show, not one");
+    }
+
+    #[tokio::test]
+    async fn flag_updates_in_among_a_first_download_dont_count_as_messages() {
+        // Message 6 is read on another computer meanwhile: each answer also tells of that.
+        let inner = mailbox_server(10, 7..=10);
+        let (mut s, _log) = fake::session(move |c| {
+            let answer = inner(c)?;
+            Some(if c.starts_with("FETCH ") { format!("* 6 FETCH (FLAGS (\\Seen) UID 106)\r\n{answer}") } else { answer })
+        })
+        .await;
+        let store = Mutex::new(Store::memory());
+        store.lock().unwrap().upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        sync_mailbox(&mut s, &store, "a", "INBOX", 5, &|| {}).await.unwrap();
+        let st = store.lock().unwrap();
+        let view = crate::model::View::Mailbox { account: "a".into(), mailbox: "INBOX".into() };
+        let mut shown: Vec<u32> = st.list(&view, &crate::store::Query::default(), false, 100, &HashSet::new()).unwrap().iter().map(|m| m.uid).collect();
+        shown.sort_unstable();
+        assert_eq!(shown, vec![102, 103, 104, 105, 106], "five messages to show");
     }
 
     #[tokio::test]
