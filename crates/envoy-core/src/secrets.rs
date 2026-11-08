@@ -8,9 +8,11 @@ use std::collections::BTreeMap;
 
 use crate::paths;
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const SERVICE: &str = "dev.envoy.Envoy";
 
 /// `ENVOY_SECRETS=file` skips the OS keychain (tests, portable installs).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn use_keychain() -> bool {
     std::env::var("ENVOY_SECRETS").map_or(true, |v| v != "file")
 }
@@ -32,20 +34,20 @@ pub fn set(account_id: &str, secret: &str) -> anyhow::Result<()> {
 
 pub fn get(account_id: &str) -> Option<String> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if use_keychain() {
-        if let Ok(s) = keyring::Entry::new(SERVICE, account_id).and_then(|e| e.get_password()) {
-            return Some(s);
-        }
+    if use_keychain()
+        && let Ok(s) = keyring::Entry::new(SERVICE, account_id).and_then(|e| e.get_password())
+    {
+        return Some(s);
     }
     file_read().remove(account_id)
 }
 
 pub fn remove(account_id: &str) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if use_keychain() {
-        if let Ok(e) = keyring::Entry::new(SERVICE, account_id) {
-            let _ = e.delete_credential();
-        }
+    if use_keychain()
+        && let Ok(e) = keyring::Entry::new(SERVICE, account_id)
+    {
+        let _ = e.delete_credential();
     }
     let _ = file_remove(account_id);
 }

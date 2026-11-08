@@ -147,7 +147,9 @@ fn scene_open(s: &mut App) {
     }
 }
 
-const SCENES: &[(&str, fn(&mut App))] = &[
+type Scene = (&'static str, fn(&mut App));
+
+const SCENES: &[Scene] = &[
     ("open", scene_open),
     ("light", |s| {
         let _ = s.settings.set("appearance.theme", serde_json::json!("light"));

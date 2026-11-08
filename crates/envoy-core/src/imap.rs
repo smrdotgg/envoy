@@ -181,7 +181,7 @@ pub fn decode_utf7(name: &str) -> String {
             let b64 = chunk.replace(',', "/");
             match base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64.trim_end_matches('=')) {
                 Ok(bytes) => {
-                    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c)).collect();
                     out.push_str(&String::from_utf16_lossy(&units));
                 }
                 Err(_) => out.push_str(&rest[start..start + end + 2]),
