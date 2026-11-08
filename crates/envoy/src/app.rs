@@ -362,6 +362,8 @@ pub struct App {
     /// Collapsed / expanded messages in the open conversation.
     pub expanded: HashSet<MessageId>,
     pub show_quoted: HashSet<MessageId>,
+    /// Messages whose "layout can't be shown here" note the user dismissed (this session).
+    pub layout_note_dismissed: HashSet<MessageId>,
     pub search: TextEdit,
     pub applied_query: String,
     pub compose: Option<Compose>,
@@ -433,6 +435,7 @@ impl App {
             prefetched: HashMap::new(),
             expanded: HashSet::new(),
             show_quoted: HashSet::new(),
+            layout_note_dismissed: HashSet::new(),
             search: TextEdit::new(""),
             applied_query: String::new(),
             compose: None,
