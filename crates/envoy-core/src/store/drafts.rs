@@ -278,6 +278,28 @@ impl Store {
         }
     }
 
+    /// Upload op `op` failed and is back in the queue: another upload of the same draft waiting
+    /// too (queued by an edit made while `op` was on the wire) is folded into it, due as soon
+    /// as either was. Uploads read the newest version, so the edit isn't lost or held back, and
+    /// retries can't pile up. Call inside a transaction.
+    pub(super) fn coalesce_uploads(&self, op: i64) -> Result<()> {
+        let found: Option<(String, String)> = self.conn.query_row("SELECT account, op FROM ops WHERE id = ?1", params![op], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let Some((account, kind)) = found else { return Ok(()) };
+        if !matches!(serde_json::from_str(&kind), Ok(Op::SaveDraft { .. })) {
+            return Ok(());
+        }
+        let others: Option<i64> = self.conn.query_row(
+            "SELECT MIN(not_before) FROM ops WHERE account = ?1 AND op = ?2 AND id != ?3 AND claimed = 0",
+            params![account, kind, op],
+            |r| r.get(0),
+        )?;
+        if let Some(due) = others {
+            self.conn.execute("DELETE FROM ops WHERE account = ?1 AND op = ?2 AND id != ?3 AND claimed = 0", params![account, kind, op])?;
+            self.conn.execute("UPDATE ops SET not_before = MIN(not_before, ?2) WHERE id = ?1", params![op, due])?;
+        }
+        Ok(())
+    }
+
     /// The draft's newest version, for the worker to upload to `account`'s Drafts mailbox, if
     /// the server's copy is behind and the draft is staying (not being sent or discarded, and
     /// still on that account). From here on the server may have a copy, even if the upload is
@@ -564,6 +586,23 @@ mod tests {
         s.op_done(claimed[0].id).unwrap();
         assert!(s.draft_needs_upload(1).unwrap(), "v4 isn't on the server yet");
         assert_eq!(s.draft_upload("a", 1).unwrap().unwrap().draft.subject, "v4");
+    }
+
+    #[test]
+    fn a_failed_upload_and_one_queued_meanwhile_become_one() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("v1"), true, 1, 100).unwrap();
+        s.queue_draft_upload("a", 1, 100).unwrap();
+        let on_the_wire = s.claim_due("a", 100).unwrap()[0].id;
+        // Edited while it's on the wire: an upload of its own, due in a few seconds.
+        s.save_draft(1, &draft("v2"), true, 2, 101).unwrap();
+        assert!(s.queue_draft_upload("a", 1, 106).unwrap());
+        // The first fails, and would retry in 15 s.
+        s.op_failed(on_the_wire, "NO [UNAVAILABLE]", 15, 101).unwrap();
+        let waiting = s.ops("a", i64::MAX).unwrap();
+        assert_eq!(waiting.len(), 1, "one upload waiting, not two");
+        assert_eq!(s.ops("a", 106).unwrap().len(), 1, "due when the edit's was: v2 isn't held back");
+        assert_eq!(s.draft_upload("a", 1).unwrap().unwrap().draft.subject, "v2");
     }
 
     #[test]

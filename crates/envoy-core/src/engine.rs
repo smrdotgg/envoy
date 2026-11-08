@@ -2152,6 +2152,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edits_during_failing_uploads_dont_pile_up_retries() {
+        let (shared, _rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "v1");
+        for rev in 2..8 {
+            shared
+                .with_writer(|st| {
+                    st.ops_due_now("a");
+                    Ok(())
+                })
+                .unwrap();
+            // Edited while each try is on the wire, and each try fails.
+            let mut server = FakeServer { fail: true, ..FakeServer::new(&shared, move |s: &Shared| type_draft(s, 7, rev, &format!("v{rev}"))) };
+            replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        }
+        assert_eq!(shared.with_writer(|st| st.pending_count()).unwrap(), 1, "one upload waiting");
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        replay_times(&shared, &mut server, 1).await;
+        assert_eq!(server.drafts(), vec![(1, "v7".to_owned())], "with every edit");
+    }
+
+    #[tokio::test]
     async fn a_refused_draft_upload_is_reported_and_kept() {
         let (shared, rx) = drafts_engine();
         type_draft(&shared, 7, 1, "hello");
