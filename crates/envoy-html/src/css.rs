@@ -118,6 +118,53 @@ struct Rule {
     order: u32,
     block: u32,
     ua: bool,
+    /// Classes and ids its ancestor compounds need ([`Bloom`]): a rule whose bits an element's
+    /// ancestors lack can't match it, and is skipped without spending budget.
+    need: Bloom,
+}
+
+/// A 512-bit Bloom filter of class and id names.
+pub type Bloom = [u64; 8];
+
+fn bloom_bit(name: &str) -> (usize, u64) {
+    // FNV-1a.
+    let mut h: u32 = 0x811c_9dc5;
+    for b in name.bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    let bit = (h % 512) as usize;
+    (bit / 64, 1 << (bit % 64))
+}
+
+/// Adds a class (`.name`) or id (`#name`) to a filter.
+pub fn bloom_add(bloom: &mut Bloom, kind: char, name: &str) {
+    let mut key = String::with_capacity(name.len() + 1);
+    key.push(kind);
+    key.push_str(name);
+    let (word, bit) = bloom_bit(&key);
+    bloom[word] |= bit;
+}
+
+fn bloom_has(have: &Bloom, need: &Bloom) -> bool {
+    have.iter().zip(need).all(|(h, n)| h & n == *n)
+}
+
+/// What a selector's ancestor compounds need, when it reaches them only by descendant and
+/// child combinators (siblings aren't ancestors).
+fn needs(sel: &Selector) -> Bloom {
+    let mut need = [0u64; 8];
+    if sel.combs.iter().any(|c| matches!(c, Comb::Adjacent | Comb::Sibling)) {
+        return need;
+    }
+    for c in &sel.parts[1..] {
+        for cl in &c.classes {
+            bloom_add(&mut need, '.', cl);
+        }
+        if let Some(id) = &c.id {
+            bloom_add(&mut need, '#', id);
+        }
+    }
+    need
 }
 
 /// An element as selectors see it.
@@ -133,6 +180,8 @@ pub struct Elem {
     /// 1-based position among element siblings.
     pub index: u32,
     pub last: bool,
+    /// Every ancestor's classes and ids.
+    pub ancestors: Bloom,
 }
 
 pub const NONE: u32 = u32::MAX;
@@ -272,7 +321,8 @@ impl Sheet {
             } else {
                 self.universal.push(idx);
             }
-            self.rules.push(Rule { sel, spec, order: self.order, block, ua });
+            let need = needs(&sel);
+            self.rules.push(Rule { sel, spec, order: self.order, block, ua, need });
         }
     }
 
@@ -299,6 +349,9 @@ impl Sheet {
         let mut hits: Vec<(u8, u32, u32, u32)> = Vec::new();
         for r in cands {
             let rule = &self.rules[r as usize];
+            if !bloom_has(&e.ancestors, &rule.need) {
+                continue;
+            }
             if !rule.ua && self.budget == 0 {
                 self.stats.exhausted = true;
                 continue;
@@ -1073,6 +1126,7 @@ mod tests {
             prev,
             index,
             last,
+            ancestors: [!0; 8],
         };
         vec![
             el("html", None, &[], &[], NONE, NONE, 1, true),
@@ -1192,11 +1246,32 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_filter_skips_impossible_rules() {
+        // div.a > p: `.a p` can match, `.z p` can't and costs nothing.
+        let mut a = [0u64; 8];
+        bloom_add(&mut a, '.', "a");
+        let els = vec![
+            Elem { tag: "div".into(), id: None, classes: vec!["a".into()], attrs: vec![], parent: NONE, prev: NONE, index: 1, last: true, ancestors: [0; 8] },
+            Elem { tag: "p".into(), id: None, classes: vec![], attrs: vec![], parent: 0, prev: NONE, index: 1, last: true, ancestors: a },
+        ];
+        let mut s = Sheet::new();
+        for i in 0..1000 {
+            s.add(&format!(".z{i} p {{ x: {i} }}"), None);
+        }
+        s.add(".a p { y: 1 }", None);
+        let before = s.budget;
+        let st = s.cascade(&els, 1, None);
+        assert_eq!(get(&st, "y"), Some("1"));
+        assert_eq!(get(&st, "x"), None);
+        assert!(before - s.budget < 50, "spent {}", before - s.budget);
+    }
+
+    #[test]
     fn matching_is_bounded() {
         // A deep chain and a selector that backtracks through every ancestor at every step.
         let mut els = Vec::new();
         for i in 0..400u32 {
-            els.push(Elem { tag: "div".into(), id: None, classes: vec![], attrs: vec![], parent: if i == 0 { NONE } else { i - 1 }, prev: NONE, index: 1, last: true });
+            els.push(Elem { tag: "div".into(), id: None, classes: vec![], attrs: vec![], parent: if i == 0 { NONE } else { i - 1 }, prev: NONE, index: 1, last: true, ancestors: [!0; 8] });
         }
         let mut s = Sheet::new();
         for _ in 0..50 {
