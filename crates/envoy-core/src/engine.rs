@@ -69,6 +69,9 @@ pub enum Event {
     Toast(String),
     Error(String),
     Sent { op: i64, undo_secs: u32 },
+    /// How many ops an undoable [`Command::Move`] actually held. 0 means it had nothing to do
+    /// (the messages were already moving, or already there), so there's nothing to undo.
+    Held { undo: i64, ops: usize },
     AccountAdded(Account),
     AccountFailed(String),
     GoogleSignedIn { email: String, name: String, refresh_token: String },
@@ -522,6 +525,9 @@ fn move_and_hold(shared: &Shared, ids: Vec<MessageId>, to: &MoveTarget, thread: 
     // exactly the window) never outlives the hold, whatever the clocks' rounding.
     let hold = undo.filter(|_| window > 0).map(|key| (now + window as i64 + 1, key));
     let mut moved = shared.with_writer(|st| st.transaction(|st| move_local(st, &ids, to, hold)))?;
+    if let Some((_, key)) = hold {
+        shared.emit(Event::Held { undo: key, ops: moved.held });
+    }
     if let Some((_, key)) = hold
         && moved.held > 0
         && let Ok(mut keys) = shared.undo_keys.lock()
@@ -601,7 +607,9 @@ fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64,
     let mut problems = Vec::new();
     let mut held = 0;
     for id in ids {
-        let Some((account, mailbox, uid)) = st.location(*id)? else { continue };
+        // Gone, or already moving (say, its undo came too late and the UI showed it again
+        // before the reload): nothing to do. The caller runs this in one transaction.
+        let Some((account, mailbox, uid)) = st.movable(*id)? else { continue };
         let here = st.role_of(&account, &mailbox);
         let dest = match to {
             MoveTarget::Archive => st.mailbox_for_role(&account, Role::Archive)?.or(st.mailbox_for_role(&account, Role::All)?),
@@ -632,7 +640,7 @@ fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64,
                 }
                 None => st.enqueue(&account, &op)?,
             };
-            st.hide_local(*id, op_id)?;
+            anyhow::ensure!(st.hide_local(*id, op_id)?, "message {id} is already moving");
         }
         if unread {
             st.bump_unread(&account, &mailbox, -1)?;
@@ -1208,6 +1216,32 @@ mod tests {
     // The undo window has just run out (the op is due) while the toast is still up.
     fn due_move(shared: &Shared, ids: Vec<MessageId>, key: i64) {
         move_and_hold(shared, ids, &MoveTarget::Archive, false, Some(key), now() - 10).unwrap();
+    }
+
+    #[test]
+    fn moving_a_message_already_on_its_way_changes_nothing() {
+        let st = setup();
+        let a = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        let b = message(&st, "INBOX", 2, "<2@x>", "", 0);
+        st.set_counts("a", "INBOX", 2, 2).unwrap();
+        let (shared, rx) = engine_with(st);
+        due_move(&shared, vec![a], 7);
+        let original = shared.with_writer(|st| st.claim_due("a", i64::MAX)).unwrap()[0].id; // on the wire
+        undo_move(&shared, 7).unwrap(); // too late; the UI put A's row back optimistically
+        let _ = rx.try_iter().count();
+        due_move(&shared, vec![a], 8); // and A is archived again before the reload
+        assert!(rx.try_iter().any(|e| matches!(e, Event::Held { undo: 8, ops: 0 })), "the UI learns there's nothing to undo");
+        shared.with_writer(|st| {
+            assert_eq!(st.pending_count()?, 1, "no second op for a message that's already moving");
+            assert_eq!(st.mailboxes("a")?[0].unread, 1, "unread counted down once");
+            assert_eq!(st.undo_batch(8)?, crate::store::Undone::default(), "nothing to undo");
+            st.op_done(original)?; // the original move lands
+            assert!(st.summary(a)?.is_none(), "no ghost left in the inbox");
+            assert_eq!(visible(st, "INBOX"), vec![b]);
+            assert_eq!(st.mailboxes("a")?[0].unread, 1, "b still counted");
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[tokio::test]

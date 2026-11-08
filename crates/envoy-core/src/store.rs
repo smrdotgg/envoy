@@ -670,11 +670,20 @@ impl Store {
         Ok(())
     }
 
+    /// Where a message is, if it can be moved: not when it's already hidden for a move (that
+    /// move may be on the wire; a second one would fight over it).
+    pub fn movable(&self, id: MessageId) -> Result<Option<(String, String, u32)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT account, mailbox, uid FROM messages WHERE id = ?1 AND held_op = 0", params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?)
+    }
+
     /// Hides a message that is moving away until `op` (the move) reaches the server, when it is
-    /// deleted ([`Store::op_done`]), or is undone or dropped, when it shows again.
-    pub fn hide_local(&self, id: MessageId, op: i64) -> Result<()> {
-        self.conn.execute("UPDATE messages SET held_op = ?2 WHERE id = ?1", params![id, op])?;
-        Ok(())
+    /// deleted ([`Store::op_done`]), or is undone or dropped, when it shows again. Never takes
+    /// over an existing hold: false (and nothing changes) if the message is already moving.
+    pub fn hide_local(&self, id: MessageId, op: i64) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE messages SET held_op = ?2 WHERE id = ?1 AND held_op = 0", params![id, op])? > 0)
     }
 
     /// The other messages of `id`'s conversation that live in the same account (for actions on
@@ -1070,7 +1079,7 @@ mod tests {
         let id = s.upsert_header("a", "INBOX", 9, flags::FLAGGED, 10, 100, &p).unwrap();
         s.set_body(id, b"raw", &p).unwrap();
         let op = s.enqueue_held("a", &Op::Move { mailbox: "INBOX".into(), uid: 9, dest: "Archive".into() }, 100, 7).unwrap();
-        s.hide_local(id, op).unwrap();
+        assert!(s.hide_local(id, op).unwrap());
         s.bump_unread("a", "INBOX", -1).unwrap();
         (id, op)
     }
@@ -1181,7 +1190,7 @@ mod tests {
         // The cache is full (window 3); the oldest message is archived, undoably.
         let local = s.local_uids("a", "INBOX").unwrap();
         let op = s.enqueue_held("a", &Op::Move { mailbox: "INBOX".into(), uid: 1, dest: "Archive".into() }, 100, 7).unwrap();
-        s.hide_local(ids[0], op).unwrap();
+        assert!(s.hide_local(ids[0], op).unwrap());
         // New mail arrives before the window ends, and the sync trims to the window.
         s.upsert_header("a", "INBOX", 4, 0, 10, 0, &parsed("New", "<4@x>", "", "Bo <bo@x.com>", 4)).unwrap();
         let server: HashMap<u32, u32> = (1..=4).map(|uid| (uid, 0)).collect();
@@ -1284,6 +1293,18 @@ mod tests {
         let dangling: i64 = s.conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
         assert_eq!(dangling, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hold_is_never_replaced() {
+        let s = Store::memory();
+        let (id, op) = held_move(&s);
+        assert_eq!(s.movable(id).unwrap(), None, "a moving message can't be moved again");
+        let second = s.enqueue_held("a", &Op::Move { mailbox: "INBOX".into(), uid: 9, dest: "Junk".into() }, 100, 8).unwrap();
+        assert!(!s.hide_local(id, second).unwrap(), "refused");
+        s.undo_batch(8).unwrap();
+        s.op_done(op).unwrap();
+        assert!(s.summary(id).unwrap().is_none(), "the first move still owns it");
     }
 
     #[test]
