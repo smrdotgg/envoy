@@ -124,8 +124,8 @@ backoff, and times out dead connections in 30 s.
 **Drafts are never lost.** What you write is saved to the local database as you type (a moment
 after you pause, every few seconds while you don't, and when the window closes), and a composer
 that was open when Envoy quit or crashed comes back, minimized, on the next start. (Should the
-database refuse a draft as Envoy closes, it's kept in `drafts-recovery.json` in the data folder
-and brought back on the next start.) A few seconds
+database refuse a draft as Envoy closes, it's kept in the `drafts-recovery` folder in the data
+folder and brought back on the next start.) A few seconds
 later the draft is copied to the account's Drafts folder through the same queue (offline, it
 waits), each save replacing the previous copy, so other devices see one draft. Opening a message
 in Drafts opens it in the composer, attachments and all; they go with it when it's saved and

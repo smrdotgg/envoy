@@ -1550,7 +1550,7 @@ impl App {
             },
             |failed| {
                 let drafts: Vec<envoy_core::drafts::Recovered> = failed.iter().map(Unsaved::recovered).collect();
-                envoy_core::drafts::save_recovery(&envoy_core::drafts::recovery_file(), &drafts).map_err(|e| format!("{e:#}"))
+                envoy_core::drafts::save_recovery(&envoy_core::drafts::recovery_dir(), &drafts).map_err(|e| format!("{e:#}"))
             },
         );
         self.engine = engine;

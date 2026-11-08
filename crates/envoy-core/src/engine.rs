@@ -372,10 +372,10 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
         workers.insert(a.id.clone(), spawn_worker(shared.clone(), a.id.clone()));
     }
     // Drafts the app couldn't write to the store as it last closed, kept in a file meanwhile.
-    match shared.with_writer(|st| drafts::import_recovery(&drafts::recovery_file(), st, now())) {
+    match shared.with_writer(|st| drafts::import_recovery(&drafts::recovery_dir(), st, now())) {
         Ok(0) => {}
         Ok(n) => shared.emit(Event::Toast(format!("Recovered {n} draft{} that couldn't be saved when Envoy last closed", if n == 1 { "" } else { "s" }))),
-        Err(e) => log::error!("couldn't import {}: {e:#}", drafts::recovery_file().display()),
+        Err(e) => log::error!("couldn't import the drafts in {}: {e:#}", drafts::recovery_dir().display()),
     }
     // What was being written when the app last closed (or crashed) goes back in the composer.
     match shared.with_writer(|st| st.draft_to_restore()) {
