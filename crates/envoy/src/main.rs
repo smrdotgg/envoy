@@ -5,6 +5,7 @@
 //! Rune's headless tooling works too: `envoy --demo --snap out.png --scene open`.
 
 mod app;
+mod bench;
 mod compose;
 mod demo;
 mod fmt;
@@ -198,6 +199,7 @@ const SCENES: &[Scene] = &[
 ];
 
 fn main() {
+    bench::started();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("envoy_core=info")).init();
     rune::prewarm_gpu();
     let spec = AppSpec {
@@ -209,5 +211,5 @@ fn main() {
         ..AppSpec::new("Envoy", (1280.0, 820.0), init, view)
     };
     let chrome = Chrome { full_size_content: true, traffic_lights: Some((16.0, 25.0)), drag_regions: true };
-    rune::App::new(spec).chrome(chrome).run();
+    bench::attach(rune::App::new(spec).chrome(chrome)).run();
 }
