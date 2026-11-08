@@ -483,13 +483,14 @@ impl Store {
             self.delete_uids(account, mailbox, &gone)?;
             changed = true;
         }
-        let all = self.local_uids(account, mailbox)?;
-        if all.len() > window as usize {
-            let excess: Vec<u32> = all.iter().take(all.len() - window as usize).map(|(u, _)| *u).collect();
-            self.delete_uids(account, mailbox, &excess)?;
-            changed = true;
-        }
-        Ok(changed)
+        // Trim: keep the newest `window` visible messages. Messages waiting for a move to
+        // replay don't count and are never evicted: undo needs them, and a sync (which only
+        // fetches UIDs above the highest one cached) would never bring them back.
+        let trimmed = self.conn.execute(
+            "DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op = 0 ORDER BY uid DESC LIMIT -1 OFFSET ?3)",
+            params![account, mailbox, window],
+        )?;
+        Ok(changed || trimmed > 0)
     }
 
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
@@ -1088,6 +1089,28 @@ mod tests {
         s.unclaim("a").unwrap();
         assert_eq!(s.ops("a", 100).unwrap().len(), 1, "unclaim puts it back in the queue");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trimming_the_cache_keeps_messages_waiting_to_move() {
+        let s = Store::memory();
+        s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        let ids: Vec<MessageId> =
+            (1..=3).map(|uid| s.upsert_header("a", "INBOX", uid, 0, 10, 0, &parsed("Hi", &format!("<{uid}@x>"), "", "Ana <ana@x.com>", uid)).unwrap()).collect();
+        // The cache is full (window 3); the oldest message is archived, undoably.
+        let local = s.local_uids("a", "INBOX").unwrap();
+        let op = s.enqueue_held("a", &Op::Move { mailbox: "INBOX".into(), uid: 1, dest: "Archive".into() }, 100, 7).unwrap();
+        s.hide_local(ids[0], op).unwrap();
+        // New mail arrives before the window ends, and the sync trims to the window.
+        s.upsert_header("a", "INBOX", 4, 0, 10, 0, &parsed("New", "<4@x>", "", "Bo <bo@x.com>", 4)).unwrap();
+        let server: HashMap<u32, u32> = (1..=4).map(|uid| (uid, 0)).collect();
+        assert!(!s.reconcile("a", "INBOX", &local, &server, 3).unwrap(), "three visible messages: nothing to trim");
+        s.undo_batch(7).unwrap();
+        assert!(inbox(&s).iter().any(|m| m.id == ids[0]), "undo still finds it");
+        // Visible messages beyond the window still go.
+        let local = s.local_uids("a", "INBOX").unwrap();
+        assert!(s.reconcile("a", "INBOX", &local, &server, 3).unwrap());
+        assert_eq!(s.local_uids("a", "INBOX").unwrap().iter().map(|(u, _)| *u).collect::<Vec<_>>(), vec![2, 3, 4]);
     }
 
     #[test]
