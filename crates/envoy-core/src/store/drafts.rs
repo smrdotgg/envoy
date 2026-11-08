@@ -112,12 +112,32 @@ impl Store {
     /// account queues the deletion of its copies on the old account's server. Returns whether
     /// the content changed.
     pub fn save_draft(&self, id: i64, draft: &Draft, open: bool, at: DraftRev, now: i64) -> Result<Option<bool>> {
-        self.transaction(|st| st.put_draft(id, draft, open, Some(at.lifecycle), Some(at.rev), now))
+        self.save_draft_from(id, draft, open, at, now, None)
+    }
+
+    /// [`Store::save_draft`] for a draft that carries on another's text (`files_from`: a save
+    /// refused under its own id, kept as a new draft): the files it lists are copied from that
+    /// draft first, if it still has them.
+    pub fn save_draft_from(&self, id: i64, draft: &Draft, open: bool, at: DraftRev, now: i64, files_from: Option<i64>) -> Result<Option<bool>> {
+        self.transaction(|st| {
+            if let Some(from) = files_from.filter(|f| *f != id) {
+                st.copy_draft_files(from, id, &draft.attachments)?;
+            }
+            let saved = st.put_draft(id, draft, open, Some(at.lifecycle), Some(at.rev), now)?;
+            if saved.is_none() {
+                // Refused: what was copied for it goes too.
+                st.conn.execute("DELETE FROM draft_files WHERE draft = ?1 AND NOT EXISTS (SELECT 1 FROM drafts WHERE id = ?1)", params![id])?;
+            }
+            Ok(saved)
+        })
     }
 
     /// [`Store::save_draft`]. `lifecycle: None` writes in whatever lifecycle: the send itself,
     /// which comes after everything (it starts a draft gone for good again). `rev: None` writes
-    /// whatever the stored rev. Call inside a transaction.
+    /// whatever the stored rev. A stored draft never lists a file it doesn't have the bytes of
+    /// (one written to a draft that's since gone, say): such a file is left off, and saving and
+    /// sending go on without what can't be had, rather than fail every time. Call inside a
+    /// transaction.
     fn put_draft(&self, id: i64, draft: &Draft, open: bool, lifecycle: Option<i64>, rev: Option<i64>, now: i64) -> Result<Option<bool>> {
         // Gone for good: no write from its life brings it back.
         let ended: Option<i64> = self.conn.query_row("SELECT lifecycle FROM draft_ends WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
@@ -127,6 +147,14 @@ impl Store {
             }
             self.conn.execute("DELETE FROM draft_ends WHERE id = ?1", params![id])?;
         }
+        let missing = self.missing_files(id, &draft.attachments)?;
+        let present;
+        let draft = if missing.is_empty() {
+            draft
+        } else {
+            present = Draft { attachments: draft.attachments.iter().filter(|a| !missing.contains(&a.id)).cloned().collect(), ..draft.clone() };
+            &present
+        };
         let content = json(draft);
         type Row = (String, String, String, i64, bool, Option<(String, u32, u32)>, bool, bool, i64, i64);
         let old: Option<Row> = self
@@ -284,6 +312,59 @@ impl Store {
                 data.map(|d| (a.clone(), d)).ok_or_else(|| anyhow::anyhow!("The attached file {} is missing from this draft", a.filename))
             })
             .collect()
+    }
+
+    /// Puts file `file`'s bytes with draft `id`, written once: the draft's saves list it from
+    /// then on, and never write it again. Only for a draft the store has (a composer saves
+    /// before it attaches): false, and nothing written, when it's gone, so no file outlives its
+    /// draft. Its bytes go with the draft (sent, discarded); a file taken off the draft stays
+    /// with it until then, so no save made before can list a file that's gone.
+    pub fn add_draft_file(&self, id: i64, file: u32, data: &[u8]) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR REPLACE INTO draft_files (draft, id, data) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM drafts WHERE id = ?1)",
+            params![id, file, data],
+        )? > 0)
+    }
+
+    /// Copies the `files` draft `from` has to draft `id`, leaving any `id` has. Call inside a
+    /// transaction that saves draft `id`.
+    fn copy_draft_files(&self, from: i64, id: i64, files: &[DraftAttachment]) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached("INSERT OR IGNORE INTO draft_files (draft, id, data) SELECT ?2, id, data FROM draft_files WHERE draft = ?1 AND id = ?3")?;
+        for f in files {
+            stmt.execute(params![from, id, f.id])?;
+        }
+        Ok(())
+    }
+
+    /// The `files` draft `id` doesn't have the bytes of (their ids).
+    pub fn missing_files(&self, id: i64, files: &[DraftAttachment]) -> Result<Vec<u32>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM draft_files WHERE draft = ?1 AND id = ?2)")?;
+        let mut missing = Vec::new();
+        for f in files {
+            if !stmt.query_row(params![id, f.id], |r| r.get::<_, bool>(0))? {
+                missing.push(f.id);
+            }
+        }
+        Ok(missing)
+    }
+
+    /// A new draft that carries on another's text ([`Store::insert_new_draft`]) gets its files
+    /// from draft `from`, those it still has; the rest are left off it. Call inside a
+    /// transaction.
+    pub fn take_files_from(&self, from: Option<i64>, id: i64) -> Result<()> {
+        let Some(d) = self.draft(id)? else { return Ok(()) };
+        if let Some(from) = from.filter(|f| *f != id) {
+            self.copy_draft_files(from, id, &d.draft.attachments)?;
+        }
+        let missing = self.missing_files(id, &d.draft.attachments)?;
+        if !missing.is_empty() {
+            let draft = Draft { attachments: d.draft.attachments.into_iter().filter(|a| !missing.contains(&a.id)).collect(), ..d.draft };
+            self.conn.execute("UPDATE drafts SET content = ?2 WHERE id = ?1", params![id, json(&draft)])?;
+        }
+        Ok(())
     }
 
     /// Whether the draft has changes the server's copy lacks, and should get them (it isn't on
@@ -1003,6 +1084,93 @@ mod tests {
         let on_a = queued(&s, "a");
         assert!(on_a.contains(&Op::PurgeDraft { message_id: mid, draft: None, copy: Some(("Drafts".into(), 7, 21)), exact: true, left_by: Some((1, 0)) }), "a's copy goes, on a, by UID: {on_a:?}");
         assert!(s.draft_upload("b", 1).unwrap().unwrap().previous.is_none(), "b's upload replaces nothing");
+    }
+
+    fn file(id: u32, name: &str, size: usize) -> DraftAttachment {
+        DraftAttachment { id, filename: name.into(), mime: crate::attach::type_for(name).into(), size }
+    }
+
+    fn with_files(subject: &str, files: &[DraftAttachment]) -> Draft {
+        Draft { attachments: files.to_vec(), ..draft(subject) }
+    }
+
+    fn stored_files(s: &Store) -> i64 {
+        s.conn.query_row("SELECT COUNT(*) FROM draft_files", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn attached_files_survive_a_restart_and_go_with_their_draft() {
+        let (dir, db) = temp_db("files");
+        let pdf = file(0, "plan.pdf", 4);
+        {
+            let s = Store::open(&db).unwrap();
+            assert!(!s.add_draft_file(1, 0, b"%PDF").unwrap(), "no draft, nothing kept: a file never outlives its draft");
+            assert_eq!(stored_files(&s), 0);
+            s.save_draft(1, &draft("plan"), true, at(1), 100).unwrap();
+            assert!(s.add_draft_file(1, 0, b"%PDF").unwrap());
+            s.save_draft(1, &with_files("plan", std::slice::from_ref(&pdf)), true, at(2), 101).unwrap();
+            // The app dies here.
+        }
+        let s = Store::open(&db).unwrap();
+        let back = s.draft_to_restore().unwrap().unwrap();
+        assert_eq!(back.draft.attachments, vec![pdf.clone()], "listed with the draft");
+        assert_eq!(s.draft_files(1, &back.draft.attachments).unwrap(), vec![(pdf, b"%PDF".to_vec())], "and the bytes with it");
+        // Typing on rewrites the text, never the file.
+        s.save_draft(1, &with_files("plan, v2", &back.draft.attachments), true, at(3), 102).unwrap();
+        assert_eq!(stored_files(&s), 1);
+        s.discard_draft(1, None).unwrap();
+        assert_eq!(stored_files(&s), 0, "gone with the draft");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_taken_off_leaves_the_draft_but_not_a_save_made_before() {
+        let s = Store::memory();
+        let (a, b) = (file(0, "a.txt", 1), file(1, "b.txt", 1));
+        s.save_draft(1, &draft("x"), true, at(1), 100).unwrap();
+        s.add_draft_file(1, 0, b"a").unwrap();
+        s.add_draft_file(1, 1, b"b").unwrap();
+        s.save_draft(1, &with_files("x", &[a.clone(), b.clone()]), true, at(2), 101).unwrap();
+        s.save_draft(1, &with_files("x", std::slice::from_ref(&a)), true, at(4), 102).unwrap();
+        let d = s.draft(1).unwrap().unwrap();
+        assert_eq!(d.draft.attachments, vec![a.clone()], "off the draft: not saved or sent with it");
+        assert_eq!(s.draft_upload("a", 1).unwrap().unwrap().draft.attachments, vec![a]);
+        // A retry of an older save, still listing b, can't win; and if it could, b is still there.
+        assert_eq!(s.save_draft(1, &with_files("x", &[file(0, "a.txt", 1), b.clone()]), true, at(3), 103).unwrap(), Some(false));
+        assert!(s.missing_files(1, &[b]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_draft_never_lists_a_file_it_doesnt_have() {
+        let s = Store::memory();
+        let (kept, lost) = (file(0, "kept.png", 3), file(1, "lost.png", 3));
+        s.save_draft(1, &draft("x"), true, at(1), 100).unwrap();
+        s.add_draft_file(1, 0, b"png").unwrap();
+        assert_eq!(s.missing_files(1, &[kept.clone(), lost.clone()]).unwrap(), vec![1]);
+        s.save_draft(1, &with_files("x", &[kept.clone(), lost]), true, at(2), 101).unwrap();
+        let d = s.draft(1).unwrap().unwrap();
+        assert_eq!(d.draft.attachments, vec![kept.clone()], "the one it has the bytes of");
+        assert!(s.draft_files(1, &d.draft.attachments).is_ok(), "so it can always be uploaded and sent");
+    }
+
+    #[test]
+    fn a_draft_carrying_on_anothers_text_takes_its_files() {
+        let s = Store::memory();
+        let pdf = file(0, "plan.pdf", 4);
+        s.save_draft(1, &draft("plan"), true, at(1), 100).unwrap();
+        s.add_draft_file(1, 0, b"%PDF").unwrap();
+        s.save_draft(1, &with_files("plan", std::slice::from_ref(&pdf)), true, at(2), 101).unwrap();
+        // A save refused under id 1 carries on as draft 2, listing 1's file.
+        assert_eq!(s.save_draft_from(2, &with_files("plan", std::slice::from_ref(&pdf)), true, at(1), 102, Some(1)).unwrap(), Some(true));
+        let d = s.draft(2).unwrap().unwrap();
+        assert_eq!(s.draft_files(2, &d.draft.attachments).unwrap()[0].1, b"%PDF".to_vec());
+        // One refused itself leaves nothing behind.
+        s.discard_draft(3, None).unwrap();
+        s.save_draft(3, &draft("gone"), true, at(1), 100).unwrap();
+        s.discard_draft(3, None).unwrap();
+        let before = stored_files(&s);
+        assert_eq!(s.save_draft_from(3, &with_files("gone", std::slice::from_ref(&pdf)), true, at(2), 103, Some(1)).unwrap(), None);
+        assert_eq!(stored_files(&s), before, "no file without its draft");
     }
 
     #[test]

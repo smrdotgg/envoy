@@ -18,23 +18,49 @@ use crate::store::{DraftRev, LocalDraft, Query, Store};
 /// seconds rather than one per save. A draft put away (another one took the composer) goes now.
 pub const UPLOAD_DELAY: i64 = 5;
 
+/// How long a draft being written waits before its upload ([`UPLOAD_DELAY`]), longer the more
+/// its files weigh: each upload sends them all again (IMAP replaces a draft whole), so a draft
+/// carrying 25 MB is uploaded every two minutes while it's typed in, not every five seconds.
+pub fn upload_delay(draft: &Draft) -> i64 {
+    let mb = (crate::attach::total(&draft.attachments) / (1024 * 1024)) as i64;
+    UPLOAD_DELAY + (mb * 4).min(115)
+}
+
 /// Saves the composer's content ([`Store::save_draft`]) and, if the server's copy is now
 /// behind, queues its upload. True when the queue changed, so the account's worker should
 /// plan its wait again; None when the store refused the save.
 pub fn save(st: &Store, id: i64, draft: &Draft, open: bool, at: DraftRev, now: i64) -> Result<Option<bool>> {
-    let Some(changed) = st.save_draft(id, draft, open, at, now)? else { return Ok(None) };
+    Ok(save_from(st, id, draft, open, at, now, None)?.map(|s| s.queued))
+}
+
+/// What [`save_from`] did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Saved {
+    /// The upload queue changed: the account's worker should plan its wait again.
+    pub queued: bool,
+    /// Files the draft listed that it doesn't have the bytes of (their ids): left off it.
+    pub missing: Vec<u32>,
+}
+
+/// [`save`], for a draft that may carry on another's text (`files_from`, see
+/// [`Store::save_draft_from`]), saying which files it listed that it doesn't have.
+pub fn save_from(st: &Store, id: i64, draft: &Draft, open: bool, at: DraftRev, now: i64, files_from: Option<i64>) -> Result<Option<Saved>> {
+    let Some(changed) = st.save_draft_from(id, draft, open, at, now, files_from)? else { return Ok(None) };
+    let missing = st.missing_files(id, &draft.attachments)?;
+    let mut queued = false;
     if (changed || !open) && st.draft_needs_upload(id)? {
-        return st.queue_draft_upload(&draft.account, id, if open { now + UPLOAD_DELAY } else { now }).map(Some);
+        queued = st.queue_draft_upload(&draft.account, id, if open { now + upload_delay(draft) } else { now })?;
     }
-    Ok(Some(false))
+    Ok(Some(Saved { queued, missing }))
 }
 
 /// Saves `draft` as a new draft ([`Store::insert_new_draft`]) and queues its upload, in one
-/// transaction. Returns its id.
-pub fn save_new(st: &Store, draft: &Draft, open: bool, rev: i64, now: i64) -> Result<i64> {
+/// transaction; its files come from draft `files_from`, the ones it still has. Returns its id.
+pub fn save_new(st: &Store, draft: &Draft, open: bool, rev: i64, now: i64, files_from: Option<i64>) -> Result<i64> {
     st.transaction(|st| {
         let id = st.insert_new_draft(draft, open, rev, now)?;
-        st.queue_draft_upload(&draft.account, id, if open { now + UPLOAD_DELAY } else { now })?;
+        st.take_files_from(files_from, id)?;
+        st.queue_draft_upload(&draft.account, id, if open { now + upload_delay(draft) } else { now })?;
         Ok(id)
     })
 }
@@ -56,6 +82,10 @@ pub struct Recovered {
     pub lifecycle: i64,
     /// A message sent but not confirmed queued: kept as a draft unless its send went through.
     pub unsent: bool,
+    /// It carries on draft `files_from`'s text (a write refused under that id), and the files
+    /// it lists are that draft's ([`Store::save_draft_from`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_from: Option<i64>,
 }
 
 /// Where [`Recovered`] drafts wait for the next start: a folder, one file per draft.
@@ -141,17 +171,21 @@ pub fn import_recovery(dir: &Path, st: &Store, now: i64) -> Result<usize> {
 
 /// One recovered draft into the store, like a save made when it was written. Only its text in
 /// the store (or, for an unsent message, its send on its way) lets its file go: refused, or
-/// overtaken by other text, it's kept as a new draft.
+/// overtaken by other text, it's kept as a new draft, with the files of the draft it was
+/// written for (those the store still has: a file it can't have is left off, whichever way).
 fn import_one(st: &Store, r: &Recovered, now: i64) -> Result<()> {
     let at = DraftRev { lifecycle: r.lifecycle, rev: r.rev };
+    let files = r.files_from.unwrap_or(r.id);
     if r.unsent {
         st.draft_unsent(r.id, &r.draft, Some(at), now)?;
     } else {
-        save(st, r.id, &r.draft, r.open, at, now)?;
+        save_from(st, r.id, &r.draft, r.open, at, now, r.files_from)?;
     }
-    let held = st.draft(r.id)?.is_some_and(|d| d.draft == r.draft) || (r.unsent && st.draft_on_its_way(r.id)?);
+    let missing = st.missing_files(files, &r.draft.attachments)?;
+    let wanted = Draft { attachments: r.draft.attachments.iter().filter(|a| !missing.contains(&a.id)).cloned().collect(), ..r.draft.clone() };
+    let held = st.draft(r.id)?.is_some_and(|d| d.draft == wanted) || (r.unsent && st.draft_on_its_way(r.id)?);
     if !held {
-        save_new(st, &r.draft, r.open, r.rev, now)?;
+        save_new(st, &r.draft, r.open, r.rev, now, Some(files))?;
     }
     Ok(())
 }
@@ -278,7 +312,7 @@ mod tests {
     }
 
     fn recovered(id: i64, subject: &str, rev: i64, unsent: bool) -> Recovered {
-        Recovered { id, draft: Draft { account: "a".into(), subject: subject.into(), ..Draft::default() }, open: true, rev, lifecycle: 0, unsent }
+        Recovered { id, draft: Draft { account: "a".into(), subject: subject.into(), ..Draft::default() }, open: true, rev, lifecycle: 0, unsent, files_from: None }
     }
 
     /// The files in `folder` (none if there's no folder).
@@ -461,6 +495,57 @@ mod tests {
         assert_eq!(st.draft(1).unwrap().unwrap().draft.subject, "edited since");
         let subjects: Vec<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
         assert!(subjects.contains(&"sent, never queued".to_owned()), "kept as a new draft: {subjects:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_heavy_draft_is_uploaded_less_often_while_its_typed_in() {
+        let carrying = |mb: usize| Draft { attachments: vec![crate::model::DraftAttachment { id: 0, filename: "f".into(), mime: String::new(), size: mb * 1024 * 1024 }], ..Draft::default() };
+        assert_eq!(upload_delay(&Draft::default()), UPLOAD_DELAY);
+        assert_eq!(upload_delay(&carrying(1)), 9);
+        assert_eq!(upload_delay(&carrying(25)), 105, "a full message: every couple of minutes");
+        assert_eq!(upload_delay(&carrying(400)), 120, "never longer");
+        // As queued: a save waits that long; putting the draft away still uploads it now.
+        let st = Store::memory();
+        save(&st, 1, &Draft { account: "a".into(), ..Draft::default() }, true, DraftRev { lifecycle: 0, rev: 1 }, 0).unwrap();
+        let first = st.claim_due("a", 10).unwrap();
+        st.op_done(first[0].id).unwrap();
+        st.add_draft_file(1, 0, &vec![0u8; 2 * 1024 * 1024]).unwrap();
+        let heavy = Draft { account: "a".into(), attachments: vec![crate::model::DraftAttachment { id: 0, filename: "f".into(), mime: String::new(), size: 2 * 1024 * 1024 }], ..Draft::default() };
+        save(&st, 1, &heavy, true, DraftRev { lifecycle: 0, rev: 2 }, 1000).unwrap();
+        assert!(st.ops("a", 1000 + UPLOAD_DELAY).unwrap().is_empty(), "not after five seconds");
+        assert_eq!(st.ops("a", 1013).unwrap().len(), 1);
+        save(&st, 1, &heavy, false, DraftRev { lifecycle: 0, rev: 3 }, 1001).unwrap();
+        assert_eq!(st.ops("a", 1001).unwrap().len(), 1, "put away: now");
+    }
+
+    #[test]
+    fn a_recovered_draft_kept_as_its_own_keeps_its_files() {
+        let dir = temp("files");
+        let folder = dir.join("drafts-recovery");
+        let st = Store::memory();
+        let pdf = crate::model::DraftAttachment { id: 0, filename: "plan.pdf".into(), mime: "application/pdf".into(), size: 4 };
+        let with_pdf = |subject: &str| Draft { account: "a".into(), subject: subject.into(), attachments: vec![pdf.clone()], ..Draft::default() };
+        st.save_draft(1, &Draft { account: "a".into(), ..Draft::default() }, true, DraftRev { lifecycle: 0, rev: 1 }, 100).unwrap();
+        st.add_draft_file(1, 0, b"%PDF").unwrap();
+        // Written at close, then other text saved over it in a later run.
+        let mut r = recovered(1, "", 40, false);
+        r.draft = with_pdf("written at close");
+        save_recovery(&folder, &[r]).unwrap();
+        st.save_draft(1, &with_pdf("saved since"), true, DraftRev { lifecycle: 0, rev: 50 }, 100).unwrap();
+        import_recovery(&folder, &st, 101).unwrap();
+        let kept = st.drafts(None).unwrap().into_iter().find(|d| d.draft.subject == "written at close").expect("kept as its own");
+        assert_ne!(kept.id, 1);
+        assert_eq!(kept.draft.attachments, vec![pdf.clone()]);
+        assert_eq!(st.draft_files(kept.id, &kept.draft.attachments).unwrap()[0].1, b"%PDF".to_vec(), "with the file");
+        // One written for a draft carrying on another's text takes that one's files.
+        let mut r = recovered(7, "", 60, false);
+        r.draft = with_pdf("carried on");
+        r.files_from = Some(1);
+        save_recovery(&folder, &[r]).unwrap();
+        import_recovery(&folder, &st, 102).unwrap();
+        let carried = st.draft(7).unwrap().unwrap();
+        assert_eq!(st.draft_files(7, &carried.draft.attachments).unwrap()[0].1, b"%PDF".to_vec());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

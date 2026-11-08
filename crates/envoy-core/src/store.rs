@@ -817,6 +817,11 @@ impl Store {
         Ok(self.conn.query_row("SELECT raw FROM bodies WHERE id = ?1", params![id], |r| r.get(0)).optional()?)
     }
 
+    /// Whether the message is downloaded ([`Store::raw`] has it), without reading it.
+    pub fn has_raw(&self, id: MessageId) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS (SELECT 1 FROM bodies WHERE id = ?1)", params![id], |r| r.get(0))?)
+    }
+
     pub fn body(&self, id: MessageId) -> Result<Option<Body>> {
         let row = self
             .conn
