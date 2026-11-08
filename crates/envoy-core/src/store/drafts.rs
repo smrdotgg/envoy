@@ -260,6 +260,19 @@ impl Store {
         )?)
     }
 
+    /// Saves `draft` as a new draft, `rev` its stamp, under an id no draft has had, picked and
+    /// taken in one statement (it holds the write lock from the start): drafts made at once,
+    /// by other Envoys too, can't land on the same id. Returns the id.
+    pub fn insert_new_draft(&self, draft: &Draft, open: bool, rev: i64, now: i64) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO drafts (id, account, content, message_id, rev, updated, version, open)
+             SELECT n, ?1, ?2, '<' || n || '.' || ?3 || '.draft@envoy>', ?4, ?5, 1, ?6
+             FROM (SELECT MAX(COALESCE((SELECT MAX(id) FROM drafts), 0) + 1, COALESCE((SELECT MAX(id) FROM draft_ends), 0) + 1, ?7) AS n)",
+            params![draft.account, json(draft), format!("{:08x}", rand::random::<u32>()), rev, now, open, now.saturating_mul(1_000_000)],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// The bytes of a draft's attachments, with them. An error if any is missing: a draft is
     /// never sent or saved without a file it lists.
     pub fn draft_files(&self, id: i64, attachments: &[DraftAttachment]) -> Result<Vec<(DraftAttachment, Vec<u8>)>> {
@@ -457,16 +470,20 @@ impl Store {
     /// without being sent, or moved on, and the caller must keep the text.
     pub fn draft_unsent(&self, id: i64, draft: &Draft, at: Option<DraftRev>, now: i64) -> Result<bool> {
         self.transaction(|st| {
-            let on_its_way: bool = st.conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM drafts WHERE id = ?1 AND (sending != 0 OR sent != 0)) OR EXISTS (SELECT 1 FROM draft_ends WHERE id = ?1 AND sent != 0)",
-                params![id],
-                |r| r.get(0),
-            )?;
-            if on_its_way {
+            if st.draft_on_its_way(id)? {
                 return Ok(true);
             }
             Ok(st.put_draft(id, draft, true, at.map(|a| a.lifecycle), at.map(|a| a.rev), now)?.is_some())
         })
+    }
+
+    /// Whether the draft's send is queued, or went out.
+    pub fn draft_on_its_way(&self, id: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM drafts WHERE id = ?1 AND (sending != 0 OR sent != 0)) OR EXISTS (SELECT 1 FROM draft_ends WHERE id = ?1 AND sent != 0)",
+            params![id],
+            |r| r.get(0),
+        )?)
     }
 
     /// Brings back the draft whose send (op `op`) was undone, in the composer, queuing the
