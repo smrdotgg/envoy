@@ -320,11 +320,15 @@ impl Store {
         Ok(())
     }
 
-    /// Keeps a draft whose send couldn't even be queued, with what was being sent, back in the
-    /// composer.
+    /// Keeps a message that wasn't sent as a draft, in the composer, with what was being sent:
+    /// its send couldn't be queued, or the window closed before the engine confirmed it. A draft
+    /// whose send is queued, or went out, is left alone.
     pub fn draft_unsent(&self, id: i64, draft: &Draft, now: i64) -> Result<Option<LocalDraft>> {
         self.transaction(|st| {
-            st.put_draft(id, draft, true, None, now)?;
+            let on_its_way: bool = st.conn.query_row("SELECT sending != 0 OR sent != 0 FROM drafts WHERE id = ?1", params![id], |r| r.get(0)).optional()?.unwrap_or(false);
+            if !on_its_way {
+                st.put_draft(id, draft, true, None, now)?;
+            }
             st.draft(id)
         })
     }
@@ -422,6 +426,11 @@ impl Store {
     pub fn ops_due_now(&self, account: &str) {
         self.conn.execute("UPDATE ops SET not_before = 0 WHERE account = ?1", params![account]).unwrap();
     }
+
+    /// Makes saving drafts fail, as a full disk would.
+    pub fn break_drafts(&self) {
+        self.conn.execute_batch("DROP TABLE drafts").unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -516,6 +525,21 @@ mod tests {
         assert!(matches!(&purge[..], [Op::PurgeDraft { draft: Some(1), .. }]), "its server copies go: {purge:?}");
         s.draft_purged(1, 110).unwrap();
         assert_eq!(s.draft(1).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unsent_message_is_kept_unless_its_send_is_queued() {
+        let s = Store::memory();
+        // The window closed before the engine got to the send: kept, in the composer.
+        let kept = s.draft_unsent(1, &draft("hello"), 100).unwrap().unwrap();
+        assert!(kept.visible && kept.draft.subject == "hello");
+        assert_eq!(s.draft_to_restore().unwrap().map(|d| d.id), Some(1));
+        // It did get to it: left to go out.
+        let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
+        s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
+        s.draft_unsent(1, &draft("hello"), 102).unwrap();
+        assert!(!s.draft(1).unwrap().unwrap().visible, "still in the outbox");
+        assert_eq!(s.draft_to_restore().unwrap(), None);
     }
 
     #[test]

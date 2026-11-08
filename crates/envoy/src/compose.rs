@@ -231,9 +231,9 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
                 .child(text("Send").font(k.ty.ui_medium).color(rune::Color::WHITE))
                 .child(icon(&icons::SEND, 15.0).color(rune::Color::WHITE)),
         );
-    if let Some(e) = &cm.error {
-        footer = footer.child(text(e.clone()).font(k.ty.text_xsmall).color(k.c.danger.fg).truncate().grow(1.0).min_w(0.0));
-    } else if cm.saved && !cm.dirty {
+    if let Some(e) = cm.error.as_ref().or(cm.save_error.as_ref()) {
+        footer = footer.child(text(e.clone()).font(k.ty.text_xsmall).color(k.c.danger.fg).help(e.clone()).truncate().grow(1.0).min_w(0.0).key("compose-error"));
+    } else if cm.shows_saved() {
         footer = footer.child(
             text("Draft saved")
                 .font(k.ty.text_xsmall)

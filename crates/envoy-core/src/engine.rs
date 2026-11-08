@@ -92,7 +92,15 @@ pub enum Event {
     Sync { account: String, state: SyncState },
     Toast(String),
     Error(String),
-    Sent { op: i64, undo_secs: u32 },
+    /// A send was queued (op `op`), with the composer's draft `draft_id`.
+    Sent { op: i64, undo_secs: u32, draft_id: Option<i64> },
+    /// A send couldn't even be queued (an [`Event::Error`] says why): the composer should get
+    /// draft `draft_id` back.
+    SendFailed { draft_id: Option<i64> },
+    /// Save `rev` of draft `id` is written to the local database ([`Command::SaveDraft`]).
+    DraftSaved { id: i64, rev: i64 },
+    /// Save `rev` of draft `id` couldn't be written: it isn't saved, and should be tried again.
+    DraftSaveFailed { id: i64, rev: i64, error: String },
     /// How many ops an undoable [`Command::Move`] actually held. 0 means it had nothing to do
     /// (the messages were already moving, or already there), so there's nothing to undo.
     Held { undo: i64, ops: usize },
@@ -197,6 +205,13 @@ impl Engine {
     pub fn save_draft_now(&self, id: i64, draft: &Draft, open: bool, rev: i64) -> Result<()> {
         let st = self.writer.lock().map_err(|_| anyhow!("store poisoned"))?;
         drafts::save(&st, id, draft, open, rev, now()).map(|_| ())
+    }
+
+    /// Keeps a message the composer sent as a draft, on the calling thread, unless its send
+    /// was queued (or went out): for when the window closes before the engine confirmed it.
+    pub fn keep_unsent_now(&self, id: i64, draft: &Draft) -> Result<()> {
+        let st = self.writer.lock().map_err(|_| anyhow!("store poisoned"))?;
+        st.draft_unsent(id, draft, now()).map(|_| ())
     }
 
     pub fn drain(&self) -> Vec<Event> {
@@ -473,12 +488,14 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
         Command::UndoMove { undo } => undo_move(shared, undo)?,
         Command::Send { draft, draft_id } => {
             if let Err(e) = queue_send(shared, workers, &draft, draft_id) {
-                // Not sent: back in the composer, so nothing written is lost.
+                // Not sent: kept as a draft here, and back in the composer, so nothing written is
+                // lost.
                 if let Some(id) = draft_id
-                    && let Ok(Some(d)) = shared.with_writer(|st| st.draft_unsent(id, &draft, now()))
+                    && let Err(e) = shared.with_writer(|st| st.draft_unsent(id, &draft, now()))
                 {
-                    shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false, notice: None });
+                    log::warn!("couldn't keep an unsent draft: {e:#}");
                 }
+                shared.emit(Event::SendFailed { draft_id });
                 return Err(e);
             }
         }
@@ -499,12 +516,17 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             }
             shared.emit_pending();
         }
-        Command::SaveDraft { id, draft, open, rev } => {
-            if shared.with_writer(|st| drafts::save(st, id, &draft, open, rev, now()))? {
-                shared.emit_pending();
-                wake(workers, &draft.account);
+        Command::SaveDraft { id, draft, open, rev } => match shared.with_writer(|st| drafts::save(st, id, &draft, open, rev, now())) {
+            Ok(queued) => {
+                // Only now is it saved: the app shows "Draft saved", and drops its own copy.
+                shared.emit(Event::DraftSaved { id, rev });
+                if queued {
+                    shared.emit_pending();
+                    wake(workers, &draft.account);
+                }
             }
-        }
+            Err(e) => shared.emit(Event::DraftSaveFailed { id, rev, error: format!("{e:#}") }),
+        },
         Command::OpenDraft { id } => match open_draft(shared, id, now())? {
             Opening::Ready(d, notice) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false, notice }),
             Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, restored: false, notice: Some(DraftNotice::Copy(why)) }),
@@ -749,7 +771,7 @@ fn queue_send(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, draft: &D
             Ok(id)
         })
     })?;
-    shared.emit(Event::Sent { op: id, undo_secs: undo });
+    shared.emit(Event::Sent { op: id, undo_secs: undo, draft_id });
     if draft_id.is_some() {
         shared.emit(Event::Changed { account: account.id.clone() });
     }
@@ -2208,9 +2230,27 @@ mod tests {
         let (shared, rx) = drafts_engine();
         let unsendable = Draft { account: "removed".into(), ..draft("unsendable") };
         assert!(handle(&shared, &mut HashMap::new(), Command::Send { draft: unsendable, draft_id: Some(9) }).await.is_err());
-        let opened = rx.try_iter().find_map(|e| if let Event::DraftOpened { id, draft, .. } = e { Some((id, draft.subject)) } else { None });
-        assert_eq!(opened, Some((9, "unsendable".to_owned())), "nothing written is lost");
-        assert!(shared.with_writer(|st| st.draft(9)).unwrap().unwrap().visible, "and it's in Drafts");
+        assert!(rx.try_iter().any(|e| matches!(e, Event::SendFailed { draft_id: Some(9) })), "the composer gets it back");
+        let kept = shared.with_writer(|st| st.draft(9)).unwrap().unwrap();
+        assert!(kept.visible && kept.draft.subject == "unsendable", "and it's kept as a draft meanwhile");
+    }
+
+    #[tokio::test]
+    async fn a_draft_save_is_confirmed_only_once_written() {
+        let (shared, rx) = drafts_engine();
+        handle(&shared, &mut HashMap::new(), Command::SaveDraft { id: 7, draft: draft("hello"), open: true, rev: 5 }).await.unwrap();
+        assert!(rx.try_iter().any(|e| matches!(e, Event::DraftSaved { id: 7, rev: 5 })));
+        // The disk fills up: the app hears it wasn't saved, never that it was.
+        shared
+            .with_writer(|st| {
+                st.break_drafts();
+                Ok(())
+            })
+            .unwrap();
+        handle(&shared, &mut HashMap::new(), Command::SaveDraft { id: 7, draft: draft("hello again"), open: true, rev: 6 }).await.unwrap();
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(events.iter().any(|e| matches!(e, Event::DraftSaveFailed { id: 7, rev: 6, .. })), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, Event::DraftSaved { rev: 6, .. })));
     }
 
     #[tokio::test]
