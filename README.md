@@ -89,8 +89,9 @@ All rebindable under Settings → Keyboard (`mod` = ⌘ on macOS, Ctrl elsewhere
 | `j` / `k` | next / previous | `c` | compose |
 | `e` | archive | `r` / `a` / `f` | reply / reply all / forward |
 | `#` | delete | `mod+enter` | send |
-| `s` | star | `/` | search |
-| `u` | toggle read | `esc` | close |
+| `z` | undo archive / delete / move / send | `/` | search |
+| `s` | star | `esc` | close |
+| `u` | toggle read | `mod+,` | settings |
 | `mod+1/2/3` | inbox / starred / sent | `mod+shift+b` | toggle sidebar |
 
 Search understands `from:`, `to:`, `subject:`, `is:unread`, `is:read`, `is:starred`,
@@ -112,7 +113,12 @@ offline).
 network. Every action (read, star, archive, delete, send) is applied locally first and
 queued in the database; the worker replays the queue on the server and retries with backoff
 until it succeeds, across restarts and offline periods. Sending waits `compose.undoSendSeconds`
-in that queue so it can be undone. The worker uses IMAP IDLE for push, reconnects with
+in that queue so it can be undone; archive, delete, spam and other moves wait
+`behavior.undoSeconds` (5 s) the same way, with the messages hidden rather than deleted
+locally, so **Undo** in the toast (or `z`) puts them back exactly as they were and the server
+never sees the move. Once the toast is gone the move goes through; if the app quits first, it
+goes through on the next start. Deleting from Trash is permanent and has no undo. The worker
+uses IMAP IDLE for push, reconnects with
 backoff, and times out dead connections in 30 s.
 
 ## Testing
@@ -122,6 +128,8 @@ cargo test                                      # unit tests
 cargo run -p envoy-core --example e2e           # engine against a local GreenMail server (see the file header)
 ENVOY_DEMO=1 target/debug/envoy --snap out.png --scene open     # headless screenshot
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/flow.json --snap out.png --at 3.6
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 1.0   # archive: toast with Undo
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 2.0   # after z: message back, open
 ```
 
 Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent`.

@@ -80,11 +80,8 @@ fn toasts(s: &App, t: &theme::Theme) -> Option<El> {
         if toast.error {
             b = b.icon(k, &icons::ALERT);
         }
-        if let Some(op) = toast.undo {
-            b = b.action(k, "Undo", true, move |s: &mut App, _: &mut Tx| {
-                s.send(Command::UndoSend { op });
-                s.toasts.retain(|t| t.id != id);
-            });
+        if toast.undo.is_some() {
+            b = b.action(k, "Undo", true, move |s: &mut App, tx: &mut Tx| s.undo_toast(id, tx));
         }
         if let Some(path) = toast.open_path.clone() {
             b = b.action(k, "Show", false, move |_: &mut App, _: &mut Tx| {
