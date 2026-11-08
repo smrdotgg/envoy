@@ -1568,7 +1568,7 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
                 st.delete_uids(id, &mailbox, &done.deleted)
             })?;
         }
-        Op::PurgeDraft { message_id, draft, copy, exact } => {
+        Op::PurgeDraft { message_id, draft, copy, exact, left_by } => {
             let (on_server, known) = match draft {
                 // The copy on record counts only if it's on this account's server.
                 Some(d) => shared.with_writer(|st| {
@@ -1580,7 +1580,18 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
             if on_server && let Some(mailbox) = drafts_mailbox(shared, id)? {
                 let known = known.filter(|(m, _, _)| *m == mailbox).map(|(_, validity, uid)| (validity, uid));
                 let gone = runner.purge_draft(&mailbox, message_id, known, !*exact).await?;
-                shared.with_writer(|st| st.delete_uids(id, &mailbox, &gone))?;
+                shared.with_writer(|st| {
+                    st.delete_uids(id, &mailbox, &gone)?;
+                    // A cleanup's search may have taken the copy of a newer upload here.
+                    if let Some((d, generation)) = left_by
+                        && !*exact
+                        && !gone.is_empty()
+                        && st.draft_cleaned_up(*d, id, *generation, now())?
+                    {
+                        log::info!("{}: an old cleanup may have taken a draft's newest copy; it goes up again", account.email);
+                    }
+                    Ok(())
+                })?;
             }
             if let Some(d) = draft {
                 shared.with_writer(|st| st.draft_purged(*d, now()))?;
@@ -2080,6 +2091,30 @@ mod tests {
         replay_times(&shared, &mut a, 1).await;
         assert!(a.drafts.is_empty(), "{:?}", a.drafts());
         assert_eq!(b.drafts().len(), 1, "and only on a");
+    }
+
+    #[tokio::test]
+    async fn an_old_cleanup_cant_take_the_copy_made_after_moving_back() {
+        let (shared, _rx) = drafts_engine();
+        // a's upload can't confirm its copy's UID.
+        let mut a = FakeServer { unsure: true, ..FakeServer::new(&shared, |_: &Shared| {}) };
+        type_draft(&shared, 7, 1, "v1");
+        replay_with(&shared, &account("a"), &mut a).await.unwrap();
+        a.unsure = false;
+        // Moved to b: a's copy goes, found by Message-ID; the first try fails and backs off.
+        let to_b = Draft { account: "b".into(), ..draft("v2") };
+        shared.with_writer(|st| drafts::save(st, 7, &to_b, true, 2, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+        a.fail = true;
+        replay_with(&shared, &account("a"), &mut a).await.unwrap();
+        a.fail = false;
+        // Back to a, with new text, uploaded before the cleanup's retry comes due.
+        type_draft(&shared, 7, 3, "v3");
+        replay_with(&shared, &account("a"), &mut a).await.unwrap();
+        assert_eq!(a.drafts().iter().filter(|(_, s)| s == "v3").count(), 1, "{:?}", a.drafts());
+        // The cleanup's retry finds v3 by its Message-ID too.
+        replay_times(&shared, &mut a, 2).await;
+        assert_eq!(a.drafts().into_iter().map(|(_, s)| s).collect::<Vec<_>>(), vec!["v3".to_owned()], "a ends up with the draft");
+        assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty(), "and nothing left to do on a");
     }
 
     #[tokio::test]
