@@ -1303,11 +1303,11 @@ trait OpRunner {
     fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send;
     /// The server's (unread, total) for a mailbox.
     fn status(&mut self, mailbox: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send;
-    /// Puts a draft in `mailbox` and deletes every other copy there with its Message-ID
-    /// ([`imap::replace_draft`]). Returns the UIDs deleted.
-    fn replace_draft(&mut self, mailbox: &str, raw: &[u8], message_id: &str) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send;
-    /// Deletes every copy with this Message-ID from `mailbox`. Returns their UIDs.
-    fn purge_draft(&mut self, mailbox: &str, message_id: &str) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send;
+    /// Puts a draft in `mailbox`, replacing its `previous` copy ([`imap::replace_draft`]).
+    fn replace_draft(&mut self, mailbox: &str, raw: &[u8], message_id: &str, previous: Option<(u32, u32)>, maybe_strays: bool) -> impl std::future::Future<Output = Result<imap::Replaced>> + Send;
+    /// Deletes a draft's copies from `mailbox`: `known`, and any with its Message-ID. Returns
+    /// their UIDs.
+    fn purge_draft(&mut self, mailbox: &str, message_id: &str, known: Option<(u32, u32)>) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send;
 }
 
 struct ImapRunner<'a> {
@@ -1322,12 +1322,12 @@ impl OpRunner for ImapRunner<'_> {
         imap::status(self.session, mailbox).await
     }
 
-    async fn replace_draft(&mut self, mailbox: &str, raw: &[u8], message_id: &str) -> Result<Vec<u32>> {
-        imap::replace_draft(self.session, self.caps, mailbox, raw, message_id).await
+    async fn replace_draft(&mut self, mailbox: &str, raw: &[u8], message_id: &str, previous: Option<(u32, u32)>, maybe_strays: bool) -> Result<imap::Replaced> {
+        imap::replace_draft(self.session, self.caps, mailbox, raw, message_id, previous, maybe_strays).await
     }
 
-    async fn purge_draft(&mut self, mailbox: &str, message_id: &str) -> Result<Vec<u32>> {
-        imap::purge_message_id(self.session, self.caps, mailbox, message_id).await
+    async fn purge_draft(&mut self, mailbox: &str, message_id: &str, known: Option<(u32, u32)>) -> Result<Vec<u32>> {
+        imap::purge_message_id(self.session, self.caps, mailbox, message_id, known).await
     }
 
     async fn run(&mut self, op: &Op) -> Result<()> {
@@ -1455,10 +1455,13 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
             let Some(mailbox) = drafts_mailbox(shared, id)? else { return Ok(()) };
             let Some(up) = shared.with_writer(|st| st.draft_upload(id, *draft))? else { return Ok(()) };
             let raw = smtp::build_draft(account, &up.draft, &up.message_id)?;
-            let replaced = runner.replace_draft(&mailbox, &raw, &up.message_id).await?;
+            // The copy on record is replaced by UID; one in another mailbox (the Drafts role
+            // moved) is left to the search.
+            let previous = up.previous.filter(|(m, _, _)| *m == mailbox).map(|(_, validity, uid)| (validity, uid));
+            let done = runner.replace_draft(&mailbox, &raw, &up.message_id, previous, up.maybe_strays).await?;
             shared.with_writer(|st| {
-                st.draft_uploaded(*draft, up.version)?;
-                st.delete_uids(id, &mailbox, &replaced)
+                st.draft_uploaded(*draft, up.version, &mailbox, done.copy, done.certain)?;
+                st.delete_uids(id, &mailbox, &done.deleted)
             })?;
         }
         Op::PurgeDraft { message_id, draft } => {
@@ -1467,7 +1470,11 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
                 None => true,
             };
             if on_server && let Some(mailbox) = drafts_mailbox(shared, id)? {
-                let gone = runner.purge_draft(&mailbox, message_id).await?;
+                let known = match draft {
+                    Some(d) => shared.with_writer(|st| st.draft_copy(*d))?.filter(|(m, _, _)| *m == mailbox).map(|(_, validity, uid)| (validity, uid)),
+                    None => None,
+                };
+                let gone = runner.purge_draft(&mailbox, message_id, known).await?;
                 shared.with_writer(|st| st.delete_uids(id, &mailbox, &gone))?;
             }
             if let Some(d) = draft {
@@ -1554,23 +1561,43 @@ mod tests {
         fail: bool,
         ran: Vec<Op>,
         counts: (u32, u32),
+        /// What a failing server answers.
+        failure: &'static str,
         /// The Drafts mailbox: `(uid, Message-ID, raw)`.
         drafts: Vec<(u32, String, Vec<u8>)>,
         next_uid: u32,
         appends: usize,
+        /// What each draft save was given: the copy on record to replace, and whether to look
+        /// for strays.
+        previous: Vec<(Option<(u32, u32)>, bool)>,
+        /// Saves can't tell the new copy from the old ones (no APPENDUID, a search that misses):
+        /// older copies are kept.
+        unsure: bool,
     }
 
     impl FakeServer {
         fn new(shared: &Arc<Shared>, during: impl FnOnce(&Shared) + Send + 'static) -> FakeServer {
-            FakeServer { shared: shared.clone(), during: Some(Box::new(during)), fail: false, ran: vec![], counts: (0, 0), drafts: vec![], next_uid: 1, appends: 0 }
+            FakeServer {
+                shared: shared.clone(),
+                during: Some(Box::new(during)),
+                fail: false,
+                failure: "code: Some(Unavailable), info: Some(\"try again later\")",
+                ran: vec![],
+                counts: (0, 0),
+                drafts: vec![],
+                next_uid: 1,
+                appends: 0,
+                previous: vec![],
+                unsure: false,
+            }
         }
 
-        /// Runs `during` if this is the first op on the wire; the error a failing server gives.
+        /// Runs `during` if this is the first op on the wire; a failing server's NO.
         fn on_the_wire(&mut self) -> Result<()> {
             if let Some(during) = self.during.take() {
                 during(&self.shared);
             }
-            if self.fail { Err(anyhow!("NO [UNAVAILABLE] try again later")) } else { Ok(()) }
+            if self.fail { Err(anyhow::Error::new(async_imap::error::Error::No(self.failure.into()))) } else { Ok(()) }
         }
 
         /// The drafts on the server, `(uid, subject)`.
@@ -1591,20 +1618,24 @@ mod tests {
             async move { Ok(counts) }
         }
 
-        fn replace_draft(&mut self, _: &str, raw: &[u8], message_id: &str) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send {
+        fn replace_draft(&mut self, _: &str, raw: &[u8], message_id: &str, previous: Option<(u32, u32)>, maybe_strays: bool) -> impl std::future::Future<Output = Result<imap::Replaced>> + Send {
+            self.previous.push((previous, maybe_strays));
             let r = self.on_the_wire().map(|()| {
                 self.appends += 1;
                 let uid = self.next_uid;
                 self.next_uid += 1;
                 let old: Vec<u32> = self.drafts.iter().filter(|(_, m, _)| m == message_id).map(|(u, _, _)| *u).collect();
-                self.drafts.retain(|(_, m, _)| m != message_id);
                 self.drafts.push((uid, message_id.to_owned(), raw.to_vec()));
-                old
+                if self.unsure {
+                    return imap::Replaced { copy: None, deleted: vec![], certain: false };
+                }
+                self.drafts.retain(|(u, m, _)| m != message_id || *u == uid);
+                imap::Replaced { copy: Some((1, uid)), deleted: old, certain: true }
             });
             async move { r }
         }
 
-        fn purge_draft(&mut self, _: &str, message_id: &str) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send {
+        fn purge_draft(&mut self, _: &str, message_id: &str, _: Option<(u32, u32)>) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send {
             let r = self.on_the_wire().map(|()| {
                 let gone: Vec<u32> = self.drafts.iter().filter(|(_, m, _)| m == message_id).map(|(u, _, _)| *u).collect();
                 self.drafts.retain(|(_, m, _)| m != message_id);
@@ -1900,6 +1931,28 @@ mod tests {
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(server.drafts(), vec![(2, "second".to_owned())], "appended anew, the old copy deleted");
         assert!(shared.with_writer(|st| st.summary(old)).unwrap().is_none(), "and gone from the cache");
+    }
+
+    #[tokio::test]
+    async fn each_save_replaces_the_copy_on_record() {
+        let (shared, _rx) = drafts_engine();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        type_draft(&shared, 7, 1, "v1");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        type_draft(&shared, 7, 2, "v2");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.previous, vec![(None, false), (Some((1, 1)), false)], "the second save replaces the first's copy, by UID");
+        // A save that can't tell its copy from older ones keeps them all...
+        server.unsure = true;
+        type_draft(&shared, 7, 3, "v3");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts().len(), 2, "kept rather than risked");
+        // ...and the next one, with no copy on record, looks for strays.
+        server.unsure = false;
+        type_draft(&shared, 7, 4, "v4");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.previous.last(), Some(&(None, true)));
+        assert_eq!(server.drafts(), vec![(4, "v4".to_owned())]);
     }
 
     #[tokio::test]
