@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS mailboxes (
     PRIMARY KEY (account, name)
 );
 CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     account TEXT NOT NULL,
     mailbox TEXT NOT NULL,
     uid INTEGER NOT NULL,
@@ -135,6 +135,52 @@ const HELD_UNREAD: &str = "SELECT account, mailbox FROM messages WHERE held_op =
 const UNHIDE: &str = "UPDATE messages SET held_op = 0 WHERE held_op = ?1 AND held_op != 0";
 const BATCH_OPS: &str = "SELECT id, claimed FROM ops WHERE batch = ?1 AND batch != 0";
 
+/// Message ids must never be reused either: an undo toast keeps a moved message's id to put
+/// it back and reopen it, and a recycled id would reopen (and mark read) someone else's mail.
+/// Caches from before AUTOINCREMENT get the table rebuilt with their ids kept, so bodies
+/// (keyed by id) and search (rowid = id) stay attached. Indexes and the trigger go with the
+/// old table and are recreated in the same transaction. Run with foreign keys off: with them
+/// on, dropping the old table would cascade-delete every body.
+const MESSAGES_AUTOINCREMENT: &str = "
+BEGIN;
+CREATE TABLE messages_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT NOT NULL,
+    mailbox TEXT NOT NULL,
+    uid INTEGER NOT NULL,
+    message_id TEXT NOT NULL DEFAULT '',
+    thread TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT '',
+    from_name TEXT NOT NULL DEFAULT '',
+    from_email TEXT NOT NULL DEFAULT '',
+    recipients TEXT NOT NULL DEFAULT '[]',
+    date INTEGER NOT NULL DEFAULT 0,
+    flags INTEGER NOT NULL DEFAULT 0,
+    size INTEGER NOT NULL DEFAULT 0,
+    preview TEXT NOT NULL DEFAULT '',
+    has_attachments INTEGER NOT NULL DEFAULT 0,
+    has_body INTEGER NOT NULL DEFAULT 0,
+    held_op INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (account, mailbox, uid)
+);
+INSERT INTO messages_new (id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op)
+    SELECT id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op FROM messages;
+DROP TABLE messages;
+ALTER TABLE messages_new RENAME TO messages;
+CREATE INDEX messages_box_date ON messages (account, mailbox, date DESC);
+CREATE INDEX messages_thread ON messages (account, thread);
+CREATE INDEX messages_flagged ON messages (flags) WHERE flags & 2;
+CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+    DELETE FROM fts WHERE rowid = old.id;
+END;
+COMMIT;
+";
+
+fn has_autoincrement(conn: &Connection, table: &str) -> Result<bool> {
+    let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1", params![table], |r| r.get(0))?;
+    Ok(sql.contains("AUTOINCREMENT"))
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     for (table, column, sql) in MIGRATIONS {
         let has: bool = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), params![column], |r| r.get::<_, i64>(0))? > 0;
@@ -142,9 +188,18 @@ fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(sql)?;
         }
     }
-    let ops_sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ops'", [], |r| r.get(0))?;
-    if !ops_sql.contains("AUTOINCREMENT") {
+    if !has_autoincrement(conn, "ops")? {
         conn.execute_batch(OPS_AUTOINCREMENT)?;
+    }
+    if !has_autoincrement(conn, "messages")? {
+        // PRAGMA foreign_keys is ignored inside a transaction, hence outside the batch.
+        conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+        let rebuilt = conn.execute_batch(MESSAGES_AUTOINCREMENT);
+        if rebuilt.is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        rebuilt?;
     }
     conn.execute_batch(POST_MIGRATION)?;
     Ok(())
@@ -1172,6 +1227,63 @@ mod tests {
         assert!(s.summary(id).unwrap().is_some(), "move bookkeeping still sees it");
         s.undo_batch(7).unwrap();
         assert_eq!(s.thread(id, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn message_ids_are_never_reused() {
+        let s = Store::memory();
+        // The newest cached message is archived and its move replays.
+        let (archived, op) = held_move(&s);
+        s.op_done(op).unwrap();
+        // New mail arrives: it must not take the archived message's id, which its undo toast
+        // (and the reader) still hold.
+        let new = s.upsert_header("a", "INBOX", 10, 0, 10, 0, &parsed("New", "<10@x>", "", "Bo <bo@x.com>", 2)).unwrap();
+        assert!(new > archived);
+        assert!(s.thread(archived, false).unwrap().is_empty(), "the old id opens nothing");
+    }
+
+    #[test]
+    fn old_caches_keep_messages_bodies_and_search_through_the_id_migration() {
+        let dir = std::env::temp_dir().join(format!("envoy-store-msgids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mail.sqlite");
+        let (old_id, other) = (5, 6);
+        {
+            // A cache from before ids were AUTOINCREMENT, with a downloaded body and search entry.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(&SCHEMA.replace(" AUTOINCREMENT", "")).unwrap();
+            conn.execute_batch(
+                "INSERT INTO mailboxes (account, name, display, role) VALUES ('a', 'INBOX', 'Inbox', 'inbox');
+                 INSERT INTO messages (id, account, mailbox, uid, message_id, thread, subject, date) VALUES
+                     (5, 'a', 'INBOX', 1, '<1@x>', '<1@x>', 'Pancakes', 100),
+                     (6, 'a', 'INBOX', 2, '<2@x>', '<2@x>', 'Waffles', 200);
+                 INSERT INTO bodies (id, raw, text) VALUES (5, 'raw', 'all about pancakes');
+                 INSERT INTO fts (rowid, subject, people, body) VALUES (5, 'Pancakes', 'Ana', 'all about pancakes'), (6, 'Waffles', 'Bo', '');",
+            )
+            .unwrap();
+            let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE name = 'messages'", [], |r| r.get(0)).unwrap();
+            assert!(!sql.contains("AUTOINCREMENT"), "set up an old cache");
+        }
+        let s = Store::open(&db).unwrap();
+        let opened = s.thread(old_id, false).unwrap();
+        assert_eq!(opened[0].summary.subject, "Pancakes", "same ids");
+        assert!(opened[0].body.is_some(), "bodies survive the rebuild");
+        let hits = s.list(&View::Role { account: None, role: Role::Inbox }, &Query::parse("pancakes"), false, 10, &HashSet::new()).unwrap();
+        assert_eq!(hits.iter().map(|m| m.id).collect::<Vec<_>>(), vec![old_id], "search still finds it");
+        // The delete trigger is back: removing a message removes it from search.
+        s.remove_local(old_id).unwrap();
+        assert!(s.list(&View::Role { account: None, role: Role::Inbox }, &Query::parse("pancakes"), false, 10, &HashSet::new()).unwrap().is_empty());
+        s.remove_local(other).unwrap();
+        let next = s.upsert_header("a", "INBOX", 3, 0, 10, 0, &parsed("New", "<3@x>", "", "Cy <cy@x.com>", 3)).unwrap();
+        assert!(next > other, "ids not reused after the migration");
+        let indexes: i64 = s.conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages' AND name LIKE 'messages_%'", [], |r| r.get(0)).unwrap();
+        assert!(indexes >= 4, "indexes rebuilt ({indexes})");
+        let fk_on: i64 = s.conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk_on, 1, "foreign keys back on");
+        let dangling: i64 = s.conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(dangling, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
