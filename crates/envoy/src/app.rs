@@ -949,8 +949,8 @@ impl App {
             if self.list.iter().any(|s| s.id == row.id) {
                 continue;
             }
-            // Newest first, like the list.
-            let at = self.list.iter().position(|s| s.date < row.date).unwrap_or(self.list.len());
+            // Where the store will put it: newest first, then the newer id (store/list.rs ORDER).
+            let at = self.list.iter().position(|s| (s.date, s.id) < (row.date, row.id)).unwrap_or(self.list.len());
             self.list.insert(at, row.clone());
         }
         true
@@ -1535,6 +1535,24 @@ mod tests {
         app.close_message();
         app.apply(Event::List { req, items: all, more: false }, &mut tx);
         assert_eq!(app.open, None, "nothing opens by itself");
+    }
+
+    #[test]
+    fn undo_puts_same_second_rows_back_in_the_stores_order() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let mut tx = Tx::default();
+        // Same second: the store orders by id, newest first.
+        let row = app.list[0].clone();
+        app.list = (1..=3).rev().map(|id| Summary { id, date: 100, thread: format!("t{id}"), ..row.clone() }).collect();
+        app.open = Some(3);
+        app.archive(vec![3], &mut tx);
+        assert!(app.undo_last(&mut tx));
+        assert_eq!(app.list.iter().map(|m| m.id).collect::<Vec<_>>(), vec![3, 2, 1], "back where the store puts it");
+        assert_eq!(app.open, Some(3));
+        app.step(1, &mut tx);
+        assert_eq!(app.open, Some(2), "j goes on to the next row, before any refresh");
     }
 
     fn move_key(app: &App) -> i64 {
