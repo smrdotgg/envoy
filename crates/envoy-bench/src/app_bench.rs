@@ -12,6 +12,9 @@
 //! - Search, end to end: a search edit → the first frame showing its results.
 //! - Idle memory: the largest sample in the idle stretches the app names (after startup, and
 //!   after the presses and searches), over all runs.
+//!
+//! A run that crashes, exits badly, times out or reports the wrong number of steps or samples
+//! makes the affected checks INVALID, which always fails (see report::Outcome::Invalid).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,6 +29,14 @@ use crate::report::{Check, budget, p50_max, quantile};
 fn now_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
 }
+
+/// What the app's probe does per run (crates/envoy/src/bench.rs: `KEYS`, `SEARCHES`); a run
+/// that reports anything else is an invalid measurement.
+const KEYS: usize = 25;
+const SEARCHES: usize = 6;
+const IDLE_WINDOWS: &[&str] = &["startup", "after use"];
+/// Memory samples (every 100 ms) each 2 s idle window must hold to count.
+const MIN_IDLE_SAMPLES: usize = 5;
 
 struct Run {
     spawn_ns: u64,
@@ -67,9 +78,15 @@ fn one_run(home: &Path, bin: &Path, k: usize) -> Result<Run> {
     let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
     let tail: String = stderr.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
     let text = std::fs::read_to_string(&report_path).with_context(|| format!("the app wrote no report ({status}): {}\nstderr:\n{tail}", reason(&stderr)))?;
-    let report: Value = serde_json::from_str(&text)?;
+    let report: Value = serde_json::from_str(&text).context("the app's report isn't valid JSON")?;
     if let Some(e) = report.get("error").and_then(Value::as_str) {
         anyhow::bail!("{e} (window error: {})\nstderr:\n{tail}", report["window_error"]);
+    }
+    // A report is only trusted from a run that ended cleanly.
+    anyhow::ensure!(status.success(), "the app wrote a report but exited badly ({status}): {}\nstderr:\n{tail}", reason(&stderr));
+    for key in ["main_ns", "first_frame_ns", "first_list_ns"] {
+        let t = report[key].as_u64().with_context(|| format!("the app's report has no {key}"))?;
+        anyhow::ensure!(t >= spawn_ns, "the app's {key} is before it was started (clock skew?)");
     }
     Ok(Run { spawn_ns, report, samples })
 }
@@ -87,18 +104,22 @@ fn ms(a: u64, b: u64) -> f64 {
     (b.saturating_sub(a)) as f64 / 1e6
 }
 
-fn floats(runs: &[Run], list: &str, field: &str) -> (Vec<f64>, usize) {
+/// `field` from every entry of each run's `list`, or why the sample isn't valid: a run with the
+/// wrong number of entries, or entries without the value (a step that timed out).
+fn sample(runs: &[Run], list: &str, field: &str, per_run: usize, what: &str) -> Result<Vec<f64>, String> {
     let mut v = Vec::new();
-    let mut missing = 0;
-    for r in runs {
-        for x in r.report[list].as_array().into_iter().flatten() {
-            match x[field].as_f64() {
-                Some(f) => v.push(f),
-                None => missing += 1,
-            }
+    for (k, r) in runs.iter().enumerate() {
+        let entries = r.report[list].as_array().map_or(&[][..], |a| a.as_slice());
+        if entries.len() != per_run {
+            return Err(format!("run {} reported {} {what}, expected {per_run}", k + 1, entries.len()));
         }
+        let missing = entries.iter().filter(|x| x[field].as_f64().is_none()).count();
+        if missing > 0 {
+            return Err(format!("run {}: {missing} of {per_run} {what} never reached the screen (timed out after 3 s)", k + 1));
+        }
+        v.extend(entries.iter().filter_map(|x| x[field].as_f64()));
     }
-    (v, missing)
+    Ok(v)
 }
 
 pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin: f64, checks: &mut Vec<Check>) -> Result<()> {
@@ -123,7 +144,7 @@ pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin:
                     ("search, end to end", budget::SEARCH_MS, "ms"),
                     ("idle memory", budget::IDLE_MEMORY_MB, "MB"),
                 ] {
-                    checks.push(Check::skipped("app", name, Some(b), unit, format!("couldn't run the app: {short}")));
+                    checks.push(Check::invalid("app", name, Some(b), unit, format!("run {} of {runs} failed: {short}", k + 1)));
                 }
                 return Ok(());
             }
@@ -132,7 +153,7 @@ pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin:
 
     let margin_note = |m: f64| if m > 1.0 { format!("; gate ×{m:.1} on this runner") } else { String::new() };
 
-    // Cold start.
+    // Cold start (one_run made sure every run has its timestamps).
     let cold: Vec<f64> = done.iter().map(|r| ms(r.spawn_ns, r.report["first_list_ns"].as_u64().unwrap_or(0))).collect();
     let main: Vec<f64> = done.iter().map(|r| ms(r.spawn_ns, r.report["main_ns"].as_u64().unwrap_or(0))).collect();
     let first: Vec<f64> = done.iter().map(|r| ms(r.spawn_ns, r.report["first_frame_ns"].as_u64().unwrap_or(0))).collect();
@@ -161,26 +182,23 @@ pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin:
         format!("median: the cache's list arriving and drawn; that frame built in {:.1} ms, encoded in {:.1} ms", p50_max(&list_build).0, p50_max(&list_encode).0),
     ));
 
-    // Keypress → frame, and open end to end.
-    let (key, key_missing) = floats(&done, "keys", "frame_ms");
-    if key.is_empty() {
-        checks.push(Check::skipped("app", "keypress → frame", Some(budget::KEY_TO_FRAME_MS), "ms", "no key press produced a frame"));
-    } else {
-        let (k50, kmax) = p50_max(&key);
-        let k95 = quantile(&key, 0.95);
-        checks.push(Check::gated(
-            "app",
-            "keypress → frame",
-            k95,
-            "ms",
-            budget::KEY_TO_FRAME_MS,
-            wall_margin,
-            format!("p95 of {} presses of j (p50 {k50:.1}, max {kmax:.1}){}{}", key.len(), if key_missing > 0 { format!(", {key_missing} without a frame") } else { String::new() }, margin_note(wall_margin)),
-        ));
+    // Keypress → frame.
+    match sample(&done, "keys", "frame_ms", KEYS, "key presses") {
+        Err(why) => checks.push(Check::invalid("app", "keypress → frame", Some(budget::KEY_TO_FRAME_MS), "ms", why)),
+        Ok(key) => {
+            let (k50, kmax) = p50_max(&key);
+            checks.push(Check::gated(
+                "app",
+                "keypress → frame",
+                quantile(&key, 0.95),
+                "ms",
+                budget::KEY_TO_FRAME_MS,
+                wall_margin,
+                format!("p95 of {} presses of j (p50 {k50:.1}, max {kmax:.1}){}", key.len(), margin_note(wall_margin)),
+            ));
+        }
     }
-    let (build, _) = floats(&done, "keys", "frame_build_ms");
-    let (encode, _) = floats(&done, "keys", "frame_encode_ms");
-    if !build.is_empty() {
+    if let (Ok(build), Ok(encode)) = (sample(&done, "keys", "frame_build_ms", KEYS, "frame costs"), sample(&done, "keys", "frame_encode_ms", KEYS, "frame costs")) {
         checks.push(Check::info(
             "app",
             "  that frame's build (CPU)",
@@ -189,72 +207,75 @@ pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin:
             format!("p95 (p50 {:.1}): events, view, layout, paint; then encode+submit p50 {:.1} ms; the rest is waiting on the GPU, present and the event loop", p50_max(&build).0, p50_max(&encode).0),
         ));
     }
-    let (open, open_missing) = floats(&done, "keys", "done_ms");
-    if open.is_empty() {
-        checks.push(Check::skipped("app", "open message, end to end", Some(budget::OPEN_MS), "ms", "no opened message reached the screen"));
-    } else {
-        let (o50, omax) = p50_max(&open);
-        let o95 = quantile(&open, 0.95);
-        let mut c = Check::gated(
-            "app",
-            "open message, end to end",
-            o95,
-            "ms",
-            budget::OPEN_MS,
-            frame_margin,
-            format!("p95 of {}: key → frame with the conversation (p50 {o50:.1}, max {omax:.1}){}{}", open.len(), if open_missing > 0 { format!(", {open_missing} timed out") } else { String::new() }, margin_note(frame_margin)),
-        );
-        if open_missing > 0 {
-            c.outcome = crate::report::Outcome::Fail;
+
+    // Open end to end: the frame margin applies (it passes on real hardware).
+    match sample(&done, "keys", "done_ms", KEYS, "opened messages") {
+        Err(why) => checks.push(Check::invalid("app", "open message, end to end", Some(budget::OPEN_MS), "ms", why)),
+        Ok(open) => {
+            let (o50, omax) = p50_max(&open);
+            checks.push(Check::gated(
+                "app",
+                "open message, end to end",
+                quantile(&open, 0.95),
+                "ms",
+                budget::OPEN_MS,
+                frame_margin,
+                format!("p95 of {}: key → frame with the conversation (p50 {o50:.1}, max {omax:.1}){}", open.len(), margin_note(frame_margin)),
+            ));
         }
-        checks.push(c);
     }
-    let (search, search_missing) = floats(&done, "searches", "done_ms");
-    if search.is_empty() {
-        checks.push(Check::skipped("app", "search, end to end", Some(budget::SEARCH_MS), "ms", "no search result reached the screen"));
-    } else {
-        let (s50, smax) = p50_max(&search);
-        let s95 = quantile(&search, 0.95);
-        let mut c = Check::gated(
-            "app",
-            "search, end to end",
-            s95,
-            "ms",
-            budget::SEARCH_MS,
-            frame_margin,
-            format!("p95 of {}: edit → frame with results (p50 {s50:.1}, max {smax:.1}){}{}", search.len(), if search_missing > 0 { format!(", {search_missing} timed out") } else { String::new() }, margin_note(frame_margin)),
-        );
-        if search_missing > 0 {
-            c.outcome = crate::report::Outcome::Fail;
+    // Search end to end: no margin; it misses on real hardware today.
+    match sample(&done, "searches", "done_ms", SEARCHES, "searches") {
+        Err(why) => checks.push(Check::invalid("app", "search, end to end", Some(budget::SEARCH_MS), "ms", why)),
+        Ok(search) => {
+            let (s50, smax) = p50_max(&search);
+            checks.push(Check::gated(
+                "app",
+                "search, end to end",
+                quantile(&search, 0.95),
+                "ms",
+                budget::SEARCH_MS,
+                1.0,
+                format!("p95 of {}: edit → frame with results (p50 {s50:.1}, max {smax:.1})", search.len()),
+            ));
         }
-        checks.push(c);
     }
 
-    // Idle memory.
-    let mut worst: Option<(f64, String)> = None;
+    // Idle memory: every run must have both idle windows, each with enough samples.
     let mut details = Vec::new();
-    for name in ["startup", "after use"] {
+    let mut worst: Option<(f64, &str)> = None;
+    let mut problem = None;
+    for name in IDLE_WINDOWS {
         let mut peak = 0u64;
-        for r in &done {
-            for w in r.report["idle"].as_array().into_iter().flatten().filter(|w| w["name"] == name) {
-                let (a, b) = (w["start_ns"].as_u64().unwrap_or(0), w["end_ns"].as_u64().unwrap_or(0));
-                for &(t, bytes) in &r.samples {
-                    if t >= a && t <= b {
-                        peak = peak.max(bytes);
-                    }
-                }
+        for (k, r) in done.iter().enumerate() {
+            let windows: Vec<&Value> = r.report["idle"].as_array().into_iter().flatten().filter(|w| w["name"] == *name).collect();
+            if windows.len() != 1 {
+                problem.get_or_insert(format!("run {} reported {} \"{name}\" idle windows, expected 1", k + 1, windows.len()));
+                continue;
             }
+            let (a, b) = (windows[0]["start_ns"].as_u64().unwrap_or(0), windows[0]["end_ns"].as_u64().unwrap_or(0));
+            let inside: Vec<u64> = r.samples.iter().filter(|(t, _)| *t >= a && *t <= b).map(|s| s.1).collect();
+            if inside.len() < MIN_IDLE_SAMPLES {
+                problem.get_or_insert(format!(
+                    "run {}: {} {} samples in the \"{name}\" idle window, need {MIN_IDLE_SAMPLES} (couldn't read the process's memory?)",
+                    k + 1,
+                    inside.len(),
+                    mem::METRIC
+                ));
+                continue;
+            }
+            peak = peak.max(inside.into_iter().max().unwrap_or(0));
         }
-        if peak > 0 {
-            let mb = peak as f64 / 1e6;
-            details.push(format!("{name} {mb:.0} MB"));
-            if worst.as_ref().is_none_or(|w| mb > w.0) {
-                worst = Some((mb, name.to_string()));
-            }
+        let mb = peak as f64 / 1e6;
+        details.push(format!("{name} {mb:.0} MB"));
+        if worst.is_none_or(|w| mb > w.0) {
+            worst = Some((mb, name));
         }
     }
-    match worst {
-        Some((mb, name)) => {
+    match (problem, worst) {
+        (Some(why), _) => checks.push(Check::invalid("app", "idle memory", Some(budget::IDLE_MEMORY_MB), "MB", why)),
+        (None, None) => checks.push(Check::invalid("app", "idle memory", Some(budget::IDLE_MEMORY_MB), "MB", "no idle windows")),
+        (None, Some((mb, name))) => {
             let peak_all = done.iter().flat_map(|r| r.samples.iter().map(|s| s.1)).max().unwrap_or(0) as f64 / 1e6;
             checks.push(Check::gated(
                 "app",
@@ -266,7 +287,6 @@ pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin:
                 format!("{} at idle, worst ({name}) over {} runs: {}; peak while busy {peak_all:.0} MB", mem::METRIC, done.len(), details.join(", ")),
             ));
         }
-        None => checks.push(Check::skipped("app", "idle memory", Some(budget::IDLE_MEMORY_MB), "MB", format!("couldn't read the process's {} here", mem::METRIC))),
     }
     Ok(())
 }

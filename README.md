@@ -127,8 +127,10 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/flow.json --snap out.png --a
 Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent`.
 
 **Latency budgets** ([`docs/NORTH_STAR.md`](docs/NORTH_STAR.md)) are checked in CI on all three OSes
-against a generated 100k-message mailbox; each check prints measured vs budget and fails over budget
-(budgets missed today run in CI steps labelled KNOWN BUDGET MISS). To run them locally:
+against a generated 100k-message mailbox; each check prints measured vs budget and fails over budget.
+Checks that miss today are listed per OS in `crates/envoy-bench/known-misses.toml`, each with a
+ceiling it mustn't reach; one that starts passing raises a warning to remove its entry. To run
+them locally:
 
 ```sh
 cargo build --profile dist -p envoy -p envoy-bench
