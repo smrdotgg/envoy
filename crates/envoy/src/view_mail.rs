@@ -515,21 +515,53 @@ fn list_header(s: &App, t: &Theme) -> El {
         .child(text(sub).font(k.ty.text_xsmall).color(k.c.text_faint).pb(2.0).truncate().min_w(0.0).grow(1.0))
 }
 
+/// Everything outside a row's own message that its look depends on, hashed once a frame.
+fn rows_env(s: &App, t: &Theme) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (t.compact, t.dark, s.settings.str("appearance.accent"), s.settings.bool("inbox.showPreview"), s.settings.bool("inbox.showAvatars")).hash(&mut h);
+    (matches!(&s.view, View::Role { role: Role::Sent, .. }), s.settings.str("inbox.dateFormat"), chrono::Local::now().date_naive()).hash(&mut h);
+    h.finish()
+}
+
+/// A row's version for `memo`: what `list_row` shows of its message, whether it's selected,
+/// and `env`. A press of j changes two rows' versions, so only those two are built again.
+fn row_version(m: &Summary, selected: bool, env: u64) -> impl std::hash::Hash + '_ {
+    let to = m.to.first().map(|a| (a.name.as_str(), a.email.as_str()));
+    (
+        (m.id, m.flags, m.thread_unread, m.thread_count, m.date, m.has_attachments, selected, env),
+        (m.participants.as_str(), m.from.name.as_str(), m.from.email.as_str(), to, m.subject.as_str(), m.preview.as_str()),
+    )
+}
+
+/// Identifies the rows' keys, in order, so the list's keys are re-read only when they change.
+fn keys_version(list: &[Summary]) -> u64 {
+    list.iter().fold(0xcbf2_9ce4_8422_2325u64 ^ list.len() as u64, |h, m| (h ^ m.id as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
 pub fn message_list(s: &App, t: &Theme) -> El {
     let est = if t.compact { 36.0 } else if s.settings.bool("inbox.showPreview") { 78.0 } else { 60.0 };
     let body = if s.list.is_empty() {
         empty_list(s, t)
     } else {
         let theme = t.clone();
-        let version = (s.list_req, s.open, s.list.len(), t.compact);
+        let env = rows_env(s, t);
         col().key("list-scroll").scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(12.0).grow(1.0).min_h(0.0).w_full().child(
             col()
                 .key("rows")
                 .w_full()
                 .px(6.0)
                 .growth(GrowthSpec::default())
-                .virtual_rows(s.list.len(), est, |s: &App, i| Cow::Owned(row_key(s.list[i].id)), move |s: &App, i| list_row(s, i, &theme))
-                .virtual_rows_version(version),
+                .virtual_rows(
+                    s.list.len(),
+                    est,
+                    |s: &App, i| Cow::Owned(row_key(s.list[i].id)),
+                    move |s: &App, i| {
+                        let m = &s.list[i];
+                        rune::memo(row_key(m.id), row_version(m, s.open == Some(m.id), env), || list_row(s, i, &theme))
+                    },
+                )
+                .virtual_rows_version(keys_version(&s.list)),
         )
     };
     col().key("list-pane").w_full().h_full().min_h(0.0).child(list_header(s, t)).child(body)
