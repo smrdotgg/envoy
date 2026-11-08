@@ -141,7 +141,7 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
             out = out.child(images_bar(t, id, &m.summary.from.email));
         }
         if doc.fidelity.verdict() == Verdict::Poor && !s.layout_note_dismissed.contains(&id) {
-            out = out.child(layout_note(t, id));
+            out = out.child(layout_note(t, id, remote));
         }
         out = out.child(rendered);
         out = attachments(out, t, b, id);
@@ -231,9 +231,10 @@ fn images_bar(t: &Theme, id: i64, sender: &str) -> El {
 }
 
 /// A quiet line over mail the native renderer can't lay out as designed (positioned layers,
-/// CSS grid, drawings, embedded media: `html::Verdict::Poor`), offering the original. Opening
-/// it is the user's choice; nothing loads until they do. Dismissed per message.
-fn layout_note(t: &Theme, id: i64) -> El {
+/// CSS grid, drawings, embedded media: `html::Verdict::Poor`), offering it in the browser,
+/// sanitized: nothing in it runs, and remote pictures load only if they would here
+/// (`remote`). Opening it is the user's choice. Dismissed per message.
+fn layout_note(t: &Theme, id: i64, remote: bool) -> El {
     let k = &t.k;
     row()
         .key(format!("layout-note-{id}"))
@@ -251,7 +252,7 @@ fn layout_note(t: &Theme, id: i64) -> El {
             Button::new("Open in browser")
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
-                .on_press(move |s: &mut App| s.send(Command::OpenOriginal { id }))
+                .on_press(move |s: &mut App| s.send(Command::OpenInBrowser { id, remote_images: remote }))
                 .build(k)
                 .key(format!("layout-note-open-{id}")),
         )

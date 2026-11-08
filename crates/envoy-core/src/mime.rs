@@ -389,6 +389,29 @@ fn tidy_markdown(md: &str) -> String {
     fixed.trim().to_owned()
 }
 
+/// A message's HTML made safe to open in a browser ([`crate::html::export`]): scripts,
+/// handlers, refreshes, frames and forms removed, a strict Content-Security-Policy, no
+/// referrer, remote pictures only with `remote_images`, and the message's own (`cid:`)
+/// pictures embedded as `data:` URIs read from `raw`.
+pub fn browser_html(html: &str, raw: Option<&[u8]>, remote_images: bool) -> String {
+    use base64::Engine as _;
+    let msg = raw.and_then(|r| MessageParser::default().parse(r));
+    let mut budget: usize = 32 << 20;
+    crate::html::export(html, remote_images, &mut |cid| {
+        let want = cid.get(4..)?.trim().trim_matches(|c| c == '<' || c == '>');
+        let part = msg.as_ref()?.parts.iter().find(|p| p.content_id().is_some_and(|id| id.trim_matches(|c| c == '<' || c == '>') == want))?;
+        let bytes = part.contents();
+        // Pictures only (the format read from the bytes, not the part's claimed type), and
+        // not without end.
+        let mime = image::guess_format(bytes).ok()?.to_mime_type();
+        if !mime.starts_with("image/") || bytes.len() > budget {
+            return None;
+        }
+        budget -= bytes.len();
+        Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+    })
+}
+
 /// The bytes of the inline part with this Content-ID (`cid:` images in HTML mail).
 pub fn inline_part(raw: &[u8], cid: &str) -> Option<Vec<u8>> {
     let msg = MessageParser::default().parse(raw)?;
@@ -401,6 +424,20 @@ mod tests {
     use super::*;
 
     const RAW: &[u8] = b"From: Ana Lima <ana@example.com>\r\nTo: me@example.com\r\nSubject: Lunch?\r\nMessage-ID: <b@x>\r\nIn-Reply-To: <a@x>\r\nReferences: <root@x> <a@x>\r\nDate: Tue, 3 Mar 2026 10:00:00 +0000\r\nContent-Type: text/plain\r\n\r\nAre you free at noon?\r\n\r\nOn Mon, Bo wrote:\r\n> hi\r\n";
+
+    #[test]
+    fn browser_html_is_sanitized_and_carries_its_own_pictures() {
+        let raw = b"From: Shop <news@shop.example>\r\nTo: me@example.com\r\nSubject: Sale\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=b\r\n\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Sale</p>\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <logo@shop>\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\r\n--b\r\nContent-Type: text/plain\r\nContent-ID: <note@shop>\r\n\r\n<script>alert(1)</script>\r\n--b--\r\n";
+        let html = r#"<meta http-equiv="refresh" content="0;url=https://t.example"><script>alert(1)</script><p onclick="x()">Sale <img src="cid:logo@shop"> <img src="CID:note@shop"> <img src="https://t.example/open.gif"></p>"#;
+        let out = browser_html(html, Some(raw), false);
+        assert!(out.contains(r#"src="data:image/png;base64,iVBORw0KGgo"#), "{out}");
+        for bad in ["<script", "onclick", "refresh", "t.example", "cid:", "CID:", "text/plain"] {
+            assert!(!out.contains(bad), "{bad} survived:\n{out}");
+        }
+        assert!(out.contains("Content-Security-Policy") && out.contains("img-src data:;"));
+        let allowed = browser_html(html, Some(raw), true);
+        assert!(allowed.contains("https://t.example/open.gif") && allowed.contains("img-src data: https: http:;"));
+    }
 
     #[test]
     fn parses_headers_and_threads() {

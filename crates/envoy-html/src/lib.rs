@@ -14,6 +14,7 @@
 //! (`[profile.dist.package]`); envoy-core re-exports it as `envoy_core::html`.
 
 mod css;
+mod export;
 mod fidelity;
 mod table;
 
@@ -23,6 +24,7 @@ use std::rc::Rc;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 
+pub use export::export;
 pub use fidelity::{Fidelity, Issue, Verdict};
 
 use css::{Elem, NONE, Sheet, Styles, get as style};
