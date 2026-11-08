@@ -14,11 +14,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::mime::{self, Parsed};
 use crate::model::{Address, Attachment, Body, Mailbox, MessageId, Role, Summary, ThreadMessage, View, flags};
+
+mod list;
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -57,7 +59,6 @@ CREATE TABLE IF NOT EXISTS messages (
     held_op INTEGER NOT NULL DEFAULT 0,
     UNIQUE (account, mailbox, uid)
 );
-CREATE INDEX IF NOT EXISTS messages_box_date ON messages (account, mailbox, date DESC);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages (account, thread);
 CREATE INDEX IF NOT EXISTS messages_flagged ON messages (flags) WHERE flags & 2;
 CREATE TABLE IF NOT EXISTS bodies (
@@ -100,7 +101,13 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
 ];
 
 /// Indexes on migrated columns (they must exist first).
+///
+/// `messages_list` is what [`Store::list`] scans: a mailbox newest first, with every column
+/// grouping and the common filters read, so a scan never touches the table (whose rows carry
+/// recipients and previews). It replaces `messages_box_date`, its first three columns.
 const POST_MIGRATION: &str = "
+DROP INDEX IF EXISTS messages_box_date;
+CREATE INDEX IF NOT EXISTS messages_list ON messages (account, mailbox, date DESC, flags, held_op, has_attachments, thread, message_id, from_email, from_name);
 CREATE INDEX IF NOT EXISTS messages_held ON messages (held_op) WHERE held_op != 0;
 CREATE INDEX IF NOT EXISTS messages_held_box ON messages (account, mailbox, flags, held_op) WHERE held_op != 0;
 CREATE INDEX IF NOT EXISTS ops_batch ON ops (batch) WHERE batch != 0;
@@ -714,9 +721,37 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The list for a view, newest first. With `conversations`, one row per conversation.
+    /// The list for a view, newest first, at most `limit` rows. With `conversations`, one row
+    /// per conversation: its newest message that matches, counting the conversation's matching
+    /// messages, their unread state and senders. See list.rs for how it stays fast.
     pub fn list(&self, view: &View, query: &Query, conversations: bool, limit: u32, me: &HashSet<String>) -> Result<Vec<Summary>> {
+        self.list_rows(view, query, conversations, limit, me, 0, &mut |_| {})
+    }
+
+    /// [`Store::list`], handing `first` its first `page` rows as soon as they're known, before
+    /// the rest is read, when there are more: a long list shows its top at once (law 1 of
+    /// docs/NORTH_STAR.md: what can't meet the budget streams in). Those rows are final: the
+    /// same as the first `page` of the list returned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_paged(
+        &self,
+        view: &View,
+        query: &Query,
+        conversations: bool,
+        limit: u32,
+        me: &HashSet<String>,
+        page: u32,
+        first: &mut dyn FnMut(Vec<Summary>),
+    ) -> Result<Vec<Summary>> {
+        self.list_rows(view, query, conversations, limit, me, page, first)
+    }
+
+    /// The list as it was read before list.rs: every match up to 4 × `limit` read in full and
+    /// grouped in Rust. Kept to check list.rs against.
+    #[cfg(test)]
+    fn list_reference(&self, view: &View, query: &Query, conversations: bool, limit: u32, me: &HashSet<String>) -> Result<Vec<Summary>> {
         let mut conds: Vec<String> = vec!["m.flags & 16 = 0".into(), "m.held_op = 0".into()];
+        use rusqlite::{params_from_iter, types::Value as SqlValue};
         let mut args: Vec<SqlValue> = Vec::new();
         match view {
             View::Mailbox { account, mailbox } => {
@@ -1118,6 +1153,143 @@ mod tests {
 
     fn send_op() -> Op {
         Op::Send { raw_b64: String::new(), from: "me@x.com".into(), to: vec!["you@x.com".into()], sent_mailbox: None, reply_of: None }
+    }
+
+    /// A mailbox with every shape `list` has to get right: two accounts, conversations of up to
+    /// seven messages across Inbox, Archive and Sent, the same message in two mailboxes (Gmail
+    /// labels), held and deleted messages, unread, starred and attachments, and full text.
+    fn varied_store() -> Store {
+        let s = Store::memory();
+        for a in ["a", "b"] {
+            s.upsert_mailbox(a, "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+            s.upsert_mailbox(a, "Archive", "Archive", Role::Archive, "/", true).unwrap();
+            s.upsert_mailbox(a, "Sent", "Sent", Role::Sent, "/", true).unwrap();
+            s.upsert_mailbox(a, "Trash", "Trash", Role::Trash, "/", true).unwrap();
+            s.upsert_mailbox(a, "Label", "Label", Role::Other, "/", true).unwrap();
+        }
+        let people = ["Ana Lima <ana@x.com>", "Bo Chen <bo@y.org>", "Cy <cy@x.com>", "me@me.test", "Dee Okafor <dee@z.net>"];
+        let words = ["pancakes", "plans", "invoice", "meeting", "parcel", "budget", "photos", "picnic"];
+        let mut rng = 7u64;
+        let mut next = move |n: u64| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) % n
+        };
+        let mut uid = 0u32;
+        let mut threads: Vec<(String, String, u32)> = Vec::new(); // (account, root mid, size)
+        for i in 0..700u32 {
+            let account = if next(5) == 0 { "b" } else { "a" };
+            let reply = !threads.is_empty() && next(3) == 0;
+            let (root, refs) = if reply {
+                let k = next(threads.len() as u64) as usize;
+                let t = &mut threads[k];
+                t.2 += 1;
+                (t.1.clone(), t.1.clone())
+            } else {
+                (format!("<m{i}@x>"), String::new())
+            };
+            let account = if reply { threads.iter().find(|t| t.1 == root).map_or(account, |t| if t.0 == "a" { "a" } else { "b" }) } else { account };
+            if !reply {
+                threads.push((account.to_owned(), root.clone(), 1));
+            }
+            let from = people[next(people.len() as u64) as usize];
+            let to = people[next(people.len() as u64) as usize];
+            let (w1, w2) = (words[next(words.len() as u64) as usize], words[next(words.len() as u64) as usize]);
+            let date = chrono::DateTime::from_timestamp(1_700_000_000 + i as i64 * 600, 0).unwrap().to_rfc2822();
+            let mid = format!("<m{i}@x>");
+            let raw = format!(
+                "From: {from}\r\nTo: {to}\r\nSubject: {}{w1} {i}\r\nMessage-ID: {mid}\r\nReferences: {refs}\r\nDate: {date}\r\n\r\nabout the {w2}\r\n",
+                if reply { "Re: " } else { "" }
+            );
+            let p = mime::parse(raw.as_bytes(), false).unwrap();
+            let mailbox = match next(10) {
+                0..=4 => "INBOX",
+                5..=7 => "Archive",
+                8 => "Sent",
+                _ => "Trash",
+            };
+            let mut fl = 0;
+            if next(3) != 0 {
+                fl |= flags::SEEN;
+            }
+            if next(6) == 0 {
+                fl |= flags::FLAGGED;
+            }
+            if next(40) == 0 {
+                fl |= flags::DELETED;
+            }
+            uid += 1;
+            let id = s.upsert_header(account, mailbox, uid, fl, 10, 0, &p).unwrap();
+            if next(4) != 0 {
+                s.set_body(id, raw.as_bytes(), &p).unwrap();
+            }
+            if next(30) == 0 {
+                s.hide_local(id, 1000 + i as i64).unwrap();
+            }
+            // The same message under a label too, a second later so the order is defined.
+            if next(8) == 0 {
+                let date = chrono::DateTime::from_timestamp(1_700_000_001 + i as i64 * 600, 0).unwrap().to_rfc2822();
+                let raw = raw.replacen(&format!("Date: {}", chrono::DateTime::from_timestamp(1_700_000_000 + i as i64 * 600, 0).unwrap().to_rfc2822()), &format!("Date: {date}"), 1);
+                let p = mime::parse(raw.as_bytes(), false).unwrap();
+                uid += 1;
+                s.upsert_header(account, "Label", uid, fl & !flags::DELETED, 10, 0, &p).unwrap();
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn list_matches_the_reference_for_every_view_and_query() {
+        let s = varied_store();
+        let me: HashSet<String> = ["me@me.test".to_owned()].into();
+        let views = [
+            View::Role { account: None, role: Role::Inbox },
+            View::Role { account: Some("b".into()), role: Role::Inbox },
+            View::Role { account: None, role: Role::Archive },
+            View::Role { account: None, role: Role::Other },
+            View::Mailbox { account: "a".into(), mailbox: "INBOX".into() },
+            View::Mailbox { account: "a".into(), mailbox: "Trash".into() },
+            View::Starred { account: None },
+            View::Starred { account: Some("b".into()) },
+            View::Role { account: None, role: Role::Junk },
+        ];
+        let queries = [
+            "", "p", "pa", "pancakes", "plans p", "meeting", "zzz", "from:", "from:a", "from:ana", "from:LIMA", "to:bo", "subject:re", "subject:", "is:unread",
+            "is:read", "is:starred", "has:attachment", "from:ana is:unread", "re picnic", "to: from:c",
+        ];
+        let mut compared = 0;
+        for view in &views {
+            for q in queries {
+                let query = Query::parse(q);
+                for conversations in [true, false] {
+                    for limit in [1, 7, 40, 1000] {
+                        let got = s.list(view, &query, conversations, limit, &me).unwrap();
+                        // Without conversations the reference read `limit` rows and then dropped
+                        // duplicates, coming up short when a labelled message was among them;
+                        // list() fills `limit` with distinct messages.
+                        let want = if conversations {
+                            s.list_reference(view, &query, true, limit, &me).unwrap()
+                        } else {
+                            let mut all = s.list_reference(view, &query, false, 100_000, &me).unwrap();
+                            all.truncate(limit as usize);
+                            all
+                        };
+                        assert_eq!(got, want, "{view:?} {q:?} conversations={conversations} limit={limit}");
+                        // Paged: the first page comes first, and is the list's top.
+                        let mut firsts = Vec::new();
+                        let paged = s.list_paged(view, &query, conversations, limit, &me, 3, &mut |rows| firsts.push(rows)).unwrap();
+                        assert_eq!(paged, want, "paged {view:?} {q:?} conversations={conversations} limit={limit}");
+                        assert!(firsts.len() <= 1);
+                        if let Some(first) = firsts.first() {
+                            assert_eq!(first[..], want[..3], "first page {view:?} {q:?} conversations={conversations} limit={limit}");
+                        } else {
+                            assert!(limit <= 3 || want.len() <= 3, "a long list hands out its first page: {view:?} {q:?} {limit}");
+                        }
+                        compared += got.len();
+                    }
+                }
+            }
+        }
+        assert!(compared > 10_000, "the cases cover real lists ({compared} rows)");
     }
 
     #[test]
