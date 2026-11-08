@@ -665,11 +665,19 @@ async fn append_uid(session: &mut async_imap::Session<impl Io>, mailbox: &str, f
 }
 
 /// Deletes a draft's copies from `mailbox`: the one on record, `known` (`(UIDVALIDITY, UID)`),
-/// and any others the Message-ID search finds (headers checked). Returns their UIDs.
-pub async fn purge_message_id(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, message_id: &str, known: Option<(u32, u32)>) -> Result<Vec<u32>> {
+/// and, with `search`, any others the Message-ID search finds (headers checked). Returns their
+/// UIDs.
+pub async fn purge_message_id(
+    session: &mut async_imap::Session<impl Io>,
+    caps: Caps,
+    mailbox: &str,
+    message_id: &str,
+    known: Option<(u32, u32)>,
+    search: bool,
+) -> Result<Vec<u32>> {
     let selected = timed("SELECT", session.select(mailbox)).await??;
     let validity = selected.uid_validity.unwrap_or(0);
-    let mut uids = uids_with_message_id(session, message_id).await?;
+    let mut uids = if search { uids_with_message_id(session, message_id).await? } else { Vec::new() };
     uids.extend(known.filter(|(v, _)| *v == validity && validity != 0).map(|(_, uid)| uid));
     uids.sort_unstable();
     uids.dedup();
@@ -946,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn a_purge_deletes_the_known_copy_and_any_found() {
         let (mut s, log) = fake::session(drafts_server("8", &[(8, "<d@envoy>")])).await;
-        assert_eq!(purge_message_id(&mut s, caps(true), "Drafts", "<d@envoy>", Some((7, 5))).await.unwrap(), vec![5, 8]);
+        assert_eq!(purge_message_id(&mut s, caps(true), "Drafts", "<d@envoy>", Some((7, 5)), true).await.unwrap(), vec![5, 8]);
         assert_eq!(commands(&log).last().map(String::as_str), Some("UID EXPUNGE 5,8"));
     }
 

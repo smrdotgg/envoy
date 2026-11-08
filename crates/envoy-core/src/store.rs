@@ -107,7 +107,9 @@ CREATE TABLE IF NOT EXISTS drafts (
     server_validity INTEGER NOT NULL DEFAULT 0,
     server_uid INTEGER NOT NULL DEFAULT 0,
     unconfirmed INTEGER NOT NULL DEFAULT 0,
-    sent INTEGER NOT NULL DEFAULT 0
+    sent INTEGER NOT NULL DEFAULT 0,
+    server_account TEXT NOT NULL DEFAULT '',
+    upload_gen INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS draft_files (
     draft INTEGER NOT NULL,
@@ -138,6 +140,10 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("drafts", "unconfirmed", "ALTER TABLE drafts ADD COLUMN unconfirmed INTEGER NOT NULL DEFAULT 0"),
     // Sent: whatever happens to its cleanup, it never shows again.
     ("drafts", "sent", "ALTER TABLE drafts ADD COLUMN sent INTEGER NOT NULL DEFAULT 0"),
+    // Whose server the copy on record is on, and which round of uploads it came from: an
+    // upload that finishes after the draft moved to another account is fenced off.
+    ("drafts", "server_account", "ALTER TABLE drafts ADD COLUMN server_account TEXT NOT NULL DEFAULT ''"),
+    ("drafts", "upload_gen", "ALTER TABLE drafts ADD COLUMN upload_gen INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Indexes on migrated columns (they must exist first).
@@ -311,9 +317,18 @@ pub enum Op {
     /// Put a local draft's newest version in the Drafts mailbox, replacing the copies before
     /// it. Reads the draft when it runs, so one op covers any number of edits.
     SaveDraft { draft: i64 },
-    /// Delete every copy of a draft from the Drafts mailbox (by its Message-ID), then the
-    /// local draft, if given, once it's no longer wanted (sent or discarded).
-    PurgeDraft { message_id: String, draft: Option<i64> },
+    /// Delete a draft's copies from the Drafts mailbox, then the local draft, if given, once
+    /// it's no longer wanted (sent or discarded). The copies are the draft's copy on record and
+    /// `copy` (`(mailbox, UIDVALIDITY, UID)`), and, unless `exact`, any others with its
+    /// Message-ID. Without a draft, it cleans up after one that moved to another account.
+    PurgeDraft {
+        message_id: String,
+        draft: Option<i64>,
+        #[serde(default)]
+        copy: Option<(String, u32, u32)>,
+        #[serde(default)]
+        exact: bool,
+    },
 }
 
 /// What [`Store::undo_batch`] managed.
