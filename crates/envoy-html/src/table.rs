@@ -130,9 +130,19 @@ pub fn resolve(n: usize, claims: &[Claim], width: f32, declared: bool) -> Column
 
 /// (narrowest, widest) a run of nodes can be laid out, in points.
 pub fn estimate(nodes: &[Node]) -> (f32, f32) {
+    estimate_capped(nodes, f32::INFINITY)
+}
+
+/// [`estimate`], stopping early once the widest passes `cap` (a big subtree needn't be walked
+/// to learn it's too wide to shrink to).
+pub fn estimate_capped(nodes: &[Node], cap: f32) -> (f32, f32) {
+    let estimate = |n: &[Node]| estimate_capped(n, cap);
     let mut lo: f32 = 0.0;
     let mut hi: f32 = 0.0;
     for n in nodes {
+        if hi > cap {
+            break;
+        }
         let (a, b) = match n {
             Node::Para(p) => {
                 let mut longest_word: f32 = 0.0;
