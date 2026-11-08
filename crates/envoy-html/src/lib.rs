@@ -457,6 +457,7 @@ fn parse_unguarded(html: &str) -> Doc {
     }
     let lead = nodes.iter().take_while(|n| matches!(n, Node::Blank(_) | Node::Space(_))).count();
     nodes.drain(..lead);
+    collect_images(&mut nodes, &mut b.doc.images, 0);
     b.doc.nodes = nodes;
     let stats = &b.sheet.stats;
     b.doc.fidelity.note_n(Issue::BadSelector, stats.bad_selectors);
@@ -917,6 +918,13 @@ fn box_style(h: &Handle, t: &str, st: &[(Rc<str>, Rc<str>)], ctx: &mut Ctx, cell
         && let Some(u) = attr(h, "background").map(|u| u.trim().to_owned()).filter(|u| usable_src(u))
     {
         b.bg_image = Some(u);
+    }
+    // A picture behind a box a few pixels across is a tracking pixel, as for `<img>`.
+    if b.bg_image.is_some() {
+        let side = |a: &str, k: &str| style(st, k).and_then(|v| length(v, size)).or_else(|| attr(h, a).and_then(|v| v.trim().trim_end_matches("px").trim().parse::<f32>().ok()));
+        if side("width", "width").is_some_and(|w| w <= 3.0) || side("height", "height").is_some_and(|v| v <= 3.0) {
+            b.bg_image = None;
+        }
     }
     for (i, k) in PADDING.iter().enumerate() {
         b.pad[i] = style(st, k).and_then(|v| length(v, size)).unwrap_or(cellpadding).clamp(0.0, 80.0);
@@ -1515,22 +1523,11 @@ impl Builder {
             return;
         }
         flush(out, para);
-        if !self.doc.images.contains(&src) {
-            self.doc.images.push(src.clone());
-        }
         let img = Node::Image(Img { src, alt: attr(h, "alt").unwrap_or_default().trim().to_owned(), width, height, href: ctx.href.clone() });
         if style(st, "margin-left") == Some("auto") && style(st, "margin-right") == Some("auto") && ctx.align != Align::Center {
             out.push(Node::Box { style: BoxStyle { align: Align::Center, ..BoxStyle::default() }, children: vec![img] });
         } else {
             out.push(img);
-        }
-    }
-
-    fn note_image(&mut self, s: &BoxStyle) {
-        if let Some(u) = &s.bg_image
-            && !self.doc.images.contains(u)
-        {
-            self.doc.images.push(u.clone());
         }
     }
 
@@ -1560,7 +1557,6 @@ impl Builder {
             ctx.align = saved;
             tstyle.align = saved;
         }
-        self.note_image(&tstyle);
         let declared = tstyle.width.is_some();
         let twidth = (match tstyle.width {
             Some(Len::Px(w)) => w,
@@ -1610,7 +1606,6 @@ impl Builder {
             let mut rctx = ctx.clone();
             text_style(r, "tr", &rst, &mut rctx);
             let row_style = box_style(r, "tr", &rst, &mut rctx, 0.0);
-            self.note_image(&row_style);
             let cell_handles: Vec<Handle> = r.children.borrow().iter().filter(|c| matches!(tag(c).as_deref(), Some("td" | "th"))).cloned().collect();
             // Cells all set to `display: block` (vertical menus) stack: each is a row of its own.
             let stacked = cell_handles.len() > 1
@@ -1646,7 +1641,6 @@ impl Builder {
                 if border_attr && bs.border.is_none() {
                     bs.border = Some(Border { widths: [1.0; 4], color: [160, 160, 160, 255], dashed: false });
                 }
-                self.note_image(&bs);
                 let decl = bs.width;
                 cctx.avail = (match decl {
                     Some(Len::Px(w)) => w.min(twidth),
@@ -1871,6 +1865,50 @@ fn line_px(ctx: &Ctx) -> f32 {
         None => (size * 1.45).round(),
     }
     .clamp(1.0, 48.0)
+}
+
+/// Every picture the finished tree draws, in order and once each: `<img>` sources, and
+/// background pictures of boxes and cells that hold something (an empty box draws no
+/// picture; its background is dropped). This list is what the reader may fetch.
+fn collect_images(nodes: &mut [Node], out: &mut Vec<String>, depth: usize) {
+    let add = |u: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|x| x == u) {
+            out.push(u.to_owned());
+        }
+    };
+    let boxed = |style: &mut BoxStyle, kids: &mut [Node], out: &mut Vec<String>| {
+        if kids.is_empty() {
+            style.bg_image = None;
+        }
+        if let Some(u) = &style.bg_image {
+            add(u, out);
+        }
+        if depth < MAX_DEPTH * 4 {
+            collect_images(kids, out, depth + 1);
+        }
+    };
+    for n in nodes {
+        match n {
+            Node::Image(img) => {
+                if !out.contains(&img.src) {
+                    out.push(img.src.clone());
+                }
+            }
+            Node::Box { style, children } => boxed(style, children, out),
+            Node::Row { cells, .. } | Node::Columns { cells, .. } => {
+                for (style, kids) in cells {
+                    boxed(style, kids, out);
+                }
+            }
+            Node::List { items, .. } => {
+                for it in items {
+                    collect_images(it, out, depth + 1);
+                }
+            }
+            Node::Quote(kids) => collect_images(kids, out, depth + 1),
+            Node::Para(_) | Node::Rule | Node::Space(_) | Node::Blank(_) | Node::Pre(_) => {}
+        }
+    }
 }
 
 /// A box placed in its parent (`margin: 0 auto`, `<table align>`) when it's narrower.
@@ -2194,4 +2232,29 @@ mod tests {
         assert_eq!(plain(&doc), "Hello");
     }
 
+    #[test]
+    fn tiny_or_empty_backgrounds_are_not_fetched() {
+        // A 1×1 cell or box with a background picture is a tracking pixel; a box with nothing
+        // in it draws no picture. Neither may reach `doc.images`, which the reader fetches.
+        let doc = parse(
+            r#"<table><tr><td width="1" height="1" background="https://tracker.example/open"></td><td>Hi</td></tr></table>
+               <div style="width:1px;height:1px;background:url(https://tracker.example/css)">x</div>
+               <table><tr><td style="height:2px" background="https://tracker.example/short">y</td></tr></table>
+               <div style="background:url(https://img.example/empty.jpg)"></div>
+               <img src="https://tracker.example/pixel.gif" width="1" height="1">"#,
+        );
+        assert!(doc.images.iter().all(|u| !u.contains("tracker.example") && !u.contains("empty")), "{:?}", doc.images);
+    }
+
+    #[test]
+    fn block_backgrounds_are_fetched_like_table_ones() {
+        // `<div>` backgrounds were drawn only when fetched, and only table paths asked for them.
+        let doc = parse(
+            r#"<style>.hero { background-image: url(https://img.example/hero.jpg) }</style>
+               <div class="hero"><p>Spring sale</p></div>
+               <table><tr><td background="https://img.example/cell.jpg">In a cell</td></tr></table>
+               <img src="cid:logo@x" width="80" height="20">"#,
+        );
+        assert_eq!(doc.images, ["https://img.example/hero.jpg", "https://img.example/cell.jpg", "cid:logo@x"]);
+    }
 }

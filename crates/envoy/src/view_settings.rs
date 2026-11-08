@@ -230,6 +230,23 @@ fn control(s: &App, t: &Theme, d: &'static SettingDef, layer: &mut Vec<El>) -> E
                 TextInput::new(&edit).label(d.title).width(Some(320.0)).on_edit(edit_access(key, current)).on_change(on_change).build(k).key(format!("field-{key}"))
             }
         }
+        Kind::List => {
+            // One entry per line; saved as a JSON array.
+            let current = v.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+            let edit = s.settings_ui.edits.get(key).cloned().unwrap_or_else(|| TextEdit::new(current.clone()));
+            TextArea::new(&edit)
+                .label(d.title)
+                .rows(4)
+                .width(Some(320.0))
+                .on_edit(edit_access(key, current))
+                .on_change(move |s: &mut App, _: &mut Tx| {
+                    let text = s.settings_ui.edits.get(key).map(|e| e.text.clone()).unwrap_or_default();
+                    let items: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                    s.set_setting(key, json!(items));
+                })
+                .build(k)
+                .key(format!("field-{key}"))
+        }
         Kind::Keybinding => {
             let current = v.as_str().unwrap_or_default().to_owned();
             let edit = s.settings_ui.edits.get(key).cloned().unwrap_or_else(|| TextEdit::new(current.clone()));

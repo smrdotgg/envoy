@@ -49,6 +49,7 @@ icon!(EXTERNAL, "external", r#"<path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path 
 icon!(DOWNLOAD, "download", r#"<path d="M12 4v11"/><path d="M7 10.5l5 5 5-5"/><path d="M4 20h16"/>"#);
 icon!(OFFLINE, "offline", r#"<path d="M3 3l18 18"/><path d="M8.5 5.6A8 8 0 0 1 19 13.5"/><path d="M5.6 8.5A8 8 0 0 0 5 18h12"/>"#);
 icon!(CHECK, "check", r#"<path d="M5 12.5l4.5 4.5L19 7.5"/>"#);
+icon!(IMAGE, "image", r#"<rect x="3" y="4.5" width="18" height="15" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="M21 15.5l-5-5L5 19.5"/>"#);
 icon!(ALERT, "alert", r#"<path d="M12 4L2.5 20h19z"/><path d="M12 10v4"/><path d="M12 17h.01"/>"#);
 icon!(USER, "user", r#"<circle cx="12" cy="8" r="4"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/>"#);
 icon!(LAYERS, "layers", r#"<path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/>"#);
