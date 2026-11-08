@@ -148,6 +148,8 @@ pub struct MovedAway {
     pub rows: Vec<Summary>,
     /// The open message, if it was one of them.
     pub open: Option<MessageId>,
+    /// A composer that closed because its draft was among them.
+    pub compose: Option<Box<Compose>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -550,6 +552,7 @@ impl App {
             }
             Event::Held { .. } => {}
             Event::DraftOpened { id, draft, restored, notice } => self.show_draft(id, draft, restored, notice),
+            Event::DraftDiscarded { id, undo } => self.draft_discarded(id, undo),
         }
         reload
     }
@@ -937,7 +940,8 @@ impl App {
     }
 
     pub fn archive(&mut self, ids: Vec<MessageId>, tx: &mut Tx) {
-        if ids.is_empty() {
+        // Drafts aren't archived (they're discarded, or sent).
+        if ids.is_empty() || ids.iter().all(|id| self.is_draft_row(*id)) {
             return;
         }
         let label = if ids.len() == 1 { "Archived".to_owned() } else { format!("Archived {}", ids.len()) };
@@ -999,6 +1003,7 @@ impl App {
             query: self.applied_query.clone(),
             rows: self.list.iter().filter(|s| ids.contains(&s.id)).cloned().collect(),
             open: self.open.filter(|o| ids.contains(o)),
+            compose: None,
         }
     }
 
@@ -1036,8 +1041,11 @@ impl App {
 
     /// Puts moved messages back where they were, right away; the engine restores its copy
     /// and the reload that follows confirms it.
-    fn restore(&mut self, m: MovedAway, tx: &mut Tx) {
+    fn restore(&mut self, mut m: MovedAway, tx: &mut Tx) {
         self.send(Command::UndoMove { undo: m.key });
+        if let Some(c) = m.compose.take() {
+            self.reopen(*c);
+        }
         if !self.restore_rows(&m) {
             return;
         }
@@ -1068,11 +1076,64 @@ impl App {
         if ids.is_empty() {
             return;
         }
+        // Drafts are discarded (Undo stands in for the confirmation).
+        if ids.iter().all(|id| self.is_draft_row(*id)) {
+            self.discard_rows(ids, tx);
+            return;
+        }
         if self.settings.bool("behavior.confirmDelete") {
             self.confirm_delete = Some(ids);
             return;
         }
         self.delete_now(ids, tx);
+    }
+
+    /// Deletes rows of a Drafts list: their drafts are discarded here and on the server (a draft
+    /// only the server has goes to Trash), off the list at once, with Undo. The composer's own
+    /// draft is discarded as the composer.
+    fn discard_rows(&mut self, ids: Vec<MessageId>, tx: &mut Tx) {
+        let mine = self.compose.as_ref().map(|c| envoy_core::drafts::list_id(c.draft_id));
+        let (open, rows): (Vec<MessageId>, Vec<MessageId>) = ids.into_iter().partition(|id| Some(*id) == mine);
+        if !open.is_empty() {
+            self.discard_compose(tx);
+        }
+        if rows.is_empty() {
+            return;
+        }
+        let window = self.settings.u32("behavior.undoSeconds");
+        let key = (window > 0).then(|| self.next_stamp());
+        let snapshot = key.map(|key| self.snapshot(key, &rows));
+        for row in &rows {
+            self.send(Command::DiscardDraftRow { row: *row, undo: key });
+        }
+        self.after_remove(&rows, tx);
+        let label = if rows.len() == 1 { "Draft discarded".to_owned() } else { format!("{} drafts discarded", rows.len()) };
+        let Some(snapshot) = snapshot else {
+            self.toast(label, false);
+            return;
+        };
+        self.toast_seq += 1;
+        self.toasts.push(Toast { id: self.toast_seq, text: label, undo: Some(Undo::Move(Box::new(snapshot))), until: self.clock + window as f64, error: false, open_path: None });
+        while self.toasts.len() > 3 {
+            self.toasts.remove(0);
+        }
+        tx.wake_after(std::time::Duration::from_secs_f64(window as f64 + 0.05));
+    }
+
+    /// A draft was discarded from the Drafts list while open in the composer: the composer
+    /// closes, and the discard's Undo brings it back.
+    fn draft_discarded(&mut self, id: i64, undo: Option<i64>) {
+        if self.compose.as_ref().is_none_or(|c| c.draft_id != id) {
+            return;
+        }
+        let Some(c) = self.compose.take() else { return };
+        let toast = self.toasts.iter_mut().find_map(|t| match &mut t.undo {
+            Some(Undo::Move(m)) if Some(m.key) == undo => Some(m),
+            _ => None,
+        });
+        if let Some(m) = toast {
+            m.compose = Some(Box::new(c));
+        }
     }
 
     pub fn delete_now(&mut self, ids: Vec<MessageId>, tx: &mut Tx) {
@@ -1328,8 +1389,13 @@ impl App {
         if let Some(undo) = d.key {
             self.send(Command::UndoMove { undo });
         }
+        self.reopen(d.compose);
+    }
+
+    /// Puts a discarded composer back as it was, saving it again (which marks its draft as open
+    /// in the composer).
+    fn reopen(&mut self, mut c: Compose) {
         self.park_compose();
-        let mut c = d.compose;
         c.minimized = false;
         c.dirty = true;
         c.edits += 1;
@@ -1942,6 +2008,49 @@ mod tests {
         type_into_body(&mut app, "More ");
         app.show_draft(first + 1, other, false, None);
         assert!(app.compose.as_ref().unwrap().body.text.starts_with("More "));
+    }
+
+    fn drafts_view(app: &mut App) -> Summary {
+        app.go(View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() });
+        app.list.first().expect("a sample draft").clone()
+    }
+
+    #[test]
+    fn deleting_a_drafts_row_discards_the_draft_with_undo() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let _ = app.settings.set("behavior.confirmDelete", serde_json::json!(true));
+        let row = drafts_view(&mut app);
+        app.delete(vec![row.id], &mut tx);
+        assert!(app.confirm_delete.is_none(), "Undo stands in for the question");
+        assert_eq!(app.toasts.last().map(|t| t.text.as_str()), Some("Draft discarded"), "not moved to Trash like a message");
+        assert!(!app.list.iter().any(|s| s.id == row.id));
+        assert!(app.undo_last(&mut tx));
+        assert!(app.list.iter().any(|s| s.id == row.id), "back");
+        // Archive doesn't apply to drafts.
+        let toasts = app.toasts.len();
+        app.archive(vec![row.id], &mut tx);
+        assert!(app.list.iter().any(|s| s.id == row.id) && app.toasts.len() == toasts);
+    }
+
+    #[test]
+    fn discarding_the_open_drafts_row_closes_the_composer_until_undo() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let row = drafts_view(&mut app);
+        app.open_message(row.id);
+        let id = app.compose.as_ref().unwrap().draft_id;
+        type_into_body(&mut app, "More: ");
+        app.delete(vec![row.id], &mut tx);
+        let key = move_key(&app);
+        // The engine resolves the row to the composer's draft.
+        app.apply(Event::DraftDiscarded { id, undo: Some(key) }, &mut tx);
+        assert!(app.compose.is_none(), "the composer closes with its draft");
+        assert!(app.undo_last(&mut tx));
+        let c = app.compose.as_ref().expect("back");
+        assert!(c.draft_id == id && c.body.text.starts_with("More: "), "as it was");
     }
 
     #[test]
