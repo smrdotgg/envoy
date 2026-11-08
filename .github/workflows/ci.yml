@@ -47,7 +47,7 @@ jobs:
         run: cargo test --workspace --locked
       # Lints Envoy's crates only: vendor/ is outside the workspace, so clippy never lints it.
       - name: Clippy
-        run: cargo clippy -p envoy -p envoy-core -p envoy-bench --all-targets --locked -- -D warnings
+        run: cargo clippy -p envoy -p envoy-html -p envoy-core -p envoy-bench --all-targets --locked -- -D warnings
 
   # The engine against a real IMAP/SMTP server, GreenMail (crates/envoy-core/examples/e2e.rs):
   # sync, IDLE, flags, moves and sends with their undo windows, drafts, and ops held across a

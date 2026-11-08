@@ -1,0 +1,11 @@
+[package]
+name = "envoy-html"
+description = "Envoy's native HTML mail renderer: email HTML and CSS to a layout tree"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+html5ever = "0.31"
+log = "0.4"
+markup5ever_rcdom = "=0.5.3-unofficial"

@@ -9,6 +9,9 @@
 //!
 //! Styles come from a bounded cascade ([`css`]): the email's sheets and `style=""` attributes
 //! over a small built-in sheet, with `@media` evaluated for a desktop pane in light mode.
+//!
+//! It runs once per message off the UI thread and is cached, so it's built for size
+//! (`[profile.dist.package]`); envoy-core re-exports it as `envoy_core::html`.
 
 mod css;
 mod fidelity;

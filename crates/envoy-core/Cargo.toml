@@ -11,11 +11,10 @@ async-imap = { version = "0.10", default-features = false, features = ["runtime-
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 directories = "6"
+envoy-html = { workspace = true }
 futures = "0.3"
 htmd = "0.2"
-html5ever = "0.31"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
-markup5ever_rcdom = "=0.5.3-unofficial"
 json_comments = "0.2"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots", "hostname"] }
 log = "0.4"
