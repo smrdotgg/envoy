@@ -1139,9 +1139,9 @@ dependencies = [
  "chrono",
  "directories",
  "env_logger",
+ "envoy-html",
  "futures",
  "htmd",
- "html5ever",
  "image",
  "json_comments",
  "keyring",
@@ -1149,7 +1149,6 @@ dependencies = [
  "libc",
  "log",
  "mail-parser",
- "markup5ever_rcdom",
  "rand 0.9.5",
  "rusqlite",
  "rustls",
@@ -1161,6 +1160,15 @@ dependencies = [
  "ureq",
  "url",
  "webpki-roots",
+]
+
+[[package]]
+name = "envoy-html"
+version = "0.1.0"
+dependencies = [
+ "html5ever",
+ "log",
+ "markup5ever_rcdom",
 ]
 
 [[package]]

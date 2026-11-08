@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/envoy-core", "crates/envoy", "crates/envoy-bench"]
+members = ["crates/envoy-html", "crates/envoy-core", "crates/envoy", "crates/envoy-bench"]
 exclude = ["vendor"]
 
 [workspace.package]
@@ -15,6 +15,7 @@ version = "0.1.0"
 rune = { path = "vendor/rune/crates/rune", default-features = false, features = ["accessibility", "dbus", "embedded-fonts", "metal-backend"] }
 rune-kit = { path = "vendor/rune/crates/rune-kit", features = ["markdown"] }
 envoy-core = { path = "crates/envoy-core" }
+envoy-html = { path = "crates/envoy-html" }
 
 # Rune's own deps compile without debug info in dev, as upstream does.
 [profile.dev.package."*"]
@@ -59,6 +60,7 @@ fdeflate = { opt-level = "s" }
 miniz_oxide = { opt-level = "s" }
 flate2 = { opt-level = "s" }
 html5ever = { opt-level = "s" }
+envoy-html = { opt-level = "s" }
 markup5ever = { opt-level = "s" }
 markup5ever_rcdom = { opt-level = "s" }
 tendril = { opt-level = "s" }

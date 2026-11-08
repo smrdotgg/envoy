@@ -103,9 +103,14 @@ offline).
 - `crates/envoy-core` — no UI. Settings schema, accounts, secrets, OAuth (loopback + PKCE),
   the SQLite store (WAL, FTS5), IMAP sync (async-imap over rustls), SMTP (lettre), and the
   engine: a background thread with one sync worker per account.
+- `crates/envoy-html` — the native HTML mail renderer: email HTML and its CSS (`<style>`
+  sheets through a bounded cascade, `@media` for a desktop pane) to a layout tree of text,
+  boxes, table rows on a shared column grid and fluid columns, with a local score of what it
+  couldn't draw ([decision record](docs/decisions/0001-html-rendering.md)). Built for size;
+  envoy-core re-exports it as `envoy_core::html`.
 - `crates/envoy` — the Rune app: sidebar, virtualized message list, conversation reader
-  (HTML mail rendered natively as Markdown — no web view, no remote images, no tracking
-  pixels), floating composer, settings and account screens.
+  (HTML mail drawn natively from that tree — no web view, tracking pixels dropped, pictures
+  per `reading.loadImages`), floating composer, settings and account screens.
 - `vendor/rune` — the Rune crates, vendored (Rune's repo is large). Refresh with
   `scripts/vendor-rune.py <path-to-rune-checkout>`.
 
@@ -141,6 +146,8 @@ has an Undo too. Opening another composer keeps the current one in Drafts.
 cargo test                                      # unit tests
 cargo run -p envoy-core --example e2e           # engine against a local GreenMail server (below)
 ENVOY_DEMO=1 target/debug/envoy --snap out.png --scene open     # headless screenshot
+ENVOY_DEMO=1 ENVOY_DEMO_HTML=mail.html target/debug/envoy --snap out.png --scene html --size 1300x3000   # a whole HTML email
+cargo run -p envoy-core --example html_dump -- mail.html            # its layout tree (TREE=1) and fidelity score
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/flow.json --snap out.png --at 3.6
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 1.0   # archive: toast with Undo
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 2.0   # after z: message back, open
@@ -148,7 +155,10 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png -
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png --at 3.6 # after z: the composer back with the edit
 ```
 
-Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice`.
+Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark`.
+
+HTML rendering is tested against the mail in `crates/envoy-core/tests/fixtures/html` (sources and
+licenses in its `LICENSES.md`).
 
 **End to end.** CI's `e2e` job runs the engine against a real IMAP/SMTP server,
 [GreenMail](https://greenmail-mail-test.github.io/greenmail/): initial sync, new mail by IDLE,

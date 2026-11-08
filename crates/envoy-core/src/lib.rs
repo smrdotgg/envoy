@@ -8,6 +8,7 @@ pub mod secrets;
 pub mod settings;
 pub mod store;
 pub mod engine;
-pub mod html;
+/// The native HTML renderer, in a crate of its own so it can be built for size.
+pub use envoy_html as html;
 pub mod imap;
 pub mod smtp;
