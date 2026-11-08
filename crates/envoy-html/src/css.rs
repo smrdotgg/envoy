@@ -28,6 +28,24 @@ pub const MATCH_BUDGET: u32 = 400_000;
 /// Rules one message's sheets may hold; the rest are dropped (and counted).
 const MAX_RULES: usize = 8_000;
 
+/// Candidate rules one message may consider in all, even those the ancestor filter rejects
+/// before they cost [`MATCH_BUDGET`].
+const CANDIDATE_BUDGET: u32 = 4_000_000;
+
+/// Declarations read from one block or `style=""`; the rest are ignored.
+const MAX_DECLS: usize = 256;
+
+/// Declarations one element collects from the sheets, highest priority first.
+const MAX_ELEMENT_DECLS: usize = 1_024;
+
+/// A selector longer than this, or with more compounds, is refused unread: matching recurses
+/// once per compound, and nothing in real mail comes close.
+const MAX_SELECTOR_LEN: usize = 1_024;
+const MAX_COMPOUNDS: usize = 32;
+
+/// Longest argument a functional pseudo-class (`:not(…)`, `:nth-child(…)`) may have.
+const MAX_PSEUDO_ARG: usize = 256;
+
 /// The built-in sheet: what browsers give elements that the email doesn't style.
 const UA: &str = "
 b, strong, th { font-weight: bold }
@@ -210,14 +228,18 @@ pub struct Sheet {
     universal: Vec<u32>,
     order: u32,
     budget: u32,
+    candidates: u32,
+    /// Rules `0..ua_rules` are the built-in sheet's.
+    ua_rules: u32,
     pub stats: SheetStats,
 }
 
 impl Sheet {
     /// The built-in sheet and nothing else yet.
     pub fn new() -> Sheet {
-        let mut s = Sheet { budget: MATCH_BUDGET, ..Sheet::default() };
+        let mut s = Sheet { budget: MATCH_BUDGET, candidates: CANDIDATE_BUDGET, ..Sheet::default() };
         s.parse(UA, true);
+        s.ua_rules = s.rules.len() as u32;
         s
     }
 
@@ -326,12 +348,42 @@ impl Sheet {
     pub fn cascade(&mut self, els: &[Elem], i: u32, inline: Option<&str>) -> Styles {
         let e = &els[i as usize];
         // Each rule sits in one bucket, and an element's classes are distinct: no rule comes
-        // up twice.
+        // up twice. Once a budget runs out only the built-in sheet applies (its rules come
+        // first in every bucket).
         let empty: &[u32] = &[];
         let id = e.id.as_ref().and_then(|id| self.by_id.get(id)).map_or(empty, |v| v.as_slice());
         let tag = self.by_tag.get(&e.tag).map_or(empty, |v| v.as_slice());
-        let classes = e.classes.iter().filter_map(|c| self.by_class.get(c)).flat_map(|v| v.iter());
-        let cands: Vec<u32> = id.iter().chain(classes).chain(tag).chain(&self.universal).copied().filter(|&r| bloom_has(&e.ancestors, &self.need[r as usize])).collect();
+        let ua_only = self.budget == 0 || self.candidates == 0;
+        if ua_only {
+            self.stats.exhausted |= self.ua_rules < self.rules.len() as u32;
+        }
+        let ua_rules = self.ua_rules;
+        let mut left = self.candidates;
+        let mut cands: Vec<u32> = Vec::new();
+        let mut take = |bucket: &[u32]| {
+            // Buckets are in rule order, built-in rules first.
+            let bucket = if ua_only { &bucket[..bucket.partition_point(|&r| r < ua_rules)] } else { bucket };
+            for &r in bucket {
+                if r >= ua_rules {
+                    if left == 0 {
+                        break;
+                    }
+                    left -= 1;
+                }
+                if bloom_has(&e.ancestors, &self.need[r as usize]) {
+                    cands.push(r);
+                }
+            }
+        };
+        take(id);
+        for c in &e.classes {
+            if let Some(v) = self.by_class.get(c) {
+                take(v);
+            }
+        }
+        take(tag);
+        take(&self.universal);
+        self.candidates = left;
         // (layer, specificity, order, block)
         let mut hits: Vec<(u8, u32, u32, u32)> = Vec::new();
         for r in cands {
@@ -358,8 +410,12 @@ impl Sheet {
         type Ranked = (u8, u32, u32, usize, (Rc<str>, Rc<str>));
         let mut normal: Styles = Vec::new();
         let mut important: Vec<Ranked> = Vec::new();
-        for (layer, spec, order, block) in &hits {
-            for (k, d) in self.blocks[*block as usize].iter().enumerate() {
+        // Highest priority first, so a cap keeps what wins.
+        for (layer, spec, order, block) in hits.iter().rev() {
+            if normal.len() + important.len() >= MAX_ELEMENT_DECLS {
+                break;
+            }
+            for (k, d) in self.blocks[*block as usize].iter().enumerate().rev() {
                 if d.important {
                     important.push((*layer, *spec, *order, k, (d.name.clone(), d.value.clone())));
                 } else {
@@ -367,6 +423,7 @@ impl Sheet {
                 }
             }
         }
+        normal.reverse();
         for (k, d) in inline_decls.iter().enumerate() {
             if d.important {
                 important.push((2, u32::MAX, u32::MAX, k, (d.name.clone(), d.value.clone())));
@@ -376,7 +433,12 @@ impl Sheet {
         }
         important.sort_by_key(|a| (a.0, a.1, a.2, a.3));
         normal.extend(important.into_iter().map(|t| t.4));
-        normal
+        // Only each property's last declaration is ever read: drop the rest, so lookups scan
+        // a few dozen entries at most.
+        let mut seen: std::collections::HashSet<Rc<str>> = std::collections::HashSet::new();
+        let mut out: Styles = normal.into_iter().rev().filter(|(k, _)| seen.insert(k.clone())).collect();
+        out.reverse();
+        out
     }
 }
 
@@ -388,7 +450,39 @@ pub fn get<'a>(st: &'a [(Rc<str>, Rc<str>)], name: &str) -> Option<&'a str> {
 
 /// Declarations in a `style=""` attribute or a rule's block, shorthands expanded.
 fn parse_decls(block: &str, out: &mut Vec<Decl>) {
-    for d in split_top(block, b';') {
+    let start = out.len();
+    parse_decls_all(block, out);
+    // Within a block one declaration per property counts: the last `!important` one, else
+    // the last. Keep just that, in its place.
+    let mut seen: HashMap<Rc<str>, bool> = HashMap::new();
+    let mut keep = vec![false; out.len() - start];
+    for (k, d) in out[start..].iter().enumerate().rev() {
+        match seen.get(&d.name) {
+            None => {
+                seen.insert(d.name.clone(), d.important);
+                keep[k] = true;
+            }
+            Some(false) if d.important => {
+                // An earlier !important beats the later normal one kept so far.
+                seen.insert(d.name.clone(), true);
+                if let Some(j) = out[start..].iter().enumerate().skip(k + 1).find(|(j, x)| keep[*j] && x.name == d.name).map(|(j, _)| j) {
+                    keep[j] = false;
+                }
+                keep[k] = true;
+            }
+            Some(_) => {}
+        }
+    }
+    let mut k = 0;
+    out.retain(|_| {
+        let r = k < start || keep[k - start];
+        k += 1;
+        r
+    });
+}
+
+fn parse_decls_all(block: &str, out: &mut Vec<Decl>) {
+    for d in split_top(block, b';').into_iter().take(MAX_DECLS) {
         let Some((k, v)) = d.split_once(':') else { continue };
         let name = k.trim().to_ascii_lowercase();
         if name.is_empty() || name.bytes().any(|c| !(c.is_ascii_alphanumeric() || c == b'-')) {
@@ -569,23 +663,28 @@ fn is_color(t: &str) -> bool {
     t.starts_with('#') || t.starts_with("rgb") || t.starts_with("hsl") || super::parse_color(t).is_some()
 }
 
-/// Lowercases a value, except what's inside `url(…)` (paths are case-sensitive).
+/// Lowercases a value, except what's inside `url(…)` (paths are case-sensitive). One pass:
+/// only ASCII bytes change, so the result stays valid UTF-8 and the same length.
 fn lower_keep_urls(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    let mut rest = v;
-    loop {
-        let lower = rest.to_ascii_lowercase();
-        let Some(at) = lower.find("url(") else {
-            out.push_str(&lower);
-            break;
-        };
-        out.push_str(&lower[..at + 4]);
-        let after = &rest[at + 4..];
-        let end = after.find(')').unwrap_or(after.len());
-        out.push_str(&after[..end]);
-        rest = &after[end..];
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    let mut in_url = false;
+    while i < b.len() {
+        if in_url {
+            out.push(b[i]);
+            in_url = b[i] != b')';
+            i += 1;
+        } else if b.len() - i >= 4 && b[i..i + 4].eq_ignore_ascii_case(b"url(") {
+            out.extend_from_slice(b"url(");
+            in_url = true;
+            i += 4;
+        } else {
+            out.push(b[i].to_ascii_lowercase());
+            i += 1;
+        }
     }
-    out
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Splits on whitespace outside parentheses and quotes.
@@ -784,6 +883,9 @@ fn is_generated(sel: &str) -> bool {
 /// Ok(None): a valid selector that can never match here (a pseudo-element or a dynamic
 /// state). Err: one we can't read.
 fn parse_selector(s: &str) -> Result<Option<Selector>, ()> {
+    if s.len() > MAX_SELECTOR_LEN {
+        return Err(());
+    }
     let mut parts: Vec<Compound> = Vec::new();
     let mut combs: Vec<Comb> = Vec::new();
     let mut never = false;
@@ -811,8 +913,8 @@ fn parse_selector(s: &str) -> Result<Option<Selector>, ()> {
             i += 1;
             continue;
         }
-        let (comp, n, nv) = parse_compound(&b[i..])?;
-        if n == 0 {
+        let (comp, n, nv) = parse_compound(&b[i..], false)?;
+        if n == 0 || parts.len() >= MAX_COMPOUNDS {
             return Err(());
         }
         never |= nv;
@@ -851,8 +953,9 @@ fn ident(b: &[char], mut i: usize) -> (String, usize) {
     (s, i)
 }
 
-/// One compound selector at the start of `b`: (it, chars read, never matches).
-fn parse_compound(b: &[char]) -> Result<(Compound, usize, bool), ()> {
+/// One compound selector at the start of `b`: (it, chars read, never matches). Inside a
+/// `:not(…)` (`negated`) another `:not` is refused, so this never recurses more than once.
+fn parse_compound(b: &[char], negated: bool) -> Result<(Compound, usize, bool), ()> {
     let mut c = Compound::default();
     let mut i = 0;
     let mut never = false;
@@ -908,7 +1011,7 @@ fn parse_compound(b: &[char]) -> Result<(Compound, usize, bool), ()> {
                         }
                         j += 1;
                     }
-                    if j >= b.len() {
+                    if j >= b.len() || j - n > MAX_PSEUDO_ARG {
                         return Err(());
                     }
                     arg = b[n + 1..j].iter().collect();
@@ -929,9 +1032,9 @@ fn parse_compound(b: &[char]) -> Result<(Compound, usize, bool), ()> {
                         let (a, bb) = parse_nth(&arg).ok_or(())?;
                         c.pseudos.push(Pseudo::Nth(a, bb));
                     }
-                    "not" => {
+                    "not" if !negated => {
                         let inner: Vec<char> = arg.trim().chars().collect();
-                        let (comp, n, nv) = parse_compound(&inner)?;
+                        let (comp, n, nv) = parse_compound(&inner, true)?;
                         if n != inner.len() || nv {
                             return Err(());
                         }
@@ -1058,8 +1161,10 @@ fn compound_matches(c: &Compound, els: &[Elem], i: u32) -> bool {
             Pseudo::Root => e.parent == NONE,
             Pseudo::Link => matches!(e.tag.as_str(), "a" | "area") && e.attr("href").is_some(),
             Pseudo::Nth(a, b) => {
-                let n = e.index as i32 - b;
-                if *a == 0 { n == 0 } else { n % a == 0 && n / a >= 0 }
+                // index = a·k + b for some k ≥ 0. In i64 nothing here can overflow: index is a
+                // u32, a and b are i32.
+                let (a, n) = (*a as i64, e.index as i64 - *b as i64);
+                if a == 0 { n == 0 } else { n % a == 0 && n / a >= 0 }
             }
             Pseudo::Not(inner) => !compound_matches(inner, els, i),
         };
@@ -1286,5 +1391,63 @@ mod tests {
         }
         assert!(s.stats.exhausted, "the budget ran out");
         assert!(t.elapsed().as_secs_f64() < 2.0, "bounded: {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn duplicate_declarations_collapse_without_changing_the_cascade() {
+        let els = tree();
+        let mut s = Sheet::new();
+        s.add(".b { color: red !important; color: blue; color: green } p { color: black !important } .b { padding: 1px; padding-top: 3px; padding: 2px }", None);
+        let st = s.cascade(&els, 3, Some("color: pink; color: teal"));
+        assert_eq!(get(&st, "color"), Some("red"), "!important in .b (more specific) beats p's");
+        assert_eq!(get(&st, "padding-top"), Some("2px"));
+        assert_eq!(st.iter().filter(|(k, _)| &**k == "color").count(), 1);
+        let st = s.cascade(&els, 4, Some("color: pink; color: teal"));
+        assert_eq!(get(&st, "color"), Some("black"), "p's !important beats inline normal");
+    }
+
+    #[test]
+    fn nth_child_extremes_dont_overflow() {
+        // Hostile `an+b` values at and past i32's ends must neither panic nor match wrongly.
+        let els = tree();
+        for arg in ["-n-2147483647", "-2147483648n-2147483648", "2147483647n+2147483647", "-n+2147483647", "-2147483648n", "-1n-1", "0n+0", "-0n-0", "2147483648", "n-2147483648"] {
+            let mut s = Sheet::new();
+            s.add(&format!("p:nth-child({arg}) {{ a: 1 }}"), None);
+            for i in 0..els.len() as u32 {
+                s.cascade(&els, i, None);
+            }
+        }
+        let mut s = Sheet::new();
+        s.add("p:nth-child(-n-2147483647) { a: 1 } p:nth-child(-n+1) { b: 1 } p:nth-child(-2147483648n+2) { c: 1 }", None);
+        assert_eq!(value(&mut s, &els, 3, None, "a"), None);
+        assert_eq!(value(&mut s, &els, 3, None, "b").as_deref(), Some("1"), "-n+1: the first");
+        assert_eq!(value(&mut s, &els, 4, None, "b"), None);
+        assert_eq!(value(&mut s, &els, 4, None, "c").as_deref(), Some("1"), "a·0+2: the second");
+    }
+
+    #[test]
+    fn nested_not_is_refused_without_recursing() {
+        // 24 KB of `:not(` overflowed a 2 MB stack and peaked near 235 MiB.
+        let sel = format!("p{}a{}", ":not(".repeat(4000), ")".repeat(4000));
+        let t = std::time::Instant::now();
+        let mut s = Sheet::new();
+        s.add(&format!("{sel} {{ a: 1 }} p:not(.b) {{ b: 1 }}"), None);
+        assert!(t.elapsed().as_secs_f64() < 1.0, "{:?}", t.elapsed());
+        assert_eq!(s.stats.bad_selectors, 1);
+        let els = tree();
+        assert_eq!(value(&mut s, &els, 4, None, "b").as_deref(), Some("1"), "a plain :not still works");
+    }
+
+    #[test]
+    fn url_normalization_is_linear() {
+        // 20,000 url()s in one value lowercased the rest of the value once per url(): 7.6 s.
+        let v = "URL(https://A.example/X.png) Center ".repeat(20_000);
+        let t = std::time::Instant::now();
+        let out = lower_keep_urls(&v);
+        assert!(t.elapsed().as_secs_f64() < 1.0, "{:?}", t.elapsed());
+        assert!(out.starts_with("url(https://A.example/X.png) center url(https://A.example/X.png)"), "{}", &out[..80]);
+        assert_eq!(out.len(), v.len());
+        assert_eq!(lower_keep_urls("Bold URL( 'https://X/Ä.png' ) UrL(cid:A) NONE"), "bold url( 'https://X/Ä.png' ) url(cid:A) none");
+        assert_eq!(lower_keep_urls("url(unclosed AND"), "url(unclosed AND");
     }
 }
