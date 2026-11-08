@@ -621,6 +621,7 @@ fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64,
         let unread = st.summary(*id)?.is_some_and(|s| !s.seen());
         if *to == MoveTarget::Trash && here == Role::Trash {
             st.remove_local(*id)?;
+            st.bump_counts(&account, &mailbox, if unread { -1 } else { 0 }, -1)?;
             st.enqueue(&account, &Op::Expunge { mailbox: mailbox.clone(), uid })?;
         } else if *to == MoveTarget::Archive && matches!(here, Role::All | Role::Archive) {
             continue;
@@ -640,10 +641,8 @@ fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64,
                 }
                 None => st.enqueue(&account, &op)?,
             };
+            // Hidden, with its mailbox's counts adjusted.
             anyhow::ensure!(st.hide_local(*id, op_id)?, "message {id} is already moving");
-        }
-        if unread {
-            st.bump_unread(&account, &mailbox, -1)?;
         }
         touched.insert(account);
     }
@@ -1325,7 +1324,7 @@ mod tests {
         assert!(moved.problems.is_empty());
         assert_eq!(moved.held, 3);
         assert!(visible(&st, "INBOX").is_empty());
-        assert_eq!(st.mailboxes("a").unwrap()[0].unread, 0);
+        assert_eq!((st.mailboxes("a").unwrap()[0].unread, st.mailboxes("a").unwrap()[0].total), (0, 0));
         assert!(st.ops("a", 999).unwrap().is_empty(), "held for the window");
         assert_eq!(st.ops("a", 1_000).unwrap().len(), 3);
 
@@ -1333,7 +1332,7 @@ mod tests {
         let mut back = visible(&st, "INBOX");
         back.sort();
         assert_eq!(back, vec![first, reply, other], "every message back, same ids");
-        assert_eq!(st.mailboxes("a").unwrap()[0].unread, 2);
+        assert_eq!((st.mailboxes("a").unwrap()[0].unread, st.mailboxes("a").unwrap()[0].total), (2, 3), "counts back");
         assert_eq!(st.pending_count().unwrap(), 0, "nothing reaches the server");
         let thread = st.thread(reply, true).unwrap();
         assert_eq!(thread.len(), 2, "the conversation opens whole again");

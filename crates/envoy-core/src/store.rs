@@ -131,7 +131,7 @@ COMMIT;
 // indexes above, not scan the cache. SQLite only uses a partial index when the query
 // itself implies the index's WHERE: hence the redundant `!= 0` terms.
 const DELETE_HELD: &str = "DELETE FROM messages WHERE held_op = ?1 AND held_op != 0";
-const HELD_UNREAD: &str = "SELECT account, mailbox FROM messages WHERE held_op = ?1 AND held_op != 0 AND flags & 1 = 0";
+const HELD_ROWS: &str = "SELECT account, mailbox, flags FROM messages WHERE held_op = ?1 AND held_op != 0";
 const UNHIDE: &str = "UPDATE messages SET held_op = 0 WHERE held_op = ?1 AND held_op != 0";
 const BATCH_OPS: &str = "SELECT id, claimed FROM ops WHERE batch = ?1 AND batch != 0";
 
@@ -680,10 +680,18 @@ impl Store {
     }
 
     /// Hides a message that is moving away until `op` (the move) reaches the server, when it is
-    /// deleted ([`Store::op_done`]), or is undone or dropped, when it shows again. Never takes
+    /// deleted ([`Store::op_done`]), or is undone or dropped, when it shows again. Its mailbox's
+    /// unread and total counts drop at once ([`Store::release`] puts them back). Never takes
     /// over an existing hold: false (and nothing changes) if the message is already moving.
+    /// Call inside a transaction.
     pub fn hide_local(&self, id: MessageId, op: i64) -> Result<bool> {
-        Ok(self.conn.execute("UPDATE messages SET held_op = ?2 WHERE id = ?1 AND held_op = 0", params![id, op])? > 0)
+        if self.conn.execute("UPDATE messages SET held_op = ?2 WHERE id = ?1 AND held_op = 0", params![id, op])? == 0 {
+            return Ok(false);
+        }
+        let (account, mailbox, fl): (String, String, u32) =
+            self.conn.query_row("SELECT account, mailbox, flags FROM messages WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        self.bump_counts(&account, &mailbox, if fl & flags::SEEN == 0 { -1 } else { 0 }, -1)?;
+        Ok(true)
     }
 
     /// The other messages of `id`'s conversation that live in the same account (for actions on
@@ -968,13 +976,14 @@ impl Store {
         let mut accounts: Vec<String> = Vec::new();
         for op in ops {
             let account: Option<String> = self.conn.query_row("SELECT account FROM ops WHERE id = ?1", params![op], |r| r.get(0)).optional()?;
-            let unread: Vec<(String, String)> = self
+            // Back in their mailbox: undo what hide_local did to its counts.
+            let held: Vec<(String, String, u32)> = self
                 .conn
-                .prepare_cached(HELD_UNREAD)?
-                .query_map(params![op], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .prepare_cached(HELD_ROWS)?
+                .query_map(params![op], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?;
-            for (a, m) in unread {
-                self.bump_unread(&a, &m, 1)?;
+            for (a, m, fl) in held {
+                self.bump_counts(&a, &m, if fl & flags::SEEN == 0 { 1 } else { 0 }, 1)?;
             }
             self.conn.execute(UNHIDE, params![op])?;
             self.conn.execute("DELETE FROM ops WHERE id = ?1", params![op])?;
@@ -1009,9 +1018,14 @@ impl Store {
     /// Recomputes a mailbox's unread count from the local copy after a local change, so the
     /// sidebar moves at once (the next sync replaces it with the server's number).
     pub fn bump_unread(&self, account: &str, mailbox: &str, delta: i64) -> Result<()> {
+        self.bump_counts(account, mailbox, delta, 0)
+    }
+
+    /// [`Store::bump_unread`], for the total too (a message left or came back).
+    pub fn bump_counts(&self, account: &str, mailbox: &str, unread: i64, total: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE mailboxes SET unread = MAX(0, unread + ?3) WHERE account = ?1 AND name = ?2",
-            params![account, mailbox, delta],
+            "UPDATE mailboxes SET unread = MAX(0, unread + ?3), total = MAX(0, total + ?4) WHERE account = ?1 AND name = ?2",
+            params![account, mailbox, unread, total],
         )?;
         Ok(())
     }
@@ -1080,7 +1094,6 @@ mod tests {
         s.set_body(id, b"raw", &p).unwrap();
         let op = s.enqueue_held("a", &Op::Move { mailbox: "INBOX".into(), uid: 9, dest: "Archive".into() }, 100, 7).unwrap();
         assert!(s.hide_local(id, op).unwrap());
-        s.bump_unread("a", "INBOX", -1).unwrap();
         (id, op)
     }
 
@@ -1206,7 +1219,7 @@ mod tests {
     #[test]
     fn undo_bookkeeping_uses_its_indexes() {
         let s = Store::memory();
-        for (sql, index) in [(DELETE_HELD, "messages_held"), (HELD_UNREAD, "messages_held"), (UNHIDE, "messages_held"), (BATCH_OPS, "ops_batch")] {
+        for (sql, index) in [(DELETE_HELD, "messages_held"), (HELD_ROWS, "messages_held"), (UNHIDE, "messages_held"), (BATCH_OPS, "ops_batch")] {
             let plan: Vec<String> =
                 s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap().query_map(params![5], |r| r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
             let searches = plan.iter().any(|d| d.starts_with("SEARCH") && d.contains(&format!("INDEX {index} ")));
@@ -1293,6 +1306,20 @@ mod tests {
         let dangling: i64 = s.conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
         assert_eq!(dangling, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn counts(s: &Store) -> (u32, u32) {
+        let m = s.mailboxes("a").unwrap().into_iter().find(|m| m.name == "INBOX").unwrap();
+        (m.unread, m.total)
+    }
+
+    #[test]
+    fn hiding_and_undoing_keep_unread_and_total_in_step() {
+        let s = Store::memory();
+        held_move(&s); // the inbox's only message, unread
+        assert_eq!(counts(&s), (0, 0), "it left the inbox");
+        s.undo_batch(7).unwrap();
+        assert_eq!(counts(&s), (1, 1), "and came back");
     }
 
     #[test]
