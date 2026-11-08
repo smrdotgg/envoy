@@ -145,9 +145,9 @@ const SAVE_RETRY: f64 = 5.0;
 pub enum Unsaved {
     /// A draft save, under its stamp (so it never overwrites a newer one).
     Save { id: i64, draft: Draft, open: bool, rev: i64 },
-    /// A message sent from the composer but not confirmed queued: kept as a draft unless its
-    /// send was queued after all.
-    Unsent { id: i64, draft: Draft },
+    /// A message sent from the composer (at `stamp`) but not confirmed queued: kept as a draft
+    /// unless its send was queued, or went out, after all.
+    Unsent { id: i64, draft: Draft, stamp: i64 },
 }
 
 pub struct Toast {
@@ -328,7 +328,8 @@ pub struct App {
     pub compose: Option<Compose>,
     /// Draft saves, and sends, not yet confirmed by the engine.
     pub pending_saves: Vec<PendingSave>,
-    pub pending_sends: Vec<(i64, Draft)>,
+    /// `(draft id, what was sent, when)`.
+    pub pending_sends: Vec<(i64, Draft, i64)>,
     pub toasts: Vec<Toast>,
     pub toast_seq: u64,
     /// The last stamp handed out ([`App::next_stamp`]).
@@ -545,7 +546,7 @@ impl App {
             Event::Sent { op, undo_secs, draft_id } => {
                 // Queued with the draft: the send's copy of it is no longer needed.
                 if let Some(d) = draft_id {
-                    self.pending_sends.retain(|(id, _)| *id != d);
+                    self.pending_sends.retain(|(id, ..)| *id != d);
                     self.pending_saves.retain(|p| p.id != d);
                 }
                 self.toast_seq += 1;
@@ -1449,8 +1450,8 @@ impl App {
     /// for that, and is saved again.
     fn send_failed(&mut self, draft_id: Option<i64>) {
         let Some(id) = draft_id else { return };
-        let Some(i) = self.pending_sends.iter().position(|(d, _)| *d == id) else { return };
-        let (_, draft) = self.pending_sends.remove(i);
+        let Some(i) = self.pending_sends.iter().position(|(d, ..)| *d == id) else { return };
+        let (_, draft, _) = self.pending_sends.remove(i);
         self.show_draft(id, draft, false, None);
         if let Some(c) = &mut self.compose
             && c.draft_id == id
@@ -1479,7 +1480,7 @@ impl App {
         for u in unsaved {
             let done = match &u {
                 Unsaved::Save { id, draft, open, rev } => engine.save_draft_now(*id, draft, *open, *rev),
-                Unsaved::Unsent { id, draft } => engine.keep_unsent_now(*id, draft),
+                Unsaved::Unsent { id, draft, stamp } => engine.keep_unsent_now(*id, draft, *stamp),
             };
             if let Err(e) = done {
                 eprintln!("couldn't save a draft: {e:#}");
@@ -1502,7 +1503,7 @@ impl App {
             c.dirty = false;
             out.push(Unsaved::Save { id: c.draft_id, draft: c.draft(), open: true, rev });
         }
-        out.extend(std::mem::take(&mut self.pending_sends).into_iter().map(|(id, draft)| Unsaved::Unsent { id, draft }));
+        out.extend(std::mem::take(&mut self.pending_sends).into_iter().map(|(id, draft, stamp)| Unsaved::Unsent { id, draft, stamp }));
         out
     }
 
@@ -1634,7 +1635,8 @@ impl App {
         }
         // Kept until the engine confirms it queued the message (Event::Sent), or gives it back
         // (Event::SendFailed), and written as a draft if the window closes first.
-        self.pending_sends.push((draft_id, draft.clone()));
+        let stamp = self.next_stamp();
+        self.pending_sends.push((draft_id, draft.clone(), stamp));
         // The draft goes with it; undoing the send brings it back (Event::DraftOpened).
         self.send(Command::Send { draft, draft_id: Some(draft_id) });
         if self.view_role() == Some(Role::Drafts) {
@@ -2187,7 +2189,7 @@ mod tests {
         // Parking saved it again (no longer open), superseding its autosave.
         assert!(matches!(unsaved.iter().find(|u| has(u, a)), Some(Unsaved::Save { open: false, rev, draft, .. }) if *rev > a_rev && draft.body.starts_with("Draft A")), "A: {unsaved:?}");
         assert!(unsaved.iter().any(|u| has(u, b)), "B, parked with its edits: {unsaved:?}");
-        assert!(unsaved.iter().any(|u| matches!(u, Unsaved::Unsent { id, draft } if *id == c && draft.to == "ana@x.com")), "C, as sent: {unsaved:?}");
+        assert!(unsaved.iter().any(|u| matches!(u, Unsaved::Unsent { id, draft, .. } if *id == c && draft.to == "ana@x.com")), "C, as sent: {unsaved:?}");
         assert!(matches!(unsaved.last(), Some(Unsaved::Unsent { .. })), "after C's own earlier save, so the sent version wins");
         assert!(app.unsaved().is_empty(), "taken");
         // Confirmed, none of it is written again.

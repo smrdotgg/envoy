@@ -120,6 +120,14 @@ CREATE TABLE IF NOT EXISTS draft_files (
 CREATE TRIGGER IF NOT EXISTS drafts_files_delete AFTER DELETE ON drafts BEGIN
     DELETE FROM draft_files WHERE draft = old.id;
 END;
+CREATE TABLE IF NOT EXISTS draft_tombstones (
+    id INTEGER PRIMARY KEY,
+    gone INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS drafts_tombstone AFTER DELETE ON drafts BEGIN
+    INSERT OR REPLACE INTO draft_tombstones (id, gone) VALUES (old.id, CAST(unixepoch('subsec') * 1000000 AS INTEGER));
+    DELETE FROM draft_tombstones WHERE gone < CAST(unixepoch('subsec') * 1000000 AS INTEGER) - 7776000000000;
+END;
 "#;
 
 /// Columns added after the first release, for caches created before them. Each runs once,

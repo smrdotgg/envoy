@@ -14,6 +14,12 @@
 //!   for a discarded or sent draft. A discard waits out the undo window, and undo
 //!   ([`Store::undo_batch`]) shows the draft again.
 //!
+//! Once a draft is gone for good (sent, purged, discarded), a tombstone remembers when, for 90
+//! days: a write that was on its way from before that (a queued save, the app's copy of a
+//! message it sent, written as the window closed) can't bring it back. Ids are never reused,
+//! so a save stamped after the tombstone is a real edit (a too-late Undo put the draft back in
+//! the composer) and starts it again.
+//!
 //! `version` counts content changes and `server_version` is the one the server has, so an
 //! upload knows whether there's anything to do. `appended` says an upload was started: the
 //! server may have a copy, and deleting the draft must look there. `server_mailbox`,
@@ -90,12 +96,22 @@ impl Store {
     /// account queues the deletion of its copies on the old account's server. Returns whether
     /// the content changed.
     pub fn save_draft(&self, id: i64, draft: &Draft, open: bool, rev: i64, now: i64) -> Result<bool> {
-        self.transaction(|st| Ok(st.put_draft(id, draft, open, Some(rev), now)?.unwrap_or(false)))
+        self.transaction(|st| Ok(st.put_draft(id, draft, open, Some(rev), rev, now)?.unwrap_or(false)))
     }
 
-    /// [`Store::save_draft`]; `rev: None` writes whatever the stored rev. None when `rev` was
-    /// too old. Call inside a transaction.
-    fn put_draft(&self, id: i64, draft: &Draft, open: bool, rev: Option<i64>, now: i64) -> Result<Option<bool>> {
+    /// [`Store::save_draft`]; `rev: None` writes whatever the stored rev. `stamp`: when the
+    /// write was made, against the draft's tombstone. None when it was too old.
+    /// Call inside a transaction.
+    fn put_draft(&self, id: i64, draft: &Draft, open: bool, rev: Option<i64>, stamp: i64, now: i64) -> Result<Option<bool>> {
+        // Gone for good since before this write was made: stays gone.
+        let gone: Option<i64> = self.conn.query_row("SELECT gone FROM draft_tombstones WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+        match gone {
+            Some(at) if stamp <= at => return Ok(None),
+            Some(_) => {
+                self.conn.execute("DELETE FROM draft_tombstones WHERE id = ?1", params![id])?;
+            }
+            None => {}
+        }
         let content = json(draft);
         type Row = (String, String, String, i64, bool, Option<(String, u32, u32)>, bool);
         let old: Option<Row> = self
@@ -351,19 +367,21 @@ impl Store {
     /// is undone ([`Store::unsend_draft`]). Creates the draft if the composer never saved it.
     /// Call inside a transaction.
     pub fn draft_sending(&self, id: i64, draft: &Draft, op: i64, now: i64) -> Result<()> {
-        self.put_draft(id, draft, false, None, now)?;
+        // Being sent now: whatever came before.
+        self.put_draft(id, draft, false, None, i64::MAX, now)?;
         self.conn.execute("UPDATE drafts SET sending = ?2 WHERE id = ?1", params![id, op])?;
         Ok(())
     }
 
     /// Keeps a message that wasn't sent as a draft, in the composer, with what was being sent:
-    /// its send couldn't be queued, or the window closed before the engine confirmed it. A draft
-    /// whose send is queued, or went out, is left alone.
-    pub fn draft_unsent(&self, id: i64, draft: &Draft, now: i64) -> Result<Option<LocalDraft>> {
+    /// its send couldn't be queued, or the window closed before the engine confirmed it.
+    /// `stamp`: when it was sent. A draft whose send is queued, or went out (gone since), is
+    /// left alone.
+    pub fn draft_unsent(&self, id: i64, draft: &Draft, stamp: i64, now: i64) -> Result<Option<LocalDraft>> {
         self.transaction(|st| {
             let on_its_way: bool = st.conn.query_row("SELECT sending != 0 OR sent != 0 FROM drafts WHERE id = ?1", params![id], |r| r.get(0)).optional()?.unwrap_or(false);
             if !on_its_way {
-                st.put_draft(id, draft, true, None, now)?;
+                st.put_draft(id, draft, true, None, stamp, now)?;
             }
             st.draft(id)
         })
@@ -567,15 +585,45 @@ mod tests {
     fn an_unsent_message_is_kept_unless_its_send_is_queued() {
         let s = Store::memory();
         // The window closed before the engine got to the send: kept, in the composer.
-        let kept = s.draft_unsent(1, &draft("hello"), 100).unwrap().unwrap();
+        let kept = s.draft_unsent(1, &draft("hello"), 1, 100).unwrap().unwrap();
         assert!(kept.visible && kept.draft.subject == "hello");
         assert_eq!(s.draft_to_restore().unwrap().map(|d| d.id), Some(1));
         // It did get to it: left to go out.
         let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
         s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
-        s.draft_unsent(1, &draft("hello"), 102).unwrap();
+        s.draft_unsent(1, &draft("hello"), 2, 102).unwrap();
         assert!(!s.draft(1).unwrap().unwrap().visible, "still in the outbox");
         assert_eq!(s.draft_to_restore().unwrap(), None);
+    }
+
+    #[test]
+    fn a_draft_that_went_out_stays_gone() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap(); // never uploaded
+        let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 100).unwrap();
+        s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
+        s.op_done(send).unwrap(); // out, before the app heard (undo send off)
+        assert_eq!(s.draft(1).unwrap(), None);
+        // The window closes: the app's copy of what it sent, and a save from before, arrive late.
+        s.draft_unsent(1, &draft("hello"), 2, 102).unwrap();
+        s.save_draft(1, &draft("hello"), true, 2, 103).unwrap();
+        assert_eq!(s.draft(1).unwrap(), None, "not brought back to life");
+    }
+
+    #[test]
+    fn a_purged_draft_stays_gone_until_edited_again() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.draft_upload("a", 1).unwrap();
+        s.discard_draft(1, None).unwrap();
+        s.draft_purged(1, 110).unwrap();
+        assert_eq!(s.draft(1).unwrap(), None);
+        s.save_draft(1, &draft("hello"), true, 2, 111).unwrap();
+        assert_eq!(s.draft(1).unwrap(), None, "a save from before the discard changes nothing");
+        // A too-late Undo put it back in the composer, and it's edited: a save made now counts.
+        let now = chrono::Utc::now().timestamp_micros() + 1_000_000;
+        s.save_draft(1, &draft("hello again"), true, now, 112).unwrap();
+        assert_eq!(s.draft(1).unwrap().map(|d| d.draft.subject), Some("hello again".into()));
     }
 
     #[test]
