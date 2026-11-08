@@ -1213,6 +1213,8 @@ async fn session_loop(
     let mut last_full: Option<Instant> = None;
     let mut last_list: Option<Instant> = None;
     let mut inbox_dirty = true;
+    // The inbox as its last sync found it: mail that came after is checked for before IDLE.
+    let mut inbox_synced: Option<imap::Contents> = None;
     loop {
         while let Ok(j) = jobs.try_recv() {
             pending.push(j);
@@ -1295,6 +1297,9 @@ async fn session_loop(
                 move || shared.emit(Event::Changed { account: id.clone() })
             };
             let out = imap::sync_mailbox(&mut session, &shared.writer, &id, name, window, &progress).await?;
+            if mailboxes.iter().any(|m| m.role == Role::Inbox && m.name == *name) {
+                inbox_synced = Some(out.contents);
+            }
             changed |= out.changed;
             if out.changed {
                 shared.emit(Event::Changed { account: id.clone() });
@@ -1358,7 +1363,14 @@ async fn session_loop(
         let inbox = mailboxes.iter().find(|m| m.role == Role::Inbox).map(|m| m.name.clone());
         log::debug!("{}: waiting up to {wait:?}", account.email);
         if caps.idle && shared.setting_bool("sync.useIdle") && inbox.is_some() {
-            imap::select(&mut session, inbox.as_deref().unwrap_or("INBOX")).await?;
+            // IDLE reports only what comes once it's started: mail delivered since the inbox's
+            // last sync (while ops replayed, say: a message sent to oneself) is synced first, or
+            // it would wait for the next interval.
+            if imap::changed_since(&mut session, inbox.as_deref().unwrap_or("INBOX"), inbox_synced).await? {
+                log::debug!("{}: the inbox changed since it was synced", account.email);
+                inbox_dirty = true;
+                continue;
+            }
             // Servers drop IDLE after ~30 minutes; renew well before.
             let wait = wait.min(Duration::from_secs(25 * 60));
             let (s, news) = imap::idle(session, wait, notify.clone()).await?;
