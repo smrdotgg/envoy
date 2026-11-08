@@ -69,20 +69,20 @@ jobs:
           # is gated at the budget: no margin may hide a budget missed on real hardware.
           - os: ubuntu-latest
             bin: target/dist/envoy
-            # lavapipe under Xvfb: frame build p50 3–4 ms, encode+submit p50 23–37 ms; end-to-end
-            # open p95 92, 114 and 142 ms over three runs (EC2 155 ms). ×4 gates at 200 ms.
+            # lavapipe under Xvfb: frame build p95 3.5–5.9 ms, encode+submit p50 23–41 ms;
+            # end-to-end open p95 85–161 ms over ten runs (EC2 155–198 ms). ×4 gates at 200 ms.
             frame_margin: "4"
           - os: macos-latest
             bin: target/dist/envoy
-            # VM with a paravirtualized GPU, and noisy: end-to-end open p95 38, 39 and 57 ms over
-            # three runs (max up to 419 ms), against 50 ms. ×2 (100 ms) so noise doesn't flake it.
+            # VM with a paravirtualized GPU, and noisy: end-to-end open p95 37–57 ms over ten runs
+            # (single presses up to 706 ms), against 50 ms. ×2 (100 ms) so noise doesn't flake it.
             frame_margin: "2"
           - os: windows-latest
             bin: target/dist/envoy.exe
-            # No GPU: frame build p50 7.5–7.8 ms, yet key→frame p50 285–341 ms waiting on the
-            # software device and present; end-to-end open p95 368–402 ms (max 440) over three
-            # runs. ×12 gates at 600 ms.
-            frame_margin: "12"
+            # No GPU: frame build p95 13–32 ms, yet key→frame p50 220–340 ms waiting on the
+            # software device and present; end-to-end open p95 368–528 ms over ten runs.
+            # ×14 gates at 700 ms.
+            frame_margin: "14"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     env:
