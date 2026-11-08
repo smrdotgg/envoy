@@ -405,10 +405,11 @@ impl Store {
     }
 
     /// A cleanup of the copies draft `id` left on `account` in upload generation `generation`
-    /// ([`Op::PurgeDraft`] without a draft) deleted copies it found by Message-ID. If the draft
-    /// is back on that account in a newer generation, with an upload started, its new copy may
-    /// have been one of them: the draft is marked as behind the server, and its upload queued
-    /// (looking for strays, in case the copy is still there). Returns whether it was.
+    /// ([`Op::PurgeDraft`] without a draft) searched by Message-ID. If the draft is back on that
+    /// account in a newer generation, with an upload started, its new copy may be gone (on this
+    /// try or an earlier one whose answer was lost): the draft is marked as behind the server,
+    /// and its upload queued (looking for strays, in case the copy is still there). Returns
+    /// whether it was.
     pub fn draft_cleaned_up(&self, id: i64, account: &str, generation: i64, now: i64) -> Result<bool> {
         self.transaction(|st| {
             let lost = st.conn.execute(
