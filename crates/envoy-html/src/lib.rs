@@ -207,6 +207,17 @@ const BASE: f32 = 14.0;
 /// Deepest the builder descends.
 const MAX_DEPTH: usize = 200;
 
+/// Stack the builder may use below where parsing started. It recurses once per element (more
+/// frames per nested table), so a level count alone can't bound it: the engine's threads have
+/// 2 MiB stacks, and an unoptimized build's frames are several times a release build's.
+const STACK_BUDGET: usize = 1 << 20;
+
+/// Where the stack is now, to compare with where parsing started.
+fn stack_here() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 enum Transform {
     #[default]
@@ -272,10 +283,169 @@ impl Ctx {
     }
 }
 
+/// The layout tree of a message's HTML. Never panics: mail is attacker-controlled and this
+/// runs while the store is locked, so a bug that panics yields an empty tree (the reader falls
+/// back to the message's text) instead of unwinding into the caller.
 pub fn parse(html: &str) -> Doc {
+    guarded(|| parse_unguarded(html))
+}
+
+/// Attributes kept per tag. html5ever checks each attribute against every earlier one of its
+/// tag, so 100,000 of them took minutes; real tags have a few dozen at most.
+const MAX_ATTRS: usize = 512;
+
+/// Elements open at once (those closed by an explicit end tag). html5ever scans its whole
+/// stack of open elements for many tags and every run of text, so depth × length is its cost;
+/// browsers cap parser nesting too (Blink at 512).
+const MAX_OPEN: usize = 256;
+
+/// Elements whose end tag is optional or that have none: not counted as open.
+const IMPLIED: &[&str] = &[
+    "p", "li", "dt", "dd", "tr", "td", "th", "tbody", "thead", "tfoot", "colgroup", "option", "optgroup", "rb", "rt", "rp", "rtc", "html", "head", "body", "br", "img", "hr",
+    "input", "meta", "link", "area", "base", "col", "embed", "param", "source", "track", "wbr", "keygen", "frame", "image", "isindex",
+];
+
+/// Elements whose content is text up to their end tag.
+const RAW: &[&str] = &["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "plaintext"];
+
+/// `html` made safe for html5ever's quadratic corners, in one linear pass: every tag cut
+/// after [`MAX_ATTRS`] attributes, and tags past [`MAX_OPEN`] open elements dropped with their
+/// end tags (their text stays). Borrowed when nothing changes, as for any real mail.
+fn prefilter(html: &str) -> std::borrow::Cow<'_, str> {
+    let b = html.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut open = 0usize;
+    let mut dropped: HashMap<String, usize> = HashMap::new();
+    let mut i = 0;
+    // Replaces html[from..to] with `with` in the output.
+    let splice = |out: &mut Option<String>, copied: &mut usize, from: usize, to: usize, with: &str| {
+        let o = out.get_or_insert_with(|| String::with_capacity(html.len()));
+        o.push_str(&html[*copied..from]);
+        o.push_str(with);
+        *copied = to;
+    };
+    while i < b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if b[i..].starts_with(b"<!--") {
+            i = find(b, i + 4, b"-->").map_or(b.len(), |e| e + 3);
+            continue;
+        }
+        let end_tag = b.get(i + 1) == Some(&b'/');
+        let name_at = if end_tag { i + 2 } else { i + 1 };
+        if !b.get(name_at).is_some_and(|c| c.is_ascii_alphabetic()) {
+            i += 1;
+            continue;
+        }
+        let mut n = name_at;
+        while n < b.len() && !b[n].is_ascii_whitespace() && b[n] != b'>' && b[n] != b'/' {
+            n += 1;
+        }
+        let name = html[name_at..n].to_ascii_lowercase();
+        let (close, cut) = tag_end(b, n);
+        let next = (close + 1).min(b.len());
+        if end_tag {
+            if let Some(d) = dropped.get_mut(&name).filter(|d| **d > 0) {
+                *d -= 1;
+                splice(&mut out, &mut copied, i, next, "");
+            } else if !IMPLIED.contains(&name.as_str()) {
+                open = open.saturating_sub(1);
+            }
+            i = next;
+            continue;
+        }
+        let counted = !IMPLIED.contains(&name.as_str()) && !(close > 0 && b.get(close - 1) == Some(&b'/'));
+        if counted && open >= MAX_OPEN {
+            *dropped.entry(name.clone()).or_default() += 1;
+            splice(&mut out, &mut copied, i, next, "");
+        } else {
+            if counted {
+                open += 1;
+            }
+            if let Some(at) = cut {
+                splice(&mut out, &mut copied, at, next, ">");
+            }
+        }
+        i = next;
+        if RAW.contains(&name.as_str()) {
+            // Its text, unread, up to `</name`.
+            i = find_raw_end(b, i, &name);
+        }
+    }
+    match out {
+        Some(mut o) => {
+            o.push_str(&html[copied..]);
+            std::borrow::Cow::Owned(o)
+        }
+        None => std::borrow::Cow::Borrowed(html),
+    }
+}
+
+fn find(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    (from..b.len().saturating_sub(needle.len() - 1)).find(|&k| b[k..].starts_with(needle))
+}
+
+/// Where the text of raw element `name` starting at `from` ends (its `</name`).
+fn find_raw_end(b: &[u8], from: usize, name: &str) -> usize {
+    let mut k = from;
+    while let Some(lt) = find(b, k, b"</") {
+        if b.len() - lt - 2 >= name.len() && b[lt + 2..lt + 2 + name.len()].eq_ignore_ascii_case(name.as_bytes()) {
+            return lt;
+        }
+        k = lt + 2;
+    }
+    b.len()
+}
+
+/// From inside a tag, its closing `>` and, past [`MAX_ATTRS`] attributes, where to cut it.
+/// Quotes count only where HTML has them, right after `=`.
+fn tag_end(b: &[u8], from: usize) -> (usize, Option<usize>) {
+    let (mut j, mut attrs, mut quote, mut space, mut eq) = (from, 0usize, 0u8, from > 0 && b[from - 1].is_ascii_whitespace(), false);
+    let mut cut = None;
+    while j < b.len() {
+        let c = b[j];
+        if quote != 0 {
+            if c == quote {
+                quote = 0;
+            }
+        } else if c == b'>' {
+            return (j, cut);
+        } else if c.is_ascii_whitespace() {
+            space = true;
+        } else {
+            if eq && (c == b'"' || c == b'\'') {
+                quote = c;
+            } else if space && !eq && c != b'=' && c != b'/' && cut.is_none() {
+                attrs += 1;
+                if attrs > MAX_ATTRS {
+                    cut = Some(j);
+                }
+            }
+            eq = c == b'=';
+            space = false;
+        }
+        j += 1;
+    }
+    (b.len(), cut)
+}
+
+/// Runs `f`, turning a panic into an empty [`Doc`].
+fn guarded(f: impl FnOnce() -> Doc + std::panic::UnwindSafe) -> Doc {
+    std::panic::catch_unwind(f).unwrap_or_else(|_| {
+        log::warn!("html: the renderer panicked on a message; showing its text instead");
+        Doc::default()
+    })
+}
+
+fn parse_unguarded(html: &str) -> Doc {
+    let html = prefilter(html);
     let dom = html5ever::parse_document(RcDom::default(), Default::default()).from_utf8().read_from(&mut html.as_bytes());
     let Ok(dom) = dom else { return Doc::default() };
     let mut b = Builder::new(&dom.document);
+    b.stack_top = stack_here();
     let mut out = Vec::new();
     let mut para = Para::default();
     b.children(&dom.document, &Ctx::default(), &mut out, &mut para);
@@ -310,6 +480,7 @@ struct Builder {
     /// block that saw one is a blank line.
     blank_hint: u32,
     too_deep: bool,
+    stack_top: usize,
 }
 
 fn key(h: &Handle) -> usize {
@@ -331,7 +502,7 @@ fn tag(h: &Handle) -> Option<String> {
 impl Builder {
     /// Indexes the document's elements for selectors and reads its `<style>` sheets.
     fn new(root: &Handle) -> Builder {
-        let mut b = Builder { doc: Doc::default(), depth: 0, sheet: Sheet::new(), els: Vec::new(), index: HashMap::new(), styles: Vec::new(), blank_hint: 0, too_deep: false };
+        let mut b = Builder { doc: Doc::default(), depth: 0, sheet: Sheet::new(), els: Vec::new(), index: HashMap::new(), styles: Vec::new(), blank_hint: 0, too_deep: false, stack_top: stack_here() };
         let mut sheets: Vec<(String, Option<String>)> = Vec::new();
         b.index_children(root, NONE, [0; 8], &mut sheets, 0);
         for (css, media) in sheets {
@@ -398,9 +569,25 @@ fn zero(v: Option<&str>) -> bool {
     v.is_some_and(|v| v.trim_end_matches("px").trim_end_matches("pt").trim_end_matches("em").trim().parse::<f32>().is_ok_and(|n| n <= 0.0))
 }
 
-/// Element children that make a block more than text: these survive `font-size: 0`.
+/// Element children that make a block more than text: these survive `font-size: 0`. Looks a
+/// few levels down and at a few hundred nodes at most; past that, assume there's more than
+/// text (and show it).
 fn has_blockish(h: &Handle) -> bool {
-    h.children.borrow().iter().any(|c| tag(c).is_some_and(|t| t == "img" || t == "table" || BLOCKS.contains(&t.as_str()) || has_blockish(c)))
+    fn walk(h: &Handle, depth: u32, budget: &mut u32) -> bool {
+        for c in h.children.borrow().iter() {
+            if *budget == 0 || depth > 6 {
+                return true;
+            }
+            *budget -= 1;
+            if let Some(t) = tag(c)
+                && (t == "img" || t == "table" || BLOCKS.contains(&t.as_str()) || walk(c, depth + 1, budget))
+            {
+                return true;
+            }
+        }
+        false
+    }
+    walk(h, 0, &mut 256)
 }
 
 fn hidden(h: &Handle, t: &str, st: &[(Rc<str>, Rc<str>)]) -> bool {
@@ -461,8 +648,12 @@ pub fn parse_color(v: &str) -> Option<Rgba> {
     })
 }
 
-/// A CSS length in points (`16px`, `12pt`, `1.2em`, `80%` of `base`).
+/// A CSS length in points (`16px`, `12pt`, `1.2em`, `80%` of `base`), within ±100,000.
 fn length(v: &str, base: f32) -> Option<f32> {
+    length_raw(v, base).map(|n| n.clamp(-100_000.0, 100_000.0)).filter(|n| n.is_finite())
+}
+
+fn length_raw(v: &str, base: f32) -> Option<f32> {
     let v = v.trim();
     let num = |s: &str| s.trim().parse::<f32>().ok().filter(|n| n.is_finite());
     if let Some(n) = v.strip_suffix("px") {
@@ -492,11 +683,11 @@ fn length(v: &str, base: f32) -> Option<f32> {
 fn len_attr(v: &str) -> Option<Len> {
     let v = v.trim();
     if let Some(p) = v.strip_suffix('%') {
-        p.trim().parse().ok().filter(|n: &f32| *n > 0.0).map(Len::Pct)
+        p.trim().parse().ok().filter(|n: &f32| *n > 0.0 && n.is_finite()).map(|n: f32| Len::Pct(n.min(1_000.0)))
     } else if v.ends_with("em") || v.ends_with("pt") {
         length(v, BASE).filter(|n| *n > 0.0).map(Len::Px)
     } else {
-        v.trim_end_matches("px").trim().parse().ok().filter(|n: &f32| *n > 0.0 && n.is_finite()).map(Len::Px)
+        v.trim_end_matches("px").trim().parse().ok().filter(|n: &f32| *n > 0.0 && n.is_finite()).map(|n: f32| Len::Px(n.min(100_000.0)))
     }
 }
 
@@ -850,9 +1041,8 @@ fn transformed(text: String, t: Transform, at_word_start: bool) -> String {
 fn flush(out: &mut Vec<Node>, para: &mut Para) {
     let mut p = std::mem::take(para);
     // Trim whitespace at the ends.
-    while p.runs.first().is_some_and(|r| r.text.trim().is_empty() && !r.text.contains('\n')) {
-        p.runs.remove(0);
-    }
+    let lead = p.runs.iter().take_while(|r| r.text.trim().is_empty() && !r.text.contains('\n')).count();
+    p.runs.drain(..lead);
     if let Some(first) = p.runs.first_mut() {
         first.text = first.text.trim_start_matches([' ', '\n']).to_owned();
     }
@@ -1109,12 +1299,14 @@ impl Builder {
             self.doc.background = Some(bg);
         }
         self.depth += 1;
-        if self.depth > MAX_DEPTH {
+        if self.depth > MAX_DEPTH || stack_here().abs_diff(self.stack_top) > STACK_BUDGET {
             self.depth -= 1;
             if !self.too_deep {
                 self.too_deep = true;
                 self.doc.fidelity.note(Issue::TooDeep);
             }
+            // Too deep to lay out: keep its text, without recursing further.
+            self.flat_text(h, parent, out, para);
             return;
         }
         let mut ctx = parent.clone();
@@ -1227,6 +1419,36 @@ impl Builder {
             _ => self.children(h, &ctx, out, para),
         }
         self.depth -= 1;
+    }
+
+    /// The visible text under `h` as plain paragraphs, walked with a stack of its own.
+    fn flat_text(&mut self, h: &Handle, ctx: &Ctx, out: &mut Vec<Node>, para: &mut Para) {
+        let mut stack = vec![h.clone()];
+        while let Some(n) = stack.pop() {
+            match &n.data {
+                NodeData::Text { contents } => {
+                    let text = contents.borrow();
+                    self.push_text(para, ctx, &text);
+                }
+                NodeData::Element { .. } => {
+                    let t = tag(&n).unwrap_or_default();
+                    if SKIP.contains(&t.as_str()) {
+                        continue;
+                    }
+                    let st = self.styles(&n);
+                    if hidden(&n, &t, &st) {
+                        continue;
+                    }
+                    if t == "br" {
+                        self.push_text(para, &Ctx { pre: true, ..ctx.clone() }, "\n");
+                    } else if BLOCKS.contains(&t.as_str()) {
+                        flush(out, para);
+                    }
+                    stack.extend(n.children.borrow().iter().rev().cloned());
+                }
+                _ => {}
+            }
+        }
     }
 
     /// A link: inline text, or a box of its own when it's drawn as a button.
@@ -1924,4 +2146,52 @@ mod tests {
             .collect();
         assert_eq!(kinds, ["p", "blank", "p", "space", "blank", "space", "blank", "p"], "{:#?}", doc.nodes);
     }
+
+    #[test]
+    fn tags_keep_a_bounded_number_of_attributes() {
+        let many = (0..2_000).map(|i| format!("a{i}=\"x y\" ")).collect::<String>();
+        let html = format!("<p class=it's title=\"a > b\" {many}>Hello</p><b>world</b>");
+        let limited = prefilter(&html);
+        assert!(limited.len() < html.len() / 2);
+        assert!(limited.ends_with(">Hello</p><b>world</b>"), "{}", &limited[limited.len() - 40..]);
+        assert_eq!(plain(&parse(&html)), "Hello\n\nworld");
+        let ordinary = "<p class='a' style=\"x\" data-x=it's>Hi <b>there</b> a<b and > c</p>";
+        assert!(matches!(prefilter(ordinary), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn deep_nesting_is_capped_before_html5ever() {
+        // Past MAX_OPEN open elements, start tags (and their end tags) go; their text stays.
+        let html = format!("{}deep{}<p>after</p>", "<div>".repeat(1_000), "</div>".repeat(1_000));
+        let f = prefilter(&html);
+        assert_eq!(f.matches("<div>").count(), MAX_OPEN);
+        assert_eq!(f.matches("</div>").count(), MAX_OPEN);
+        assert_eq!(plain(&parse(&html)), "deep\n\nafter");
+        // Comments and raw text aren't tags.
+        let html = format!("<!--{}--><style>{}</style><p>x</p>", "<div>".repeat(1_000), "<div>".repeat(1_000));
+        assert!(matches!(prefilter(&html), std::borrow::Cow::Borrowed(_)));
+        // Real mail passes through untouched.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../envoy-core/tests/fixtures/html");
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_some_and(|x| x == "html") {
+                let html = std::fs::read_to_string(&p).unwrap();
+                assert!(matches!(prefilter(&html), std::borrow::Cow::Borrowed(_)), "{} was changed", p.display());
+            }
+        }
+    }
+
+    #[test]
+    fn a_panic_while_parsing_becomes_an_empty_doc() {
+        // Parsing runs while the store is locked: a panic must not unwind into the lock.
+        let doc = guarded(|| panic!("a renderer bug"));
+        assert_eq!(doc, Doc::default());
+    }
+
+    #[test]
+    fn hostile_nth_child_doesnt_panic() {
+        let doc = parse("<style>p:nth-child(-n-2147483647){color:red}</style><p>Hello</p>");
+        assert_eq!(plain(&doc), "Hello");
+    }
+
 }
