@@ -4,8 +4,10 @@
 //! deletions replay through the op queue ([`Op::SaveDraft`], [`Op::PurgeDraft`]).
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{Address, Draft, MessageId, Role, Summary, View, flags};
 #[cfg(doc)]
@@ -25,6 +27,66 @@ pub fn save(st: &Store, id: i64, draft: &Draft, open: bool, rev: i64, now: i64) 
         return st.queue_draft_upload(&draft.account, id, if open { now + UPLOAD_DELAY } else { now });
     }
     Ok(false)
+}
+
+/// A draft the app couldn't write to the store as the window closed: kept in a plain file
+/// ([`recovery_file`]) and imported on the next start, so it's never lost.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Recovered {
+    pub id: i64,
+    pub draft: Draft,
+    /// It was in the composer.
+    pub open: bool,
+    /// When it was written (or sent): imported like a save made then, so it neither
+    /// overwrites anything newer nor brings back a draft that's gone since.
+    pub stamp: i64,
+    /// A message sent but not confirmed queued: kept as a draft unless its send went through.
+    pub unsent: bool,
+}
+
+/// Where [`Recovered`] drafts wait for the next start.
+pub fn recovery_file() -> PathBuf {
+    crate::paths::data_dir().join("drafts-recovery.json")
+}
+
+/// Adds drafts to the recovery file at `path`, with any already waiting there, replacing it
+/// atomically. A file that can't be read is set aside, never overwritten.
+pub fn save_recovery(path: &Path, drafts: &[Recovered]) -> Result<()> {
+    let mut all: Vec<Recovered> = match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(waiting) => waiting,
+            Err(_) => {
+                std::fs::rename(path, path.with_extension(format!("unreadable-{}", chrono::Utc::now().timestamp())))?;
+                Vec::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    all.extend(drafts.iter().cloned());
+    crate::paths::write_atomic(path, &serde_json::to_vec_pretty(&all)?)?;
+    Ok(())
+}
+
+/// Imports the drafts waiting in the recovery file at `path` (none if there's no file), each
+/// like a save made when it was written, then removes the file. On any failure the file stays,
+/// for the next start. Returns how many there were.
+pub fn import_recovery(path: &Path, st: &Store, now: i64) -> Result<usize> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let waiting: Vec<Recovered> = serde_json::from_slice(&bytes)?;
+    for r in &waiting {
+        if r.unsent {
+            st.draft_unsent(r.id, &r.draft, r.stamp, now)?;
+        } else {
+            save(st, r.id, &r.draft, r.open, r.stamp, now)?;
+        }
+    }
+    std::fs::remove_file(path)?;
+    Ok(waiting.len())
 }
 
 /// A Drafts list row for a local draft the server doesn't have yet: negative, so it's never a
@@ -134,4 +196,64 @@ fn matches(q: &Query, d: &Draft) -> bool {
     let to = format!("{} {}", d.to, d.cc).to_lowercase();
     let subject = d.subject.to_lowercase();
     q.text.iter().all(|w| all.contains(&w.to_lowercase())) && q.to.iter().all(|t| to.contains(t)) && q.subject.iter().all(|s| subject.contains(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("envoy-recovery-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn recovered(id: i64, subject: &str, stamp: i64, unsent: bool) -> Recovered {
+        Recovered { id, draft: Draft { account: "a".into(), subject: subject.into(), ..Draft::default() }, open: true, stamp, unsent }
+    }
+
+    #[test]
+    fn drafts_kept_in_the_recovery_file_come_back_on_the_next_start() {
+        let dir = temp("roundtrip");
+        let file = dir.join("drafts-recovery.json");
+        save_recovery(&file, &[recovered(1, "first close", 10, false)]).unwrap();
+        save_recovery(&file, &[recovered(2, "second close", 20, false), recovered(3, "sent, unconfirmed", 30, true)]).unwrap();
+        let st = Store::memory();
+        assert_eq!(import_recovery(&file, &st, 100).unwrap(), 3, "both closes kept");
+        assert!(!file.exists(), "done with");
+        let subjects: Vec<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
+        assert_eq!(subjects.len(), 3, "{subjects:?}");
+        assert_eq!(import_recovery(&file, &st, 100).unwrap(), 0, "no file, nothing to do");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_drafts_overwrite_nothing_newer_and_revive_nothing_gone() {
+        let dir = temp("rules");
+        let file = dir.join("drafts-recovery.json");
+        let st = Store::memory();
+        st.save_draft(1, &Draft { account: "a".into(), subject: "newer".into(), ..Draft::default() }, true, 50, 100).unwrap();
+        // Draft 2 was discarded for good after its snapshot was taken.
+        st.save_draft(2, &Draft { account: "a".into(), subject: "discarded".into(), ..Draft::default() }, true, 5, 100).unwrap();
+        st.discard_draft(2, None).unwrap();
+        save_recovery(&file, &[recovered(1, "older", 40, false), recovered(2, "discarded", 6, false)]).unwrap();
+        import_recovery(&file, &st, 101).unwrap();
+        assert_eq!(st.draft(1).unwrap().unwrap().draft.subject, "newer");
+        assert_eq!(st.draft(2).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_recovery_file_is_set_aside_not_overwritten() {
+        let dir = temp("unreadable");
+        let file = dir.join("drafts-recovery.json");
+        std::fs::write(&file, b"{ half written").unwrap();
+        save_recovery(&file, &[recovered(1, "kept", 10, false)]).unwrap();
+        let aside = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().contains("unreadable")).count();
+        assert_eq!(aside, 1, "the old file is still there");
+        let st = Store::memory();
+        assert_eq!(import_recovery(&file, &st, 100).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

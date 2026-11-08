@@ -141,13 +141,23 @@ pub struct PendingSave {
 const SAVE_RETRY: f64 = 5.0;
 
 /// What closing the window must still write ([`App::unsaved`]).
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Unsaved {
     /// A draft save, under its stamp (so it never overwrites a newer one).
     Save { id: i64, draft: Draft, open: bool, rev: i64 },
     /// A message sent from the composer (at `stamp`) but not confirmed queued: kept as a draft
     /// unless its send was queued, or went out, after all.
     Unsent { id: i64, draft: Draft, stamp: i64 },
+}
+
+impl Unsaved {
+    /// For the recovery file.
+    fn recovered(&self) -> envoy_core::drafts::Recovered {
+        match self {
+            Unsaved::Save { id, draft, open, rev } => envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: *open, stamp: *rev, unsent: false },
+            Unsaved::Unsent { id, draft, stamp } => envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: true, stamp: *stamp, unsent: true },
+        }
+    }
 }
 
 pub struct Toast {
@@ -1475,15 +1485,46 @@ impl App {
     /// The window is closing: everything not confirmed written is written now, before the
     /// process can exit ([`App::unsaved`]). The composer opens again on the next start.
     pub fn on_close(&mut self) {
-        let unsaved = self.unsaved();
-        let Some(engine) = &self.engine else { return };
-        for u in unsaved {
-            let done = match &u {
-                Unsaved::Save { id, draft, open, rev } => engine.save_draft_now(*id, draft, *open, *rev),
-                Unsaved::Unsent { id, draft, stamp } => engine.keep_unsent_now(*id, draft, *stamp),
-            };
-            if let Err(e) = done {
-                eprintln!("couldn't save a draft: {e:#}");
+        if self.demo {
+            return;
+        }
+        let engine = self.engine.take();
+        self.close_with(
+            |u| {
+                let Some(engine) = &engine else { return Err("the mail database isn't open".into()) };
+                match u {
+                    Unsaved::Save { id, draft, open, rev } => engine.save_draft_now(*id, draft, *open, *rev),
+                    Unsaved::Unsent { id, draft, stamp } => engine.keep_unsent_now(*id, draft, *stamp),
+                }
+                .map_err(|e| format!("{e:#}"))
+            },
+            |failed| {
+                let drafts: Vec<envoy_core::drafts::Recovered> = failed.iter().map(Unsaved::recovered).collect();
+                envoy_core::drafts::save_recovery(&envoy_core::drafts::recovery_file(), &drafts).map_err(|e| format!("{e:#}"))
+            },
+        );
+        self.engine = engine;
+    }
+
+    /// [`App::on_close`]'s work: everything unsaved goes through `write`, and what fails to
+    /// `recover` (the recovery file, imported on the next start). A snapshot is dropped only
+    /// once one of them holds it; if neither can, its text goes to the log, the last place left.
+    fn close_with(&mut self, mut write: impl FnMut(&Unsaved) -> Result<(), String>, recover: impl FnOnce(Vec<Unsaved>) -> Result<(), String>) {
+        let mut failed = Vec::new();
+        for u in self.unsaved() {
+            if let Err(e) = write(&u) {
+                eprintln!("couldn't save a draft ({e}): keeping it in the recovery file");
+                failed.push(u);
+            }
+        }
+        if failed.is_empty() {
+            return;
+        }
+        let text: Vec<String> = failed.iter().map(|u| format!("{u:#?}")).collect();
+        if let Err(e) = recover(failed) {
+            eprintln!("ENVOY COULDN'T SAVE {} DRAFT(S) ANYWHERE ({e}). THEIR TEXT, TO COPY FROM HERE:", text.len());
+            for t in text {
+                eprintln!("{t}");
             }
         }
     }
@@ -2186,6 +2227,22 @@ mod tests {
         app.tick(t + SAVE_RETRY + 1.0, &mut Tx::default());
         assert!(app.pending_saves.iter().all(|p| p.id != id), "the old text isn't saved over what was sent");
         assert!(matches!(&app.unsaved()[..], [Unsaved::Unsent { draft, .. }] if draft.body == "Newer text"));
+    }
+
+    #[test]
+    fn a_draft_that_cant_be_written_on_close_goes_to_the_recovery_file() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let (a, _) = typed_and_saved(&mut app, "Draft A");
+        app.compose_new();
+        type_into_body(&mut app, "Draft B");
+        let mut recovered = Vec::new();
+        // The database refuses A (disk full, say); B goes in.
+        app.close_with(|u| if matches!(u, Unsaved::Save { id, .. } if *id == a) { Err("disk I/O error".to_owned()) } else { Ok(()) }, |failed| {
+            recovered = failed;
+            Ok(())
+        });
+        assert!(matches!(&recovered[..], [Unsaved::Save { id, draft, .. }] if *id == a && draft.body == "Draft A"), "{recovered:?}");
     }
 
     #[test]
