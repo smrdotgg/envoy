@@ -128,8 +128,23 @@ pub fn server_draft(raw: &[u8]) -> Option<ServerDraft> {
     let part = |i: &u32| msg.parts.get(*i as usize);
     let has_html = msg.html_body.iter().any(|i| part(i).is_some_and(|p| p.is_text_html()));
     let texts = msg.text_body.iter().filter(|i| part(i).is_some_and(|p| p.is_text() && !p.is_text_html())).count();
-    let root = mime_of(msg.root_part());
-    let copy = if matches!(root.as_str(), "multipart/signed" | "multipart/encrypted" | "application/pkcs7-mime" | "application/x-pkcs7-mime") {
+    // Signed or encrypted anywhere in it (a signed part beside an attachment, an S/MIME
+    // signature file, PGP inline in the text): rebuilding it would drop the protection.
+    const PROTECTED: &[&str] = &[
+        "multipart/signed",
+        "multipart/encrypted",
+        "application/pkcs7-mime",
+        "application/x-pkcs7-mime",
+        "application/pkcs7-signature",
+        "application/x-pkcs7-signature",
+        "application/pgp-encrypted",
+        "application/pgp-signature",
+    ];
+    let protected = msg.parts.iter().any(|p| {
+        PROTECTED.contains(&mime_of(p).as_str())
+            || p.text_contents().is_some_and(|t| p.is_text() && (t.contains("-----BEGIN PGP SIGNED MESSAGE-----") || t.contains("-----BEGIN PGP MESSAGE-----")))
+    });
+    let copy = if protected {
         Some("it's signed or encrypted")
     } else if has_html && texts == 0 {
         Some("it only has a formatted version")
@@ -408,6 +423,20 @@ mod tests {
         // Text, a picture, more text (as Apple Mail writes): one text field can't hold it.
         let pieces = b"From: a@x.com\r\nSubject: Hi\r\nContent-Type: multipart/mixed; boundary=\"m\"\r\n\r\n--m\r\nContent-Type: text/plain\r\n\r\nBefore\r\n--m\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\n\r\nPNG\r\n--m\r\nContent-Type: text/plain\r\n\r\nAfter\r\n--m--\r\n";
         assert!(matches!(server_draft(pieces).unwrap().notice, Some(DraftNotice::Copy(_))));
+    }
+
+    #[test]
+    fn a_draft_signed_or_encrypted_anywhere_inside_is_left_as_it_is() {
+        use crate::model::DraftNotice;
+        let copy = |raw: &[u8]| matches!(server_draft(raw).unwrap().notice, Some(DraftNotice::Copy(ref why)) if why.contains("signed or encrypted"));
+        // A signed message with a file beside it: the signature is a level down.
+        let nested = b"From: a@x.com\r\nSubject: Hi\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"m\"\r\n\r\n--m\r\nContent-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=\"s\"\r\n\r\n--s\r\nContent-Type: text/plain\r\n\r\nSigned words.\r\n--s\r\nContent-Type: application/pgp-signature\r\n\r\nSIG\r\n--s--\r\n--m\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"a.pdf\"\r\n\r\nPDF\r\n--m--\r\n";
+        assert!(copy(nested), "{:?}", server_draft(nested).unwrap().notice);
+        let smime = b"From: a@x.com\r\nSubject: Hi\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"m\"\r\n\r\n--m\r\nContent-Type: text/plain\r\n\r\nHello\r\n--m\r\nContent-Type: application/pkcs7-signature; name=\"smime.p7s\"\r\n\r\nSIG\r\n--m--\r\n";
+        assert!(copy(smime));
+        // Signed inline (PGP in the text itself): editing would break it too.
+        let inline = b"From: a@x.com\r\nSubject: Hi\r\nContent-Type: text/plain\r\n\r\n-----BEGIN PGP SIGNED MESSAGE-----\r\nHash: SHA256\r\n\r\nHello\r\n-----BEGIN PGP SIGNATURE-----\r\nxyz\r\n-----END PGP SIGNATURE-----\r\n";
+        assert!(copy(inline));
     }
 
     #[test]
