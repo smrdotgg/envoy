@@ -64,8 +64,10 @@ pub enum Undo {
 pub struct MovedAway {
     /// The key the engine holds the move's ops under.
     pub key: i64,
-    /// The view they were removed from; they're put back only if it's still showing.
+    /// The view and search they were removed from; they're put back only if those are still
+    /// showing (otherwise the reload after undo decides what belongs in the list).
     pub view: View,
+    pub query: String,
     pub rows: Vec<Summary>,
     /// The open message, if it was one of them.
     pub open: Option<MessageId>,
@@ -717,29 +719,40 @@ impl App {
     /// Moves messages off the list at once and tells the engine. While the undo window lasts,
     /// the toast offers Undo; deleting from Trash is for good and offers none.
     fn move_away(&mut self, ids: Vec<MessageId>, to: MoveTarget, label: String, tx: &mut Tx) {
-        let rows: Vec<Summary> = self.list.iter().filter(|s| ids.contains(&s.id)).cloned().collect();
-        let in_trash = match rows.first() {
+        let first = self.list.iter().find(|s| ids.contains(&s.id));
+        let in_trash = match first {
             Some(r) => self.role_of(&r.account, &r.mailbox) == Role::Trash,
             None => matches!(self.view, View::Role { role: Role::Trash, .. }),
         };
         let forever = to == MoveTarget::Trash && in_trash;
         let window = self.settings.u32("behavior.undoSeconds");
         let key = (window > 0 && !forever).then(|| self.next_undo_key());
-        let open = self.open.filter(|o| ids.contains(o));
+        let snapshot = key.map(|key| self.snapshot(key, &ids));
         self.send(Command::Move { ids: ids.clone(), to, thread: self.conversations(), undo: key });
         self.after_remove(&ids, tx);
         let label = if forever { "Deleted forever".to_owned() } else { label };
-        let Some(key) = key else {
+        let Some(snapshot) = snapshot else {
             self.toast(label, false);
             return;
         };
         self.toast_seq += 1;
-        let undo = Undo::Move(Box::new(MovedAway { key, view: self.view.clone(), rows, open }));
+        let undo = Undo::Move(Box::new(snapshot));
         self.toasts.push(Toast { id: self.toast_seq, text: label, undo: Some(undo), until: self.clock + window as f64, error: false, open_path: None });
         while self.toasts.len() > 3 {
             self.toasts.remove(0);
         }
         tx.wake_after(std::time::Duration::from_secs_f64(window as f64 + 0.05));
+    }
+
+    /// What undo needs to put these rows back on screen.
+    fn snapshot(&self, key: i64, ids: &[MessageId]) -> MovedAway {
+        MovedAway {
+            key,
+            view: self.view.clone(),
+            query: self.applied_query.clone(),
+            rows: self.list.iter().filter(|s| ids.contains(&s.id)).cloned().collect(),
+            open: self.open.filter(|o| ids.contains(o)),
+        }
     }
 
     /// A key for [`Command::Move`]'s undo: microseconds since the epoch, so keys of held ops
@@ -785,10 +798,10 @@ impl App {
         }
     }
 
-    /// Re-inserts moved rows into the list if it still shows what they were moved from.
-    /// False when it doesn't (the engine's reload will sort it out).
+    /// Re-inserts moved rows into the list if it still shows what they were moved from (same
+    /// view, same search). False when it doesn't (the engine's reload will sort it out).
     fn restore_rows(&mut self, m: &MovedAway) -> bool {
-        if self.view != m.view || self.screen != Screen::Mail {
+        if self.view != m.view || self.applied_query != m.query || self.screen != Screen::Mail {
             return false;
         }
         for row in &m.rows {
@@ -1227,6 +1240,32 @@ mod tests {
                 assert!(part.trim().parse::<rune::Chord>().is_ok(), "{}: {part:?}", d.key);
             }
         }
+    }
+
+    #[test]
+    fn undo_puts_rows_back_only_into_the_list_they_left() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let search = |app: &mut App, q: &str| {
+            app.applied_query = q.into();
+            app.request_list();
+        };
+        // Archive the one result of a search.
+        search(&mut app, "design");
+        let row = app.list[0].clone();
+        let m = app.snapshot(1, &[row.id]);
+        app.list.retain(|s| s.id != row.id);
+        // Search for something else, then undo: the row doesn't match, so it isn't added.
+        search(&mut app, "receipt");
+        let receipts = app.list.clone();
+        assert!(!receipts.contains(&row));
+        app.restore_rows(&m);
+        assert_eq!(app.list, receipts, "undo mustn't add rows the search doesn't match");
+        // Undo from the search it was archived in puts it back where it was.
+        search(&mut app, "design");
+        app.list.retain(|s| s.id != row.id);
+        assert!(app.restore_rows(&m));
+        assert_eq!(app.list.first(), Some(&row));
     }
 
     #[test]
