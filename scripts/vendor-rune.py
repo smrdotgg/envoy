@@ -9,6 +9,8 @@ keys keep resolving.
 Envoy's own changes to Rune are kept as patches in scripts/rune-patches/ and
 applied, in name order, after copying. One that no longer applies (Rune changed
 there, or took the change) stops the script: drop it or redo it.
+- 0001-open-several-files: `Tx::open_files`, an Open dialog that picks several
+  files at once (attaching files in the composer).
 - 0002-zbus-5: Rune's D-Bus services (portals, tray) on zbus 5, the version
   AccessKit's AT-SPI bridge uses, so Linux builds carry one D-Bus stack, not two.
 - 0003-windows-dx12-only: no Vulkan backend on Windows, where DX12 always has an

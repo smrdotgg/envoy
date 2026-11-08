@@ -52,6 +52,7 @@ fn request_options<'a>(kind: FileDialogKind, options: &'a FileDialogOptions, tok
         map.insert("current_folder", Variant::from(bytes));
     }
     if kind == FileDialogKind::Folder { map.insert("directory", Variant::from(true)); }
+    if kind == FileDialogKind::OpenMany { map.insert("multiple", Variant::from(true)); }
     if kind == FileDialogKind::Save && let Some(name) = options.file_name.as_deref().filter(|s| !s.is_empty()) {
         map.insert("current_name", Variant::from(name));
     }
@@ -62,7 +63,7 @@ fn uris(results: &HashMap<String, OwnedVariant>) -> Vec<String> {
     results.get("uris").and_then(|v| v.try_clone().ok()).and_then(|v| Vec::<String>::try_from(v).ok()).unwrap_or_default()
 }
 
-pub(super) async fn show(kind: FileDialogKind, options: FileDialogOptions) -> Result<Option<PathBuf>, FileDialogError> {
+pub(super) async fn show(kind: FileDialogKind, options: FileDialogOptions) -> Result<Vec<PathBuf>, FileDialogError> {
     let (reply, result) = oneshot::channel();
     let parent = parent_window(PARENT.load(Ordering::Relaxed));
     std::thread::Builder::new().name("rune-file-dialog".into()).spawn(move || {
@@ -75,7 +76,7 @@ pub(super) async fn show(kind: FileDialogKind, options: FileDialogOptions) -> Re
     result.await.unwrap_or_else(|_| Err(FileDialogError("file dialog worker stopped".into())))
 }
 
-async fn run(kind: FileDialogKind, options: FileDialogOptions, parent: String, mut reply: oneshot::Sender<Result<Option<PathBuf>, FileDialogError>>) {
+async fn run(kind: FileDialogKind, options: FileDialogOptions, parent: String, mut reply: oneshot::Sender<Result<Vec<PathBuf>, FileDialogError>>) {
     let token = format!("rune_file_dialog_{}", TOKEN.fetch_add(1, Ordering::Relaxed));
     let started = tokio::time::timeout(RPC_TIMEOUT, async {
         // No session bus means this desktop cannot supply the portal.
@@ -93,7 +94,7 @@ async fn run(kind: FileDialogKind, options: FileDialogOptions, parent: String, m
             _ = reply.closed() => { let _ = conn.close().await; return Ok(None); }
         };
         // A folder is OpenFile's `directory` choice (portal version 3).
-        let method = match kind { FileDialogKind::Open | FileDialogKind::Folder => "OpenFile", FileDialogKind::Save => "SaveFile" };
+        let method = match kind { FileDialogKind::Open | FileDialogKind::OpenMany | FileDialogKind::Folder => "OpenFile", FileDialogKind::Save => "SaveFile" };
         let body = (parent.as_str(), options.title.as_str(), request_options(kind, &options, &token));
         let handle: OwnedObjectPath = portal.call(method, &body).await.map_err(dbus_error)?;
         if handle.as_str() != path {
@@ -133,7 +134,7 @@ mod tests {
         let list = vec!["file:///tmp/a%20b".to_string(), "file:///tmp/c".to_string()];
         let results = HashMap::from([("uris".to_string(), OwnedVariant::try_from(Variant::from(list.clone())).unwrap())]);
         assert_eq!(uris(&results), list);
-        assert_eq!(outcome(0, &uris(&results)).unwrap(), Some(PathBuf::from("/tmp/a b")));
+        assert_eq!(outcome(0, &uris(&results)).unwrap(), vec![PathBuf::from("/tmp/a b"), PathBuf::from("/tmp/c")]);
         assert!(uris(&HashMap::new()).is_empty());
         let mistyped = HashMap::from([("uris".to_string(), OwnedVariant::try_from(Variant::from(7u32)).unwrap())]);
         assert!(uris(&mistyped).is_empty());
@@ -148,6 +149,10 @@ mod tests {
         assert_eq!(open.get("current_folder"), Some(&Variant::from(b"/home/a/Downloads\0".to_vec())));
         assert!(!open.contains_key("current_name"));
         assert!(!open.contains_key("directory"));
+        assert!(!open.contains_key("multiple"));
+        let many = request_options(FileDialogKind::OpenMany, &options, "t5");
+        assert_eq!(many.get("multiple"), Some(&Variant::from(true)));
+        assert!(many.contains_key("filters"));
         let folder = request_options(FileDialogKind::Folder, &options, "t4");
         assert_eq!(folder.get("directory"), Some(&Variant::from(true)));
         assert!(!folder.contains_key("filters"));

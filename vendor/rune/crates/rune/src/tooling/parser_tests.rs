@@ -29,14 +29,19 @@ fn a_physical_chord_releases_its_modifiers_after_the_key() {
 
 #[test]
 fn script_events_answer_a_file_dialog() {
-    let kinds: Vec<_> = parse_script(json!([{"t": 0.1, "type": "file-dialog", "path": "/exports/a.json"}, {"t": 0.2, "type": "file-dialog-cancel"}]))
+    let kinds: Vec<_> = parse_script(json!([
+        {"t": 0.1, "type": "file-dialog", "path": "/exports/a.json"},
+        {"t": 0.2, "type": "file-dialog-cancel"},
+        {"t": 0.3, "type": "file-dialog", "paths": ["/files/a.pdf", "/files/b.png"]},
+    ]))
         .into_iter().map(|e| {
             let ScriptEvent::FileDialog(public) = e.public().event else { panic!("public event lost the dialog answer") };
-            let Kind::FileDialog(path) = e.kind else { panic!("parsed as another event") };
-            assert_eq!(public, path);
-            path
+            let Kind::FileDialog(paths) = e.kind else { panic!("parsed as another event") };
+            assert_eq!(public, paths.first().cloned());
+            paths
         }).collect();
-    assert_eq!(kinds, [Some("/exports/a.json".into()), None]);
+    let path = |p: &str| std::path::PathBuf::from(p);
+    assert_eq!(kinds, [vec![path("/exports/a.json")], vec![], vec![path("/files/a.pdf"), path("/files/b.png")]]);
 }
 
 #[test]

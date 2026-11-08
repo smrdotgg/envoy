@@ -37,12 +37,13 @@ pub(super) fn path_bytes(path: &Path) -> Option<Vec<u8>> {
     })
 }
 
-/// The `Response` signal: 0 is a choice, 1 a cancelled dialog, 2 a dialog that ended another
-/// way (for example closed with its parent), which is also no choice.
-pub(super) fn outcome(status: u32, uris: &[String]) -> Result<Option<PathBuf>, FileDialogError> {
+/// The `Response` signal: 0 is a choice (one path, or several from a `multiple` dialog), 1 a
+/// cancelled dialog, 2 a dialog that ended another way (for example closed with its parent),
+/// which is also no choice.
+pub(super) fn outcome(status: u32, uris: &[String]) -> Result<Vec<PathBuf>, FileDialogError> {
     match status {
-        0 => uris.first().map(|uri| uri_path(uri)).transpose(),
-        1 | 2 => Ok(None),
+        0 => uris.iter().map(|uri| uri_path(uri)).collect(),
+        1 | 2 => Ok(Vec::new()),
         n => Err(FileDialogError(format!("file dialog portal response {n}"))),
     }
 }
@@ -80,11 +81,11 @@ mod tests {
     #[test]
     fn chosen_uris_become_percent_decoded_paths() {
         assert_eq!(outcome(0, &uris(&["file:///home/a/My%20Export%20%E5%BD%95.csv"])).unwrap(),
-            Some(PathBuf::from("/home/a/My Export 录.csv")));
+            vec![PathBuf::from("/home/a/My Export 录.csv")]);
         assert_eq!(outcome(0, &uris(&["file://localhost/tmp/a%2fb", "file:///tmp/second"])).unwrap(),
-            Some(PathBuf::from("/tmp/a/b")));
-        assert_eq!(outcome(0, &uris(&["file://LOCALHOST/tmp/a"])).unwrap(), Some(PathBuf::from("/tmp/a")));
-        assert_eq!(outcome(0, &[]).unwrap(), None);
+            vec![PathBuf::from("/tmp/a/b"), PathBuf::from("/tmp/second")]);
+        assert_eq!(outcome(0, &uris(&["file://LOCALHOST/tmp/a"])).unwrap(), vec![PathBuf::from("/tmp/a")]);
+        assert_eq!(outcome(0, &[]).unwrap(), Vec::<PathBuf>::new());
         // A malformed or truncated escape stays literal.
         assert_eq!(uri_path("file:///tmp/100%").unwrap(), PathBuf::from("/tmp/100%"));
         assert_eq!(uri_path("file:///tmp/1%2").unwrap(), PathBuf::from("/tmp/1%2"));
@@ -96,8 +97,8 @@ mod tests {
     }
     #[test]
     fn cancelled_or_ended_dialog_is_no_choice() {
-        assert_eq!(outcome(1, &uris(&["file:///tmp/a"])).unwrap(), None);
-        assert_eq!(outcome(2, &[]).unwrap(), None);
+        assert!(outcome(1, &uris(&["file:///tmp/a"])).unwrap().is_empty());
+        assert!(outcome(2, &[]).unwrap().is_empty());
         assert!(outcome(3, &[]).is_err());
     }
     #[test]

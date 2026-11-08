@@ -204,10 +204,15 @@ pub(crate) fn parse_script(list: Value) -> Vec<Ev> {
             }
             "menu-cancel" => out.push(Ev { t, kind: Kind::PopupMenu(None), pos: Pos::Rel(0.0, 0.0) }),
             "file-dialog" => {
-                let path = e["path"].as_str().unwrap_or_else(|| die("file-dialog needs a \"path\" (file-dialog-cancel cancels)"));
-                out.push(Ev { t, kind: Kind::FileDialog(Some(path.into())), pos: Pos::Rel(0.0, 0.0) });
+                // One "path", or "paths" for a dialog that picks several.
+                let paths: Vec<std::path::PathBuf> = match (e["path"].as_str(), e["paths"].as_array()) {
+                    (Some(path), _) => vec![path.into()],
+                    (None, Some(paths)) => paths.iter().map(|p| p.as_str().unwrap_or_else(|| die("file-dialog \"paths\" are strings")).into()).collect(),
+                    (None, None) => die("file-dialog needs a \"path\" or \"paths\" (file-dialog-cancel cancels)"),
+                };
+                out.push(Ev { t, kind: Kind::FileDialog(paths), pos: Pos::Rel(0.0, 0.0) });
             }
-            "file-dialog-cancel" => out.push(Ev { t, kind: Kind::FileDialog(None), pos: Pos::Rel(0.0, 0.0) }),
+            "file-dialog-cancel" => out.push(Ev { t, kind: Kind::FileDialog(Vec::new()), pos: Pos::Rel(0.0, 0.0) }),
             "mark" => {
                 let name = e["name"].as_str().filter(|n| !n.is_empty()).unwrap_or_else(|| die("a mark needs a \"name\""));
                 out.push(Ev { t, kind: Kind::Mark(name.to_owned()), pos });

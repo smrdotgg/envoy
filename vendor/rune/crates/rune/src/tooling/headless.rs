@@ -254,7 +254,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
                 Kind::Shortcut(shortcut) => shared.shortcuts.fire(shortcut).unwrap_or_else(|e| die(&format!("script shortcut: {e}"))),
                 Kind::Menu(item) => crate::native_menu::fire(&shared, item).unwrap_or_else(|e| die(&format!("script menu: {e}"))),
                 Kind::PopupMenu(picked) => rt.resolve_popup(picked.as_deref()).unwrap_or_else(|e| die(&format!("script pop-up menu: {e}"))),
-                Kind::FileDialog(path) => rt.resolve_file_dialog(path.clone()).unwrap_or_else(|e| die(&format!("script file dialog: {e}"))),
+                Kind::FileDialog(paths) => rt.resolve_file_dialog_paths(paths.clone()).unwrap_or_else(|e| die(&format!("script file dialog: {e}"))),
                 Kind::Move => rt.pointer_move(x, y),
                 Kind::Down => {
                     last_down = (x, y);
