@@ -198,6 +198,8 @@ pub struct App {
     pub thread: Vec<ThreadMessage>,
     pub thread_req: u64,
     pub thread_for: Option<MessageId>,
+    /// Conversations read ahead for the open row's neighbours (`prefetch_neighbours`).
+    pub prefetched: HashMap<MessageId, Vec<ThreadMessage>>,
     /// Collapsed / expanded messages in the open conversation.
     pub expanded: HashSet<MessageId>,
     pub show_quoted: HashSet<MessageId>,
@@ -261,6 +263,7 @@ impl App {
             thread: Vec::new(),
             thread_req: 0,
             thread_for: None,
+            prefetched: HashMap::new(),
             expanded: HashSet::new(),
             show_quoted: HashSet::new(),
             search: TextEdit::new(""),
@@ -312,7 +315,8 @@ impl App {
             Some(e) => e.drain(),
             None => return false,
         };
-        let changed = !events.is_empty();
+        // A conversation read ahead changes nothing on screen.
+        let changed = events.iter().any(|e| !matches!(e, Event::Prefetched { .. }));
         let mut reload = false;
         let before = (self.list_gen, self.thread_for);
         for ev in events {
@@ -376,20 +380,14 @@ impl App {
             }
             Event::Thread { req, id, messages } => {
                 if req == self.thread_req {
-                    let first = self.thread_for != Some(id) || self.thread.is_empty();
-                    self.thread_for = Some(id);
-                    if first {
-                        self.expanded.clear();
-                        // Unread messages and the newest start open, as Gmail does.
-                        for (i, m) in messages.iter().enumerate() {
-                            if !m.summary.seen() || i + 1 == messages.len() {
-                                self.expanded.insert(m.summary.id);
-                            }
-                        }
-                    }
-                    self.thread = messages;
-                    self.request_images();
+                    self.set_thread(id, messages);
                     self.shown(id);
+                    self.prefetch_neighbours();
+                }
+            }
+            Event::Prefetched { id, messages } => {
+                if self.neighbours().contains(&id) {
+                    self.prefetched.insert(id, messages);
                 }
             }
             Event::Image { url, width, height, rgba } => {
@@ -493,6 +491,41 @@ impl App {
             }
             self.images.insert(url.clone(), ImageState::Loading);
             self.send(Command::FetchImage { url, message });
+        }
+    }
+
+    /// Shows `messages` as the open conversation `id`. Opening it afresh resets which messages
+    /// are expanded: the unread ones and the newest, as Gmail does.
+    fn set_thread(&mut self, id: MessageId, messages: Vec<ThreadMessage>) {
+        let first = self.thread_for != Some(id) || self.thread.is_empty();
+        self.thread_for = Some(id);
+        if first {
+            self.expanded.clear();
+            for (i, m) in messages.iter().enumerate() {
+                if !m.summary.seen() || i + 1 == messages.len() {
+                    self.expanded.insert(m.summary.id);
+                }
+            }
+        }
+        self.thread = messages;
+        self.request_images();
+    }
+
+    /// The rows either side of the open one: what j and k open next.
+    fn neighbours(&self) -> Vec<MessageId> {
+        let Some(i) = self.index_of_open() else { return Vec::new() };
+        [i.checked_sub(1), Some(i + 1)].into_iter().flatten().filter_map(|j| self.list.get(j)).map(|m| m.id).collect()
+    }
+
+    /// Reads the open row's neighbours ahead, so j and k show them at once (the North Star's
+    /// "opening one is a swap"); forgets conversations read for earlier neighbours.
+    fn prefetch_neighbours(&mut self) {
+        let near = self.neighbours();
+        self.prefetched.retain(|id, _| near.contains(id));
+        for id in near {
+            if !self.prefetched.contains_key(&id) {
+                self.send(Command::Prefetch { id, conversations: self.conversations() });
+            }
         }
     }
 
@@ -600,6 +633,10 @@ impl App {
         self.show_quoted.clear();
         self.thread_req += 1;
         self.send(Command::Open { req: self.thread_req, id, conversations: self.conversations() });
+        // Read ahead: show it now; the Open above brings it fresh a moment later.
+        if let Some(messages) = self.prefetched.remove(&id) {
+            self.set_thread(id, messages);
+        }
         if self.demo {
             self.thread = crate::demo::thread_for(id);
             self.thread_for = Some(id);
@@ -649,6 +686,7 @@ impl App {
         self.open = None;
         self.thread.clear();
         self.thread_for = None;
+        self.prefetched.clear();
         self.mark_read_at = None;
         self.mark_read_when_shown = None;
     }
@@ -1377,6 +1415,27 @@ mod tests {
         let req = app.thread_req;
         app.apply(Event::Thread { req, id, messages: crate::demo::thread_for(id) }, &mut tx);
         assert!(!unread(&app), "marked read when it shows");
+    }
+
+    #[test]
+    fn a_neighbour_read_ahead_opens_at_once() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false; // threads come from the engine
+        let mut tx = Tx::default();
+        let (first, second) = (app.list[0].id, app.list[1].id);
+        app.open_message(first);
+        let req = app.thread_req;
+        app.apply(Event::Thread { req, id: first, messages: crate::demo::thread_for(first) }, &mut tx);
+        // The engine reads the next row ahead, and j shows it at once, before the Open returns.
+        app.apply(Event::Prefetched { id: second, messages: crate::demo::thread_for(second) }, &mut tx);
+        app.step(1, &mut tx);
+        assert_eq!((app.open, app.thread_for), (Some(second), Some(second)));
+        assert_eq!(app.thread, crate::demo::thread_for(second));
+        // Only the open row's neighbours are kept.
+        let far = app.list[app.list.len() - 1].id;
+        app.apply(Event::Prefetched { id: far, messages: crate::demo::thread_for(far) }, &mut tx);
+        assert!(!app.prefetched.contains_key(&far));
     }
 
     fn move_key(app: &App) -> i64 {

@@ -33,6 +33,9 @@ pub enum MoveTarget {
 pub enum Command {
     List { req: u64, view: View, query: String, conversations: bool, limit: u32 },
     Open { req: u64, id: MessageId, conversations: bool },
+    /// Read a conversation ahead (the list's neighbours of the open one), so the UI can show it
+    /// the moment it's opened. Answered with [`Event::Prefetched`]; downloads nothing.
+    Prefetch { id: MessageId, conversations: bool },
     /// `thread`: apply to every message of each id's conversation.
     SetFlags { ids: Vec<MessageId>, add: u32, remove: u32, thread: bool },
     /// `thread`: move each id's whole conversation (the part in the same mailbox).
@@ -65,6 +68,8 @@ pub enum Event {
     /// the same rows) follows in another `List` with the same `req`.
     List { req: u64, items: Vec<Summary>, more: bool },
     Thread { req: u64, id: MessageId, messages: Vec<ThreadMessage> },
+    /// A [`Command::Prefetch`]'s conversation, as `Thread` would bring it.
+    Prefetched { id: MessageId, messages: Vec<ThreadMessage> },
     /// Something in this account's local copy changed: reload what's on screen.
     Changed { account: String },
     Sync { account: String, state: SyncState },
@@ -334,6 +339,17 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             for ((account, mailbox), uids) in missing {
                 poke(workers, &account, Job::Bodies { mailbox, uids, reply: Some((req, id, conversations)) });
             }
+        }
+        Command::Prefetch { id, conversations } => {
+            let shared = shared.clone();
+            tokio::task::spawn_blocking(move || {
+                let messages = shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| st.thread(id, conversations));
+                if let Ok(messages) = messages
+                    && !messages.is_empty()
+                {
+                    shared.emit(Event::Prefetched { id, messages });
+                }
+            });
         }
         Command::SetFlags { ids, add, remove, thread } => {
             let touched = set_flags(shared, ids, add, remove, thread)?;
