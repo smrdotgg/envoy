@@ -3,6 +3,10 @@
 //! The UI never waits on the network: it reads lists and bodies from here, and every action
 //! (read, star, archive, delete, send) is applied here first and queued in `ops` for the sync
 //! worker to replay on the server, retrying until it succeeds.
+//!
+//! Undoable actions (sending, moves) wait in `ops` until `not_before`. A message being moved
+//! is hidden (`held_op`) rather than deleted until its move replays, so undo can show it again
+//! untouched and a sync meanwhile doesn't download it a second time.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -48,6 +52,7 @@ CREATE TABLE IF NOT EXISTS messages (
     preview TEXT NOT NULL DEFAULT '',
     has_attachments INTEGER NOT NULL DEFAULT 0,
     has_body INTEGER NOT NULL DEFAULT 0,
+    held_op INTEGER NOT NULL DEFAULT 0,
     UNIQUE (account, mailbox, uid)
 );
 CREATE INDEX IF NOT EXISTS messages_box_date ON messages (account, mailbox, date DESC);
@@ -71,12 +76,40 @@ CREATE TABLE IF NOT EXISTS ops (
     op TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    not_before INTEGER NOT NULL DEFAULT 0
+    not_before INTEGER NOT NULL DEFAULT 0,
+    batch INTEGER NOT NULL DEFAULT 0
 );
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM fts WHERE rowid = old.id;
 END;
 "#;
+
+/// Columns added after the first release, for caches created before them. Each runs once,
+/// when the column is missing.
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    // A message moved away locally whose move hasn't reached the server yet: hidden, not
+    // deleted, so undo can bring it back and a sync can't re-download it meanwhile.
+    ("messages", "held_op", "ALTER TABLE messages ADD COLUMN held_op INTEGER NOT NULL DEFAULT 0"),
+    // Ops queued by one user action, so undo can take them all back.
+    ("ops", "batch", "ALTER TABLE ops ADD COLUMN batch INTEGER NOT NULL DEFAULT 0"),
+];
+
+/// Indexes on migrated columns (they must exist first).
+const POST_MIGRATION: &str = "
+CREATE INDEX IF NOT EXISTS messages_held ON messages (held_op) WHERE held_op != 0;
+CREATE INDEX IF NOT EXISTS ops_batch ON ops (batch) WHERE batch != 0;
+";
+
+fn migrate(conn: &Connection) -> Result<()> {
+    for (table, column, sql) in MIGRATIONS {
+        let has: bool = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), params![column], |r| r.get::<_, i64>(0))? > 0;
+        if !has {
+            conn.execute_batch(sql)?;
+        }
+    }
+    conn.execute_batch(POST_MIGRATION)?;
+    Ok(())
+}
 
 /// A change queued for the server.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -203,6 +236,7 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Store { conn })
     }
 
@@ -210,6 +244,7 @@ impl Store {
     pub fn memory() -> Store {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
         Store { conn }
     }
 
@@ -396,7 +431,7 @@ impl Store {
     /// are smaller than `max_size` bytes.
     pub fn missing_bodies(&self, account: &str, mailbox: &str, limit: u32, max_size: u32) -> Result<Vec<u32>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT uid FROM (SELECT uid, has_body, size FROM messages WHERE account = ?1 AND mailbox = ?2 ORDER BY date DESC LIMIT ?3)
+            "SELECT uid FROM (SELECT uid, has_body, size FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op = 0 ORDER BY date DESC LIMIT ?3)
              WHERE has_body = 0 AND size <= ?4",
         )?;
         let rows = stmt.query_map(params![account, mailbox, limit, max_size], |r| r.get(0))?;
@@ -480,9 +515,16 @@ impl Store {
             .optional()?)
     }
 
-    /// Removes a message locally (it moved away or was expunged); the server copy follows via `ops`.
+    /// Removes a message locally (it was expunged); the server copy follows via `ops`.
     pub fn remove_local(&self, id: MessageId) -> Result<()> {
         self.conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Hides a message that is moving away until `op` (the move) reaches the server, when it is
+    /// deleted ([`Store::op_done`]), or is undone or dropped, when it shows again.
+    pub fn hide_local(&self, id: MessageId, op: i64) -> Result<()> {
+        self.conn.execute("UPDATE messages SET held_op = ?2 WHERE id = ?1", params![id, op])?;
         Ok(())
     }
 
@@ -491,9 +533,9 @@ impl Store {
     pub fn thread_ids(&self, id: MessageId, view_mailbox_only: bool) -> Result<Vec<MessageId>> {
         let Some(s) = self.summary(id)? else { return Ok(vec![]) };
         let sql = if view_mailbox_only {
-            "SELECT id FROM messages WHERE account = ?1 AND thread = ?2 AND mailbox = ?3 ORDER BY date DESC"
+            "SELECT id FROM messages WHERE account = ?1 AND thread = ?2 AND mailbox = ?3 AND held_op = 0 ORDER BY date DESC"
         } else {
-            "SELECT id FROM messages WHERE account = ?1 AND thread = ?2 AND ?3 = ?3 ORDER BY date DESC"
+            "SELECT id FROM messages WHERE account = ?1 AND thread = ?2 AND ?3 = ?3 AND held_op = 0 ORDER BY date DESC"
         };
         let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map(params![s.account, s.thread, s.mailbox], |r| r.get(0))?;
@@ -502,7 +544,7 @@ impl Store {
 
     /// The list for a view, newest first. With `conversations`, one row per conversation.
     pub fn list(&self, view: &View, query: &Query, conversations: bool, limit: u32, me: &HashSet<String>) -> Result<Vec<Summary>> {
-        let mut conds: Vec<String> = vec!["m.flags & 16 = 0".into()];
+        let mut conds: Vec<String> = vec!["m.flags & 16 = 0".into(), "m.held_op = 0".into()];
         let mut args: Vec<SqlValue> = Vec::new();
         match view {
             View::Mailbox { account, mailbox } => {
@@ -617,7 +659,7 @@ impl Store {
         let mut items = Vec::new();
         if conversations {
             let sql = format!(
-                "SELECT {SUMMARY_COLS} FROM messages m WHERE m.account = ?1 AND m.thread = ?2 AND m.flags & 16 = 0
+                "SELECT {SUMMARY_COLS} FROM messages m WHERE m.account = ?1 AND m.thread = ?2 AND m.flags & 16 = 0 AND m.held_op = 0
                  AND ((m.account, m.mailbox) NOT IN (SELECT account, name FROM mailboxes WHERE role IN ('trash', 'junk')) OR m.mailbox = ?3)
                  ORDER BY m.date ASC"
             );
@@ -674,14 +716,71 @@ impl Store {
             .map(|t| t - now))
     }
 
+    /// An op that can be undone: it waits until `not_before` and is tagged with the user
+    /// action (`batch`) it belongs to, so [`Store::undo_batch`] can take the whole action back.
+    pub fn enqueue_held(&self, account: &str, op: &Op, not_before: i64, batch: i64) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO ops (account, op, not_before, batch) VALUES (?1, ?2, ?3, ?4)",
+            params![account, json(op), not_before, batch],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The op reached the server. A message it was moving away now leaves the local copy too.
     pub fn op_done(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])?;
-        Ok(())
+        self.transaction(|st| {
+            st.conn.execute("DELETE FROM messages WHERE held_op = ?1", params![id])?;
+            st.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    /// Gives up on an op the server keeps refusing. A message it was moving away shows again
+    /// where it still is. Returns the op's account (None if it was already gone).
+    pub fn op_dropped(&self, id: i64) -> Result<Option<String>> {
+        self.transaction(|st| Ok(st.release(&[id])?.into_iter().next()))
     }
 
     /// Cancels a queued op if it hasn't run (undo send). True when it was still queued.
     pub fn cancel_op(&self, id: i64) -> Result<bool> {
         Ok(self.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])? > 0)
+    }
+
+    /// Undoes a user action: cancels its ops that haven't reached the server and shows the
+    /// messages they were moving again, unread counts included. Returns the accounts touched;
+    /// empty when nothing was left to undo (it had already replayed).
+    pub fn undo_batch(&self, batch: i64) -> Result<Vec<String>> {
+        if batch == 0 {
+            return Ok(vec![]);
+        }
+        self.transaction(|st| {
+            let ids: Vec<i64> = st.conn.prepare("SELECT id FROM ops WHERE batch = ?1")?.query_map(params![batch], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            st.release(&ids)
+        })
+    }
+
+    /// Deletes these ops and un-hides what they were moving. Call inside a transaction.
+    fn release(&self, ops: &[i64]) -> Result<Vec<String>> {
+        let mut accounts: Vec<String> = Vec::new();
+        for op in ops {
+            let account: Option<String> = self.conn.query_row("SELECT account FROM ops WHERE id = ?1", params![op], |r| r.get(0)).optional()?;
+            let unread: Vec<(String, String)> = self
+                .conn
+                .prepare_cached("SELECT account, mailbox FROM messages WHERE held_op = ?1 AND flags & 1 = 0")?
+                .query_map(params![op], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (a, m) in unread {
+                self.bump_unread(&a, &m, 1)?;
+            }
+            self.conn.execute("UPDATE messages SET held_op = 0 WHERE held_op = ?1", params![op])?;
+            self.conn.execute("DELETE FROM ops WHERE id = ?1", params![op])?;
+            if let Some(a) = account
+                && !accounts.contains(&a)
+            {
+                accounts.push(a);
+            }
+        }
+        Ok(accounts)
     }
 
     pub fn op_failed(&self, id: i64, error: &str, retry_in: i64, now: i64) -> Result<()> {
@@ -764,5 +863,120 @@ mod tests {
         s.op_failed(id, "offline", 30, 0).unwrap();
         assert!(s.ops("a", 0).unwrap().is_empty());
         assert_eq!(s.ops("a", 31).unwrap().len(), 1);
+    }
+
+    /// One unread inbox message moved away under undo key 7, held until t=100.
+    fn held_move(s: &Store) -> (MessageId, i64) {
+        s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        s.upsert_mailbox("a", "Archive", "Archive", Role::Archive, "/", true).unwrap();
+        s.set_counts("a", "INBOX", 1, 1).unwrap();
+        let id = s.upsert_header("a", "INBOX", 9, 0, 10, 100, &parsed("Hi", "<9@x>", "", "Ana <ana@x.com>", 1)).unwrap();
+        let op = s.enqueue_held("a", &Op::Move { mailbox: "INBOX".into(), uid: 9, dest: "Archive".into() }, 100, 7).unwrap();
+        s.hide_local(id, op).unwrap();
+        s.bump_unread("a", "INBOX", -1).unwrap();
+        (id, op)
+    }
+
+    fn inbox(s: &Store) -> Vec<Summary> {
+        s.list(&View::Role { account: None, role: Role::Inbox }, &Query::default(), true, 100, &HashSet::new()).unwrap()
+    }
+
+    fn unread(s: &Store) -> u32 {
+        s.mailboxes("a").unwrap().iter().find(|m| m.name == "INBOX").unwrap().unread
+    }
+
+    #[test]
+    fn held_move_hides_but_keeps_the_row() {
+        let s = Store::memory();
+        let (id, _) = held_move(&s);
+        assert!(inbox(&s).is_empty(), "gone from the list");
+        assert!(s.thread_ids(id, true).unwrap().is_empty(), "not moved again with its conversation");
+        assert_eq!(s.local_uids("a", "INBOX").unwrap(), vec![(9, 0)], "sync still sees it, so it isn't re-downloaded");
+        // A sync during the window refreshes flags without showing it again.
+        s.upsert_header("a", "INBOX", 9, flags::SEEN, 10, 100, &parsed("Hi", "<9@x>", "", "Ana <ana@x.com>", 1)).unwrap();
+        assert!(inbox(&s).is_empty());
+    }
+
+    #[test]
+    fn held_op_waits_for_its_window() {
+        let s = Store::memory();
+        held_move(&s);
+        assert!(s.ops("a", 99).unwrap().is_empty(), "not replayed during the window");
+        assert_eq!(s.next_op_due("a", 95).unwrap(), Some(5), "the worker wakes when it ends");
+        assert_eq!(s.ops("a", 100).unwrap().len(), 1, "replayed once it ends");
+    }
+
+    #[test]
+    fn undo_cancels_and_restores() {
+        let s = Store::memory();
+        let (id, _) = held_move(&s);
+        assert_eq!(unread(&s), 0);
+        assert_eq!(s.undo_batch(7).unwrap(), vec!["a".to_owned()]);
+        assert!(s.ops("a", i64::MAX).unwrap().is_empty(), "the server never sees it");
+        let back = inbox(&s);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].id, id, "same row: flags, body and open state intact");
+        assert_eq!(unread(&s), 1, "unread count back");
+        assert!(s.undo_batch(7).unwrap().is_empty(), "nothing left to undo");
+        assert!(s.undo_batch(0).unwrap().is_empty(), "key 0 is never an undo key");
+    }
+
+    #[test]
+    fn replayed_move_deletes_the_row_and_cant_be_undone() {
+        let s = Store::memory();
+        let (id, op) = held_move(&s);
+        s.op_done(op).unwrap();
+        assert!(s.summary(id).unwrap().is_none());
+        assert!(s.undo_batch(7).unwrap().is_empty());
+        assert!(inbox(&s).is_empty());
+    }
+
+    #[test]
+    fn dropped_move_shows_the_message_again() {
+        let s = Store::memory();
+        let (id, op) = held_move(&s);
+        assert_eq!(s.op_dropped(op).unwrap(), Some("a".to_owned()));
+        assert_eq!(inbox(&s)[0].id, id);
+        assert_eq!(s.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn held_moves_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("envoy-store-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mail.sqlite");
+        {
+            let s = Store::open(&db).unwrap();
+            held_move(&s);
+        }
+        let s = Store::open(&db).unwrap();
+        assert!(inbox(&s).is_empty(), "still hidden after restart");
+        let due = s.ops("a", 1_000).unwrap();
+        assert_eq!(due.len(), 1, "a window that ran out while closed just replays");
+        s.op_done(due[0].id).unwrap();
+        assert_eq!(s.local_uids("a", "INBOX").unwrap(), vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_caches_gain_the_new_columns() {
+        let dir = std::env::temp_dir().join(format!("envoy-store-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mail.sqlite");
+        {
+            let old = SCHEMA.replace("    held_op INTEGER NOT NULL DEFAULT 0,\n", "").replace(",\n    batch INTEGER NOT NULL DEFAULT 0", "");
+            assert!(!old.contains("held_op") && !old.contains("batch"));
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(&old).unwrap();
+            conn.execute("INSERT INTO ops (account, op) VALUES ('a', '{}')", []).unwrap();
+        }
+        let s = Store::open(&db).unwrap();
+        held_move(&s);
+        assert_eq!(s.undo_batch(7).unwrap(), vec!["a".to_owned()]);
+        drop(s);
+        Store::open(&db).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
