@@ -205,10 +205,15 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// An account's two connections: `jobs` feeds the background sync loop; `now` feeds the
+/// foreground connection, which serves whatever the user is looking at right away (opening
+/// a message or a folder) instead of queuing behind a long background download.
 struct Worker {
     jobs: mpsc::UnboundedSender<Job>,
+    now: mpsc::UnboundedSender<Job>,
     notify: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
+    fg_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -237,8 +242,15 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
 
 fn poke(workers: &HashMap<String, Worker>, account: &str, job: Job) {
     if let Some(w) = workers.get(account) {
-        let _ = w.jobs.send(job);
-        w.notify.notify_one();
+        match job {
+            Job::Bodies { .. } | Job::SyncMailbox(_) => {
+                let _ = w.now.send(job);
+            }
+            Job::Sync => {
+                let _ = w.jobs.send(job);
+                w.notify.notify_one();
+            }
+        }
     }
 }
 
@@ -446,6 +458,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
         Command::RemoveAccount { id } => {
             if let Some(w) = workers.remove(&id) {
                 w.task.abort();
+                w.fg_task.abort();
             }
             secrets::remove(&id);
             let list = {
@@ -600,9 +613,99 @@ pub fn open_browser(url: &str) -> std::io::Result<()> {
 
 fn spawn_worker(shared: Arc<Shared>, account: String) -> Worker {
     let (jobs, rx) = mpsc::unbounded_channel();
+    let (now, now_rx) = mpsc::unbounded_channel();
     let notify = Arc::new(Notify::new());
-    let task = tokio::spawn(worker(shared, account, rx, notify.clone()));
-    Worker { jobs, notify, task }
+    let task = tokio::spawn(worker(shared.clone(), account.clone(), rx, notify.clone()));
+    let fg_task = tokio::spawn(foreground(shared, account, now_rx, jobs.clone(), notify.clone()));
+    Worker { jobs, now, notify, task, fg_task }
+}
+
+/// The foreground connection: opened on demand, closed after five idle minutes. If it can't
+/// connect, its jobs fall back to the background loop, so nothing is lost.
+async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedReceiver<Job>, fallback: mpsc::UnboundedSender<Job>, notify: Arc<Notify>) {
+    let mut session: Option<Session> = None;
+    loop {
+        let job = match &session {
+            Some(_) => match tokio::time::timeout(Duration::from_secs(300), rx.recv()).await {
+                Ok(Some(j)) => j,
+                Ok(None) => return,
+                Err(_) => {
+                    if let Some(mut s) = session.take() {
+                        let _ = tokio::time::timeout(Duration::from_secs(5), s.logout()).await;
+                    }
+                    continue;
+                }
+            },
+            None => match rx.recv().await {
+                Some(j) => j,
+                None => return,
+            },
+        };
+        let Some(account) = shared.account(&id) else { return };
+        if session.is_none() {
+            let connected = match shared.credential(&account).await {
+                Ok(cred) => imap::connect(&account, &cred).await,
+                Err(e) => Err(e),
+            };
+            match connected {
+                Ok(s) => session = Some(s),
+                Err(e) => {
+                    log::warn!("{}: foreground connect failed: {e:#}", account.email);
+                    let _ = fallback.send(job);
+                    notify.notify_one();
+                    continue;
+                }
+            }
+        }
+        let Some(s) = session.as_mut() else { continue };
+        if let Err(e) = foreground_job(&shared, &account, s, &job).await {
+            log::warn!("{}: {e:#}", account.email);
+            session = None;
+            let _ = fallback.send(job);
+            notify.notify_one();
+        }
+    }
+}
+
+async fn foreground_job(shared: &Arc<Shared>, account: &Account, session: &mut Session, job: &Job) -> Result<()> {
+    let id = &account.id;
+    match job {
+        Job::Bodies { mailbox, uids, reply } => {
+            imap::select(session, mailbox).await?;
+            imap::fetch_bodies(session, &shared.writer, id, mailbox, uids).await?;
+            if let Some((req, mid, conv)) = reply {
+                let messages = shared.reader.lock().map_err(|_| anyhow!("store poisoned"))?.thread(*mid, *conv)?;
+                shared.emit(Event::Thread { req: *req, id: *mid, messages });
+            }
+            shared.emit(Event::Changed { account: id.clone() });
+        }
+        Job::SyncMailbox(mailbox) => {
+            let window = shared.setting_u32("sync.initialMessages").max(50);
+            let progress = {
+                let shared = shared.clone();
+                let id = id.clone();
+                move || shared.emit(Event::Changed { account: id.clone() })
+            };
+            let out = imap::sync_mailbox(session, &shared.writer, id, mailbox, window, &progress).await?;
+            if let Ok((unread, total)) = imap::status(session, mailbox).await {
+                shared.with_writer(|st| st.set_counts(id, mailbox, unread, total))?;
+            }
+            shared.emit_mailboxes(id);
+            if out.changed {
+                shared.emit(Event::Changed { account: id.clone() });
+            }
+            // Bodies for the top of the list, so the first messages opened are instant.
+            let max_size = shared.setting_u32("sync.maxPrefetchSizeKb").saturating_mul(1024);
+            let missing = shared.with_writer(|st| st.missing_bodies(id, mailbox, 25, max_size))?;
+            if !missing.is_empty() {
+                imap::select(session, mailbox).await?;
+                imap::fetch_bodies(session, &shared.writer, id, mailbox, &missing).await?;
+                shared.emit(Event::Changed { account: id.clone() });
+            }
+        }
+        Job::Sync => {}
+    }
+    Ok(())
 }
 
 /// One account's sync loop: connect, catch up, replay queued changes, download ahead, then
@@ -740,7 +843,12 @@ async fn session_loop(
         }
         for name in &targets {
             shared.emit(Event::Sync { account: id.clone(), state: SyncState::Syncing(display_of(&mailboxes, name)) });
-            let out = imap::sync_mailbox(&mut session, &shared.writer, &id, name, window).await?;
+            let progress = {
+                let shared = shared.clone();
+                let id = id.clone();
+                move || shared.emit(Event::Changed { account: id.clone() })
+            };
+            let out = imap::sync_mailbox(&mut session, &shared.writer, &id, name, window, &progress).await?;
             changed |= out.changed;
             if out.changed {
                 shared.emit(Event::Changed { account: id.clone() });

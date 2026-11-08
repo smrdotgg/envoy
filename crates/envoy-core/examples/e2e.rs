@@ -108,8 +108,11 @@ fn main() {
 
     // Folders the test needs (GreenMail starts with INBOX only).
     let probe = Probe::new();
-    for name in ["Trash", "Sent", "Archive"] {
+    for name in ["Trash", "Sent", "Archive", "Junk"] {
         probe.create(name);
+    }
+    for i in 0..3 {
+        probe.append("Junk", &format!("From: Spammer <s@spam.example>\r\nTo: alice@localhost\r\nSubject: Win a prize {i}\r\nMessage-ID: <spam-{i}@x>\r\n\r\nClick here\r\n"));
     }
 
     let t0 = Instant::now();
@@ -196,6 +199,21 @@ fn main() {
     }
     req += 1;
     assert_eq!(list(&engine, req, &inbox, "", false).len(), 1, "inbox shows one message locally");
+
+    // Opening a folder that isn't synced yet: the foreground connection brings it in at once.
+    let junk = View::Mailbox { account: "alice".into(), mailbox: "Junk".into() };
+    let t_junk = Instant::now();
+    engine.send(Command::Watch { view: junk.clone() });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        req += 1;
+        if list(&engine, req, &junk, "", false).len() == 3 {
+            println!("✓ opened an unsynced folder: 3 messages in {:?}", t_junk.elapsed());
+            break;
+        }
+        assert!(Instant::now() < deadline, "Junk never synced");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     // Push: a new message arrives while idle.
     let t_push = Instant::now();
@@ -298,6 +316,13 @@ impl Probe {
         let name = name.to_owned();
         self.run(async move |s| {
             let _ = s.create(&name).await;
+        })
+    }
+
+    fn append(&self, mailbox: &str, raw: &str) {
+        let (m, r) = (mailbox.to_owned(), raw.to_owned());
+        self.run(async move |s| {
+            s.append(&m, None, None, r.as_bytes()).await.unwrap();
         })
     }
 

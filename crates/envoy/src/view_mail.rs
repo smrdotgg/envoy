@@ -439,20 +439,44 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
     r.child(body).child(actions)
 }
 
+/// Messages the server says the current view has (from the folder counts), and its name.
+fn server_total(s: &App) -> Option<(u32, String)> {
+    let boxes: Vec<&Mailbox> = match &s.view {
+        View::Mailbox { account, mailbox } => s.mailboxes.get(account).into_iter().flatten().filter(|m| &m.name == mailbox).collect(),
+        View::Role { account, role } => s
+            .mailboxes
+            .iter()
+            .filter(|(a, _)| account.as_ref().is_none_or(|x| x == *a))
+            .flat_map(|(_, m)| m.iter())
+            .filter(|m| m.role == *role)
+            .collect(),
+        View::Starred { .. } => Vec::new(),
+    };
+    let total: u32 = boxes.iter().map(|m| m.total).sum();
+    let name = boxes.first().map(|m| m.display.clone()).unwrap_or_default();
+    (total > 0).then_some((total, name))
+}
+
 fn empty_list(s: &App, t: &Theme) -> El {
     let k = &t.k;
+    let downloading = s.applied_query.is_empty() && s.list_loaded && !s.demo;
+    let pending = if downloading { server_total(s) } else { None };
     let syncing = s.sync.values().any(|st| matches!(st, SyncState::Connecting | SyncState::Syncing(_)));
-    let (title, sub) = if !s.list_loaded {
-        ("Loading…", "")
+    let (title, sub): (String, String) = if !s.list_loaded {
+        ("Loading…".into(), String::new())
+    } else if let Some((n, name)) = &pending {
+        let noun = if *n == 1 { "message" } else { "messages" };
+        (format!("Downloading {name}…"), format!("{n} {noun} on the server. The newest appear here first."))
     } else if syncing && s.applied_query.is_empty() {
-        ("Syncing your mail…", "Messages appear here as they download.")
+        ("Syncing your mail…".into(), "Messages appear here as they download.".into())
     } else if !s.applied_query.is_empty() {
-        ("No results", "Only mail stored on this computer is searched. Try fewer words.")
+        ("No results".into(), "Only mail stored on this computer is searched. Try fewer words.".into())
     } else if matches!(&s.view, View::Role { role: Role::Inbox, .. }) {
-        ("All caught up", "Nothing in your inbox.")
+        ("All caught up".into(), "Nothing in your inbox.".into())
     } else {
-        ("Nothing here", "")
+        ("Nothing here".into(), String::new())
     };
+    let busy = pending.is_some() || (syncing && s.applied_query.is_empty());
     col()
         .key("empty-list")
         .w_full()
@@ -460,7 +484,7 @@ fn empty_list(s: &App, t: &Theme) -> El {
         .center()
         .gap(8.0)
         .padding(24.0)
-        .child(icon(&icons::INBOX, 36.0).color(k.c.icon_faint))
+        .child(if busy { Spinner::new().build(k) } else { icon(&icons::INBOX, 36.0).color(k.c.icon_faint) })
         .child(text(title).font(k.ty.body_medium).color(k.c.text_muted))
         .child(text(sub).font(k.ty.text_small).color(k.c.text_faint).wrap())
 }

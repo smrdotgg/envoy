@@ -320,7 +320,28 @@ pub struct SyncOutcome {
 
 /// Brings one mailbox's local copy up to date: new messages' headers, flag changes and
 /// deletions, keeping the newest `window` messages.
-pub async fn sync_mailbox(session: &mut Session, store: &Mutex<Store>, account: &str, mailbox: &str, window: u32) -> Result<SyncOutcome> {
+/// Headers per FETCH during a first download.
+const HEADER_CHUNK: u32 = 200;
+
+fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[Fetch], above_uid: u32) -> Result<u32> {
+    if fetched.is_empty() {
+        return Ok(0);
+    }
+    let st = store.lock().map_err(|_| anyhow!("store poisoned"))?;
+    st.transaction(|st| {
+        let mut n = 0;
+        for f in fetched {
+            if f.uid.is_some_and(|u| u > above_uid) && store_header(st, account, mailbox, f)? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    })
+}
+
+/// Brings one mailbox's local copy up to date (see the module docs). `progress` runs after
+/// each chunk of a first download lands, so the UI can show it.
+pub async fn sync_mailbox(session: &mut Session, store: &Mutex<Store>, account: &str, mailbox: &str, window: u32, progress: &(dyn Fn() + Send + Sync)) -> Result<SyncOutcome> {
     let mb = timed("SELECT", session.select(mailbox)).await??;
     let uidvalidity = mb.uid_validity.unwrap_or(0);
     let mut changed = false;
@@ -344,25 +365,31 @@ pub async fn sync_mailbox(session: &mut Session, store: &Mutex<Store>, account: 
         return Ok(SyncOutcome { changed, new_messages });
     }
 
-    // New messages (or the initial window, by sequence number).
-    let fetched: Vec<Fetch> = if local.is_empty() {
-        let first = mb.exists.saturating_sub(window.max(1)) + 1;
-        timed("FETCH headers", async { session.fetch(format!("{first}:*"), HEADER_QUERY).await?.try_collect::<Vec<_>>().await }).await??
-    } else {
-        timed("FETCH new", async { session.uid_fetch(format!("{}:*", max_uid + 1), HEADER_QUERY).await?.try_collect::<Vec<_>>().await })
-            .await??
-    };
-    if !fetched.is_empty() {
-        let st = store.lock().map_err(|_| anyhow!("store poisoned"))?;
-        st.transaction(|st| {
-            for f in &fetched {
-                if f.uid.is_some_and(|u| u > max_uid) && store_header(st, account, mailbox, f)? {
-                    new_messages += 1;
-                }
+    if local.is_empty() {
+        // First download: newest first, a chunk at a time, so the list fills in as it goes.
+        let lowest = mb.exists.saturating_sub(window.max(1)) + 1;
+        let mut hi = mb.exists;
+        while hi >= lowest {
+            let lo = hi.saturating_sub(HEADER_CHUNK - 1).max(lowest);
+            let fetched: Vec<Fetch> =
+                timed("FETCH headers", async { session.fetch(format!("{lo}:{hi}"), HEADER_QUERY).await?.try_collect::<Vec<_>>().await }).await??;
+            let n = store_fetched(store, account, mailbox, &fetched, 0)?;
+            if n > 0 {
+                new_messages += n;
+                changed = true;
+                progress();
             }
-            Ok(())
-        })?;
-        if new_messages > 0 {
+            if lo <= 1 {
+                break;
+            }
+            hi = lo - 1;
+        }
+    } else {
+        let fetched: Vec<Fetch> =
+            timed("FETCH new", async { session.uid_fetch(format!("{}:*", max_uid + 1), HEADER_QUERY).await?.try_collect::<Vec<_>>().await }).await??;
+        let n = store_fetched(store, account, mailbox, &fetched, max_uid)?;
+        if n > 0 {
+            new_messages += n;
             changed = true;
         }
     }
