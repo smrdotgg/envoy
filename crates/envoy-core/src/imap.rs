@@ -383,9 +383,32 @@ impl Contents {
 
 /// Selects `mailbox` and says whether its contents changed since `synced` (what its last sync
 /// found): mail delivered after that sync, which an IDLE started now would never report.
+///
+/// What the server said unasked before this is dropped first: it's older than the SELECT, which
+/// counts it, and the channel async-imap files it in holds only so much, dropping what comes
+/// once it's full, so [`idle`] would never hear of mail that arrives as it starts.
 pub async fn changed_since(session: &mut async_imap::Session<impl Io>, mailbox: &str, synced: Option<Contents>) -> Result<bool> {
+    news(session);
     let mb = timed("SELECT", session.select(mailbox)).await??;
-    Ok(synced != Some(Contents::of(&mb)))
+    // Anything told unasked during the SELECT may be newer than its counts.
+    let told = news(session);
+    Ok(synced != Some(Contents::of(&mb)) || told)
+}
+
+/// Takes what the server said unasked (async-imap files it away) and says whether mail came or
+/// went: EXISTS, RECENT or EXPUNGE.
+fn news(session: &mut async_imap::Session<impl Io>) -> bool {
+    news_in(|| session.unsolicited_responses.try_recv().ok())
+}
+
+/// [`news`], from what `next` takes off async-imap's channel until it's empty.
+fn news_in(mut next: impl FnMut() -> Option<async_imap::types::UnsolicitedResponse>) -> bool {
+    use async_imap::types::UnsolicitedResponse as U;
+    let mut news = false;
+    while let Some(r) = next() {
+        news |= matches!(r, U::Exists(_) | U::Recent(_) | U::Expunge(_));
+    }
+    news
 }
 
 /// Brings one mailbox's local copy up to date: new messages' headers, flag changes and
@@ -750,10 +773,14 @@ pub async fn capabilities(session: &mut Session) -> Result<Caps> {
 
 /// Waits on IDLE for up to `wait`, returning early when the server reports a change or
 /// `interrupt` fires. Gives the session back either way.
-pub async fn idle(session: Session, wait: Duration, interrupt: Arc<tokio::sync::Notify>) -> Result<(Session, bool)> {
+pub async fn idle<T: Io>(session: async_imap::Session<T>, wait: Duration, interrupt: Arc<tokio::sync::Notify>) -> Result<(async_imap::Session<T>, bool)> {
+    let unsolicited = session.unsolicited_responses.clone();
     let mut handle = session.idle();
     timed("IDLE", handle.init()).await??;
-    let changed = {
+    // Mail that arrived since the caller last looked ([`changed_since`]) may be told before the
+    // server's go-ahead: async-imap files that away rather than ending the wait, so it's looked
+    // for here, and the wait skipped.
+    let changed = news_in(|| unsolicited.try_recv().ok()) || {
         let (fut, stop) = handle.wait_with_timeout(wait);
         tokio::pin!(fut);
         let mut stop = Some(stop);
@@ -766,7 +793,9 @@ pub async fn idle(session: Session, wait: Duration, interrupt: Arc<tokio::sync::
             }
         }
     };
-    let session = timed("DONE", handle.done()).await??;
+    // Told as the IDLE ended, before its OK: filed away too.
+    let mut session = timed("DONE", handle.done()).await??;
+    let changed = news(&mut session) | changed;
     Ok((session, changed))
 }
 
@@ -800,13 +829,21 @@ pub(crate) mod fake {
             let mut r = BufReader::new(r);
             w.write_all(b"* OK fake ready\r\n").await.unwrap();
             let mut line = String::new();
+            let mut last_tag = String::new();
             loop {
                 line.clear();
                 if r.read_line(&mut line).await.unwrap_or(0) == 0 {
                     return;
                 }
-                let Some((tag, command)) = line.trim_end().split_once(' ') else { return };
-                let (tag, command) = (tag.to_owned(), command.to_owned());
+                // IDLE's DONE has no tag: it ends the command before it.
+                let (tag, command) = match line.trim_end() {
+                    "DONE" => (last_tag.clone(), "DONE".to_owned()),
+                    l => match l.split_once(' ') {
+                        Some((tag, command)) => (tag.to_owned(), command.to_owned()),
+                        None => return,
+                    },
+                };
+                last_tag = tag.clone();
                 // A literal follows: ask for it and read it (plus the line's end).
                 if let Some(n) = command.strip_suffix('}').and_then(|c| c.rsplit_once('{')).and_then(|(_, n)| n.parse::<usize>().ok()) {
                     w.write_all(b"+ go ahead\r\n").await.unwrap();
@@ -924,6 +961,42 @@ mod tests {
         delivered.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(changed_since(&mut s, "INBOX", Some(synced)).await.unwrap(), "a message delivered after the sync");
         assert!(changed_since(&mut s, "INBOX", None).await.unwrap(), "never synced");
+    }
+
+    /// A server whose inbox holds 3 messages (UIDNEXT 11) when selected, and that answers IDLE
+    /// with `idle` (which ends with the go-ahead). An earlier NOOP was told of 150 changes
+    /// unasked, more than async-imap's channel for them holds.
+    fn idle_server(idle: &'static str) -> impl Fn(&str) -> Option<String> + Send + 'static {
+        move |c: &str| match c {
+            "NOOP" => Some((1..=150).map(|n| format!("* {n} EXISTS\r\n")).collect::<String>() + "TAG OK done\r\n"),
+            "IDLE" => Some(idle.into()),
+            c if c.starts_with("SELECT") => Some(fake::selected(7, 11)),
+            _ => None,
+        }
+    }
+
+    const SYNCED: Contents = Contents { exists: 3, uid_next: Some(11) };
+
+    #[tokio::test]
+    async fn mail_told_before_idles_go_ahead_is_noticed() {
+        // Delivered between the check and IDLE: the server tells of it before its "+".
+        let (mut s, log) = fake::session(idle_server("* 4 EXISTS\r\n* 1 RECENT\r\n+ idling\r\n")).await;
+        s.noop().await.unwrap();
+        assert!(!changed_since(&mut s, "INBOX", Some(SYNCED)).await.unwrap(), "what was told before the check is older than it");
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (_s, news) = tokio::time::timeout(Duration::from_secs(5), idle(s, Duration::from_secs(60), notify)).await.expect("no waiting for the timeout").unwrap();
+        assert!(news, "a sync follows at once");
+        assert_eq!(commands(&log)[commands(&log).len() - 2..], ["IDLE", "DONE"]);
+    }
+
+    #[tokio::test]
+    async fn idle_without_news_waits_it_out() {
+        let (mut s, _log) = fake::session(idle_server("+ idling\r\n")).await;
+        s.noop().await.unwrap();
+        assert!(!changed_since(&mut s, "INBOX", Some(SYNCED)).await.unwrap());
+        let started = std::time::Instant::now();
+        let (_s, news) = idle(s, Duration::from_millis(300), Arc::new(tokio::sync::Notify::new())).await.unwrap();
+        assert!(!news && started.elapsed() >= Duration::from_millis(300));
     }
 
     fn caps(uidplus: bool) -> Caps {
