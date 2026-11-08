@@ -188,6 +188,11 @@ pub struct App {
     pub list_loaded: bool,
     /// False while `list` is the top of a longer list whose rest is on its way.
     pub list_complete: bool,
+    /// Counts the lists the engine sent that replaced `list`.
+    pub list_gen: u64,
+    /// The pending list request is the user's (a search, another view): its rows show at once
+    /// rather than animate in like a reload's.
+    pub list_at_once: bool,
     /// The opened row (its newest message in conversation view).
     pub open: Option<MessageId>,
     pub thread: Vec<ThreadMessage>,
@@ -250,6 +255,8 @@ impl App {
             list_req: 0,
             list_loaded: false,
             list_complete: true,
+            list_gen: 0,
+            list_at_once: true,
             open: None,
             thread: Vec::new(),
             thread_req: 0,
@@ -307,8 +314,18 @@ impl App {
         };
         let changed = !events.is_empty();
         let mut reload = false;
+        let before = (self.list_gen, self.thread_for);
         for ev in events {
             reload |= self.apply(ev, tx);
+        }
+        // A conversation just opened, or the list a search or a new view asked for, shows at
+        // once, without fading its paragraphs or rows in: it's what was asked for, and a fade
+        // still running when the next key comes keeps every frame waiting for the display's
+        // next tick. A reload's changes (new mail, a sync) still animate.
+        let thread_arrived = self.thread_for != before.1 && self.thread_for.is_some();
+        let list_arrived = self.list_gen != before.0 && self.list_at_once;
+        if thread_arrived || list_arrived {
+            tx.instant();
         }
         if reload {
             self.reload();
@@ -347,6 +364,7 @@ impl App {
                     self.list = items;
                     self.list_loaded = true;
                     self.list_complete = !more;
+                    self.list_gen += 1;
                 }
             }
             Event::Thread { req, id, messages } if req == self.thread_req && messages.is_empty() => {
@@ -491,6 +509,7 @@ impl App {
     /// Re-reads the list and the open conversation after the store changed.
     pub fn reload(&mut self) {
         self.request_list();
+        self.list_at_once = false;
         if let Some(id) = self.thread_for.or(self.open) {
             self.thread_req += 1;
             self.send(Command::Open { req: self.thread_req, id, conversations: self.conversations() });
@@ -516,6 +535,7 @@ impl App {
             return;
         }
         self.list_req += 1;
+        self.list_at_once = true;
         self.send(Command::List {
             req: self.list_req,
             view: self.view.clone(),
@@ -649,6 +669,9 @@ impl App {
         let id = self.list[next].id;
         self.open_message(id);
         tx.scroll_into_view(row_key(id));
+        // Stepping through the list with the keyboard moves at once, like a native list: no
+        // highlight or scroll animation trailing behind a quick j j j.
+        tx.instant();
     }
 
     /// Ticks timers from `poll`: delayed mark-read, toast expiry, settings file changes.
