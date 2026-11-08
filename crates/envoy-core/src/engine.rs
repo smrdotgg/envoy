@@ -931,7 +931,7 @@ async fn session_loop(
     notify: &Arc<Notify>,
 ) -> Result<()> {
     let id = account.id.clone();
-    let (has_move, has_idle) = imap::capabilities(&mut session).await?;
+    let caps = imap::capabilities(&mut session).await?;
     let mut last_full: Option<Instant> = None;
     let mut last_list: Option<Instant> = None;
     let mut inbox_dirty = true;
@@ -963,7 +963,7 @@ async fn session_loop(
 
         // Replay queued changes.
         log::debug!("{}: replaying ops", account.email);
-        let ran_ops = replay_ops(shared, account, &mut session, has_move).await?;
+        let ran_ops = replay_ops(shared, account, &mut session, caps).await?;
 
         let interval = Duration::from_secs(shared.setting_u32("sync.intervalSeconds").max(15) as u64);
         let full_due = last_full.is_none_or(|t| t.elapsed() >= interval);
@@ -1080,7 +1080,7 @@ async fn session_loop(
         }
         let inbox = mailboxes.iter().find(|m| m.role == Role::Inbox).map(|m| m.name.clone());
         log::debug!("{}: waiting up to {wait:?}", account.email);
-        if has_idle && shared.setting_bool("sync.useIdle") && inbox.is_some() {
+        if caps.idle && shared.setting_bool("sync.useIdle") && inbox.is_some() {
             imap::select(&mut session, inbox.as_deref().unwrap_or("INBOX")).await?;
             // Servers drop IDLE after ~30 minutes; renew well before.
             let wait = wait.min(Duration::from_secs(25 * 60));
@@ -1103,8 +1103,8 @@ fn display_of(mailboxes: &[Mailbox], name: &str) -> String {
     mailboxes.iter().find(|m| m.name == name).map_or_else(|| name.to_owned(), |m| m.display.clone())
 }
 
-async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut Session, has_move: bool) -> Result<bool> {
-    replay_with(shared, account, &mut ImapRunner { shared, account, session, has_move }).await
+async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut Session, caps: imap::Caps) -> Result<bool> {
+    replay_with(shared, account, &mut ImapRunner { shared, account, session, caps }).await
 }
 
 /// Carries out one queued op on the server. A seam so replay can be tested without a server.
@@ -1118,7 +1118,7 @@ struct ImapRunner<'a> {
     shared: &'a Arc<Shared>,
     account: &'a Account,
     session: &'a mut Session,
-    has_move: bool,
+    caps: imap::Caps,
 }
 
 impl OpRunner for ImapRunner<'_> {
@@ -1130,8 +1130,8 @@ impl OpRunner for ImapRunner<'_> {
         let (shared, account, session) = (self.shared, self.account, &mut *self.session);
         match op {
             Op::SetFlags { mailbox, uid, add, remove } => imap::store_flags(session, mailbox, *uid, *add, *remove).await,
-            Op::Move { mailbox, uid, dest } => imap::move_message(session, self.has_move, mailbox, *uid, dest).await,
-            Op::Expunge { mailbox, uid } => imap::expunge(session, mailbox, *uid, true).await,
+            Op::Move { mailbox, uid, dest } => imap::move_message(session, self.caps, mailbox, *uid, dest).await,
+            Op::Expunge { mailbox, uid } => imap::expunge(session, self.caps, mailbox, *uid, true).await,
             Op::Send { raw_b64, from, to, sent_mailbox, reply_of } => {
                 let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
                 let cred = shared.credential(account).await?;
