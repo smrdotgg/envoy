@@ -423,12 +423,14 @@ impl App {
             }
             Event::Pending(n) => self.pending_ops = n,
             Event::Held { undo, ops: 0 } => {
-                // The move had nothing to do (already moving, or already there): no Undo.
+                // The move had nothing to do (already moving, or already there): no Undo, and
+                // the rows the UI took away optimistically come back with a reload.
                 for t in &mut self.toasts {
                     if matches!(&t.undo, Some(Undo::Move(m)) if m.key == undo) {
                         t.undo = None;
                     }
                 }
+                reload = true;
             }
             Event::Held { .. } => {}
         }
@@ -1365,6 +1367,13 @@ mod tests {
         app.apply(Event::Held { undo: key, ops: 0 }, &mut tx);
         assert!(app.toasts.last().unwrap().undo.is_none(), "no Undo button for a move that did nothing");
         assert!(!app.undo_last(&mut tx), "and z has nothing to undo");
+        // Nothing moved (say, it was already in All Mail), so the row the UI took away comes
+        // back: the list is reloaded (pump does this when apply asks for it).
+        assert!(!app.list.iter().any(|s| s.id == first));
+        let reload = app.apply(Event::Held { undo: key, ops: 0 }, &mut tx);
+        assert!(reload, "a zero-op move reloads the list");
+        app.reload();
+        assert!(app.list.iter().any(|s| s.id == first), "the row is back");
         // A move that did hold its ops keeps its Undo.
         let next = app.list[0].id;
         app.archive(vec![next], &mut tx);
