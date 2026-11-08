@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod drafts;
 pub mod mime;
 pub mod model;
 pub mod oauth;

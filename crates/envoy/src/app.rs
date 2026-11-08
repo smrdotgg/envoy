@@ -472,6 +472,7 @@ impl App {
                 reload = true;
             }
             Event::Held { .. } => {}
+            Event::DraftOpened { .. } => {}
         }
         reload
     }
@@ -1171,7 +1172,7 @@ impl App {
             self.toast("Sent (demo mode — nothing left your computer)", false);
             return;
         }
-        self.send(Command::Send { draft });
+        self.send(Command::Send { draft, draft_id: None });
     }
 
     // ── accounts ──

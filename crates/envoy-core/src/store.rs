@@ -9,6 +9,8 @@
 //! untouched and a sync meanwhile doesn't download it a second time. The worker claims ops
 //! before running them on the server; undo and cancel only touch unclaimed ones. Op ids are
 //! never reused, so a stale id can't reach a newer op.
+//!
+//! Drafts (what the composer holds, saved as it's typed) live here too: see `store/drafts.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -20,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use crate::mime::{self, Parsed};
 use crate::model::{Address, Attachment, Body, Mailbox, MessageId, Role, Summary, ThreadMessage, View, flags};
 
+mod drafts;
 mod list;
+pub use drafts::{DraftUpload, LocalDraft};
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -86,6 +90,20 @@ CREATE TABLE IF NOT EXISTS ops (
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM fts WHERE rowid = old.id;
 END;
+CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY,
+    account TEXT NOT NULL,
+    content TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    rev INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
+    server_version INTEGER NOT NULL DEFAULT 0,
+    appended INTEGER NOT NULL DEFAULT 0,
+    open INTEGER NOT NULL DEFAULT 0,
+    sending INTEGER NOT NULL DEFAULT 0,
+    purge_op INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 /// Columns added after the first release, for caches created before them. Each runs once,
@@ -268,6 +286,12 @@ pub enum Op {
     /// Delete for good (expunge), used in Trash.
     Expunge { mailbox: String, uid: u32 },
     Send { raw_b64: String, from: String, to: Vec<String>, sent_mailbox: Option<String>, reply_of: Option<(String, u32)> },
+    /// Put a local draft's newest version in the Drafts mailbox, replacing the copies before
+    /// it. Reads the draft when it runs, so one op covers any number of edits.
+    SaveDraft { draft: i64 },
+    /// Delete every copy of a draft from the Drafts mailbox (by its Message-ID), then the
+    /// local draft, if given, once it's no longer wanted (sent or discarded).
+    PurgeDraft { message_id: String, draft: Option<i64> },
 }
 
 /// What [`Store::undo_batch`] managed.
@@ -1047,12 +1071,13 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// The op reached the server. A message it was moving away now leaves the local copy too.
+    /// The op reached the server. A message it was moving away now leaves the local copy too,
+    /// and a draft it was sending is done with ([`Store::draft_sent`]).
     pub fn op_done(&self, id: i64) -> Result<()> {
         self.transaction(|st| {
             st.conn.execute(DELETE_HELD, params![id])?;
             st.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])?;
-            Ok(())
+            st.draft_sent(id)
         })
     }
 
@@ -1091,7 +1116,8 @@ impl Store {
         })
     }
 
-    /// Deletes these ops and un-hides what they were moving. Call inside a transaction.
+    /// Deletes these ops and un-hides what they were moving, or the drafts they were going to
+    /// discard. Call inside a transaction.
     fn release(&self, ops: &[i64]) -> Result<Vec<String>> {
         let mut accounts: Vec<String> = Vec::new();
         for op in ops {
@@ -1107,6 +1133,7 @@ impl Store {
             }
             self.conn.execute(UNHIDE, params![op])?;
             self.conn.execute("DELETE FROM ops WHERE id = ?1", params![op])?;
+            self.undiscard_drafts(*op)?;
             if let Some(a) = account
                 && !accounts.contains(&a)
             {
@@ -1132,6 +1159,7 @@ impl Store {
         self.conn.execute("DELETE FROM messages WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM mailboxes WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM ops WHERE account = ?1", params![account])?;
+        self.conn.execute("DELETE FROM drafts WHERE account = ?1", params![account])?;
         Ok(())
     }
 

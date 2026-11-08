@@ -198,7 +198,10 @@ pub struct ThreadMessage {
     pub body: Option<Body>,
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+/// What the composer holds: a message being written, or one being sent. Saved as JSON in the
+/// local drafts table, so fields only ever get added, with defaults.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Draft {
     pub account: String,
     pub to: String,

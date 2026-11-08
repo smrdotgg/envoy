@@ -92,6 +92,32 @@ pub fn parse(raw: &[u8], headers_only: bool) -> Option<Parsed> {
     Some(p)
 }
 
+/// A draft from the server (one Envoy saved, or another client), as the composer edits it.
+/// The account is left for the caller.
+pub fn draft_from_raw(raw: &[u8]) -> Option<crate::model::Draft> {
+    let msg = MessageParser::default().parse(raw)?;
+    // As typed into a recipients field: names that would split it are quoted.
+    let field = |v: Option<&mail_parser::Address>| {
+        addresses(v)
+            .iter()
+            .map(|a| if a.name.contains([',', ';', '"', '<', '>', '@']) { format!("\"{}\" <{}>", a.name.replace('"', ""), a.email) } else { a.formatted() })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let refs: Vec<String> = ids(msg.references()).into_iter().map(|s| angle(&s)).collect();
+    Some(crate::model::Draft {
+        account: String::new(),
+        to: field(msg.to()),
+        cc: field(msg.cc()),
+        bcc: field(msg.bcc()),
+        subject: msg.subject().unwrap_or_default().to_owned(),
+        body: msg.body_text(0).map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
+        in_reply_to: ids(msg.in_reply_to()).first().map(|s| angle(s)).unwrap_or_default(),
+        references: refs.join(" "),
+        reply_of: None,
+    })
+}
+
 /// Writes attachment `index` of a raw message to `dir`, returning the file path.
 pub fn save_attachment(raw: &[u8], index: usize, dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let msg = MessageParser::default().parse(raw).ok_or_else(|| anyhow::anyhow!("unreadable message"))?;
