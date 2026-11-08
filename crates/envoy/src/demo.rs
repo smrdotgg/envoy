@@ -1,7 +1,7 @@
 //! Sample mail for `--demo` and for headless screenshots: the whole UI without an account.
 
 use envoy_core::accounts::{Account, AuthKind};
-use envoy_core::model::{Address, Attachment, Body, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
+use envoy_core::model::{Address, Attachment, Body, Draft, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 
 use crate::app::App;
 
@@ -37,7 +37,11 @@ const SAMPLES: &[Sample] = &[
     Sample { from: ("Hacker Newsletter", "kale@hackernewsletter.com"), subject: "Hacker Newsletter #712", preview: "The best articles from Hacker News this week: native UI is back, SQLite in production, and a love letter to IMAP.", hours_ago: 200, unread: false, starred: false, count: 1, attach: false, mailbox: "INBOX" },
     Sample { from: ("Jordan Lee", "jordan@northwind.dev"), subject: "Offsite agenda", preview: "Draft agenda for the offsite. Day one is planning, day two is hack day. Let me know what's missing.", hours_ago: 260, unread: false, starred: false, count: 2, attach: true, mailbox: "INBOX" },
     Sample { from: ("You", "you@gmail.com"), subject: "Re: Design review moved to Thursday", preview: "Thursday works. I'll bring the prototype on my laptop.", hours_ago: 0, unread: false, starred: false, count: 1, attach: false, mailbox: "[Gmail]/Sent Mail" },
+    Sample { from: ("You", "you@gmail.com"), subject: "Offsite travel plan", preview: "Thinking we take the 8:10 train on Thursday and share a car from the station. Could you check whether the hotel does early check-in?", hours_ago: 3, unread: false, starred: false, count: 1, attach: false, mailbox: DRAFTS },
 ];
+
+const DRAFTS: &str = "[Gmail]/Drafts";
+const DRAFT_TO: (&str, &str) = ("Jordan Lee", "jordan@northwind.dev");
 
 pub fn account() -> Account {
     Account {
@@ -73,6 +77,10 @@ fn summary(i: usize, s: &Sample) -> Summary {
     if s.starred {
         fl |= flags::FLAGGED;
     }
+    let draft = s.mailbox == DRAFTS;
+    if draft {
+        fl |= flags::DRAFT;
+    }
     let participants = match s.count {
         1 => String::new(),
         2 => format!("{}, me", first(s.from.0)),
@@ -86,7 +94,7 @@ fn summary(i: usize, s: &Sample) -> Summary {
         thread: format!("t{i}"),
         subject: s.subject.into(),
         from: addr(s.from.0, s.from.1),
-        to: vec![addr("You", "you@gmail.com")],
+        to: vec![if draft { addr(DRAFT_TO.0, DRAFT_TO.1) } else { addr("You", "you@gmail.com") }],
         date: now() - s.hours_ago * 3600 - 600,
         flags: fl,
         preview: s.preview.into(),
@@ -109,11 +117,24 @@ pub fn list_for(view: &View) -> Vec<Summary> {
         .filter(|m| match view {
             View::Role { role: Role::Inbox, .. } => m.mailbox == "INBOX",
             View::Role { role: Role::Sent, .. } => m.mailbox.contains("Sent"),
+            View::Role { role: Role::Drafts, .. } => m.mailbox == DRAFTS,
             View::Role { role: Role::Flagged, .. } | View::Starred { .. } => m.flagged(),
             View::Mailbox { mailbox, .. } => &m.mailbox == mailbox,
             _ => false,
         })
         .collect()
+}
+
+/// A sample draft, as it opens in the composer.
+pub fn draft_for(id: MessageId) -> Option<Draft> {
+    let s = SAMPLES.get(usize::try_from(id - 1).ok()?).filter(|s| s.mailbox == DRAFTS)?;
+    Some(Draft {
+        account: ACCOUNT.into(),
+        to: format!("{} <{}>", DRAFT_TO.0, DRAFT_TO.1),
+        subject: s.subject.into(),
+        body: format!("Hi Jordan,\n\n{}\n\nThanks!", s.preview),
+        ..Draft::default()
+    })
 }
 
 const DESIGN_MD: &str = "Hey!\n\nQuick heads up — the room was double-booked so I moved us to **Thursday at 2pm**. Same Zoom link if you're remote.\n\nI also added the new onboarding flows to the deck:\n\n- Welcome screen with account picker\n- Gmail app-password walkthrough\n- First sync progress (with the *download ahead* setting)\n\nThe prototype is here: [figma.com/file/envoy-onboarding](https://figma.com/file/envoy-onboarding)\n\nThanks,\\\nMaya";

@@ -121,6 +121,15 @@ goes through on the next start. Deleting from Trash is permanent and has no undo
 uses IMAP IDLE for push, reconnects with
 backoff, and times out dead connections in 30 s.
 
+**Drafts are never lost.** What you write is saved to the local database as you type (a moment
+after you pause, every few seconds while you don't, and when the window closes), and a composer
+that was open when Envoy quit or crashed comes back, minimized, on the next start. A few seconds
+later the draft is copied to the account's Drafts folder through the same queue (offline, it
+waits), each save replacing the previous copy, so other devices see one draft. Opening a message
+in Drafts opens it in the composer. Sending removes the draft, and Undo send brings the composer
+back as it was; discarding a draft has an Undo too. Opening another composer keeps the current
+one in Drafts.
+
 ## Testing
 
 ```sh
@@ -130,9 +139,11 @@ ENVOY_DEMO=1 target/debug/envoy --snap out.png --scene open     # headless scree
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/flow.json --snap out.png --at 3.6
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 1.0   # archive: toast with Undo
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 2.0   # after z: message back, open
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png --at 2.8 # draft opened, edited, discarded: toast with Undo
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png --at 3.6 # after z: the composer back with the edit
 ```
 
-Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent`.
+Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent drafts draft`.
 
 **Latency budgets** ([`docs/NORTH_STAR.md`](docs/NORTH_STAR.md)) are checked in CI on all three OSes
 against a generated 100k-message mailbox; each check prints measured vs budget and fails over budget.
