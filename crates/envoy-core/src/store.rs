@@ -420,6 +420,38 @@ impl Store {
         Ok(())
     }
 
+    /// Applies what the server reported about the messages we already had (`local`, read
+    /// before fetching; `server`: uid → flags): new flags, deletions, then trims the mailbox to
+    /// its newest `window` messages. True when anything changed.
+    pub fn reconcile(&self, account: &str, mailbox: &str, local: &[(u32, u32)], server: &HashMap<u32, u32>, window: u32) -> Result<bool> {
+        let mut changed = false;
+        let mut gone = Vec::new();
+        self.transaction(|st| {
+            for (uid, local_flags) in local {
+                match server.get(uid) {
+                    None => gone.push(*uid),
+                    Some(&f) if f != *local_flags => {
+                        st.set_flags_by_uid(account, mailbox, *uid, f)?;
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        })?;
+        if !gone.is_empty() {
+            self.delete_uids(account, mailbox, &gone)?;
+            changed = true;
+        }
+        let all = self.local_uids(account, mailbox)?;
+        if all.len() > window as usize {
+            let excess: Vec<u32> = all.iter().take(all.len() - window as usize).map(|(u, _)| *u).collect();
+            self.delete_uids(account, mailbox, &excess)?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let tx = self.conn.unchecked_transaction()?;
         let out = f(self)?;
@@ -741,8 +773,8 @@ impl Store {
         self.transaction(|st| Ok(st.release(&[id])?.into_iter().next()))
     }
 
-    /// Cancels a queued op if it hasn't run (undo send). True when it was still queued.
-    pub fn cancel_op(&self, id: i64) -> Result<bool> {
+    /// Cancels a queued send if it hasn't run (undo send). True when it was still queued.
+    pub fn cancel_send(&self, id: i64) -> Result<bool> {
         Ok(self.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])? > 0)
     }
 

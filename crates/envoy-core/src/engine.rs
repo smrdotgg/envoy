@@ -347,24 +347,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             }
             shared.emit_pending();
         }
-        Command::UndoMove { undo } => {
-            let touched = shared.with_writer(|st| st.undo_batch(undo))?;
-            let queued = shared.undo_keys.lock().is_ok_and(|mut k| k.remove(&undo));
-            if touched.is_empty() {
-                // Nothing was held: it already replayed, or the move had nothing to do (say,
-                // archiving in All Mail). The UI already put the rows back; a reload shows
-                // where the messages really are.
-                if queued {
-                    shared.emit(Event::Toast("Too late to undo — it already reached the server".into()));
-                }
-                shared.emit(Event::Changed { account: String::new() });
-            }
-            for a in touched {
-                shared.emit_mailboxes(&a);
-                shared.emit(Event::Changed { account: a });
-            }
-            shared.emit_pending();
-        }
+        Command::UndoMove { undo } => undo_move(shared, undo)?,
         Command::Send { draft } => {
             let account = shared.account(&draft.account).ok_or_else(|| anyhow!("Choose an account to send from"))?;
             let built = smtp::build(&account, &draft)?;
@@ -390,7 +373,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             poke(workers, &account.id, Job::Sync);
         }
         Command::UndoSend { op } => {
-            let cancelled = shared.with_writer(|st| st.cancel_op(op))?;
+            let cancelled = shared.with_writer(|st| st.cancel_send(op))?;
             shared.emit(Event::Toast(if cancelled { "Sending undone".into() } else { "Too late — it was already sent".into() }));
             shared.emit_pending();
         }
@@ -545,6 +528,27 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             }
         }
     }
+    Ok(())
+}
+
+/// [`Command::UndoMove`]: takes back what's still queued of a move and tells the UI how it went.
+fn undo_move(shared: &Shared, undo: i64) -> Result<()> {
+    let touched = shared.with_writer(|st| st.undo_batch(undo))?;
+    let queued = shared.undo_keys.lock().is_ok_and(|mut k| k.remove(&undo));
+    if touched.is_empty() {
+        // Nothing was held: it already replayed, or the move had nothing to do (say,
+        // archiving in All Mail). The UI already put the rows back; a reload shows
+        // where the messages really are.
+        if queued {
+            shared.emit(Event::Toast("Too late to undo — it already reached the server".into()));
+        }
+        shared.emit(Event::Changed { account: String::new() });
+    }
+    for a in touched {
+        shared.emit_mailboxes(&a);
+        shared.emit(Event::Changed { account: a });
+    }
+    shared.emit_pending();
     Ok(())
 }
 
@@ -987,35 +991,57 @@ fn display_of(mailboxes: &[Mailbox], name: &str) -> String {
 }
 
 async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut Session, has_move: bool) -> Result<bool> {
+    replay_with(shared, account, &mut ImapRunner { shared, account, session, has_move }).await
+}
+
+/// Carries out one queued op on the server. A seam so replay can be tested without a server.
+trait OpRunner {
+    fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+struct ImapRunner<'a> {
+    shared: &'a Arc<Shared>,
+    account: &'a Account,
+    session: &'a mut Session,
+    has_move: bool,
+}
+
+impl OpRunner for ImapRunner<'_> {
+    async fn run(&mut self, op: &Op) -> Result<()> {
+        let (shared, account, session) = (self.shared, self.account, &mut *self.session);
+        match op {
+            Op::SetFlags { mailbox, uid, add, remove } => imap::store_flags(session, mailbox, *uid, *add, *remove).await,
+            Op::Move { mailbox, uid, dest } => imap::move_message(session, self.has_move, mailbox, *uid, dest).await,
+            Op::Expunge { mailbox, uid } => imap::expunge(session, mailbox, *uid, true).await,
+            Op::Send { raw_b64, from, to, sent_mailbox, reply_of } => {
+                let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
+                let cred = shared.credential(account).await?;
+                log::info!("{}: sending to {} recipient(s)", account.email, to.len());
+                smtp::send(account, &cred, from, to, &raw).await?;
+                log::info!("{}: sent", account.email);
+                shared.emit(Event::Toast("Message sent".into()));
+                // From here on the message is out; failures below must not resend it.
+                if let Some(sent) = sent_mailbox
+                    && let Err(e) = imap::append(session, sent, &raw, true).await
+                {
+                    log::warn!("couldn't save to Sent: {e:#}");
+                }
+                if let Some((mailbox, uid)) = reply_of {
+                    let _ = imap::store_flags(session, mailbox, *uid, flags::ANSWERED, 0).await;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Replays the account's due ops, in order, retrying failures with backoff. True when any
+/// op finished (or was given up on).
+async fn replay_with(shared: &Arc<Shared>, account: &Account, runner: &mut impl OpRunner) -> Result<bool> {
     let ops = shared.with_writer(|st| st.ops(&account.id, now()))?;
     let mut any = false;
     for q in ops {
-        let r: Result<()> = async {
-            match &q.op {
-                Op::SetFlags { mailbox, uid, add, remove } => imap::store_flags(session, mailbox, *uid, *add, *remove).await,
-                Op::Move { mailbox, uid, dest } => imap::move_message(session, has_move, mailbox, *uid, dest).await,
-                Op::Expunge { mailbox, uid } => imap::expunge(session, mailbox, *uid, true).await,
-                Op::Send { raw_b64, from, to, sent_mailbox, reply_of } => {
-                    let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
-                    let cred = shared.credential(account).await?;
-                    log::info!("{}: sending to {} recipient(s)", account.email, to.len());
-                    smtp::send(account, &cred, from, to, &raw).await?;
-                    log::info!("{}: sent", account.email);
-                    shared.emit(Event::Toast("Message sent".into()));
-                    // From here on the message is out; failures below must not resend it.
-                    if let Some(sent) = sent_mailbox
-                        && let Err(e) = imap::append(session, sent, &raw, true).await
-                    {
-                        log::warn!("couldn't save to Sent: {e:#}");
-                    }
-                    if let Some((mailbox, uid)) = reply_of {
-                        let _ = imap::store_flags(session, mailbox, *uid, flags::ANSWERED, 0).await;
-                    }
-                    Ok(())
-                }
-            }
-        }
-        .await;
+        let r = runner.run(&q.op).await;
         match r {
             Ok(()) => {
                 shared.with_writer(|st| st.op_done(q.id))?;
