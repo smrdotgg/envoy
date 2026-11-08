@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS ops (
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     not_before INTEGER NOT NULL DEFAULT 0,
-    batch INTEGER NOT NULL DEFAULT 0
+    batch INTEGER NOT NULL DEFAULT 0,
+    claimed INTEGER NOT NULL DEFAULT 0
 );
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM fts WHERE rowid = old.id;
@@ -92,6 +93,8 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("messages", "held_op", "ALTER TABLE messages ADD COLUMN held_op INTEGER NOT NULL DEFAULT 0"),
     // Ops queued by one user action, so undo can take them all back.
     ("ops", "batch", "ALTER TABLE ops ADD COLUMN batch INTEGER NOT NULL DEFAULT 0"),
+    // Taken by the worker for replay (on the wire): undo and cancel leave it alone.
+    ("ops", "claimed", "ALTER TABLE ops ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Indexes on migrated columns (they must exist first).
@@ -112,10 +115,11 @@ CREATE TABLE ops_new (
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     not_before INTEGER NOT NULL DEFAULT 0,
-    batch INTEGER NOT NULL DEFAULT 0
+    batch INTEGER NOT NULL DEFAULT 0,
+    claimed INTEGER NOT NULL DEFAULT 0
 );
-INSERT INTO ops_new (id, account, op, attempts, last_error, not_before, batch)
-    SELECT id, account, op, attempts, last_error, not_before, batch FROM ops;
+INSERT INTO ops_new (id, account, op, attempts, last_error, not_before, batch, claimed)
+    SELECT id, account, op, attempts, last_error, not_before, batch, claimed FROM ops;
 DROP TABLE ops;
 ALTER TABLE ops_new RENAME TO ops;
 COMMIT;
@@ -145,6 +149,17 @@ pub enum Op {
     /// Delete for good (expunge), used in Trash.
     Expunge { mailbox: String, uid: u32 },
     Send { raw_b64: String, from: String, to: Vec<String>, sent_mailbox: Option<String>, reply_of: Option<(String, u32)> },
+}
+
+/// What [`Store::undo_batch`] managed.
+#[derive(Debug, Default, PartialEq)]
+pub struct Undone {
+    /// Accounts whose messages came back.
+    pub accounts: Vec<String>,
+    /// Ops cancelled before reaching the server.
+    pub released: usize,
+    /// Ops already on their way to the server, left to finish.
+    pub in_flight: usize,
 }
 
 pub struct QueuedOp {
@@ -749,8 +764,38 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Due ops not taken for replay, oldest first. Read-only apart from dropping unreadable
+    /// ones; replay uses [`Store::claim_due`].
     pub fn ops(&self, account: &str, now: i64) -> Result<Vec<QueuedOp>> {
-        let mut stmt = self.conn.prepare_cached("SELECT id, op, attempts FROM ops WHERE account = ?1 AND not_before <= ?2 ORDER BY id")?;
+        self.transaction(|st| st.due(account, now))
+    }
+
+    /// Takes the account's due ops for replay, atomically: from here until [`Store::op_done`],
+    /// [`Store::op_failed`] or [`Store::unclaim`], undo and cancel can't touch them, because
+    /// the server may already be carrying them out. Claims left over from a replay that never
+    /// finished (a crash) are released first. Only the account's worker calls this, one pass
+    /// at a time.
+    pub fn claim_due(&self, account: &str, now: i64) -> Result<Vec<QueuedOp>> {
+        self.transaction(|st| {
+            st.unclaim(account)?;
+            let due = st.due(account, now)?;
+            let mut claim = st.conn.prepare_cached("UPDATE ops SET claimed = 1 WHERE id = ?1")?;
+            for q in &due {
+                claim.execute(params![q.id])?;
+            }
+            Ok(due)
+        })
+    }
+
+    /// Hands back the account's claimed ops that didn't finish (replay stopped early).
+    pub fn unclaim(&self, account: &str) -> Result<()> {
+        self.conn.execute("UPDATE ops SET claimed = 0 WHERE account = ?1 AND claimed = 1", params![account])?;
+        Ok(())
+    }
+
+    /// Call inside a transaction.
+    fn due(&self, account: &str, now: i64) -> Result<Vec<QueuedOp>> {
+        let mut stmt = self.conn.prepare_cached("SELECT id, op, attempts FROM ops WHERE account = ?1 AND not_before <= ?2 AND claimed = 0 ORDER BY id")?;
         let rows = stmt.query_map(params![account, now], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?)))?;
         let mut out = Vec::new();
         let mut unreadable = Vec::new();
@@ -763,7 +808,7 @@ impl Store {
         }
         drop(stmt);
         if !unreadable.is_empty() {
-            self.transaction(|st| st.release(&unreadable))?;
+            self.release(&unreadable)?;
         }
         Ok(out)
     }
@@ -808,19 +853,25 @@ impl Store {
         if !op.is_some_and(|o| matches!(serde_json::from_str(&o), Ok(Op::Send { .. }))) {
             return Ok(false);
         }
-        Ok(self.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])? > 0)
+        Ok(self.conn.execute("DELETE FROM ops WHERE id = ?1 AND claimed = 0", params![id])? > 0)
     }
 
-    /// Undoes a user action: cancels its ops that haven't reached the server and shows the
-    /// messages they were moving again, unread counts included. Returns the accounts touched;
-    /// empty when nothing was left to undo (it had already replayed).
-    pub fn undo_batch(&self, batch: i64) -> Result<Vec<String>> {
+    /// Undoes a user action: cancels its ops that haven't gone to the server and shows the
+    /// messages they were moving again, unread counts included. Ops already claimed for replay
+    /// are left to finish (the server may be carrying them out): they're counted in
+    /// `in_flight`. Ops that already replayed are simply gone.
+    pub fn undo_batch(&self, batch: i64) -> Result<Undone> {
         if batch == 0 {
-            return Ok(vec![]);
+            return Ok(Undone::default());
         }
         self.transaction(|st| {
-            let ids: Vec<i64> = st.conn.prepare("SELECT id FROM ops WHERE batch = ?1")?.query_map(params![batch], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-            st.release(&ids)
+            let ops: Vec<(i64, bool)> = st
+                .conn
+                .prepare_cached("SELECT id, claimed FROM ops WHERE batch = ?1")?
+                .query_map(params![batch], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let unclaimed: Vec<i64> = ops.iter().filter(|(_, c)| !c).map(|(id, _)| *id).collect();
+            Ok(Undone { accounts: st.release(&unclaimed)?, released: unclaimed.len(), in_flight: ops.len() - unclaimed.len() })
         })
     }
 
@@ -850,7 +901,7 @@ impl Store {
 
     pub fn op_failed(&self, id: i64, error: &str, retry_in: i64, now: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE ops SET attempts = attempts + 1, last_error = ?2, not_before = ?3 WHERE id = ?1",
+            "UPDATE ops SET attempts = attempts + 1, last_error = ?2, not_before = ?3, claimed = 0 WHERE id = ?1",
             params![id, error, now + retry_in],
         )?;
         Ok(())
@@ -1001,6 +1052,45 @@ mod tests {
     }
 
     #[test]
+    fn claimed_ops_are_out_of_reach_of_undo_and_cancel() {
+        let s = Store::memory();
+        let (id, op) = held_move(&s);
+        let send = s.enqueue_at("a", &send_op(), 0).unwrap();
+        let claimed: Vec<i64> = s.claim_due("a", 100).unwrap().iter().map(|q| q.id).collect();
+        assert_eq!(claimed, vec![op, send]);
+        assert!(s.ops("a", 100).unwrap().is_empty(), "claimed ops aren't due for anyone else");
+        assert!(!s.cancel_send(send).unwrap(), "a send on the wire can't be undone");
+        assert_eq!(s.undo_batch(7).unwrap(), Undone { accounts: vec![], released: 0, in_flight: 1 });
+        assert!(inbox(&s).is_empty(), "the move may be happening: stays hidden");
+        s.op_done(op).unwrap();
+        assert!(s.summary(id).unwrap().is_none());
+        // A failure hands the op back to the queue, where undo can reach it again.
+        s.op_failed(send, "offline", 0, 100).unwrap();
+        assert!(s.cancel_send(send).unwrap());
+        assert_eq!(orphaned_holds(&s), 0);
+    }
+
+    #[test]
+    fn claims_left_by_a_crash_are_retried() {
+        let dir = std::env::temp_dir().join(format!("envoy-store-claims-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mail.sqlite");
+        let op = {
+            let s = Store::open(&db).unwrap();
+            let (_, op) = held_move(&s);
+            assert_eq!(s.claim_due("a", 100).unwrap().len(), 1);
+            op // the app dies here, mid-replay
+        };
+        let s = Store::open(&db).unwrap();
+        let again: Vec<i64> = s.claim_due("a", 100).unwrap().iter().map(|q| q.id).collect();
+        assert_eq!(again, vec![op], "replayed on the next start");
+        s.unclaim("a").unwrap();
+        assert_eq!(s.ops("a", 100).unwrap().len(), 1, "unclaim puts it back in the queue");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn held_move_hides_but_keeps_the_row() {
         let s = Store::memory();
         let (id, _) = held_move(&s);
@@ -1026,14 +1116,14 @@ mod tests {
         let s = Store::memory();
         let (id, _) = held_move(&s);
         assert_eq!(unread(&s), 0);
-        assert_eq!(s.undo_batch(7).unwrap(), vec!["a".to_owned()]);
+        assert_eq!(s.undo_batch(7).unwrap().accounts, vec!["a".to_owned()]);
         assert!(s.ops("a", i64::MAX).unwrap().is_empty(), "the server never sees it");
         let back = inbox(&s);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].id, id, "same row: flags, body and open state intact");
         assert_eq!(unread(&s), 1, "unread count back");
-        assert!(s.undo_batch(7).unwrap().is_empty(), "nothing left to undo");
-        assert!(s.undo_batch(0).unwrap().is_empty(), "key 0 is never an undo key");
+        assert_eq!(s.undo_batch(7).unwrap(), Undone::default(), "nothing left to undo");
+        assert_eq!(s.undo_batch(0).unwrap(), Undone::default(), "key 0 is never an undo key");
     }
 
     #[test]
@@ -1042,7 +1132,7 @@ mod tests {
         let (id, op) = held_move(&s);
         s.op_done(op).unwrap();
         assert!(s.summary(id).unwrap().is_none());
-        assert!(s.undo_batch(7).unwrap().is_empty());
+        assert_eq!(s.undo_batch(7).unwrap(), Undone::default());
         assert!(inbox(&s).is_empty());
     }
 
@@ -1094,7 +1184,7 @@ mod tests {
         assert_eq!(s.ops("a", 0).unwrap()[0].id, 41, "queued ops kept, same ids");
         let (_, op) = held_move(&s);
         assert!(op > 41);
-        assert_eq!(s.undo_batch(7).unwrap(), vec!["a".to_owned()]);
+        assert_eq!(s.undo_batch(7).unwrap().accounts, vec!["a".to_owned()]);
         drop(s);
         Store::open(&db).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
