@@ -502,26 +502,129 @@ pub async fn append(session: &mut Session, mailbox: &str, raw: &[u8], seen: bool
     Ok(())
 }
 
-/// Saves a draft: APPENDs it to `mailbox` (flagged \Draft and \Seen), then deletes every other
-/// copy there with its Message-ID: the version it replaces, or one an interrupted save left
-/// behind. Found by Message-ID, this needs no UIDPLUS, and an old copy that's already gone
-/// (deleted elsewhere) is no matter. Returns the UIDs deleted.
-pub async fn replace_draft(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, raw: &[u8], message_id: &str) -> Result<Vec<u32>> {
-    timed("APPEND", session.append(mailbox, Some("(\\Draft \\Seen)"), None, raw)).await??;
-    select(session, mailbox).await?;
-    let mut uids = uids_with_message_id(session, message_id).await?;
-    // UIDs only grow: the highest is the copy just appended.
-    uids.sort_unstable();
-    uids.pop();
-    delete_uids(session, caps, &uids).await?;
-    Ok(uids)
+/// What saving a draft did on the server ([`replace_draft`]).
+#[derive(Debug, Default, PartialEq)]
+pub struct Replaced {
+    /// The new copy, `(UIDVALIDITY, UID)`, when known.
+    pub copy: Option<(u32, u32)>,
+    /// Older copies deleted.
+    pub deleted: Vec<u32>,
+    /// Every older copy is known to be gone. False when a search had to be trusted and
+    /// couldn't be (it didn't find the copy just made): older copies were kept, not risked.
+    pub certain: bool,
 }
 
-/// Deletes every message with this Message-ID from `mailbox` (a draft's copies). Returns their
-/// UIDs.
-pub async fn purge_message_id(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, message_id: &str) -> Result<Vec<u32>> {
-    select(session, mailbox).await?;
-    let uids = uids_with_message_id(session, message_id).await?;
+/// Saves a draft: APPENDs it to `mailbox` (flagged \Draft and \Seen), then deletes the copy
+/// the last save made, `previous` (`(UIDVALIDITY, UID)`), exactly. The new copy's UID comes
+/// from APPENDUID (UIDPLUS). Only when it can't be known that way, or there's no previous copy
+/// on record, or `maybe_strays` (an earlier upload was cut off and may have left a copy) does a
+/// search by the draft's Message-ID stand in, and then only if it finds the copy just made.
+pub async fn replace_draft(
+    session: &mut async_imap::Session<impl Io>,
+    caps: Caps,
+    mailbox: &str,
+    raw: &[u8],
+    message_id: &str,
+    previous: Option<(u32, u32)>,
+    maybe_strays: bool,
+) -> Result<Replaced> {
+    let before = timed("SELECT", session.select(mailbox)).await??;
+    let validity = before.uid_validity.unwrap_or(0);
+    let appended = timed("APPEND", append_uid(session, mailbox, "(\\Draft \\Seen)", raw)).await??;
+    let appended = appended.filter(|(v, _)| *v == validity || validity == 0);
+    let validity = appended.map_or(validity, |(v, _)| v);
+    let previous = previous.filter(|(v, _)| *v == validity && validity != 0).map(|(_, uid)| uid);
+    let found = if appended.is_none() || previous.is_none() || maybe_strays {
+        // Selected again, so the search sees the new copy.
+        select(session, mailbox).await?;
+        Some(uids_with_message_id(session, message_id).await?)
+    } else {
+        None
+    };
+    let plan = cleanup(appended.map(|(_, uid)| uid), before.uid_next, previous, found.as_deref());
+    if !plan.certain {
+        log::warn!("draft {message_id}: the search didn't find the copy just saved, so older copies were kept");
+    }
+    delete_uids(session, caps, &plan.delete).await?;
+    Ok(Replaced { copy: plan.new.map(|uid| (validity, uid)), deleted: plan.delete, certain: plan.certain })
+}
+
+/// Which older copies a draft save deletes ([`replace_draft`]).
+#[derive(Debug, PartialEq)]
+struct Cleanup {
+    new: Option<u32>,
+    delete: Vec<u32>,
+    certain: bool,
+}
+
+/// [`replace_draft`]'s decision. `appended`: the new copy's UID if the server said;
+/// `uid_next`: the mailbox's UIDNEXT before the APPEND, so a copy at or above it is new;
+/// `previous`: the last save's copy, in this UIDVALIDITY; `found`: the Message-ID search's
+/// hits (headers checked), if it ran. UIDs only grow, so copies below the new one are older.
+fn cleanup(appended: Option<u32>, uid_next: Option<u32>, previous: Option<u32>, found: Option<&[u32]>) -> Cleanup {
+    let new = appended.or_else(|| found.zip(uid_next).and_then(|(f, next)| f.iter().copied().filter(|u| *u >= next).max()));
+    // A search that doesn't find the copy just made can't be trusted to have found the others.
+    let trusted = found.zip(new).is_some_and(|(f, n)| f.contains(&n));
+    let mut delete: Vec<u32> = previous.filter(|p| Some(*p) != new).into_iter().collect();
+    if let (true, Some(f), Some(n)) = (trusted, found, new) {
+        delete.extend(f.iter().copied().filter(|u| *u < n));
+    }
+    delete.sort_unstable();
+    delete.dedup();
+    Cleanup { new, delete, certain: found.map_or(previous.is_some(), |_| trusted) }
+}
+
+/// APPENDs a message, returning its `(UIDVALIDITY, UID)` if the server reports it (APPENDUID,
+/// from UIDPLUS). async-imap's own APPEND drops that.
+async fn append_uid(session: &mut async_imap::Session<impl Io>, mailbox: &str, flags: &str, raw: &[u8]) -> Result<Option<(u32, u32)>> {
+    use async_imap::imap_proto::{Response, ResponseCode, Status, UidSetMember};
+    use tokio::io::AsyncWriteExt;
+    let tag = session.run_command(format!("APPEND {} {flags} {{{}}}", quoted(mailbox), raw.len())).await?;
+    // As async-imap reports a refusal, so errors read the same.
+    fn refused(status: &Status, code: &impl std::fmt::Debug, info: &impl std::fmt::Debug) -> anyhow::Error {
+        let what = format!("code: {code:?}, info: {info:?}");
+        anyhow::Error::new(if *status == Status::Bad { async_imap::error::Error::Bad(what) } else { async_imap::error::Error::No(what) })
+    }
+    loop {
+        let r = session.read_response().await.ok_or(async_imap::error::Error::ConnectionLost)??;
+        match r.parsed() {
+            Response::Continue { .. } => break,
+            Response::Done { tag: t, status, code, information } if *t == tag => return Err(refused(status, code, information)),
+            _ => {}
+        }
+    }
+    let stream = session.as_mut();
+    stream.write_all(raw).await?;
+    stream.write_all(b"\r\n").await?;
+    stream.flush().await?;
+    loop {
+        let r = session.read_response().await.ok_or(async_imap::error::Error::ConnectionLost)??;
+        if let Response::Done { tag: t, status, code, information } = r.parsed()
+            && *t == tag
+        {
+            if *status != Status::Ok {
+                return Err(refused(status, code, information));
+            }
+            return Ok(match code {
+                Some(ResponseCode::AppendUid(validity, uids)) => match uids.as_slice() {
+                    [UidSetMember::Uid(uid)] => Some((*validity, *uid)),
+                    _ => None,
+                },
+                _ => None,
+            });
+        }
+    }
+}
+
+/// Deletes a draft's copies from `mailbox`: the one on record, `known` (`(UIDVALIDITY, UID)`),
+/// and any others the Message-ID search finds (headers checked). Returns their UIDs.
+pub async fn purge_message_id(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, message_id: &str, known: Option<(u32, u32)>) -> Result<Vec<u32>> {
+    let selected = timed("SELECT", session.select(mailbox)).await??;
+    let validity = selected.uid_validity.unwrap_or(0);
+    let mut uids = uids_with_message_id(session, message_id).await?;
+    uids.extend(known.filter(|(v, _)| *v == validity && validity != 0).map(|(_, uid)| uid));
+    uids.sort_unstable();
+    uids.dedup();
     delete_uids(session, caps, &uids).await?;
     Ok(uids)
 }
@@ -702,10 +805,87 @@ mod tests {
             }
         })
         .await;
-        replace_draft(&mut s, caps(false), "Drafts", b"Subject: x\r\n\r\nhi\r\n", "<d@envoy>").await.unwrap();
+        let done = replace_draft(&mut s, caps(false), "Drafts", b"Subject: x\r\n\r\nhi\r\n", "<d@envoy>", None, false).await.unwrap();
         let cmds = commands(&log);
         assert!(!expunges_everything(&cmds), "{cmds:?}");
         assert!(cmds.contains(&"UID STORE 5 +FLAGS.SILENT (\\Deleted)".to_owned()), "the old copy is flagged: {cmds:?}");
+        assert_eq!(done, Replaced { copy: Some((7, 21)), deleted: vec![5], certain: true }, "the new copy found above UIDNEXT");
+    }
+
+    #[test]
+    fn a_save_deletes_the_copy_it_knows_exactly() {
+        assert_eq!(cleanup(Some(21), Some(21), Some(5), None), Cleanup { new: Some(21), delete: vec![5], certain: true });
+    }
+
+    #[test]
+    fn a_search_that_misses_the_new_copy_is_not_trusted() {
+        // APPENDUID says 21, the search doesn't have it: nothing it found is deleted.
+        assert_eq!(cleanup(Some(21), Some(21), None, Some(&[5, 9])), Cleanup { new: Some(21), delete: vec![], certain: false });
+        // No APPENDUID, and nothing found above UIDNEXT: the new copy can't be told apart.
+        assert_eq!(cleanup(None, Some(21), None, Some(&[5, 9])), Cleanup { new: None, delete: vec![], certain: false });
+        assert_eq!(cleanup(None, None, None, Some(&[5, 9])), Cleanup { new: None, delete: vec![], certain: false });
+        // The copy on record still goes: it's this draft's, and the APPEND succeeded.
+        assert_eq!(cleanup(None, Some(21), Some(5), Some(&[9])), Cleanup { new: None, delete: vec![5], certain: false });
+    }
+
+    #[test]
+    fn a_trusted_search_deletes_only_older_copies() {
+        // 30 came after the copy just made (another computer): kept.
+        assert_eq!(cleanup(Some(21), Some(21), None, Some(&[5, 21, 30])), Cleanup { new: Some(21), delete: vec![5], certain: true });
+        assert_eq!(cleanup(None, Some(21), None, Some(&[5, 21])), Cleanup { new: Some(21), delete: vec![5], certain: true });
+        // A copy left by an interrupted upload, besides the one on record.
+        assert_eq!(cleanup(Some(21), Some(21), Some(5), Some(&[5, 8, 21])), Cleanup { new: Some(21), delete: vec![5, 8], certain: true });
+    }
+
+    fn drafts_server(search: &'static str, found: &'static [(u32, &'static str)]) -> impl Fn(&str) -> Option<String> + Send + 'static {
+        move |c: &str| {
+            if c.starts_with("SELECT") {
+                Some(fake::selected(7, 21))
+            } else if c.starts_with("APPEND") {
+                Some("TAG OK [APPENDUID 7 21] saved\r\n".into())
+            } else if c.starts_with("UID SEARCH") {
+                Some(format!("* SEARCH {search}\r\nTAG OK done\r\n"))
+            } else if c.starts_with("UID FETCH") {
+                Some(fake::message_ids(found))
+            } else {
+                None
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn with_appenduid_the_previous_copy_goes_by_uid_without_a_search() {
+        let (mut s, log) = fake::session(drafts_server("", &[])).await;
+        let done = replace_draft(&mut s, caps(true), "Drafts", b"Subject: x\r\n\r\nhi\r\n", "<d@envoy>", Some((7, 5)), false).await.unwrap();
+        assert_eq!(done, Replaced { copy: Some((7, 21)), deleted: vec![5], certain: true });
+        let cmds = commands(&log);
+        assert!(!cmds.iter().any(|c| c.starts_with("UID SEARCH")), "{cmds:?}");
+        assert_eq!(&cmds[cmds.len() - 2..], ["UID STORE 5 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 5"]);
+    }
+
+    #[tokio::test]
+    async fn a_search_that_misses_the_new_copy_deletes_nothing() {
+        let (mut s, log) = fake::session(drafts_server("5 9", &[(5, "<d@envoy>"), (9, "<d@envoy>")])).await;
+        let done = replace_draft(&mut s, caps(true), "Drafts", b"Subject: x\r\n\r\nhi\r\n", "<d@envoy>", None, false).await.unwrap();
+        assert_eq!(done, Replaced { copy: Some((7, 21)), deleted: vec![], certain: false });
+        let cmds = commands(&log);
+        assert!(!cmds.iter().any(|c| c.starts_with("UID STORE") || c.contains("EXPUNGE")), "{cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn a_uid_from_another_uidvalidity_is_not_trusted() {
+        let (mut s, log) = fake::session(drafts_server("5 21", &[(5, "<d@envoy>"), (21, "<d@envoy>")])).await;
+        // The mailbox was recreated (UIDVALIDITY 7, not 6): UID 4 means nothing now; the search decides.
+        let done = replace_draft(&mut s, caps(true), "Drafts", b"Subject: x\r\n\r\nhi\r\n", "<d@envoy>", Some((6, 4)), false).await.unwrap();
+        assert_eq!(done.deleted, vec![5]);
+        assert!(!commands(&log).iter().any(|c| c.contains("STORE 4 ")));
+    }
+
+    #[tokio::test]
+    async fn a_purge_deletes_the_known_copy_and_any_found() {
+        let (mut s, log) = fake::session(drafts_server("8", &[(8, "<d@envoy>")])).await;
+        assert_eq!(purge_message_id(&mut s, caps(true), "Drafts", "<d@envoy>", Some((7, 5))).await.unwrap(), vec![5, 8]);
+        assert_eq!(commands(&log).last().map(String::as_str), Some("UID EXPUNGE 5,8"));
     }
 
     #[test]

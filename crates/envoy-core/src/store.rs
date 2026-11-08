@@ -102,7 +102,11 @@ CREATE TABLE IF NOT EXISTS drafts (
     appended INTEGER NOT NULL DEFAULT 0,
     open INTEGER NOT NULL DEFAULT 0,
     sending INTEGER NOT NULL DEFAULT 0,
-    purge_op INTEGER NOT NULL DEFAULT 0
+    purge_op INTEGER NOT NULL DEFAULT 0,
+    server_mailbox TEXT NOT NULL DEFAULT '',
+    server_validity INTEGER NOT NULL DEFAULT 0,
+    server_uid INTEGER NOT NULL DEFAULT 0,
+    unconfirmed INTEGER NOT NULL DEFAULT 0
 );
 "#;
 
@@ -116,6 +120,12 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("ops", "batch", "ALTER TABLE ops ADD COLUMN batch INTEGER NOT NULL DEFAULT 0"),
     // Taken by the worker for replay (on the wire): undo and cancel leave it alone.
     ("ops", "claimed", "ALTER TABLE ops ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0"),
+    // Where a draft's server copy is, exactly, so the next save deletes it by UID.
+    ("drafts", "server_mailbox", "ALTER TABLE drafts ADD COLUMN server_mailbox TEXT NOT NULL DEFAULT ''"),
+    ("drafts", "server_validity", "ALTER TABLE drafts ADD COLUMN server_validity INTEGER NOT NULL DEFAULT 0"),
+    ("drafts", "server_uid", "ALTER TABLE drafts ADD COLUMN server_uid INTEGER NOT NULL DEFAULT 0"),
+    // An upload started and not confirmed: the server may have a copy no one knows the UID of.
+    ("drafts", "unconfirmed", "ALTER TABLE drafts ADD COLUMN unconfirmed INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Indexes on migrated columns (they must exist first).

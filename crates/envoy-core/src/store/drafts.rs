@@ -16,7 +16,10 @@
 //!
 //! `version` counts content changes and `server_version` is the one the server has, so an
 //! upload knows whether there's anything to do. `appended` says an upload was started: the
-//! server may have a copy, and deleting the draft must look there.
+//! server may have a copy, and deleting the draft must look there. `server_mailbox`,
+//! `server_validity` and `server_uid` say where the last confirmed copy is, so the next save
+//! deletes exactly that one; `unconfirmed` marks an upload that didn't confirm (cut off, or its
+//! cleanup unsure), so the next one also searches for strays.
 
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
@@ -43,6 +46,10 @@ pub struct DraftUpload {
     pub draft: Draft,
     pub message_id: String,
     pub version: i64,
+    /// The last confirmed copy, `(mailbox, UIDVALIDITY, UID)`, which this upload replaces.
+    pub previous: Option<(String, u32, u32)>,
+    /// An earlier upload didn't confirm, and may have left a copy behind.
+    pub maybe_strays: bool,
 }
 
 const COLS: &str = "d.id, d.account, d.content, d.message_id, d.updated, d.sending = 0 AND d.purge_op = 0";
@@ -110,7 +117,8 @@ impl Store {
         self.conn.execute(
             "UPDATE drafts SET account = ?2, content = ?3, rev = ?4, open = ?5, purge_op = 0,
                  updated = CASE WHEN ?6 THEN ?7 ELSE updated END, version = version + ?6,
-                 appended = appended AND NOT ?8, server_version = CASE WHEN ?8 THEN 0 ELSE server_version END
+                 appended = appended AND NOT ?8, server_version = CASE WHEN ?8 THEN 0 ELSE server_version END,
+                 server_uid = CASE WHEN ?8 THEN 0 ELSE server_uid END, unconfirmed = unconfirmed AND NOT ?8
              WHERE id = ?1",
             params![id, draft.account, content, rev.unwrap_or(old_rev), open, changed, now, moved],
         )?;
@@ -222,25 +230,43 @@ impl Store {
     /// still on that account). From here on the server may have a copy, even if the upload is
     /// cut off.
     pub fn draft_upload(&self, account: &str, id: i64) -> Result<Option<DraftUpload>> {
-        let found: Option<(String, String, i64)> = self
+        type Row = (String, String, i64, String, u32, u32, bool);
+        let found: Option<Row> = self
             .conn
             .query_row(
-                "SELECT content, message_id, version FROM drafts WHERE id = ?1 AND account = ?2 AND sending = 0 AND purge_op = 0 AND version > server_version",
+                "SELECT content, message_id, version, server_mailbox, server_validity, server_uid, unconfirmed != 0 FROM drafts
+                 WHERE id = ?1 AND account = ?2 AND sending = 0 AND purge_op = 0 AND version > server_version",
                 params![id, account],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
             )
             .optional()?;
-        let Some((content, message_id, version)) = found else { return Ok(None) };
-        self.conn.execute("UPDATE drafts SET appended = 1 WHERE id = ?1", params![id])?;
+        let Some((content, message_id, version, mailbox, validity, uid, maybe_strays)) = found else { return Ok(None) };
+        self.conn.execute("UPDATE drafts SET appended = 1, unconfirmed = 1 WHERE id = ?1", params![id])?;
         let mut draft: Draft = serde_json::from_str(&content).unwrap_or_default();
         draft.account = account.to_owned();
-        Ok(Some(DraftUpload { draft, message_id, version }))
+        let previous = (uid != 0).then_some((mailbox, validity, uid));
+        Ok(Some(DraftUpload { draft, message_id, version, previous, maybe_strays }))
     }
 
-    /// The server has `version` of the draft, and no other copy.
-    pub fn draft_uploaded(&self, id: i64, version: i64) -> Result<()> {
-        self.conn.execute("UPDATE drafts SET server_version = MAX(server_version, ?2) WHERE id = ?1", params![id, version])?;
+    /// The server has `version` of the draft, as `copy` (`(UIDVALIDITY, UID)` in `mailbox`) if
+    /// its UID is known. `certain`: the copies before it are known to be gone.
+    pub fn draft_uploaded(&self, id: i64, version: i64, mailbox: &str, copy: Option<(u32, u32)>, certain: bool) -> Result<()> {
+        let (validity, uid) = copy.unwrap_or((0, 0));
+        self.conn.execute(
+            "UPDATE drafts SET server_version = MAX(server_version, ?2), server_mailbox = ?3, server_validity = ?4, server_uid = ?5, unconfirmed = ?6 WHERE id = ?1",
+            params![id, version, mailbox, validity, uid, !certain],
+        )?;
         Ok(())
+    }
+
+    /// The draft's server copy on record: `(mailbox, UIDVALIDITY, UID)`.
+    pub fn draft_copy(&self, id: i64) -> Result<Option<(String, u32, u32)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT server_mailbox, server_validity, server_uid FROM drafts WHERE id = ?1 AND server_uid != 0", params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?)
     }
 
     /// Whether the server may have copies of the draft (an upload was started). False for a
@@ -259,7 +285,7 @@ impl Store {
             }
             let account: Option<String> = st.conn.query_row("SELECT account FROM drafts WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
             let Some(account) = account else { return Ok(()) };
-            st.conn.execute("UPDATE drafts SET appended = 0, server_version = 0 WHERE id = ?1", params![id])?;
+            st.conn.execute("UPDATE drafts SET appended = 0, server_version = 0, server_uid = 0, unconfirmed = 0 WHERE id = ?1", params![id])?;
             if st.draft_needs_upload(id)? {
                 st.queue_draft_upload(&account, id, now)?;
             }
@@ -436,7 +462,7 @@ mod tests {
         assert_eq!(up.draft.subject, "v3");
         s.save_draft(1, &draft("v4"), true, 4, 101).unwrap();
         assert!(s.queue_draft_upload("a", 1, 106).unwrap());
-        s.draft_uploaded(1, up.version).unwrap();
+        s.draft_uploaded(1, up.version, "Drafts", Some((1, 1)), true).unwrap();
         s.op_done(claimed[0].id).unwrap();
         assert!(s.draft_needs_upload(1).unwrap(), "v4 isn't on the server yet");
         assert_eq!(s.draft_upload("a", 1).unwrap().unwrap().draft.subject, "v4");
@@ -520,7 +546,7 @@ mod tests {
         let s = Store::memory();
         s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
         s.draft_upload("a", 1).unwrap();
-        s.draft_uploaded(1, 1).unwrap();
+        s.draft_uploaded(1, 1, "Drafts", Some((1, 1)), true).unwrap();
         s.discard_draft(1, Some((110, 7))).unwrap();
         s.claim_due("a", 110).unwrap(); // the purge is on the wire: undo is too late
         assert_eq!(s.undo_batch(7).unwrap().in_flight, 1);
@@ -575,7 +601,7 @@ mod tests {
         s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
         let mid = s.draft(1).unwrap().unwrap().message_id;
         s.draft_upload("a", 1).unwrap();
-        s.draft_uploaded(1, 1).unwrap();
+        s.draft_uploaded(1, 1, "Drafts", Some((1, 1)), true).unwrap();
         let moved = Draft { account: "b".into(), ..draft("hello") };
         assert!(s.save_draft(1, &moved, true, 2, 101).unwrap());
         assert_eq!(queued(&s, "a"), vec![Op::PurgeDraft { message_id: mid, draft: None }]);
