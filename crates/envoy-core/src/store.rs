@@ -535,6 +535,8 @@ impl Store {
             .optional()?)
     }
 
+    /// Any cached message, hidden or not (for bookkeeping; what the user sees goes through
+    /// [`Store::list`] and [`Store::thread`]).
     pub fn summary(&self, id: MessageId) -> Result<Option<Summary>> {
         let sql = format!("SELECT {SUMMARY_COLS} FROM messages m WHERE m.id = ?1");
         Ok(self.conn.query_row(&sql, params![id], summary_row).optional()?.map(|(s, _)| s))
@@ -744,8 +746,10 @@ impl Store {
     }
 
     /// An opened message, or its whole conversation (oldest first) with `conversations`.
+    /// Empty for a message that's gone, or hidden while its move waits to replay.
     pub fn thread(&self, id: MessageId, conversations: bool) -> Result<Vec<ThreadMessage>> {
-        let Some(s) = self.summary(id)? else { return Ok(vec![]) };
+        let sql = format!("SELECT {SUMMARY_COLS} FROM messages m WHERE m.id = ?1 AND m.held_op = 0");
+        let Some((s, _)) = self.conn.query_row(&sql, params![id], summary_row).optional()? else { return Ok(vec![]) };
         let mut items = Vec::new();
         if conversations {
             let sql = format!(
@@ -1152,6 +1156,17 @@ mod tests {
         assert_eq!((inbox_box().unread, inbox_box().total), (0, 0), "the held message isn't counted");
         s.undo_batch(7).unwrap();
         assert_eq!(unread(&s), 1, "one unread message, one unread");
+    }
+
+    #[test]
+    fn a_hidden_message_cant_be_opened() {
+        let s = Store::memory();
+        let (id, _) = held_move(&s);
+        assert!(s.thread(id, false).unwrap().is_empty(), "flat");
+        assert!(s.thread(id, true).unwrap().is_empty(), "conversation");
+        assert!(s.summary(id).unwrap().is_some(), "move bookkeeping still sees it");
+        s.undo_batch(7).unwrap();
+        assert_eq!(s.thread(id, false).unwrap().len(), 1);
     }
 
     #[test]
