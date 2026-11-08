@@ -257,9 +257,29 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
         workers.insert(a.id.clone(), spawn_worker(shared.clone(), a.id.clone()));
     }
     shared.emit_pending();
+    tokio::spawn(upgrade_search(shared.clone()));
     while let Some(cmd) = rx.recv().await {
         if let Err(e) = handle(&shared, &mut workers, cmd).await {
             shared.emit(Event::Error(format!("{e:#}")));
+        }
+    }
+}
+
+/// Gives an old cache's search index its prefix index ([`Store::upgrade_search`]), a few
+/// hundred messages at a time with the writer free in between, once startup is out of the way.
+/// Searches keep using the old index until it's done.
+async fn upgrade_search(shared: Arc<Shared>) {
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    loop {
+        let s = shared.clone();
+        match tokio::task::spawn_blocking(move || s.with_writer(|st| st.upgrade_search(400))).await {
+            Ok(Ok(true)) => tokio::time::sleep(Duration::from_millis(25)).await,
+            Ok(Ok(false)) => return,
+            Ok(Err(e)) => {
+                log::warn!("upgrading the search index: {e:#}");
+                return;
+            }
+            Err(_) => return,
         }
     }
 }
