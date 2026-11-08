@@ -5,9 +5,17 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 publish = false
+# src/bin: the launch floors `app` measures Envoy's cold start above (floor-window, floor-rune).
+default-run = "envoy-bench"
 
 [dependencies]
 anyhow = "1"
+# floor-rune: the smallest Rune app (same build of Rune as Envoy's).
+rune = { workspace = true }
+# floor-window: a bare native window, no GPU. Same winit build as Rune's; softbuffer hands the
+# window server CPU pixels (CoreGraphics, GDI, X11/Wayland shared memory).
+softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 envoy-core = { workspace = true }
 # Same version and features as envoy-core's, so it's the same build: only to pick sample ids.

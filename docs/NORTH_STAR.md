@@ -46,6 +46,8 @@ Pains we solve, in order: **slowness**, then **overload**, then **too many accou
 | Idle memory | < 150 MB |
 | Binary size | < 30 MB |
 
+Cold start is measured above the OS's own launch floor: what a bare Hello World window takes to appear on the same machine.
+
 Network-bound work (fetching new mail, sending) can take longer, but never blocks the UI, and
 new mail arrives without layout jank.
 

@@ -126,7 +126,7 @@ jobs:
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/size.json" --only "binary · " --label "${{ matrix.os }}"
       - name: "Budget: local search < 50 ms (KNOWN BUDGET MISS: some queries)"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/store.json" --from "$MAILBOX/app.json" --only "search · " --only "app · search, end to end" --label "${{ matrix.os }}"
-      - name: "Budget: cold start < 100 ms (KNOWN BUDGET MISS)"
+      - name: "Budget: cold start above the OS launch floor < 100 ms (KNOWN BUDGET MISS)"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/app.json" --only "app · cold start" --label "${{ matrix.os }}"
       - name: "Budget: keypress → frame < 16 ms (KNOWN BUDGET MISS)"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/app.json" --only "app · keypress → frame" --label "${{ matrix.os }}"
