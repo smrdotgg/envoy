@@ -41,8 +41,9 @@ A feasibility study of live child web views concluded against them:
    likely can't be reproduced (`Verdict::Poor`: positioned layers, CSS grid or flex layouts,
    drawings, embedded media, forms…), a single quiet line above the message offers "Open in
    browser"; the user can dismiss it. Mail that merely differs in details (`Approximate`) gets no
-   note. Nothing loads as a side effect: the browser opens only when the user asks. The score
-   never leaves the machine; it is logged at debug level only.
+   note. Nothing loads as a side effect: the browser opens only when the user asks, and it gets
+   a sanitized copy (below). The score never leaves the machine; it is logged at debug level
+   only.
 3. **(c) Later, maybe: an offscreen snapshot helper** for mail the classifier flags, drawn
    into the reading pane as pictures (below). Not built now.
 
@@ -67,6 +68,20 @@ A feasibility study of live child web views concluded against them:
   applying and the classifier notes it. The renderer is its own crate (`envoy-html`), built at
   opt-level "s" like html5ever under it: it runs once per message, off the UI thread. It adds
   about 50 KB to the macOS binary.
+- **Hostile input is bounded.** Mail is attacker-controlled and parsing runs on 2 MiB engine
+  threads while the store is locked. `parse` catches panics at its boundary (an empty tree, so
+  the reader falls back to text, rather than a poisoned lock); the builder stops laying out at
+  200 levels or 1 MiB of stack and keeps the rest as text; a linear pre-pass caps what reaches
+  html5ever's quadratic corners (512 attributes per tag, 256 open elements); selectors,
+  declarations and candidate rules have caps. `tests/hostile.rs` in `envoy-html` keeps it so.
+- **Remote images are a per-sender opt-in.** `reading.loadImages` defaults to "ask":
+  remote pictures (and background pictures) stay hidden behind a quiet "Images hidden" bar
+  that loads them once or always from that sender (`reading.imagesFrom`). Embedded `cid:`
+  pictures always show. Tracking pixels never load, `<img>` or background.
+- **"Open in browser" opens a sanitized copy** (`envoy_html::export`): no scripts, handlers,
+  refreshes, frames or forms; a strict CSP `<meta>` first in `<head>`; no referrer; remote
+  pictures only when they'd load in Envoy; the message's own pictures inlined as `data:` URIs.
+  The toolbar's Open original still writes the message's HTML as it came.
 - **Families map to generic faces.** Sans → the app's sans, mono → its mono, serif → a system
   serif by name (Georgia; DejaVu Serif on Linux). Rune only registers its bundled faces and a
   few system families (symbols, CJK, mono), so the serif request falls back to the sans face
@@ -112,8 +127,8 @@ the reading pane draws natively, so nothing sits over the window and nothing tak
 
 - The North Star's "Rendering" bullet ("pool of 2–3 warm views … opening one is a swap") no
   longer describes the plan. Revising it is for the user; this record doesn't edit it.
-- Mail that needs a browser gets one only on request, in the user's own browser, which then
-  loads remote content as that browser does.
+- Mail that needs a browser gets one only on request, in the user's own browser, sanitized:
+  nothing in it runs, and it loads remote pictures only if Envoy would have.
 - What the renderer still doesn't do (and how the score treats it): absolute/fixed positioning,
   flex and grid layout, floats that aren't columns, inline SVG, forms, embedded media, transforms
   and filters, multi-column text, `::before`/`::after` content, `rowspan` away from the table's
