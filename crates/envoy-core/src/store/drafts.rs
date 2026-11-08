@@ -115,7 +115,7 @@ impl Store {
         }
         let changed = old_content != content;
         self.conn.execute(
-            "UPDATE drafts SET account = ?2, content = ?3, rev = ?4, open = ?5, purge_op = 0,
+            "UPDATE drafts SET account = ?2, content = ?3, rev = ?4, open = ?5, purge_op = CASE WHEN sent THEN purge_op ELSE 0 END,
                  updated = CASE WHEN ?6 THEN ?7 ELSE updated END, version = version + ?6,
                  appended = appended AND NOT ?8, server_version = CASE WHEN ?8 THEN 0 ELSE server_version END,
                  server_uid = CASE WHEN ?8 THEN 0 ELSE server_uid END, unconfirmed = unconfirmed AND NOT ?8
@@ -339,7 +339,7 @@ impl Store {
         for (id, account, message_id, appended) in sent {
             if appended {
                 let purge = self.enqueue(&account, &Op::PurgeDraft { message_id, draft: Some(id) })?;
-                self.conn.execute("UPDATE drafts SET sending = 0, purge_op = ?2, open = 0 WHERE id = ?1", params![id, purge])?;
+                self.conn.execute("UPDATE drafts SET sending = 0, purge_op = ?2, open = 0, sent = 1 WHERE id = ?1", params![id, purge])?;
             } else {
                 self.conn.execute("DELETE FROM drafts WHERE id = ?1", params![id])?;
             }
@@ -375,21 +375,35 @@ impl Store {
         })
     }
 
-    /// Shows again the drafts op `op` was going to discard (its undo, or it was given up on),
-    /// queuing the upload they skipped meanwhile. Call inside a transaction.
+    /// Shows again the drafts op `op` was going to discard (its undo), queuing the upload they
+    /// skipped meanwhile. A sent draft's cleanup that lost its op (unreadable) is queued again
+    /// instead: a sent draft never comes back. Call inside a transaction.
     pub(super) fn undiscard_drafts(&self, op: i64) -> Result<()> {
-        let back: Vec<(i64, String)> = self
+        let back: Vec<(i64, String, String, bool)> = self
             .conn
-            .prepare_cached("SELECT id, account FROM drafts WHERE purge_op = ?1 AND purge_op != 0")?
-            .query_map(params![op], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .prepare_cached("SELECT id, account, message_id, sent != 0 FROM drafts WHERE purge_op = ?1 AND purge_op != 0")?
+            .query_map(params![op], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        for (id, account) in back {
+        for (id, account, message_id, sent) in back {
+            if sent {
+                let purge = self.enqueue(&account, &Op::PurgeDraft { message_id, draft: Some(id) })?;
+                self.conn.execute("UPDATE drafts SET purge_op = ?2 WHERE id = ?1", params![id, purge])?;
+                continue;
+            }
             self.conn.execute("UPDATE drafts SET purge_op = 0 WHERE id = ?1", params![id])?;
             if self.draft_needs_upload(id)? {
                 self.queue_draft_upload(&account, id, 0)?;
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Store {
+    /// Every queued op of the account comes due (a retry's wait passing).
+    pub fn ops_due_now(&self, account: &str) {
+        self.conn.execute("UPDATE ops SET not_before = 0 WHERE account = ?1", params![account]).unwrap();
     }
 }
 
@@ -485,6 +499,24 @@ mod tests {
         assert!(matches!(&purge[..], [Op::PurgeDraft { draft: Some(1), .. }]), "its server copies go: {purge:?}");
         s.draft_purged(1, 110).unwrap();
         assert_eq!(s.draft(1).unwrap(), None);
+    }
+
+    #[test]
+    fn a_sent_draft_never_comes_back() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.draft_upload("a", 1).unwrap();
+        let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
+        s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
+        s.op_done(send).unwrap();
+        let purge = s.ops("a", i64::MAX).unwrap()[0].id;
+        // Its cleanup op lost (say, unreadable after a downgrade): queued again, not undone.
+        s.op_dropped(purge).unwrap();
+        assert!(!s.draft(1).unwrap().unwrap().visible, "still on its way out");
+        assert!(matches!(&queued(&s, "a")[..], [Op::PurgeDraft { draft: Some(1), .. }]));
+        // A late save (the window closing as it was sent) doesn't bring it back either.
+        s.save_draft(1, &draft("hello"), true, 9, 102).unwrap();
+        assert!(!s.draft(1).unwrap().unwrap().visible);
     }
 
     #[test]

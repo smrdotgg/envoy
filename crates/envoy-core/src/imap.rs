@@ -162,6 +162,54 @@ pub fn is_auth_error(e: &anyhow::Error) -> bool {
     e.downcast_ref::<AuthError>().is_some()
 }
 
+/// A request that can't succeed as it is, whatever the server's state (say, a draft that
+/// can't be built into a message): [`failure`] reads it as [`Failure::Permanent`].
+#[derive(Debug)]
+pub struct Refused(pub String);
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Refused {}
+
+/// What kind of failure a command met, to decide whether to keep quiet and retry.
+#[derive(Debug, PartialEq)]
+pub enum Failure {
+    /// Network trouble, or a server saying "not now" (UNAVAILABLE, INUSE, SERVERBUG): it
+    /// clears by itself.
+    Temporary,
+    /// Refused, and it would be again until someone acts: BAD, or NO with OVERQUOTA,
+    /// TRYCREATE, NOPERM and the like (RFC 5530), or [`Refused`].
+    Permanent,
+    /// Refused without saying why.
+    Unknown,
+}
+
+pub fn failure(e: &anyhow::Error) -> Failure {
+    const NOW: &[&str] = &["UNAVAILABLE", "INUSE", "SERVERBUG", "EXPUNGEISSUED"];
+    const FOR_GOOD: &[&str] =
+        &["TRYCREATE", "OVERQUOTA", "NONEXISTENT", "NOPERM", "CANNOT", "LIMIT", "AUTHORIZATIONFAILED", "PARSE", "PRIVACYREQUIRED", "CONTACTADMIN", "ALREADYEXISTS"];
+    if e.downcast_ref::<Refused>().is_some() || is_auth_error(e) {
+        return Failure::Permanent;
+    }
+    match e.downcast_ref::<async_imap::error::Error>() {
+        Some(async_imap::error::Error::Bad(_)) => Failure::Permanent,
+        Some(async_imap::error::Error::No(what)) => {
+            let what = what.to_ascii_uppercase();
+            if NOW.iter().any(|c| what.contains(c)) {
+                Failure::Temporary
+            } else if FOR_GOOD.iter().any(|c| what.contains(c)) {
+                Failure::Permanent
+            } else {
+                Failure::Unknown
+            }
+        }
+        // Lost connections, timeouts, I/O errors, a folder list not loaded yet.
+        _ => Failure::Temporary,
+    }
+}
+
 /// Decodes IMAP's modified UTF-7 mailbox names (`&AOk-t&AOk-` → `été`).
 pub fn decode_utf7(name: &str) -> String {
     use base64::Engine as _;
@@ -810,6 +858,20 @@ mod tests {
         assert!(!expunges_everything(&cmds), "{cmds:?}");
         assert!(cmds.contains(&"UID STORE 5 +FLAGS.SILENT (\\Deleted)".to_owned()), "the old copy is flagged: {cmds:?}");
         assert_eq!(done, Replaced { copy: Some((7, 21)), deleted: vec![5], certain: true }, "the new copy found above UIDNEXT");
+    }
+
+    #[test]
+    fn failures_are_told_apart() {
+        use async_imap::error::Error;
+        let no = |s: &str| anyhow::Error::new(Error::No(s.into()));
+        // Codes imap-proto doesn't know arrive in the text; ones it knows, in the code.
+        assert_eq!(failure(&no("code: None, info: Some(\"[UNAVAILABLE] busy, try later\")")), Failure::Temporary);
+        assert_eq!(failure(&no("code: None, info: Some(\"[OVERQUOTA] mailbox full\")")), Failure::Permanent);
+        assert_eq!(failure(&no("code: Some(TryCreate), info: None")), Failure::Permanent);
+        assert_eq!(failure(&no("code: None, info: Some(\"APPEND failed\")")), Failure::Unknown);
+        assert_eq!(failure(&anyhow::Error::new(Error::Bad("parse error".into()))), Failure::Permanent);
+        assert_eq!(failure(&anyhow!("FETCH timed out (connection lost?)")), Failure::Temporary);
+        assert_eq!(failure(&anyhow::Error::new(Refused("account address is invalid".into()))), Failure::Permanent);
     }
 
     #[test]

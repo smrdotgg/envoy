@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS drafts (
     server_mailbox TEXT NOT NULL DEFAULT '',
     server_validity INTEGER NOT NULL DEFAULT 0,
     server_uid INTEGER NOT NULL DEFAULT 0,
-    unconfirmed INTEGER NOT NULL DEFAULT 0
+    unconfirmed INTEGER NOT NULL DEFAULT 0,
+    sent INTEGER NOT NULL DEFAULT 0
 );
 "#;
 
@@ -126,6 +127,8 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("drafts", "server_uid", "ALTER TABLE drafts ADD COLUMN server_uid INTEGER NOT NULL DEFAULT 0"),
     // An upload started and not confirmed: the server may have a copy no one knows the UID of.
     ("drafts", "unconfirmed", "ALTER TABLE drafts ADD COLUMN unconfirmed INTEGER NOT NULL DEFAULT 0"),
+    // Sent: whatever happens to its cleanup, it never shows again.
+    ("drafts", "sent", "ALTER TABLE drafts ADD COLUMN sent INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Indexes on migrated columns (they must exist first).

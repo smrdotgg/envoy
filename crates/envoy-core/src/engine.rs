@@ -1393,9 +1393,28 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
             Err(e) => {
                 let msg = format!("{e:#}");
                 let connection_lost = msg.contains("timed out") || msg.contains("connection") || msg.contains("Connection") || msg.contains("broken pipe");
+                let draft_op = matches!(q.op, Op::SaveDraft { .. } | Op::PurgeDraft { .. });
                 // A message the server rejects for good (gone, no such mailbox) is dropped
-                // after a few tries; network trouble keeps it queued.
-                if q.attempts >= 5 && !connection_lost && !matches!(q.op, Op::Send { .. }) {
+                // after a few tries; network trouble keeps it queued. Sends and drafts are
+                // never given up on: giving up would leave a draft off the server (its only
+                // upload gone), or bring back a draft that was sent.
+                if draft_op {
+                    let retry = 15i64 << q.attempts.min(6);
+                    shared.with_writer(|st| st.op_failed(q.id, &msg, retry, now()))?;
+                    // Quiet about trouble that clears by itself; told about refusals, again
+                    // every few tries.
+                    let tell = match imap::failure(&e) {
+                        imap::Failure::Temporary => false,
+                        imap::Failure::Permanent => q.attempts % 5 == 0,
+                        imap::Failure::Unknown => q.attempts % 5 == 4,
+                    };
+                    if tell {
+                        shared.emit(Event::Error(match q.op {
+                            Op::SaveDraft { .. } => format!("Couldn't save a draft to Drafts on {} ({msg}). It's safe on this computer, and Envoy keeps trying.", account.email),
+                            _ => format!("Couldn't remove a draft from Drafts on {} ({msg}). Envoy keeps trying.", account.email),
+                        }));
+                    }
+                } else if q.attempts >= 5 && !connection_lost && !matches!(q.op, Op::Send { .. }) {
                     // A move that never happened: its message shows again where it still is.
                     shared.with_writer(|st| st.op_dropped(q.id))?;
                     any = true;
@@ -1454,7 +1473,8 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
         Op::SaveDraft { draft } => {
             let Some(mailbox) = drafts_mailbox(shared, id)? else { return Ok(()) };
             let Some(up) = shared.with_writer(|st| st.draft_upload(id, *draft))? else { return Ok(()) };
-            let raw = smtp::build_draft(account, &up.draft, &up.message_id)?;
+            // A draft that can't be built won't build on a retry either.
+            let raw = smtp::build_draft(account, &up.draft, &up.message_id).map_err(|e| imap::Refused(format!("{e:#}")))?;
             // The copy on record is replaced by UID; one in another mailbox (the Drafts role
             // moved) is left to the search.
             let previous = up.previous.filter(|(m, _, _)| *m == mailbox).map(|(_, validity, uid)| (validity, uid));
@@ -1986,6 +2006,79 @@ mod tests {
         server.fail = false;
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(server.drafts(), vec![(1, "written offline".to_owned())]);
+    }
+
+    fn errors(rx: &std::sync::mpsc::Receiver<Event>) -> Vec<String> {
+        rx.try_iter().filter_map(|e| if let Event::Error(t) = e { Some(t) } else { None }).collect()
+    }
+
+    /// Replays `n` times, the retry's wait passing in between.
+    async fn replay_times(shared: &Arc<Shared>, server: &mut FakeServer, n: usize) {
+        for _ in 0..n {
+            shared.with_writer(|st| {
+                st.ops_due_now("a");
+                Ok(())
+            })
+            .unwrap();
+            replay_with(shared, &account("a"), server).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_server_never_makes_a_draft_upload_give_up() {
+        let (shared, rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "hello");
+        let mut server = FakeServer { fail: true, ..FakeServer::new(&shared, |_: &Shared| {}) }; // NO [UNAVAILABLE]
+        replay_times(&shared, &mut server, 8).await;
+        shared
+            .with_writer(|st| {
+                let q = st.ops("a", i64::MAX)?;
+                assert_eq!((q.len(), q[0].attempts), (1, 8), "still queued after eight tries");
+                assert!(st.draft(7)?.unwrap().visible);
+                Ok(())
+            })
+            .unwrap();
+        assert!(errors(&rx).is_empty(), "trouble that clears by itself isn't reported");
+        server.fail = false;
+        replay_times(&shared, &mut server, 1).await;
+        assert_eq!(server.drafts(), vec![(1, "hello".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_draft_upload_is_reported_and_kept() {
+        let (shared, rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "hello");
+        let mut server = FakeServer { fail: true, failure: "code: Some(TryCreate), info: Some(\"no such mailbox\")", ..FakeServer::new(&shared, |_: &Shared| {}) };
+        replay_times(&shared, &mut server, 1).await;
+        let told = errors(&rx);
+        assert!(told.len() == 1 && told[0].contains("safe on this computer"), "{told:?}");
+        replay_times(&shared, &mut server, 4).await;
+        assert!(errors(&rx).is_empty(), "not on every retry");
+        replay_times(&shared, &mut server, 1).await;
+        assert_eq!(errors(&rx).len(), 1, "again every few");
+        assert_eq!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().len(), 1, "and kept: it'll go once the folder exists");
+    }
+
+    #[tokio::test]
+    async fn a_sent_drafts_cleanup_failing_never_brings_it_back() {
+        let (shared, rx) = drafts_engine();
+        shared.settings.write().unwrap().set("compose.undoSendSeconds", serde_json::json!(0)).unwrap();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        type_draft(&shared, 7, 1, "hello");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("hello"), draft_id: Some(7) }).await.unwrap();
+        replay_with(&shared, &account("a"), &mut server).await.unwrap(); // sent; the purge is queued
+        server.fail = true;
+        server.failure = "code: Some(Parse), info: Some(\"bad\")";
+        for _ in 0..8 {
+            replay_times(&shared, &mut server, 1).await;
+            assert!(drafts_list(&shared, "").is_empty(), "a sent draft stays gone");
+            assert!(!shared.with_writer(|st| st.draft(7)).unwrap().unwrap().visible);
+        }
+        assert!(errors(&rx).iter().all(|e| !e.starts_with("Gave up")));
+        server.fail = false;
+        replay_times(&shared, &mut server, 1).await;
+        assert!(server.drafts.is_empty() && shared.with_writer(|st| st.draft(7)).unwrap().is_none(), "cleaned up once the server lets it");
     }
 
     #[tokio::test]
