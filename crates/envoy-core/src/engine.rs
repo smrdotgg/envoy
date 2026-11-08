@@ -2050,6 +2050,17 @@ mod tests {
         assert!(shared.with_writer(|st| drafts::merge(st, &inbox, &q, 10, vec![], |a| shared.sender(a))).unwrap().is_empty());
     }
 
+    #[test]
+    fn a_copy_flagged_deleted_doesnt_show() {
+        // Without UIDPLUS, replaced and discarded copies are only flagged \Deleted on the server,
+        // and a sync can bring one into the cache.
+        let (shared, _rx) = drafts_engine();
+        let raw = b"From: a@x.com\r\nSubject: Old version\r\nMessage-ID: <old@x>\r\n\r\nhi\r\n";
+        let p = crate::mime::parse(raw, true).unwrap();
+        shared.with_writer(|st| st.upsert_header("a", "Drafts", 5, flags::DRAFT | flags::DELETED, 10, 0, &p)).unwrap();
+        assert!(drafts_list(&shared, "").is_empty());
+    }
+
     #[tokio::test]
     async fn a_cached_copy_shows_the_local_draft() {
         let (shared, _rx) = drafts_engine();

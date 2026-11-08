@@ -433,7 +433,16 @@ pub async fn fetch_bodies(session: &mut Session, store: &Mutex<Store>, account: 
     Ok(ids)
 }
 
-pub async fn select(session: &mut Session, mailbox: &str) -> Result<()> {
+/// An IMAP quoted string.
+fn quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// What a session runs over: TLS to the server in the app, an in-memory pipe in tests.
+pub trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send> Io for T {}
+
+pub async fn select(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<()> {
     timed("SELECT", session.select(mailbox)).await??;
     Ok(())
 }
@@ -453,28 +462,30 @@ pub async fn store_flags(session: &mut Session, mailbox: &str, uid: u32, add: u3
     Ok(())
 }
 
-pub async fn move_message(session: &mut Session, caps: Caps, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
+pub async fn move_message(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
     select(session, mailbox).await?;
     if caps.moves {
         timed("MOVE", session.uid_mv(uid.to_string(), dest)).await??;
     } else {
-        timed("COPY", session.uid_copy(uid.to_string(), dest)).await??;
-        expunge(session, caps, mailbox, uid, false).await?;
+        // async-imap sends COPY's mailbox as given: quoted here, for names with spaces.
+        timed("COPY", session.uid_copy(uid.to_string(), quoted(dest))).await??;
+        delete_uids(session, caps, &[uid]).await?;
     }
     Ok(())
 }
 
-pub async fn expunge(session: &mut Session, caps: Caps, mailbox: &str, uid: u32, select_first: bool) -> Result<()> {
+pub async fn expunge(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, uid: u32, select_first: bool) -> Result<()> {
     if select_first {
         select(session, mailbox).await?;
     }
     delete_uids(session, caps, &[uid]).await
 }
 
-/// Deletes messages from the selected mailbox: flags them \Deleted and expunges them, by UID
-/// with UIDPLUS, else with a plain EXPUNGE (which also takes anything else already flagged
-/// \Deleted there, as other clients do on such servers).
-async fn delete_uids(session: &mut Session, caps: Caps, uids: &[u32]) -> Result<()> {
+/// Deletes these messages from the selected mailbox: flags them \Deleted and, with UIDPLUS,
+/// expunges exactly them (UID EXPUNGE). Without UIDPLUS they stay flagged, for the server or
+/// the user to remove: a plain EXPUNGE would also destroy anything else flagged \Deleted there,
+/// by the user or another client, so Envoy never sends one. Envoy's lists hide \Deleted mail.
+async fn delete_uids(session: &mut async_imap::Session<impl Io>, caps: Caps, uids: &[u32]) -> Result<()> {
     if uids.is_empty() {
         return Ok(());
     }
@@ -482,8 +493,6 @@ async fn delete_uids(session: &mut Session, caps: Caps, uids: &[u32]) -> Result<
     timed("STORE", async { session.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await }).await??;
     if caps.uidplus {
         timed("EXPUNGE", async { session.uid_expunge(&set).await?.try_collect::<Vec<_>>().await }).await??;
-    } else {
-        timed("EXPUNGE", async { session.expunge().await?.try_collect::<Vec<_>>().await }).await??;
     }
     Ok(())
 }
@@ -497,7 +506,7 @@ pub async fn append(session: &mut Session, mailbox: &str, raw: &[u8], seen: bool
 /// copy there with its Message-ID: the version it replaces, or one an interrupted save left
 /// behind. Found by Message-ID, this needs no UIDPLUS, and an old copy that's already gone
 /// (deleted elsewhere) is no matter. Returns the UIDs deleted.
-pub async fn replace_draft(session: &mut Session, caps: Caps, mailbox: &str, raw: &[u8], message_id: &str) -> Result<Vec<u32>> {
+pub async fn replace_draft(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, raw: &[u8], message_id: &str) -> Result<Vec<u32>> {
     timed("APPEND", session.append(mailbox, Some("(\\Draft \\Seen)"), None, raw)).await??;
     select(session, mailbox).await?;
     let mut uids = uids_with_message_id(session, message_id).await?;
@@ -510,18 +519,18 @@ pub async fn replace_draft(session: &mut Session, caps: Caps, mailbox: &str, raw
 
 /// Deletes every message with this Message-ID from `mailbox` (a draft's copies). Returns their
 /// UIDs.
-pub async fn purge_message_id(session: &mut Session, caps: Caps, mailbox: &str, message_id: &str) -> Result<Vec<u32>> {
+pub async fn purge_message_id(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, message_id: &str) -> Result<Vec<u32>> {
     select(session, mailbox).await?;
     let uids = uids_with_message_id(session, message_id).await?;
     delete_uids(session, caps, &uids).await?;
     Ok(uids)
 }
 
-/// UIDs of the messages in the selected mailbox with exactly this Message-ID. SEARCH matches
-/// substrings, and some servers match loosely, so each hit's header is checked: a draft's save
-/// must never delete anything else.
-async fn uids_with_message_id(session: &mut Session, message_id: &str) -> Result<Vec<u32>> {
-    let query = format!("HEADER Message-ID \"{}\"", message_id.replace('\\', "\\\\").replace('"', "\\\""));
+/// UIDs of the messages in the selected mailbox with exactly this Message-ID, not already
+/// flagged \Deleted. SEARCH matches substrings, and some servers match loosely, so each hit's
+/// header is checked: a draft's save must never delete anything else.
+async fn uids_with_message_id(session: &mut async_imap::Session<impl Io>, message_id: &str) -> Result<Vec<u32>> {
+    let query = format!("UNDELETED HEADER Message-ID {}", quoted(message_id));
     let hits = timed("SEARCH", session.uid_search(query)).await??;
     if hits.is_empty() {
         return Ok(Vec::new());
@@ -581,8 +590,123 @@ pub fn ensure(cond: bool, msg: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) mod fake {
+    //! A scripted IMAP server on an in-memory pipe, to check what Envoy sends.
+
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
+
+    /// Every command the client sent, without its tag (a literal's bytes are left out).
+    pub type Log = Arc<Mutex<Vec<String>>>;
+
+    /// A logged-in session with a server that answers each command with `answer(command)`:
+    /// the response lines, where `TAG` stands for the command's tag. `None` answers
+    /// `TAG OK done`.
+    pub async fn session(answer: impl Fn(&str) -> Option<String> + Send + 'static) -> (async_imap::Session<DuplexStream>, Log) {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let log: Log = Arc::default();
+        let seen = log.clone();
+        tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(server);
+            let mut r = BufReader::new(r);
+            w.write_all(b"* OK fake ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let Some((tag, command)) = line.trim_end().split_once(' ') else { return };
+                let (tag, command) = (tag.to_owned(), command.to_owned());
+                // A literal follows: ask for it and read it (plus the line's end).
+                if let Some(n) = command.strip_suffix('}').and_then(|c| c.rsplit_once('{')).and_then(|(_, n)| n.parse::<usize>().ok()) {
+                    w.write_all(b"+ go ahead\r\n").await.unwrap();
+                    let mut literal = vec![0; n + 2];
+                    r.read_exact(&mut literal).await.unwrap();
+                }
+                seen.lock().unwrap().push(command.clone());
+                let reply = if command.starts_with("LOGIN") { None } else { answer(&command) };
+                let reply = reply.unwrap_or_else(|| "TAG OK done\r\n".into()).replace("TAG", &tag);
+                w.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let mut c = async_imap::Client::new(client);
+        c.read_response().await.unwrap().unwrap();
+        (c.login("me", "pw").await.map_err(|e| e.0).unwrap(), log)
+    }
+
+    /// A SELECT's answer.
+    pub fn selected(validity: u32, uid_next: u32) -> String {
+        format!("* 3 EXISTS\r\n* OK [UIDVALIDITY {validity}] ok\r\n* OK [UIDNEXT {uid_next}] ok\r\nTAG OK [READ-WRITE] done\r\n")
+    }
+
+    /// A UID FETCH of Message-ID headers' answer: `(uid, Message-ID)` each.
+    pub fn message_ids(found: &[(u32, &str)]) -> String {
+        let mut out = String::new();
+        for (i, (uid, mid)) in found.iter().enumerate() {
+            let header = format!("Message-ID: {mid}\r\n\r\n");
+            out.push_str(&format!("* {} FETCH (UID {uid} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{header})\r\n", i + 1, header.len()));
+        }
+        out + "TAG OK done\r\n"
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caps(uidplus: bool) -> Caps {
+        Caps { moves: false, idle: false, uidplus }
+    }
+
+    fn commands(log: &fake::Log) -> Vec<String> {
+        log.lock().unwrap().iter().filter(|c| !c.starts_with("LOGIN")).cloned().collect()
+    }
+
+    fn expunges_everything(cmds: &[String]) -> bool {
+        cmds.iter().any(|c| c.trim() == "EXPUNGE" || c.starts_with("EXPUNGE"))
+    }
+
+    #[tokio::test]
+    async fn without_uidplus_deleting_only_flags_the_message() {
+        let (mut s, log) = fake::session(|c| c.starts_with("SELECT").then(|| fake::selected(7, 10))).await;
+        expunge(&mut s, caps(false), "Trash", 5, true).await.unwrap();
+        move_message(&mut s, caps(false), "INBOX", 6, "Archive").await.unwrap();
+        let cmds = commands(&log);
+        assert!(!expunges_everything(&cmds), "a plain EXPUNGE would destroy everything else flagged \\Deleted: {cmds:?}");
+        assert!(cmds.contains(&"UID STORE 5 +FLAGS.SILENT (\\Deleted)".to_owned()), "{cmds:?}");
+        assert!(cmds.contains(&"UID COPY 6 \"Archive\"".to_owned()) && cmds.contains(&"UID STORE 6 +FLAGS.SILENT (\\Deleted)".to_owned()), "{cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn with_uidplus_only_the_given_messages_are_expunged() {
+        let (mut s, log) = fake::session(|c| c.starts_with("SELECT").then(|| fake::selected(7, 10))).await;
+        expunge(&mut s, caps(true), "Trash", 5, true).await.unwrap();
+        let cmds = commands(&log);
+        assert!(!expunges_everything(&cmds), "{cmds:?}");
+        assert_eq!(cmds.last().map(String::as_str), Some("UID EXPUNGE 5"));
+    }
+
+    #[tokio::test]
+    async fn without_uidplus_a_draft_save_never_expunges_the_mailbox() {
+        let (mut s, log) = fake::session(|c| {
+            if c.starts_with("SELECT") {
+                Some(fake::selected(7, 21))
+            } else if c.starts_with("UID SEARCH") {
+                Some("* SEARCH 5 21\r\nTAG OK done\r\n".into())
+            } else if c.starts_with("UID FETCH") {
+                Some(fake::message_ids(&[(5, "<d@envoy>"), (21, "<d@envoy>")]))
+            } else {
+                None
+            }
+        })
+        .await;
+        replace_draft(&mut s, caps(false), "Drafts", b"Subject: x\r\n\r\nhi\r\n", "<d@envoy>").await.unwrap();
+        let cmds = commands(&log);
+        assert!(!expunges_everything(&cmds), "{cmds:?}");
+        assert!(cmds.contains(&"UID STORE 5 +FLAGS.SILENT (\\Deleted)".to_owned()), "the old copy is flagged: {cmds:?}");
+    }
 
     #[test]
     fn utf7_decodes() {
