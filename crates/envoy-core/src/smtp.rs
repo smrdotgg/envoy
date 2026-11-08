@@ -56,11 +56,14 @@ fn sender(account: &Account) -> Result<LMailbox> {
     ))
 }
 
-/// A draft's files, with their bytes, as [`build`] and [`build_draft`] take them.
-pub type Files = [(DraftAttachment, Vec<u8>)];
+/// A draft's files, with their bytes, as [`build`] and [`build_draft`] take them (by value:
+/// each is encoded straight from its bytes, never copied first).
+pub type Files = Vec<(DraftAttachment, Vec<u8>)>;
 
-/// The body: the text, and the attachments after it (multipart/mixed) if there are any.
-fn with_body(b: lettre::message::MessageBuilder, text: &str, files: &Files) -> Result<Message> {
+/// The body: the text, and the attachments after it (multipart/mixed) if there are any. A
+/// file's name goes in its Content-Disposition, RFC 2231-encoded when it isn't plain ASCII;
+/// its bytes in base64, or quoted-printable or as they are when they're text that allows it.
+fn with_body(b: lettre::message::MessageBuilder, text: &str, files: Files) -> Result<Message> {
     use lettre::message::{Attachment, MultiPart, SinglePart};
     let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
     if files.is_empty() {
@@ -68,10 +71,11 @@ fn with_body(b: lettre::message::MessageBuilder, text: &str, files: &Files) -> R
     }
     let mut parts = MultiPart::mixed().singlepart(SinglePart::builder().header(header::ContentType::TEXT_PLAIN).body(text));
     for (a, data) in files {
-        // Text files were read as UTF-8, whatever they were in.
-        let mime = if a.mime.starts_with("text/") { format!("{}; charset=utf-8", a.mime) } else { a.mime.clone() };
+        // Text that is UTF-8 says so (a server draft's text files were read as UTF-8); any
+        // other is left for the reader to work out, rather than mislabelled.
+        let mime = if a.mime.starts_with("text/") && std::str::from_utf8(&data).is_ok() { format!("{}; charset=utf-8", a.mime) } else { a.mime.clone() };
         let kind = header::ContentType::parse(&mime).or_else(|_| header::ContentType::parse("application/octet-stream"))?;
-        parts = parts.singlepart(Attachment::new(a.filename.clone()).body(data.clone(), kind));
+        parts = parts.singlepart(Attachment::new(a.filename).body(data, kind));
     }
     Ok(b.multipart(parts)?)
 }
@@ -79,7 +83,7 @@ fn with_body(b: lettre::message::MessageBuilder, text: &str, files: &Files) -> R
 /// A draft's copy for the Drafts mailbox, with the draft's own Message-ID (see
 /// `store/drafts.rs`) and its `files`. Unlike a message being sent it may have no recipients,
 /// or half-typed ones (kept as typed), and it keeps Bcc, so it opens again as it was written.
-pub fn build_draft(account: &Account, draft: &Draft, message_id: &str, files: &Files) -> Result<Vec<u8>> {
+pub fn build_draft(account: &Account, draft: &Draft, message_id: &str, files: Files) -> Result<Vec<u8>> {
     use lettre::address::Envelope;
     use lettre::message::header::{HeaderName, HeaderValue};
     let from = sender(account)?;
@@ -120,7 +124,7 @@ pub fn build_draft(account: &Account, draft: &Draft, message_id: &str, files: &F
 }
 
 /// The message to send, with the draft's `files` attached.
-pub fn build(account: &Account, draft: &Draft, files: &Files) -> Result<Built> {
+pub fn build(account: &Account, draft: &Draft, files: Files) -> Result<Built> {
     let from = sender(account)?;
     let to = parse_recipients(&draft.to)?;
     let cc = parse_recipients(&draft.cc)?;
@@ -222,7 +226,7 @@ mod tests {
             reply_of: None,
             attachments: vec![],
         };
-        let raw = build_draft(&account(), &draft, "<7.abc.draft@envoy>", &[]).unwrap();
+        let raw = build_draft(&account(), &draft, "<7.abc.draft@envoy>", vec![]).unwrap();
         let back = crate::mime::server_draft(&raw).unwrap();
         assert_eq!(back.notice, None, "nothing lost editing it");
         assert_eq!(Draft { account: "a".into(), ..back.draft }, draft, "{}", String::from_utf8_lossy(&raw));
@@ -233,9 +237,9 @@ mod tests {
     #[test]
     fn a_draft_copy_keeps_half_typed_recipients() {
         let draft = Draft { to: "ana@x.com, bo@".into(), subject: "Hi".into(), ..Draft::default() };
-        let raw = String::from_utf8(build_draft(&account(), &draft, "<1.a.draft@envoy>", &[]).unwrap()).unwrap();
+        let raw = String::from_utf8(build_draft(&account(), &draft, "<1.a.draft@envoy>", vec![]).unwrap()).unwrap();
         assert!(raw.contains("To: ana@x.com, bo@"), "{raw}");
-        let empty = build_draft(&account(), &Draft::default(), "<2.a.draft@envoy>", &[]).unwrap();
+        let empty = build_draft(&account(), &Draft::default(), "<2.a.draft@envoy>", vec![]).unwrap();
         assert!(crate::mime::server_draft(&empty).is_some(), "no recipients, subject or text: still a draft");
     }
 
@@ -247,12 +251,67 @@ mod tests {
             (DraftAttachment { id: 1, filename: "notes.txt".into(), mime: "text/plain".into(), size: 6 }, "café\n".as_bytes().to_vec()),
         ];
         let draft = Draft { to: "ana@x.com".into(), subject: "Plans".into(), body: "See attached.".into(), attachments: files.iter().map(|(a, _)| a.clone()).collect(), ..Draft::default() };
-        for raw in [build_draft(&account(), &draft, "<3.a.draft@envoy>", &files).unwrap(), build(&account(), &draft, &files).unwrap().raw] {
+        for raw in [build_draft(&account(), &draft, "<3.a.draft@envoy>", files.clone()).unwrap(), build(&account(), &draft, files.clone()).unwrap().raw] {
             let back = crate::mime::server_draft(&raw).unwrap();
             assert_eq!(back.draft.body.trim_end(), "See attached.");
             assert_eq!(back.draft.attachments.iter().map(|a| (a.filename.as_str(), a.mime.as_str())).collect::<Vec<_>>(), vec![("plan.pdf", "application/pdf"), ("notes.txt", "text/plain")]);
             assert_eq!(back.files, vec![pdf.clone(), "café\n".as_bytes().to_vec()], "the bytes, exactly");
         }
+    }
+
+    /// A file as the composer attaches it: its type from its name.
+    fn attached(id: u32, name: &str, data: &[u8]) -> (DraftAttachment, Vec<u8>) {
+        (DraftAttachment { id, filename: name.into(), mime: crate::attach::type_for(name).into(), size: data.len() }, data.to_vec())
+    }
+
+    fn message_with(files: Files) -> Vec<u8> {
+        let draft = Draft { to: "ana@x.com".into(), subject: "Files".into(), body: "Attached.".into(), attachments: files.iter().map(|(a, _)| a.clone()).collect(), ..Draft::default() };
+        build(&account(), &draft, files).unwrap().raw
+    }
+
+    #[test]
+    fn non_ascii_file_names_are_encoded_and_come_back_whole() {
+        let long = format!("Протокол встречи {} — итоги.pdf", "очень длинное название ".repeat(4));
+        let names = ["Résumé 2026.pdf", "会议纪要.docx", "naïve \"quoted\"; name.txt", long.as_str()];
+        let files: Files = names.iter().enumerate().map(|(i, n)| attached(i as u32, n, b"data")).collect();
+        let raw = message_with(files);
+        let text = String::from_utf8(raw.clone()).expect("the message is ASCII");
+        assert!(text.is_ascii(), "headers are encoded, never raw UTF-8");
+        assert!(text.contains("filename*0*=utf-8''") || text.contains("filename*=utf-8''"), "RFC 2231: {text}");
+        let back = crate::mime::server_draft(&raw).unwrap();
+        assert_eq!(back.draft.attachments.iter().map(|a| a.filename.as_str()).collect::<Vec<_>>(), names);
+        let parsed = crate::mime::parse(&raw, false).unwrap();
+        assert_eq!(parsed.attachments.iter().map(|a| a.filename.as_str()).collect::<Vec<_>>(), names, "and as the reader lists them");
+    }
+
+    #[test]
+    fn each_file_goes_with_the_type_its_name_says() {
+        let raw = message_with(vec![attached(0, "photo.JPG", &[0xff, 0xd8, 0xff]), attached(1, "deck.pptx", b"PK"), attached(2, "unknown.zzz", b"?")]);
+        let back = crate::mime::server_draft(&raw).unwrap();
+        let types: Vec<&str> = back.draft.attachments.iter().map(|a| a.mime.as_str()).collect();
+        assert_eq!(types, ["image/jpeg", "application/vnd.openxmlformats-officedocument.presentationml.presentation", "application/octet-stream"]);
+    }
+
+    #[test]
+    fn text_files_say_utf_8_only_when_they_are() {
+        let latin1 = b"caf\xe9 cr\xe8me\n".to_vec();
+        let raw = message_with(vec![attached(0, "menu.txt", &latin1), attached(1, "notes.txt", "café\n".as_bytes())]);
+        let text = String::from_utf8_lossy(&raw);
+        assert_eq!(text.matches("charset=utf-8").count(), 2, "the body and notes.txt, not menu.txt: {text}");
+        // Forwarded on, each is the bytes it was.
+        let back = crate::mime::forwarded_files(&raw, &[(0, 0), (1, 1)]);
+        assert_eq!(back[0].as_ref().unwrap().1, latin1);
+        assert_eq!(back[1].as_ref().unwrap().1, "café\n".as_bytes());
+    }
+
+    #[test]
+    fn a_large_file_is_encoded_in_short_lines_and_comes_back_exact() {
+        let big: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let raw = message_with(vec![attached(0, "video.mov", &big)]);
+        assert!(raw.len() < big.len() * 14 / 10, "base64, not anything bigger: {} for {}", raw.len(), big.len());
+        assert!(raw.split(|b| *b == b'\n').all(|l| l.len() <= 1000), "no line over SMTP's 1000");
+        let back = crate::mime::forwarded_files(&raw, &[(0, 0)]);
+        assert!(back[0].as_ref().unwrap().1 == big, "the bytes, exactly");
     }
 
     #[test]

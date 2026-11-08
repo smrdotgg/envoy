@@ -173,6 +173,7 @@ pub const SCHEMA: &[SettingDef] = &[
     def("keys.refresh", "Keyboard", "Check mail", "Check for new mail now.", Kind::Keybinding, S("mod+shift+n, f5")),
     def("keys.settings", "Keyboard", "Settings", "Open settings.", Kind::Keybinding, S("mod+comma")),
     def("keys.send", "Keyboard", "Send", "Send the message being written.", Kind::Keybinding, S("mod+enter")),
+    def("keys.attach", "Keyboard", "Attach files", "Attach files to the message being written. You can also drop files on it.", Kind::Keybinding, S("mod+shift+a")),
     def("keys.close", "Keyboard", "Close", "Close the open message, the composer or settings.", Kind::Keybinding, S("escape")),
     def("keys.goInbox", "Keyboard", "Go to inbox", "Show the inbox.", Kind::Keybinding, S("mod+1")),
     def("keys.goStarred", "Keyboard", "Go to starred", "Show starred messages.", Kind::Keybinding, S("mod+2")),

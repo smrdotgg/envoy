@@ -122,9 +122,6 @@ pub fn server_draft(raw: &[u8]) -> Option<ServerDraft> {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let mime_of = |p: &mail_parser::MessagePart| {
-        p.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")).to_ascii_lowercase()).unwrap_or_else(|| "application/octet-stream".into())
-    };
     let part = |i: &u32| msg.parts.get(*i as usize);
     let has_html = msg.html_body.iter().any(|i| part(i).is_some_and(|p| p.is_text_html()));
     let texts = msg.text_body.iter().filter(|i| part(i).is_some_and(|p| p.is_text() && !p.is_text_html())).count();
@@ -141,7 +138,7 @@ pub fn server_draft(raw: &[u8]) -> Option<ServerDraft> {
         "application/pgp-signature",
     ];
     let protected = msg.parts.iter().any(|p| {
-        PROTECTED.contains(&mime_of(p).as_str())
+        PROTECTED.contains(&part_type(p).as_str())
             || p.text_contents().is_some_and(|t| p.is_text() && (t.contains("-----BEGIN PGP SIGNED MESSAGE-----") || t.contains("-----BEGIN PGP MESSAGE-----")))
     });
     let copy = if protected {
@@ -175,12 +172,50 @@ pub fn server_draft(raw: &[u8]) -> Option<ServerDraft> {
         draft.attachments.push(DraftAttachment {
             id: i as u32,
             filename: p.attachment_name().map(str::to_owned).unwrap_or_else(|| format!("attachment-{}", i + 1)),
-            mime: mime_of(p),
+            mime: part_type(p),
             size: data.len(),
         });
         files.push(data);
     }
     Some(ServerDraft { draft, files, notice: has_html.then_some(DraftNotice::PlainText) })
+}
+
+/// A part's `type/subtype`, lowercase.
+fn part_type(p: &mail_parser::MessagePart) -> String {
+    p.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")).to_ascii_lowercase()).unwrap_or_else(|| "application/octet-stream".into())
+}
+
+/// The attachments of a raw message a forward takes along: `(id, index)` pairs, each the
+/// attachment's id in the draft and its index among the message's attachments (as
+/// [`Attachment::index`] numbers them). Each comes back with its bytes, or why it can't.
+pub fn forwarded_files(raw: &[u8], files: &[(u32, usize)]) -> Vec<Result<(crate::model::DraftAttachment, Vec<u8>), String>> {
+    let Some(msg) = MessageParser::default().parse(raw) else { return files.iter().map(|_| Err("The original message can't be read".to_owned())).collect() };
+    files
+        .iter()
+        .map(|&(id, index)| {
+            let p = msg.attachments().nth(index).ok_or_else(|| "The original message doesn't have this file any more".to_owned())?;
+            let data = part_bytes(&msg, p);
+            let filename = p.attachment_name().map(str::to_owned).unwrap_or_else(|| format!("attachment-{}", index + 1));
+            Ok((crate::model::DraftAttachment { id, filename, mime: part_type(p), size: data.len() }, data))
+        })
+        .collect()
+}
+
+/// A part's bytes as they were sent, transfer encoding undone. Text that doesn't name its
+/// charset isn't read as UTF-8 on the way (which mangles what isn't): a file goes on as it came.
+fn part_bytes(msg: &mail_parser::Message, p: &mail_parser::MessagePart) -> Vec<u8> {
+    use mail_parser::{Encoding, PartType};
+    let text = matches!(p.body, PartType::Text(_) | PartType::Html(_));
+    if !text || p.content_type().and_then(|c| c.attribute("charset")).is_some() {
+        return p.contents().to_vec();
+    }
+    let raw = msg.raw_message.get(p.offset_body as usize..p.offset_end as usize).unwrap_or_default();
+    match p.encoding {
+        Encoding::Base64 => mail_parser::decoders::base64::base64_decode(raw),
+        Encoding::QuotedPrintable => mail_parser::decoders::quoted_printable::quoted_printable_decode(raw),
+        Encoding::None => Some(raw.to_vec()),
+    }
+    .unwrap_or_else(|| p.contents().to_vec())
 }
 
 /// Writes attachment `index` of a raw message to `dir`, returning the file path.
