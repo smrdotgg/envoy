@@ -49,7 +49,7 @@ pub(super) enum Action {
     /// A `Tx::read_clipboard` callback's id and what the clipboard held.
     ClipboardRead(u64, crate::ClipboardContent),
     /// A `Tx::open_file` or `Tx::save_file` callback's id and the dialog's answer.
-    FileDialog(u64, crate::file_dialog::FileDialogResult),
+    FileDialog(u64, crate::file_dialog::FileDialogPaths),
     Focus(String, f32, f32),
     Blur,
     /// What assistive technology asked of an element (`a11y/actions.rs`).

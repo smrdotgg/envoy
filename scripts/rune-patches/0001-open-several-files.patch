@@ -1,0 +1,497 @@
+diff --git a/vendor/rune/crates/rune/src/desktop.rs b/vendor/rune/crates/rune/src/desktop.rs
+index b07c681..fd793c0 100644
+--- a/vendor/rune/crates/rune/src/desktop.rs
++++ b/vendor/rune/crates/rune/src/desktop.rs
+@@ -364,10 +364,10 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
+                     let i = open.or(desk.key).unwrap_or(selected);
+                     desk.members[i].resolve_popup(picked.as_deref()).unwrap_or_else(|e| die(&format!("script pop-up menu: {e}")));
+                 }
+-                Kind::FileDialog(path) => {
++                Kind::FileDialog(paths) => {
+                     let open = desk.key.into_iter().chain(desk.z.iter().rev().copied()).find(|&i| desk.members[i].file_dialog_open());
+                     let i = open.or(desk.key).unwrap_or(selected);
+-                    desk.members[i].resolve_file_dialog(path.clone()).unwrap_or_else(|e| die(&format!("script file dialog: {e}")));
++                    desk.members[i].resolve_file_dialog(paths.clone()).unwrap_or_else(|e| die(&format!("script file dialog: {e}")));
+                 }
+                 // While another app is active, as after a click on the backdrop, keys go to it.
+                 Kind::Key(..) | Kind::KeyUp(_) | Kind::Physical(_) | Kind::PhysicalKey(..) | Kind::Paste(_) => {
+diff --git a/vendor/rune/crates/rune/src/desktop/window.rs b/vendor/rune/crates/rune/src/desktop/window.rs
+index 374b2b3..a360472 100644
+--- a/vendor/rune/crates/rune/src/desktop/window.rs
++++ b/vendor/rune/crates/rune/src/desktop/window.rs
+@@ -66,7 +66,7 @@ pub(crate) trait Member {
+     fn popup_open(&self) -> bool;
+     fn resolve_popup(&mut self, picked: Option<&str>) -> Result<(), crate::PopupMenuError>;
+     fn file_dialog_open(&self) -> bool;
+-    fn resolve_file_dialog(&mut self, path: Option<std::path::PathBuf>) -> Result<(), crate::FileDialogError>;
++    fn resolve_file_dialog(&mut self, paths: Vec<std::path::PathBuf>) -> Result<(), crate::FileDialogError>;
+     /// Draws its frame into `slot`, `px` device pixels.
+     fn render(&mut self, gpu: &Gpu, slot: &Slot, px: (u32, u32), dt: f64, update_ms: f64);
+     fn backdrop_dark(&self) -> Option<bool>;
+@@ -367,7 +367,7 @@ impl<S: 'static> Member for Window<S> {
+     fn popup_open(&self) -> bool { self.rt.popup_menu().is_some() }
+     fn resolve_popup(&mut self, picked: Option<&str>) -> Result<(), crate::PopupMenuError> { self.rt.resolve_popup(picked) }
+     fn file_dialog_open(&self) -> bool { self.rt.file_dialog().is_some() }
+-    fn resolve_file_dialog(&mut self, path: Option<std::path::PathBuf>) -> Result<(), crate::FileDialogError> { self.rt.resolve_file_dialog(path) }
++    fn resolve_file_dialog(&mut self, paths: Vec<std::path::PathBuf>) -> Result<(), crate::FileDialogError> { self.rt.resolve_file_dialog_paths(paths) }
+ 
+     fn render(&mut self, gpu: &Gpu, slot: &Slot, px: (u32, u32), dt: f64, update_ms: f64) {
+         let format = if self.rt.srgb_blend() { OFFSCREEN_FORMAT.remove_srgb_suffix() } else { OFFSCREEN_FORMAT };
+diff --git a/vendor/rune/crates/rune/src/file_dialog.rs b/vendor/rune/crates/rune/src/file_dialog.rs
+index e002169..17d061e 100644
+--- a/vendor/rune/crates/rune/src/file_dialog.rs
++++ b/vendor/rune/crates/rune/src/file_dialog.rs
+@@ -40,13 +40,15 @@ impl FileDialogOptions {
+     }
+ }
+ 
+-/// Which dialog: Open picks an existing file, Save names a file to write, Folder picks an
+-/// existing folder (its options' filters and file name don't apply).
++/// Which dialog: Open picks an existing file, OpenMany one or more of them, Save names a file
++/// to write, Folder picks an existing folder (its options' filters and file name don't apply).
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub enum FileDialogKind { Open, Save, Folder }
++pub enum FileDialogKind { Open, OpenMany, Save, Folder }
+ 
+ impl FileDialogKind {
+-    fn name(self) -> &'static str { match self { Self::Open => "open", Self::Save => "save", Self::Folder => "folder" } }
++    fn name(self) -> &'static str {
++        match self { Self::Open => "open", Self::OpenMany => "open-many", Self::Save => "save", Self::Folder => "folder" }
++    }
+ }
+ 
+ /// Expected request and its response. `None` is cancellation, not a missing fixture.
+@@ -103,13 +105,13 @@ impl FileDialogs {
+                 Ok(responses.pop_front().unwrap().path)
+             }
+             #[cfg(feature = "native-file-dialog")]
+-            Backend::Native => native(kind, options).await,
++            Backend::Native => native(kind, options).await.map(|paths| paths.into_iter().next()),
+         }
+     }
+ }
+ 
+ #[cfg(all(feature = "native-file-dialog", any(target_os = "macos", target_os = "windows")))]
+-async fn native(kind: FileDialogKind, options: FileDialogOptions) -> Result<Option<PathBuf>, FileDialogError> {
++async fn native(kind: FileDialogKind, options: FileDialogOptions) -> FileDialogPaths {
+     rfd_show(rfd_dialog(options), kind).await
+ }
+ #[cfg(all(feature = "native-file-dialog", any(target_os = "macos", target_os = "windows")))]
+@@ -122,16 +124,17 @@ fn rfd_dialog(options: FileDialogOptions) -> rfd::AsyncFileDialog {
+ }
+ /// Calling this starts the dialog (on macOS, a sheet over the parent); awaiting reads it.
+ #[cfg(all(feature = "native-file-dialog", any(target_os = "macos", target_os = "windows")))]
+-fn rfd_show(dialog: rfd::AsyncFileDialog, kind: FileDialogKind) -> impl Future<Output = Result<Option<PathBuf>, FileDialogError>> {
+-    let file: Pin<Box<dyn Future<Output = Option<rfd::FileHandle>> + Send>> = match kind {
+-        FileDialogKind::Open => Box::pin(dialog.pick_file()),
+-        FileDialogKind::Save => Box::pin(dialog.save_file()),
+-        FileDialogKind::Folder => Box::pin(dialog.pick_folder()),
++fn rfd_show(dialog: rfd::AsyncFileDialog, kind: FileDialogKind) -> impl Future<Output = FileDialogPaths> {
++    let files: Pin<Box<dyn Future<Output = Vec<rfd::FileHandle>> + Send>> = match kind {
++        FileDialogKind::Open => { let f = dialog.pick_file(); Box::pin(async move { f.await.into_iter().collect() }) }
++        FileDialogKind::OpenMany => { let f = dialog.pick_files(); Box::pin(async move { f.await.unwrap_or_default() }) }
++        FileDialogKind::Save => { let f = dialog.save_file(); Box::pin(async move { f.await.into_iter().collect() }) }
++        FileDialogKind::Folder => { let f = dialog.pick_folder(); Box::pin(async move { f.await.into_iter().collect() }) }
+     };
+-    async move { Ok(file.await.map(|file| file.path().to_path_buf())) }
++    async move { Ok(files.await.iter().map(|file| file.path().to_path_buf()).collect()) }
+ }
+ #[cfg(all(feature = "native-file-dialog", not(any(target_os = "linux", target_os = "macos", target_os = "windows"))))]
+-async fn native(_: FileDialogKind, _: FileDialogOptions) -> Result<Option<PathBuf>, FileDialogError> {
++async fn native(_: FileDialogKind, _: FileDialogOptions) -> FileDialogPaths {
+     Err(FileDialogError("native file dialogs aren't supported on this platform".into()))
+ }
+ 
+@@ -139,7 +142,12 @@ async fn native(_: FileDialogKind, _: FileDialogOptions) -> Result<Option<PathBu
+ /// when the user cancels, or why no dialog could show.
+ pub type FileDialogResult = Result<Option<PathBuf>, FileDialogError>;
+ 
+-pub(crate) type AnswerFn = Box<dyn FnOnce(crate::states::States<'_>, FileDialogResult, &mut Tx)>;
++/// What a [`Tx::open_files`] callback gets: the chosen files, in the order the dialog gives
++/// them, none when the user cancels, or why no dialog could show. Every dialog answers with
++/// this inside; the one-path dialogs take the first.
++pub type FileDialogPaths = Result<Vec<PathBuf>, FileDialogError>;
++
++pub(crate) type AnswerFn = Box<dyn FnOnce(crate::states::States<'_>, FileDialogPaths, &mut Tx)>;
+ 
+ pub(crate) struct Request {
+     pub kind: FileDialogKind,
+@@ -203,22 +211,29 @@ impl Tx {
+     /// })
+     /// ```
+     pub fn open_file<S: 'static>(&mut self, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx) + 'static) {
+-        self.file_dialog(FileDialogKind::Open, options, on_answer);
++        self.file_dialog(FileDialogKind::Open, options, first(on_answer));
++    }
++
++    /// [`Tx::open_file`] for an Open dialog that picks one or more files at once, as an app
++    /// attaching files does: `on_answer` gets them all, or none when the user cancels. A
++    /// script answers it with `{"type": "file-dialog", "paths": […]}` (or one `"path"`).
++    pub fn open_files<S: 'static>(&mut self, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogPaths, &mut Tx) + 'static) {
++        self.file_dialog(FileDialogKind::OpenMany, options, on_answer);
+     }
+ 
+     /// [`Tx::open_file`] for a Save dialog: the path to write, which may not exist yet.
+     pub fn save_file<S: 'static>(&mut self, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx) + 'static) {
+-        self.file_dialog(FileDialogKind::Save, options, on_answer);
++        self.file_dialog(FileDialogKind::Save, options, first(on_answer));
+     }
+ 
+     /// [`Tx::open_file`] for a folder: an Open dialog that picks an existing folder, as an app
+     /// opening a project or choosing where exports go. `options`' title and directory apply;
+     /// its filters and file name don't. A script answers it as it does a file dialog.
+     pub fn open_folder<S: 'static>(&mut self, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx) + 'static) {
+-        self.file_dialog(FileDialogKind::Folder, options, on_answer);
++        self.file_dialog(FileDialogKind::Folder, options, first(on_answer));
+     }
+ 
+-    fn file_dialog<S: 'static>(&mut self, kind: FileDialogKind, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx) + 'static) {
++    fn file_dialog<S: 'static>(&mut self, kind: FileDialogKind, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogPaths, &mut Tx) + 'static) {
+         let on_answer: AnswerFn = Box::new(move |s, result, tx| {
+             // None once the playground has dropped the stage that asked.
+             if let Some(s) = s.cast::<S>() { on_answer(s, result, tx); }
+@@ -227,11 +242,16 @@ impl Tx {
+     }
+ }
+ 
++/// A one-path dialog's callback, given the first of the paths every dialog answers with.
++fn first<S>(on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx)) -> impl FnOnce(&mut S, FileDialogPaths, &mut Tx) {
++    move |s, paths, tx| on_answer(s, paths.map(|p| p.into_iter().next()), tx)
++}
++
+ /// One window's native file dialog: shows what its runtime asks for, and queues the answer
+ /// after `wake` brings the host back to poll it. The dialog's future owns copies of the
+ /// options and the window's handle, never the app's state or the runtime.
+ pub(crate) struct Presenter {
+-    showing: Option<(u64, Pin<Box<dyn Future<Output = FileDialogResult>>>)>,
++    showing: Option<(u64, Pin<Box<dyn Future<Output = FileDialogPaths>>>)>,
+     #[cfg(all(feature = "native-file-dialog", target_os = "macos"))]
+     sheet_parent: Option<objc2::rc::Retained<objc2_app_kit::NSWindow>>,
+     wake: std::task::Waker,
+@@ -306,7 +326,7 @@ impl Drop for Presenter {
+     fn drop(&mut self) { self.stop(); }
+ }
+ 
+-fn show_over(kind: FileDialogKind, options: FileDialogOptions, window: &winit::window::Window) -> Pin<Box<dyn Future<Output = FileDialogResult>>> {
++fn show_over(kind: FileDialogKind, options: FileDialogOptions, window: &winit::window::Window) -> Pin<Box<dyn Future<Output = FileDialogPaths>>> {
+     #[cfg(all(feature = "native-file-dialog", any(target_os = "macos", target_os = "windows")))]
+     return Box::pin(rfd_show(rfd_dialog(options).set_parent(window), kind));
+     // The portal's parent is the focused window (`window_focus`).
+@@ -383,6 +403,34 @@ mod tests {
+         assert!(rt.resolve_file_dialog(None).is_err(), "nothing is open");
+     }
+ 
++    #[test]
++    fn an_open_many_dialog_answers_with_every_file_chosen() {
++        #[derive(Default)]
++        struct Attach { answers: Vec<Result<Vec<PathBuf>, String>> }
++        fn view(_: &Attach, _: &mut Cx<Attach>) -> El {
++            el().key("attach").size(80.0, 20.0).on_press_tx(|_: &mut Attach, tx: &mut Tx| {
++                tx.open_files(FileDialogOptions { title: "Attach".into(), ..Default::default() }, |s: &mut Attach, result, _| s.answers.push(result.map_err(|e| e.0)));
++            })
++        }
++        let mut rt = Runtime::new(Attach::default(), view, (200.0, 100.0), Env::new(true, 1.0));
++        rt.frame(0.0);
++        let press = |rt: &mut Runtime<Attach>, t: f64| {
++            rt.pointer_down(10.0, 10.0);
++            rt.pointer_up(10.0, 10.0);
++            rt.frame(t);
++        };
++        press(&mut rt, 1.0 / 60.0);
++        assert_eq!(rt.file_dialog().map(|(kind, _)| kind), Some(FileDialogKind::OpenMany));
++        assert_eq!(rt.file_dialog_json().unwrap()["kind"], "open-many");
++        rt.resolve_file_dialog_paths(vec!["/files/a.pdf".into(), "/files/录音.wav".into()]).unwrap();
++        rt.frame(2.0 / 60.0);
++        assert_eq!(rt.state.answers, [Ok(vec![PathBuf::from("/files/a.pdf"), PathBuf::from("/files/录音.wav")])]);
++        press(&mut rt, 3.0 / 60.0);
++        rt.resolve_file_dialog(None).unwrap();
++        rt.frame(4.0 / 60.0);
++        assert_eq!(rt.state.answers[1], Ok(vec![]), "cancelling answers none");
++    }
++
+     #[test]
+     fn a_folder_dialog_waits_open_as_a_folder_and_answers_with_the_folder() {
+         fn view(_: &Import, _: &mut Cx<Import>) -> El {
+diff --git a/vendor/rune/crates/rune/src/file_dialog/portal.rs b/vendor/rune/crates/rune/src/file_dialog/portal.rs
+index 8dddbf6..ebbca0a 100644
+--- a/vendor/rune/crates/rune/src/file_dialog/portal.rs
++++ b/vendor/rune/crates/rune/src/file_dialog/portal.rs
+@@ -52,6 +52,7 @@ fn request_options<'a>(kind: FileDialogKind, options: &'a FileDialogOptions, tok
+         map.insert("current_folder", Variant::from(bytes));
+     }
+     if kind == FileDialogKind::Folder { map.insert("directory", Variant::from(true)); }
++    if kind == FileDialogKind::OpenMany { map.insert("multiple", Variant::from(true)); }
+     if kind == FileDialogKind::Save && let Some(name) = options.file_name.as_deref().filter(|s| !s.is_empty()) {
+         map.insert("current_name", Variant::from(name));
+     }
+@@ -62,7 +63,7 @@ fn uris(results: &HashMap<String, OwnedVariant>) -> Vec<String> {
+     results.get("uris").and_then(|v| v.try_clone().ok()).and_then(|v| Vec::<String>::try_from(v).ok()).unwrap_or_default()
+ }
+ 
+-pub(super) async fn show(kind: FileDialogKind, options: FileDialogOptions) -> Result<Option<PathBuf>, FileDialogError> {
++pub(super) async fn show(kind: FileDialogKind, options: FileDialogOptions) -> Result<Vec<PathBuf>, FileDialogError> {
+     let (reply, result) = oneshot::channel();
+     let parent = parent_window(PARENT.load(Ordering::Relaxed));
+     std::thread::Builder::new().name("rune-file-dialog".into()).spawn(move || {
+@@ -75,7 +76,7 @@ pub(super) async fn show(kind: FileDialogKind, options: FileDialogOptions) -> Re
+     result.await.unwrap_or_else(|_| Err(FileDialogError("file dialog worker stopped".into())))
+ }
+ 
+-async fn run(kind: FileDialogKind, options: FileDialogOptions, parent: String, mut reply: oneshot::Sender<Result<Option<PathBuf>, FileDialogError>>) {
++async fn run(kind: FileDialogKind, options: FileDialogOptions, parent: String, mut reply: oneshot::Sender<Result<Vec<PathBuf>, FileDialogError>>) {
+     let token = format!("rune_file_dialog_{}", TOKEN.fetch_add(1, Ordering::Relaxed));
+     let started = tokio::time::timeout(RPC_TIMEOUT, async {
+         // No session bus means this desktop cannot supply the portal.
+@@ -93,7 +94,7 @@ async fn run(kind: FileDialogKind, options: FileDialogOptions, parent: String, m
+             _ = reply.closed() => { let _ = conn.close().await; return Ok(None); }
+         };
+         // A folder is OpenFile's `directory` choice (portal version 3).
+-        let method = match kind { FileDialogKind::Open | FileDialogKind::Folder => "OpenFile", FileDialogKind::Save => "SaveFile" };
++        let method = match kind { FileDialogKind::Open | FileDialogKind::OpenMany | FileDialogKind::Folder => "OpenFile", FileDialogKind::Save => "SaveFile" };
+         let body = (parent.as_str(), options.title.as_str(), request_options(kind, &options, &token));
+         let handle: OwnedObjectPath = portal.call(method, &body).await.map_err(dbus_error)?;
+         if handle.as_str() != path {
+@@ -133,7 +134,7 @@ mod tests {
+         let list = vec!["file:///tmp/a%20b".to_string(), "file:///tmp/c".to_string()];
+         let results = HashMap::from([("uris".to_string(), OwnedVariant::try_from(Variant::from(list.clone())).unwrap())]);
+         assert_eq!(uris(&results), list);
+-        assert_eq!(outcome(0, &uris(&results)).unwrap(), Some(PathBuf::from("/tmp/a b")));
++        assert_eq!(outcome(0, &uris(&results)).unwrap(), vec![PathBuf::from("/tmp/a b"), PathBuf::from("/tmp/c")]);
+         assert!(uris(&HashMap::new()).is_empty());
+         let mistyped = HashMap::from([("uris".to_string(), OwnedVariant::try_from(Variant::from(7u32)).unwrap())]);
+         assert!(uris(&mistyped).is_empty());
+@@ -148,6 +149,10 @@ mod tests {
+         assert_eq!(open.get("current_folder"), Some(&Variant::from(b"/home/a/Downloads\0".to_vec())));
+         assert!(!open.contains_key("current_name"));
+         assert!(!open.contains_key("directory"));
++        assert!(!open.contains_key("multiple"));
++        let many = request_options(FileDialogKind::OpenMany, &options, "t5");
++        assert_eq!(many.get("multiple"), Some(&Variant::from(true)));
++        assert!(many.contains_key("filters"));
+         let folder = request_options(FileDialogKind::Folder, &options, "t4");
+         assert_eq!(folder.get("directory"), Some(&Variant::from(true)));
+         assert!(!folder.contains_key("filters"));
+diff --git a/vendor/rune/crates/rune/src/file_dialog/portal_format.rs b/vendor/rune/crates/rune/src/file_dialog/portal_format.rs
+index c68451e..f80fe11 100644
+--- a/vendor/rune/crates/rune/src/file_dialog/portal_format.rs
++++ b/vendor/rune/crates/rune/src/file_dialog/portal_format.rs
+@@ -37,12 +37,13 @@ pub(super) fn path_bytes(path: &Path) -> Option<Vec<u8>> {
+     })
+ }
+ 
+-/// The `Response` signal: 0 is a choice, 1 a cancelled dialog, 2 a dialog that ended another
+-/// way (for example closed with its parent), which is also no choice.
+-pub(super) fn outcome(status: u32, uris: &[String]) -> Result<Option<PathBuf>, FileDialogError> {
++/// The `Response` signal: 0 is a choice (one path, or several from a `multiple` dialog), 1 a
++/// cancelled dialog, 2 a dialog that ended another way (for example closed with its parent),
++/// which is also no choice.
++pub(super) fn outcome(status: u32, uris: &[String]) -> Result<Vec<PathBuf>, FileDialogError> {
+     match status {
+-        0 => uris.first().map(|uri| uri_path(uri)).transpose(),
+-        1 | 2 => Ok(None),
++        0 => uris.iter().map(|uri| uri_path(uri)).collect(),
++        1 | 2 => Ok(Vec::new()),
+         n => Err(FileDialogError(format!("file dialog portal response {n}"))),
+     }
+ }
+@@ -80,11 +81,11 @@ mod tests {
+     #[test]
+     fn chosen_uris_become_percent_decoded_paths() {
+         assert_eq!(outcome(0, &uris(&["file:///home/a/My%20Export%20%E5%BD%95.csv"])).unwrap(),
+-            Some(PathBuf::from("/home/a/My Export 录.csv")));
++            vec![PathBuf::from("/home/a/My Export 录.csv")]);
+         assert_eq!(outcome(0, &uris(&["file://localhost/tmp/a%2fb", "file:///tmp/second"])).unwrap(),
+-            Some(PathBuf::from("/tmp/a/b")));
+-        assert_eq!(outcome(0, &uris(&["file://LOCALHOST/tmp/a"])).unwrap(), Some(PathBuf::from("/tmp/a")));
+-        assert_eq!(outcome(0, &[]).unwrap(), None);
++            vec![PathBuf::from("/tmp/a/b"), PathBuf::from("/tmp/second")]);
++        assert_eq!(outcome(0, &uris(&["file://LOCALHOST/tmp/a"])).unwrap(), vec![PathBuf::from("/tmp/a")]);
++        assert_eq!(outcome(0, &[]).unwrap(), Vec::<PathBuf>::new());
+         // A malformed or truncated escape stays literal.
+         assert_eq!(uri_path("file:///tmp/100%").unwrap(), PathBuf::from("/tmp/100%"));
+         assert_eq!(uri_path("file:///tmp/1%2").unwrap(), PathBuf::from("/tmp/1%2"));
+@@ -96,8 +97,8 @@ mod tests {
+     }
+     #[test]
+     fn cancelled_or_ended_dialog_is_no_choice() {
+-        assert_eq!(outcome(1, &uris(&["file:///tmp/a"])).unwrap(), None);
+-        assert_eq!(outcome(2, &[]).unwrap(), None);
++        assert!(outcome(1, &uris(&["file:///tmp/a"])).unwrap().is_empty());
++        assert!(outcome(2, &[]).unwrap().is_empty());
+         assert!(outcome(3, &[]).is_err());
+     }
+     #[test]
+diff --git a/vendor/rune/crates/rune/src/lib.rs b/vendor/rune/crates/rune/src/lib.rs
+index 9e61260..583bfa1 100644
+--- a/vendor/rune/crates/rune/src/lib.rs
++++ b/vendor/rune/crates/rune/src/lib.rs
+@@ -133,6 +133,7 @@ pub use file_dialog::FileDialogError;
+ pub use file_dialog::FileDialogKind;
+ pub use file_dialog::FileDialogOptions;
+ pub use file_dialog::FileDialogResult;
++pub use file_dialog::FileDialogPaths;
+ pub use file_dialog::FileDialogs;
+ pub use file_dialog::ScriptedFileDialog;
+ pub use frame::encoded::FrameEncoded;
+diff --git a/vendor/rune/crates/rune/src/runtime/input/action.rs b/vendor/rune/crates/rune/src/runtime/input/action.rs
+index d319e51..a2c7baf 100644
+--- a/vendor/rune/crates/rune/src/runtime/input/action.rs
++++ b/vendor/rune/crates/rune/src/runtime/input/action.rs
+@@ -49,7 +49,7 @@ pub(super) enum Action {
+     /// A `Tx::read_clipboard` callback's id and what the clipboard held.
+     ClipboardRead(u64, crate::ClipboardContent),
+     /// A `Tx::open_file` or `Tx::save_file` callback's id and the dialog's answer.
+-    FileDialog(u64, crate::file_dialog::FileDialogResult),
++    FileDialog(u64, crate::file_dialog::FileDialogPaths),
+     Focus(String, f32, f32),
+     Blur,
+     /// What assistive technology asked of an element (`a11y/actions.rs`).
+diff --git a/vendor/rune/crates/rune/src/runtime/input/file_dialog.rs b/vendor/rune/crates/rune/src/runtime/input/file_dialog.rs
+index d88bfe4..6f1e937 100644
+--- a/vendor/rune/crates/rune/src/runtime/input/file_dialog.rs
++++ b/vendor/rune/crates/rune/src/runtime/input/file_dialog.rs
+@@ -1,5 +1,5 @@
+ use super::*;
+-use crate::file_dialog::{FileDialogError, FileDialogKind, FileDialogOptions, FileDialogResult, Pending, Request};
++use crate::file_dialog::{FileDialogError, FileDialogKind, FileDialogOptions, FileDialogPaths, Pending, Request};
+ 
+ impl<S: 'static> Runtime<S> {
+     /// The file dialog showing, or about to show, from [`Tx::open_file`], [`Tx::save_file`] or
+@@ -12,8 +12,14 @@ impl<S: 'static> Runtime<S> {
+     /// Its callback runs on the next frame. For tests and headless drivers; native dialogs
+     /// answer themselves.
+     pub fn resolve_file_dialog(&mut self, path: Option<std::path::PathBuf>) -> Result<(), FileDialogError> {
++        self.resolve_file_dialog_paths(path.into_iter().collect())
++    }
++
++    /// [`Runtime::resolve_file_dialog`] with every file chosen, as a [`Tx::open_files`] dialog
++    /// answers (a one-path dialog gets the first); none is cancelling.
++    pub fn resolve_file_dialog_paths(&mut self, paths: Vec<std::path::PathBuf>) -> Result<(), FileDialogError> {
+         let id = self.file_dialog.as_ref().ok_or_else(|| FileDialogError("no file dialog is open".into()))?.id;
+-        self.answer_file_dialog(id, Ok(path));
++        self.answer_file_dialog(id, Ok(paths));
+         Ok(())
+     }
+ 
+@@ -45,7 +51,7 @@ impl<S: 'static> Runtime<S> {
+     }
+ 
+     /// Queues dialog `id`'s answer for the next frame, closing it.
+-    pub(crate) fn answer_file_dialog(&mut self, id: u64, result: FileDialogResult) {
++    pub(crate) fn answer_file_dialog(&mut self, id: u64, result: FileDialogPaths) {
+         if self.file_dialog.as_ref().is_some_and(|d| d.id == id) { self.file_dialog = None; }
+         self.queue.push(Action::FileDialog(id, result));
+     }
+@@ -57,12 +63,12 @@ impl<S: 'static> Runtime<S> {
+         }
+     }
+ 
+-    pub(super) fn run_file_dialog(&mut self, id: u64, result: FileDialogResult, one: &mut Tx) -> bool {
++    pub(super) fn run_file_dialog(&mut self, id: u64, result: FileDialogPaths, one: &mut Tx) -> bool {
+         let Some(i) = self.file_dialog_answers.iter().position(|(dialog, _)| *dialog == id) else { return false };
+         let (_, f) = self.file_dialog_answers.remove(i);
+         self.trace_event(format_args!(
+             "file-dialog:answer:{}",
+-            if result.as_ref().is_ok_and(Option::is_some) { "path" } else if result.is_ok() { "cancel" } else { "error" }
++            if result.as_ref().is_ok_and(|p| !p.is_empty()) { "path" } else if result.is_ok() { "cancel" } else { "error" }
+         ));
+         f(states!(self), result, one);
+         true
+@@ -74,7 +80,7 @@ impl<S: 'static> Runtime<S> {
+     pub(crate) fn cancel_file_dialogs(&mut self) {
+         for _ in 0..64 {
+             if let Some(d) = self.file_dialog.take() {
+-                self.queue.push(Action::FileDialog(d.id, Ok(None)));
++                self.queue.push(Action::FileDialog(d.id, Ok(Vec::new())));
+             }
+             let Some(pos) = self.queue.iter().position(|a| matches!(a, Action::FileDialog(..))) else { return };
+             let Action::FileDialog(id, result) = self.queue.remove(pos) else { unreachable!() };
+diff --git a/vendor/rune/crates/rune/src/tooling.rs b/vendor/rune/crates/rune/src/tooling.rs
+index f913819..880b7fa 100644
+--- a/vendor/rune/crates/rune/src/tooling.rs
++++ b/vendor/rune/crates/rune/src/tooling.rs
+@@ -312,8 +312,8 @@ pub(crate) enum Kind {
+     Menu(String),
+     /// Answers the open pop-up menu: an item's id, or `None` to dismiss it.
+     PopupMenu(Option<String>),
+-    /// Answers the open file dialog: the chosen path, or `None` to cancel it.
+-    FileDialog(Option<PathBuf>),
++    /// Answers the open file dialog: the chosen paths, or none to cancel it.
++    FileDialog(Vec<PathBuf>),
+     Physical(crate::PhysicalInput),
+     /// A registered global shortcut, delivered only to its handler.
+     Shortcut(crate::Shortcut),
+@@ -422,7 +422,7 @@ impl Ev {
+             Kind::Reopen => ScriptEvent::Reopen,
+             Kind::Menu(item) => ScriptEvent::Menu(item.clone()),
+             Kind::PopupMenu(picked) => ScriptEvent::PopupMenu(picked.clone()),
+-            Kind::FileDialog(path) => ScriptEvent::FileDialog(path.clone()),
++            Kind::FileDialog(paths) => ScriptEvent::FileDialog(paths.first().cloned()),
+             Kind::Physical(input) => ScriptEvent::Physical(*input),
+             Kind::Shortcut(chord) => ScriptEvent::Shortcut(chord.clone()),
+             Kind::Move => pointer(PointerAction::Move),
+diff --git a/vendor/rune/crates/rune/src/tooling/headless.rs b/vendor/rune/crates/rune/src/tooling/headless.rs
+index 8da2a8d..9c7f4f3 100644
+--- a/vendor/rune/crates/rune/src/tooling/headless.rs
++++ b/vendor/rune/crates/rune/src/tooling/headless.rs
+@@ -254,7 +254,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
+                 Kind::Shortcut(shortcut) => shared.shortcuts.fire(shortcut).unwrap_or_else(|e| die(&format!("script shortcut: {e}"))),
+                 Kind::Menu(item) => crate::native_menu::fire(&shared, item).unwrap_or_else(|e| die(&format!("script menu: {e}"))),
+                 Kind::PopupMenu(picked) => rt.resolve_popup(picked.as_deref()).unwrap_or_else(|e| die(&format!("script pop-up menu: {e}"))),
+-                Kind::FileDialog(path) => rt.resolve_file_dialog(path.clone()).unwrap_or_else(|e| die(&format!("script file dialog: {e}"))),
++                Kind::FileDialog(paths) => rt.resolve_file_dialog_paths(paths.clone()).unwrap_or_else(|e| die(&format!("script file dialog: {e}"))),
+                 Kind::Move => rt.pointer_move(x, y),
+                 Kind::Down => {
+                     last_down = (x, y);
+diff --git a/vendor/rune/crates/rune/src/tooling/parser_tests.rs b/vendor/rune/crates/rune/src/tooling/parser_tests.rs
+index 2b4a4c2..997c4d2 100644
+--- a/vendor/rune/crates/rune/src/tooling/parser_tests.rs
++++ b/vendor/rune/crates/rune/src/tooling/parser_tests.rs
+@@ -29,14 +29,19 @@ fn a_physical_chord_releases_its_modifiers_after_the_key() {
+ 
+ #[test]
+ fn script_events_answer_a_file_dialog() {
+-    let kinds: Vec<_> = parse_script(json!([{"t": 0.1, "type": "file-dialog", "path": "/exports/a.json"}, {"t": 0.2, "type": "file-dialog-cancel"}]))
++    let kinds: Vec<_> = parse_script(json!([
++        {"t": 0.1, "type": "file-dialog", "path": "/exports/a.json"},
++        {"t": 0.2, "type": "file-dialog-cancel"},
++        {"t": 0.3, "type": "file-dialog", "paths": ["/files/a.pdf", "/files/b.png"]},
++    ]))
+         .into_iter().map(|e| {
+             let ScriptEvent::FileDialog(public) = e.public().event else { panic!("public event lost the dialog answer") };
+-            let Kind::FileDialog(path) = e.kind else { panic!("parsed as another event") };
+-            assert_eq!(public, path);
+-            path
++            let Kind::FileDialog(paths) = e.kind else { panic!("parsed as another event") };
++            assert_eq!(public, paths.first().cloned());
++            paths
+         }).collect();
+-    assert_eq!(kinds, [Some("/exports/a.json".into()), None]);
++    let path = |p: &str| std::path::PathBuf::from(p);
++    assert_eq!(kinds, [vec![path("/exports/a.json")], vec![], vec![path("/files/a.pdf"), path("/files/b.png")]]);
+ }
+ 
+ #[test]
+diff --git a/vendor/rune/crates/rune/src/tooling/script.rs b/vendor/rune/crates/rune/src/tooling/script.rs
+index 1db8612..d85064c 100644
+--- a/vendor/rune/crates/rune/src/tooling/script.rs
++++ b/vendor/rune/crates/rune/src/tooling/script.rs
+@@ -204,10 +204,15 @@ pub(crate) fn parse_script(list: Value) -> Vec<Ev> {
+             }
+             "menu-cancel" => out.push(Ev { t, kind: Kind::PopupMenu(None), pos: Pos::Rel(0.0, 0.0) }),
+             "file-dialog" => {
+-                let path = e["path"].as_str().unwrap_or_else(|| die("file-dialog needs a \"path\" (file-dialog-cancel cancels)"));
+-                out.push(Ev { t, kind: Kind::FileDialog(Some(path.into())), pos: Pos::Rel(0.0, 0.0) });
++                // One "path", or "paths" for a dialog that picks several.
++                let paths: Vec<std::path::PathBuf> = match (e["path"].as_str(), e["paths"].as_array()) {
++                    (Some(path), _) => vec![path.into()],
++                    (None, Some(paths)) => paths.iter().map(|p| p.as_str().unwrap_or_else(|| die("file-dialog \"paths\" are strings")).into()).collect(),
++                    (None, None) => die("file-dialog needs a \"path\" or \"paths\" (file-dialog-cancel cancels)"),
++                };
++                out.push(Ev { t, kind: Kind::FileDialog(paths), pos: Pos::Rel(0.0, 0.0) });
+             }
+-            "file-dialog-cancel" => out.push(Ev { t, kind: Kind::FileDialog(None), pos: Pos::Rel(0.0, 0.0) }),
++            "file-dialog-cancel" => out.push(Ev { t, kind: Kind::FileDialog(Vec::new()), pos: Pos::Rel(0.0, 0.0) }),
+             "mark" => {
+                 let name = e["name"].as_str().filter(|n| !n.is_empty()).unwrap_or_else(|| die("a mark needs a \"name\""));
+                 out.push(Ev { t, kind: Kind::Mark(name.to_owned()), pos });

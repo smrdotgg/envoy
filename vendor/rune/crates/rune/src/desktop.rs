@@ -364,10 +364,10 @@ pub(crate) fn run(windows: Vec<AnyWindowSpec>, selected: usize, args: Args, acce
                     let i = open.or(desk.key).unwrap_or(selected);
                     desk.members[i].resolve_popup(picked.as_deref()).unwrap_or_else(|e| die(&format!("script pop-up menu: {e}")));
                 }
-                Kind::FileDialog(path) => {
+                Kind::FileDialog(paths) => {
                     let open = desk.key.into_iter().chain(desk.z.iter().rev().copied()).find(|&i| desk.members[i].file_dialog_open());
                     let i = open.or(desk.key).unwrap_or(selected);
-                    desk.members[i].resolve_file_dialog(path.clone()).unwrap_or_else(|e| die(&format!("script file dialog: {e}")));
+                    desk.members[i].resolve_file_dialog(paths.clone()).unwrap_or_else(|e| die(&format!("script file dialog: {e}")));
                 }
                 // While another app is active, as after a click on the backdrop, keys go to it.
                 Kind::Key(..) | Kind::KeyUp(_) | Kind::Physical(_) | Kind::PhysicalKey(..) | Kind::Paste(_) => {

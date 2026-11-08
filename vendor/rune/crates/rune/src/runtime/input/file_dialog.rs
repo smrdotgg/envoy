@@ -1,5 +1,5 @@
 use super::*;
-use crate::file_dialog::{FileDialogError, FileDialogKind, FileDialogOptions, FileDialogResult, Pending, Request};
+use crate::file_dialog::{FileDialogError, FileDialogKind, FileDialogOptions, FileDialogPaths, Pending, Request};
 
 impl<S: 'static> Runtime<S> {
     /// The file dialog showing, or about to show, from [`Tx::open_file`], [`Tx::save_file`] or
@@ -12,8 +12,14 @@ impl<S: 'static> Runtime<S> {
     /// Its callback runs on the next frame. For tests and headless drivers; native dialogs
     /// answer themselves.
     pub fn resolve_file_dialog(&mut self, path: Option<std::path::PathBuf>) -> Result<(), FileDialogError> {
+        self.resolve_file_dialog_paths(path.into_iter().collect())
+    }
+
+    /// [`Runtime::resolve_file_dialog`] with every file chosen, as a [`Tx::open_files`] dialog
+    /// answers (a one-path dialog gets the first); none is cancelling.
+    pub fn resolve_file_dialog_paths(&mut self, paths: Vec<std::path::PathBuf>) -> Result<(), FileDialogError> {
         let id = self.file_dialog.as_ref().ok_or_else(|| FileDialogError("no file dialog is open".into()))?.id;
-        self.answer_file_dialog(id, Ok(path));
+        self.answer_file_dialog(id, Ok(paths));
         Ok(())
     }
 
@@ -45,7 +51,7 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// Queues dialog `id`'s answer for the next frame, closing it.
-    pub(crate) fn answer_file_dialog(&mut self, id: u64, result: FileDialogResult) {
+    pub(crate) fn answer_file_dialog(&mut self, id: u64, result: FileDialogPaths) {
         if self.file_dialog.as_ref().is_some_and(|d| d.id == id) { self.file_dialog = None; }
         self.queue.push(Action::FileDialog(id, result));
     }
@@ -57,12 +63,12 @@ impl<S: 'static> Runtime<S> {
         }
     }
 
-    pub(super) fn run_file_dialog(&mut self, id: u64, result: FileDialogResult, one: &mut Tx) -> bool {
+    pub(super) fn run_file_dialog(&mut self, id: u64, result: FileDialogPaths, one: &mut Tx) -> bool {
         let Some(i) = self.file_dialog_answers.iter().position(|(dialog, _)| *dialog == id) else { return false };
         let (_, f) = self.file_dialog_answers.remove(i);
         self.trace_event(format_args!(
             "file-dialog:answer:{}",
-            if result.as_ref().is_ok_and(Option::is_some) { "path" } else if result.is_ok() { "cancel" } else { "error" }
+            if result.as_ref().is_ok_and(|p| !p.is_empty()) { "path" } else if result.is_ok() { "cancel" } else { "error" }
         ));
         f(states!(self), result, one);
         true
@@ -74,7 +80,7 @@ impl<S: 'static> Runtime<S> {
     pub(crate) fn cancel_file_dialogs(&mut self) {
         for _ in 0..64 {
             if let Some(d) = self.file_dialog.take() {
-                self.queue.push(Action::FileDialog(d.id, Ok(None)));
+                self.queue.push(Action::FileDialog(d.id, Ok(Vec::new())));
             }
             let Some(pos) = self.queue.iter().position(|a| matches!(a, Action::FileDialog(..))) else { return };
             let Action::FileDialog(id, result) = self.queue.remove(pos) else { unreachable!() };

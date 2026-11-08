@@ -40,13 +40,15 @@ impl FileDialogOptions {
     }
 }
 
-/// Which dialog: Open picks an existing file, Save names a file to write, Folder picks an
-/// existing folder (its options' filters and file name don't apply).
+/// Which dialog: Open picks an existing file, OpenMany one or more of them, Save names a file
+/// to write, Folder picks an existing folder (its options' filters and file name don't apply).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileDialogKind { Open, Save, Folder }
+pub enum FileDialogKind { Open, OpenMany, Save, Folder }
 
 impl FileDialogKind {
-    fn name(self) -> &'static str { match self { Self::Open => "open", Self::Save => "save", Self::Folder => "folder" } }
+    fn name(self) -> &'static str {
+        match self { Self::Open => "open", Self::OpenMany => "open-many", Self::Save => "save", Self::Folder => "folder" }
+    }
 }
 
 /// Expected request and its response. `None` is cancellation, not a missing fixture.
@@ -103,13 +105,13 @@ impl FileDialogs {
                 Ok(responses.pop_front().unwrap().path)
             }
             #[cfg(feature = "native-file-dialog")]
-            Backend::Native => native(kind, options).await,
+            Backend::Native => native(kind, options).await.map(|paths| paths.into_iter().next()),
         }
     }
 }
 
 #[cfg(all(feature = "native-file-dialog", any(target_os = "macos", target_os = "windows")))]
-async fn native(kind: FileDialogKind, options: FileDialogOptions) -> Result<Option<PathBuf>, FileDialogError> {
+async fn native(kind: FileDialogKind, options: FileDialogOptions) -> FileDialogPaths {
     rfd_show(rfd_dialog(options), kind).await
 }
 #[cfg(all(feature = "native-file-dialog", any(target_os = "macos", target_os = "windows")))]
@@ -122,16 +124,17 @@ fn rfd_dialog(options: FileDialogOptions) -> rfd::AsyncFileDialog {
 }
 /// Calling this starts the dialog (on macOS, a sheet over the parent); awaiting reads it.
 #[cfg(all(feature = "native-file-dialog", any(target_os = "macos", target_os = "windows")))]
-fn rfd_show(dialog: rfd::AsyncFileDialog, kind: FileDialogKind) -> impl Future<Output = Result<Option<PathBuf>, FileDialogError>> {
-    let file: Pin<Box<dyn Future<Output = Option<rfd::FileHandle>> + Send>> = match kind {
-        FileDialogKind::Open => Box::pin(dialog.pick_file()),
-        FileDialogKind::Save => Box::pin(dialog.save_file()),
-        FileDialogKind::Folder => Box::pin(dialog.pick_folder()),
+fn rfd_show(dialog: rfd::AsyncFileDialog, kind: FileDialogKind) -> impl Future<Output = FileDialogPaths> {
+    let files: Pin<Box<dyn Future<Output = Vec<rfd::FileHandle>> + Send>> = match kind {
+        FileDialogKind::Open => { let f = dialog.pick_file(); Box::pin(async move { f.await.into_iter().collect() }) }
+        FileDialogKind::OpenMany => { let f = dialog.pick_files(); Box::pin(async move { f.await.unwrap_or_default() }) }
+        FileDialogKind::Save => { let f = dialog.save_file(); Box::pin(async move { f.await.into_iter().collect() }) }
+        FileDialogKind::Folder => { let f = dialog.pick_folder(); Box::pin(async move { f.await.into_iter().collect() }) }
     };
-    async move { Ok(file.await.map(|file| file.path().to_path_buf())) }
+    async move { Ok(files.await.iter().map(|file| file.path().to_path_buf()).collect()) }
 }
 #[cfg(all(feature = "native-file-dialog", not(any(target_os = "linux", target_os = "macos", target_os = "windows"))))]
-async fn native(_: FileDialogKind, _: FileDialogOptions) -> Result<Option<PathBuf>, FileDialogError> {
+async fn native(_: FileDialogKind, _: FileDialogOptions) -> FileDialogPaths {
     Err(FileDialogError("native file dialogs aren't supported on this platform".into()))
 }
 
@@ -139,7 +142,12 @@ async fn native(_: FileDialogKind, _: FileDialogOptions) -> Result<Option<PathBu
 /// when the user cancels, or why no dialog could show.
 pub type FileDialogResult = Result<Option<PathBuf>, FileDialogError>;
 
-pub(crate) type AnswerFn = Box<dyn FnOnce(crate::states::States<'_>, FileDialogResult, &mut Tx)>;
+/// What a [`Tx::open_files`] callback gets: the chosen files, in the order the dialog gives
+/// them, none when the user cancels, or why no dialog could show. Every dialog answers with
+/// this inside; the one-path dialogs take the first.
+pub type FileDialogPaths = Result<Vec<PathBuf>, FileDialogError>;
+
+pub(crate) type AnswerFn = Box<dyn FnOnce(crate::states::States<'_>, FileDialogPaths, &mut Tx)>;
 
 pub(crate) struct Request {
     pub kind: FileDialogKind,
@@ -203,22 +211,29 @@ impl Tx {
     /// })
     /// ```
     pub fn open_file<S: 'static>(&mut self, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx) + 'static) {
-        self.file_dialog(FileDialogKind::Open, options, on_answer);
+        self.file_dialog(FileDialogKind::Open, options, first(on_answer));
+    }
+
+    /// [`Tx::open_file`] for an Open dialog that picks one or more files at once, as an app
+    /// attaching files does: `on_answer` gets them all, or none when the user cancels. A
+    /// script answers it with `{"type": "file-dialog", "paths": […]}` (or one `"path"`).
+    pub fn open_files<S: 'static>(&mut self, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogPaths, &mut Tx) + 'static) {
+        self.file_dialog(FileDialogKind::OpenMany, options, on_answer);
     }
 
     /// [`Tx::open_file`] for a Save dialog: the path to write, which may not exist yet.
     pub fn save_file<S: 'static>(&mut self, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx) + 'static) {
-        self.file_dialog(FileDialogKind::Save, options, on_answer);
+        self.file_dialog(FileDialogKind::Save, options, first(on_answer));
     }
 
     /// [`Tx::open_file`] for a folder: an Open dialog that picks an existing folder, as an app
     /// opening a project or choosing where exports go. `options`' title and directory apply;
     /// its filters and file name don't. A script answers it as it does a file dialog.
     pub fn open_folder<S: 'static>(&mut self, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx) + 'static) {
-        self.file_dialog(FileDialogKind::Folder, options, on_answer);
+        self.file_dialog(FileDialogKind::Folder, options, first(on_answer));
     }
 
-    fn file_dialog<S: 'static>(&mut self, kind: FileDialogKind, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx) + 'static) {
+    fn file_dialog<S: 'static>(&mut self, kind: FileDialogKind, options: FileDialogOptions, on_answer: impl FnOnce(&mut S, FileDialogPaths, &mut Tx) + 'static) {
         let on_answer: AnswerFn = Box::new(move |s, result, tx| {
             // None once the playground has dropped the stage that asked.
             if let Some(s) = s.cast::<S>() { on_answer(s, result, tx); }
@@ -227,11 +242,16 @@ impl Tx {
     }
 }
 
+/// A one-path dialog's callback, given the first of the paths every dialog answers with.
+fn first<S>(on_answer: impl FnOnce(&mut S, FileDialogResult, &mut Tx)) -> impl FnOnce(&mut S, FileDialogPaths, &mut Tx) {
+    move |s, paths, tx| on_answer(s, paths.map(|p| p.into_iter().next()), tx)
+}
+
 /// One window's native file dialog: shows what its runtime asks for, and queues the answer
 /// after `wake` brings the host back to poll it. The dialog's future owns copies of the
 /// options and the window's handle, never the app's state or the runtime.
 pub(crate) struct Presenter {
-    showing: Option<(u64, Pin<Box<dyn Future<Output = FileDialogResult>>>)>,
+    showing: Option<(u64, Pin<Box<dyn Future<Output = FileDialogPaths>>>)>,
     #[cfg(all(feature = "native-file-dialog", target_os = "macos"))]
     sheet_parent: Option<objc2::rc::Retained<objc2_app_kit::NSWindow>>,
     wake: std::task::Waker,
@@ -306,7 +326,7 @@ impl Drop for Presenter {
     fn drop(&mut self) { self.stop(); }
 }
 
-fn show_over(kind: FileDialogKind, options: FileDialogOptions, window: &winit::window::Window) -> Pin<Box<dyn Future<Output = FileDialogResult>>> {
+fn show_over(kind: FileDialogKind, options: FileDialogOptions, window: &winit::window::Window) -> Pin<Box<dyn Future<Output = FileDialogPaths>>> {
     #[cfg(all(feature = "native-file-dialog", any(target_os = "macos", target_os = "windows")))]
     return Box::pin(rfd_show(rfd_dialog(options).set_parent(window), kind));
     // The portal's parent is the focused window (`window_focus`).
@@ -381,6 +401,34 @@ mod tests {
         rt.frame(5.0 / 60.0);
         assert_eq!(rt.state.answers[1], Ok(None), "cancelling answers None");
         assert!(rt.resolve_file_dialog(None).is_err(), "nothing is open");
+    }
+
+    #[test]
+    fn an_open_many_dialog_answers_with_every_file_chosen() {
+        #[derive(Default)]
+        struct Attach { answers: Vec<Result<Vec<PathBuf>, String>> }
+        fn view(_: &Attach, _: &mut Cx<Attach>) -> El {
+            el().key("attach").size(80.0, 20.0).on_press_tx(|_: &mut Attach, tx: &mut Tx| {
+                tx.open_files(FileDialogOptions { title: "Attach".into(), ..Default::default() }, |s: &mut Attach, result, _| s.answers.push(result.map_err(|e| e.0)));
+            })
+        }
+        let mut rt = Runtime::new(Attach::default(), view, (200.0, 100.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        let press = |rt: &mut Runtime<Attach>, t: f64| {
+            rt.pointer_down(10.0, 10.0);
+            rt.pointer_up(10.0, 10.0);
+            rt.frame(t);
+        };
+        press(&mut rt, 1.0 / 60.0);
+        assert_eq!(rt.file_dialog().map(|(kind, _)| kind), Some(FileDialogKind::OpenMany));
+        assert_eq!(rt.file_dialog_json().unwrap()["kind"], "open-many");
+        rt.resolve_file_dialog_paths(vec!["/files/a.pdf".into(), "/files/录音.wav".into()]).unwrap();
+        rt.frame(2.0 / 60.0);
+        assert_eq!(rt.state.answers, [Ok(vec![PathBuf::from("/files/a.pdf"), PathBuf::from("/files/录音.wav")])]);
+        press(&mut rt, 3.0 / 60.0);
+        rt.resolve_file_dialog(None).unwrap();
+        rt.frame(4.0 / 60.0);
+        assert_eq!(rt.state.answers[1], Ok(vec![]), "cancelling answers none");
     }
 
     #[test]
