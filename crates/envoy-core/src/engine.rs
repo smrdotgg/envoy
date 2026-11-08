@@ -1806,6 +1806,24 @@ mod tests {
     }
 
     #[test]
+    fn a_held_move_is_due_exactly_when_its_window_and_grace_end() {
+        let st = setup();
+        let a = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        let (shared, _rx) = engine_with(st);
+        // Undone at 1000 with the 5 s window: due at 1006, after the second of grace.
+        move_and_hold(&shared, vec![a], &MoveTarget::Archive, false, Some(3), 1000).unwrap();
+        shared
+            .with_writer(|st| {
+                assert_eq!(st.next_op_due("a", 1000)?, Some(6), "the worker plans to wake at the end");
+                assert!(st.claim_due("a", 1005)?.is_empty(), "a second before: not replayed");
+                st.unclaim("a")?;
+                assert_eq!(st.claim_due("a", 1006)?.len(), 1, "at the end: replayed");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn a_move_that_does_nothing_tells_the_ui() {
         let st = setup();
         let a = message(&st, "Archive", 1, "<1@x>", "", 0);
