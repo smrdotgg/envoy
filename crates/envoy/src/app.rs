@@ -7,6 +7,7 @@ use rune_kit::PaneState;
 use serde_json::Value;
 
 use envoy_core::accounts::{Account, AuthKind};
+use envoy_core::attach;
 use envoy_core::engine::{Command, Engine, Event, MoveTarget};
 use envoy_core::model::{Draft, DraftAttachment, DraftNotice, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use envoy_core::settings::Settings;
@@ -42,8 +43,16 @@ pub struct Compose {
     pub minimized: bool,
     pub error: Option<String>,
     pub from_open: bool,
-    /// Files that go with it (kept with the draft in the store).
-    pub attachments: Vec<DraftAttachment>,
+    /// Its files, in the order they were added: those attached go with the draft (their bytes
+    /// are in the store with it); the others are on their way, or couldn't be attached.
+    pub files: Vec<ComposeFile>,
+    /// A file drag from another app is over it.
+    pub drop_hover: bool,
+    /// Ids below this were handed out to files since taken off.
+    pub next_file: u32,
+    /// The draft this one carries on the text of (a save refused under that id), whose files
+    /// it lists, until its saves are confirmed.
+    pub files_from: Option<i64>,
     /// What the user should know about it: a draft from the server that can't be edited
     /// without losing something.
     pub notice: Option<String>,
@@ -93,7 +102,10 @@ impl Compose {
             minimized: false,
             error: None,
             from_open: false,
-            attachments: Vec::new(),
+            files: Vec::new(),
+            drop_hover: false,
+            next_file: 0,
+            files_from: None,
             notice: None,
             draft_id,
             lifecycle: 0,
@@ -125,9 +137,60 @@ impl Compose {
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             reply_of: self.reply_of,
-            attachments: self.attachments.clone(),
+            attachments: self.files.iter().filter(|f| f.state == FileState::Attached).map(|f| f.file.clone()).collect(),
         }
     }
+
+    /// An id for the next file: never one a file of this draft has had, so bytes left with the
+    /// draft by a file taken off it are never mistaken for another's.
+    fn next_file_id(&self) -> u32 {
+        self.files.iter().map(|f| f.file.id + 1).max().unwrap_or(0).max(self.next_file)
+    }
+
+    /// The files' total size, those still on their way included (as far as it's known).
+    pub fn files_size(&self) -> usize {
+        self.files.iter().filter(|f| !matches!(f.state, FileState::Failed(_))).map(|f| f.file.size).sum()
+    }
+
+    fn file_mut(&mut self, id: u32) -> Option<&mut ComposeFile> {
+        self.files.iter_mut().find(|f| f.file.id == id)
+    }
+}
+
+/// A file in the composer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComposeFile {
+    /// Its id in the draft, name, type and size (0 until a file being read is read).
+    pub file: DraftAttachment,
+    pub state: FileState,
+    /// Where it came from, to attach it again should its bytes be lost; None for the files of
+    /// a draft opened from the store.
+    pub source: Option<FileSource>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileState {
+    /// In the store with the draft: saved and sent with it.
+    Attached,
+    /// Being read (or, for a forward, fetched) by the engine.
+    Attaching,
+    /// Couldn't be attached: why, to show.
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileSource {
+    /// A file on this computer.
+    Path(std::path::PathBuf),
+    /// Attachment `index` of a message (a forward's).
+    Message { id: MessageId, index: usize },
+}
+
+/// A file demo mode is pretending to read: attached at `at` (app clock).
+pub struct DemoRead {
+    pub at: f64,
+    pub draft: i64,
+    pub file: u32,
 }
 
 /// A draft save handed to the engine and not yet confirmed written: kept to try again, and to
@@ -138,6 +201,8 @@ pub struct PendingSave {
     pub lifecycle: i64,
     pub draft: Draft,
     pub open: bool,
+    /// The draft whose files it lists, if not its own ([`Compose::files_from`]).
+    pub files_from: Option<i64>,
     /// Failures so far; after one, it's tried again at `retry_at` (app clock).
     pub failures: u32,
     pub retry_at: Option<f64>,
@@ -160,8 +225,9 @@ const SAVE_RETRY: f64 = 5.0;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Unsaved {
     /// A draft save, under its stamp and lifecycle (so it never overwrites a newer one, nor
-    /// brings back a draft that moved on).
-    Save { id: i64, draft: Draft, open: bool, rev: i64, lifecycle: i64 },
+    /// brings back a draft that moved on); `files_from`: the draft whose files it lists, if not
+    /// its own.
+    Save { id: i64, draft: Draft, open: bool, rev: i64, lifecycle: i64, files_from: Option<i64> },
     /// A message sent from the composer (at `rev`, in `lifecycle`) but not confirmed queued:
     /// kept as a draft unless its send was queued, or went out, after all.
     Unsent { id: i64, draft: Draft, rev: i64, lifecycle: i64 },
@@ -171,21 +237,23 @@ impl Unsaved {
     /// For the recovery file.
     fn recovered(&self) -> envoy_core::drafts::Recovered {
         match self {
-            Unsaved::Save { id, draft, open, rev, lifecycle } => {
-                envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: *open, rev: *rev, lifecycle: *lifecycle, unsent: false }
+            Unsaved::Save { id, draft, open, rev, lifecycle, files_from } => {
+                envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: *open, rev: *rev, lifecycle: *lifecycle, unsent: false, files_from: *files_from }
             }
-            Unsaved::Unsent { id, draft, rev, lifecycle } => envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: true, rev: *rev, lifecycle: *lifecycle, unsent: true },
+            Unsaved::Unsent { id, draft, rev, lifecycle } => {
+                envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: true, rev: *rev, lifecycle: *lifecycle, unsent: true, files_from: None }
+            }
         }
     }
 
-    /// Its text as a new draft, `id`, saved at `rev`: for one the store refused (its draft
-    /// moved on without it).
+    /// Its text as a new draft, `id`, saved at `rev`, with the files of the draft it was for:
+    /// for one the store refused (its draft moved on without it).
     fn as_new_draft(&self, id: i64, rev: i64) -> Unsaved {
-        let (draft, open) = match self {
-            Unsaved::Save { draft, open, .. } => (draft.clone(), *open),
-            Unsaved::Unsent { draft, .. } => (draft.clone(), true),
+        let (draft, open, files_from) = match self {
+            Unsaved::Save { id, draft, open, files_from, .. } => (draft.clone(), *open, files_from.unwrap_or(*id)),
+            Unsaved::Unsent { id, draft, .. } => (draft.clone(), true, *id),
         };
-        Unsaved::Save { id, draft, open, rev, lifecycle: 0 }
+        Unsaved::Save { id, draft, open, rev, lifecycle: 0, files_from: Some(files_from) }
     }
 }
 
@@ -302,6 +370,7 @@ pub enum Action {
     Refresh,
     Settings,
     Send,
+    Attach,
     Close,
     GoInbox,
     GoStarred,
@@ -324,6 +393,7 @@ const ACTIONS: &[(Action, &str)] = &[
     (Action::Refresh, "keys.refresh"),
     (Action::Settings, "keys.settings"),
     (Action::Send, "keys.send"),
+    (Action::Attach, "keys.attach"),
     (Action::Close, "keys.close"),
     (Action::GoInbox, "keys.goInbox"),
     (Action::GoStarred, "keys.goStarred"),
@@ -393,6 +463,8 @@ pub struct App {
     pub confirm_delete: Option<Vec<MessageId>>,
     pub images: HashMap<String, ImageState>,
     pub image_cache: Option<rune::ImageCache>,
+    /// Files demo mode is pretending to read.
+    pub demo_reads: Vec<DemoRead>,
     /// What `send` was asked to send, for tests.
     #[cfg(test)]
     pub sent: std::cell::RefCell<Vec<String>>,
@@ -400,6 +472,14 @@ pub struct App {
 
 pub fn parse_keys(s: &Settings) -> Vec<(Action, Keybind)> {
     ACTIONS.iter().map(|(a, key)| (*a, keybind(&s.str(key)))).collect()
+}
+
+/// The command that saves a draft: one that carries on another's text says whose files it lists.
+fn save_command(id: i64, draft: Draft, open: bool, rev: i64, lifecycle: i64, files_from: Option<i64>) -> Command {
+    match files_from {
+        Some(files_from) => Command::SaveDraftFrom { id, draft, open, rev, lifecycle, files_from },
+        None => Command::SaveDraft { id, draft, open, rev, lifecycle },
+    }
 }
 
 /// Parses a user's keybinding, skipping chords that don't parse (they're flagged in Settings).
@@ -469,6 +549,7 @@ impl App {
             confirm_delete: None,
             images: HashMap::new(),
             image_cache: None,
+            demo_reads: Vec::new(),
             #[cfg(test)]
             sent: Default::default(),
         }
@@ -651,6 +732,9 @@ impl App {
             Event::DraftSaved { id, rev } => self.draft_saved(id, rev),
             Event::DraftSaveFailed { id, rev, error } => self.draft_save_failed(id, rev, error),
             Event::DraftSaveRefused { id, rev } => self.draft_save_refused(id, rev),
+            Event::DraftFilesMissing { id, files } => self.draft_files_missing(id, &files),
+            Event::FileAttached { draft, file } => self.file_attached(draft, file),
+            Event::AttachFailed { draft, file, error } => self.attach_failed(draft, file, error),
             Event::SendFailed { draft_id } => self.send_failed(draft_id),
         }
         reload
@@ -973,7 +1057,8 @@ impl App {
     /// settings file changes.
     pub fn tick(&mut self, clock: f64, tx: &mut Tx) -> bool {
         self.clock = clock;
-        let mut changed = self.autosave(clock, tx);
+        let mut changed = self.finish_demo_reads(clock, tx);
+        changed |= self.autosave(clock, tx);
         self.retry_saves(clock, tx);
         if let Some((id, at)) = self.mark_read_at {
             if clock >= at {
@@ -1406,6 +1491,9 @@ impl App {
             (primary.join(", "), cc_list.join(", "), format!("Re: {base}"), format!("{sig}{quoted}"), mid, refs)
         };
         let reply_of = if forward { None } else { Some(s.id) };
+        // A forward takes the original's files along, fetched by the engine; a reply doesn't.
+        let original = s.id;
+        let forwarded: Vec<_> = if forward { body.map(|b| b.attachments.clone()).unwrap_or_default() } else { Vec::new() };
         self.park_compose();
         let mut c = Compose::new(account, self.next_stamp());
         c.show_cc = !cc.is_empty();
@@ -1424,7 +1512,23 @@ impl App {
         c.references = refs;
         c.reply_of = reply_of;
         c.title = subject;
+        c.files = forwarded
+            .iter()
+            .enumerate()
+            .map(|(id, a)| ComposeFile {
+                file: DraftAttachment { id: id as u32, filename: a.filename.clone(), mime: a.mime.clone(), size: a.size },
+                // Demo mode has nothing to fetch.
+                state: if self.demo { FileState::Attached } else { FileState::Attaching },
+                source: Some(FileSource::Message { id: original, index: a.index }),
+            })
+            .collect();
+        let draft_id = c.draft_id;
         self.compose = Some(c);
+        if !forwarded.is_empty() && !self.demo {
+            // The draft goes in the store first: its files are kept with it.
+            self.save_compose(true);
+            self.send(Command::AttachForwarded { draft: draft_id, message: original, files: forwarded.iter().enumerate().map(|(id, a)| (id as u32, a.index)).collect() });
+        }
     }
 
     /// A field of the composer was edited: its draft is saved shortly ([`App::autosave`]).
@@ -1466,20 +1570,20 @@ impl App {
         c.dirty_since = None;
         c.saved = true;
         c.submitted = rev;
-        let (id, draft, lifecycle) = (c.draft_id, c.draft(), c.lifecycle);
-        self.submit_save(id, draft, open, rev, lifecycle);
+        let (id, draft, lifecycle, files_from) = (c.draft_id, c.draft(), c.lifecycle, c.files_from);
+        self.submit_save(id, draft, open, rev, lifecycle, files_from);
         if self.view_role() == Some(Role::Drafts) {
             // The list on screen, read again.
             self.request_list_as(false);
         }
     }
 
-    fn submit_save(&mut self, id: i64, draft: Draft, open: bool, rev: i64, lifecycle: i64) {
+    fn submit_save(&mut self, id: i64, draft: Draft, open: bool, rev: i64, lifecycle: i64, files_from: Option<i64>) {
         // A newer save of the same draft supersedes one still waiting.
         let failures = self.pending_saves.iter().find(|p| p.id == id).map_or(0, |p| p.failures);
         self.pending_saves.retain(|p| p.id != id);
-        self.pending_saves.push(PendingSave { id, rev, lifecycle, draft: draft.clone(), open, failures, retry_at: None });
-        self.send(Command::SaveDraft { id, draft, open, rev, lifecycle });
+        self.pending_saves.push(PendingSave { id, rev, lifecycle, draft: draft.clone(), open, files_from, failures, retry_at: None });
+        self.send(save_command(id, draft, open, rev, lifecycle, files_from));
     }
 
     /// The engine wrote save `rev` of draft `id`.
@@ -1491,6 +1595,8 @@ impl App {
             c.acked = c.acked.max(rev);
             if rev >= c.submitted {
                 c.save_error = None;
+                // Its files are its own now.
+                c.files_from = None;
             }
         }
     }
@@ -1519,13 +1625,17 @@ impl App {
         let Some(i) = self.pending_saves.iter().position(|p| p.id == id && p.rev == rev) else { return };
         let p = self.pending_saves.remove(i);
         let new_id = self.next_stamp();
+        let files_from = Some(p.files_from.unwrap_or(id));
         if let Some(c) = self.compose.as_mut().filter(|c| c.draft_id == id) {
             c.draft_id = new_id;
             c.lifecycle = 0;
+            c.files_from = files_from;
             self.save_compose(true);
+            // Files on their way to the old draft go to the new one.
+            self.attach_again(|f| f.state == FileState::Attaching);
         } else {
             let rev = self.next_stamp();
-            self.submit_save(new_id, p.draft, p.open, rev, 0);
+            self.submit_save(new_id, p.draft, p.open, rev, 0, files_from);
         }
         self.toast("Saved as a new draft: the one it was saved to had already been sent or deleted", false);
     }
@@ -1538,13 +1648,13 @@ impl App {
             let Some(p) = self.pending_saves.iter_mut().find(|p| p.id == id) else { continue };
             p.rev = rev;
             p.retry_at = None;
-            let (draft, open, lifecycle) = (p.draft.clone(), p.open, p.lifecycle);
+            let (draft, open, lifecycle, files_from) = (p.draft.clone(), p.open, p.lifecycle, p.files_from);
             if let Some(c) = &mut self.compose
                 && c.draft_id == id
             {
                 c.submitted = rev;
             }
-            self.send(Command::SaveDraft { id, draft, open, rev, lifecycle });
+            self.send(save_command(id, draft, open, rev, lifecycle, files_from));
         }
         if let Some(next) = self.pending_saves.iter().filter_map(|p| p.retry_at).reduce(f64::min) {
             tx.wake_after(std::time::Duration::from_secs_f64((next - clock).max(0.05)));
@@ -1588,7 +1698,7 @@ impl App {
             |u| {
                 let Some(engine) = &engine else { return Err("the mail database isn't open".into()) };
                 match u {
-                    Unsaved::Save { id, draft, open, rev, lifecycle } => engine.save_draft_now(*id, draft, *open, DraftRev { lifecycle: *lifecycle, rev: *rev }),
+                    Unsaved::Save { id, draft, open, rev, lifecycle, files_from } => engine.save_draft_now(*id, draft, *open, DraftRev { lifecycle: *lifecycle, rev: *rev }, *files_from),
                     Unsaved::Unsent { id, draft, rev, lifecycle } => engine.keep_unsent_now(*id, draft, DraftRev { lifecycle: *lifecycle, rev: *rev }),
                 }
                 .map_err(|e| format!("{e:#}"))
@@ -1649,13 +1759,14 @@ impl App {
     pub fn unsaved(&mut self) -> Vec<Unsaved> {
         let mut saves = std::mem::take(&mut self.pending_saves);
         saves.sort_by_key(|p| p.rev);
-        let mut out: Vec<Unsaved> = saves.into_iter().map(|p| Unsaved::Save { id: p.id, draft: p.draft, open: p.open, rev: p.rev, lifecycle: p.lifecycle }).collect();
+        let mut out: Vec<Unsaved> =
+            saves.into_iter().map(|p| Unsaved::Save { id: p.id, draft: p.draft, open: p.open, rev: p.rev, lifecycle: p.lifecycle, files_from: p.files_from }).collect();
         let rev = self.next_stamp();
         if let Some(c) = &mut self.compose
             && c.dirty
         {
             c.dirty = false;
-            out.push(Unsaved::Save { id: c.draft_id, draft: c.draft(), open: true, rev, lifecycle: c.lifecycle });
+            out.push(Unsaved::Save { id: c.draft_id, draft: c.draft(), open: true, rev, lifecycle: c.lifecycle, files_from: c.files_from });
         }
         out.extend(std::mem::take(&mut self.pending_sends).into_iter().map(|p| Unsaved::Unsent { id: p.id, draft: p.draft, rev: p.rev, lifecycle: p.lifecycle }));
         out
@@ -1754,7 +1865,7 @@ impl App {
         c.in_reply_to = draft.in_reply_to;
         c.references = draft.references;
         c.reply_of = draft.reply_of;
-        c.attachments = draft.attachments;
+        c.files = draft.attachments.into_iter().map(|file| ComposeFile { file, state: FileState::Attached, source: None }).collect();
         c.notice = notice.map(|n| match n {
             DraftNotice::PlainText => "This draft has formatting Envoy doesn't write: saving an edit keeps its text and attachments, not the formatting.".to_owned(),
             DraftNotice::Copy(why) => format!("Envoy can't edit this draft in place ({why}), so it stays in Drafts as it is. This is a copy, without its attachments: what you write is saved as a new draft."),
@@ -1786,6 +1897,20 @@ impl App {
                 return;
             }
         }
+        // Never sent without a file the composer shows, nor bounced for its size.
+        if let Some(f) = c.files.iter().find(|f| f.state == FileState::Attaching) {
+            c.error = Some(format!("Still attaching {}…", f.file.filename));
+            return;
+        }
+        if let Some(f) = c.files.iter().find(|f| matches!(f.state, FileState::Failed(_))) {
+            c.error = Some(format!("{} isn't attached: remove it, or attach it again", f.file.filename));
+            return;
+        }
+        let account = self.accounts.iter().find(|a| a.id == c.account);
+        if let Some(why) = attach::over_limit(account, c.files_size()) {
+            c.error = Some(why);
+            return;
+        }
         let (draft, draft_id, lifecycle) = (c.draft(), c.draft_id, c.lifecycle);
         self.compose = None;
         if self.demo {
@@ -1805,6 +1930,156 @@ impl App {
             // The list on screen, read again.
             self.request_list_as(false);
         }
+    }
+
+    // ── attachments ──
+
+    /// Opens the system's file picker for the composer (several files at once); what's picked
+    /// is attached.
+    pub fn attach_dialog(&mut self, tx: &mut Tx) {
+        let Some(c) = &mut self.compose else { return };
+        c.minimized = false;
+        let options = rune::FileDialogOptions { title: "Attach files".into(), ..Default::default() };
+        tx.open_files(options, |s: &mut App, picked, _| match picked {
+            Ok(paths) => s.attach_paths(paths),
+            Err(e) => s.toast(format!("Couldn't open the file picker: {e}"), true),
+        });
+    }
+
+    /// Attaches files from this computer (picked, or dropped on the composer). They show at
+    /// once, as being attached, while the engine reads them into the store with the draft, off
+    /// this thread; each is part of the draft once it's in ([`Event::FileAttached`]).
+    pub fn attach_paths(&mut self, paths: Vec<std::path::PathBuf>) {
+        let Some(c) = &mut self.compose else { return };
+        if paths.is_empty() {
+            return;
+        }
+        c.minimized = false;
+        c.drop_hover = false;
+        c.error = None;
+        let mut files = Vec::new();
+        for path in paths {
+            let id = c.next_file_id();
+            let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+            let file = DraftAttachment { id, mime: attach::type_for(&filename).to_owned(), filename, size: 0 };
+            c.files.push(ComposeFile { file, state: FileState::Attaching, source: Some(FileSource::Path(path.clone())) });
+            files.push((id, path));
+        }
+        let draft = c.draft_id;
+        if self.demo {
+            let at = self.clock + 0.8;
+            self.demo_reads.extend(files.into_iter().map(|(file, _)| DemoRead { at, draft, file }));
+            return;
+        }
+        // The draft goes in the store first: a file is kept with its draft, never without one.
+        if !c.saved {
+            self.save_compose(true);
+        }
+        self.send(Command::AttachFiles { draft, files });
+    }
+
+    /// Hands the composer's files `which` picks to the engine again, under its draft (one it
+    /// moved to, or whose bytes were lost), as long as it knows where they came from.
+    fn attach_again(&mut self, which: impl Fn(&ComposeFile) -> bool) {
+        let Some(c) = &mut self.compose else { return };
+        let (mut paths, mut forwarded) = (Vec::new(), Vec::new());
+        for f in c.files.iter_mut().filter(|f| which(f)) {
+            match &f.source {
+                Some(FileSource::Path(p)) => paths.push((f.file.id, p.clone())),
+                Some(FileSource::Message { id, index }) => forwarded.push((*id, (f.file.id, *index))),
+                None => continue,
+            }
+            f.state = FileState::Attaching;
+        }
+        let draft = c.draft_id;
+        if !paths.is_empty() {
+            self.send(Command::AttachFiles { draft, files: paths });
+        }
+        let messages: HashSet<MessageId> = forwarded.iter().map(|(m, _)| *m).collect();
+        for message in messages {
+            let files = forwarded.iter().filter(|(m, _)| *m == message).map(|(_, f)| *f).collect();
+            self.send(Command::AttachForwarded { draft, message, files });
+        }
+    }
+
+    /// Takes a file off the composer: off the draft too, if it was attached.
+    pub fn remove_file(&mut self, id: u32) {
+        let Some(c) = &mut self.compose else { return };
+        let Some(i) = c.files.iter().position(|f| f.file.id == id) else { return };
+        let gone = c.files.remove(i);
+        c.next_file = c.next_file.max(gone.file.id + 1);
+        c.error = None;
+        if gone.state == FileState::Attached {
+            self.compose_edited();
+        }
+    }
+
+    /// The composer (or one closed, waiting in an Undo) holding draft `draft`.
+    fn compose_for(&mut self, draft: i64) -> Option<&mut Compose> {
+        if self.compose.as_ref().is_some_and(|c| c.draft_id == draft) {
+            return self.compose.as_mut();
+        }
+        self.toasts.iter_mut().find_map(|t| match &mut t.undo {
+            Some(Undo::Discard(d)) if d.compose.draft_id == draft => Some(&mut d.compose),
+            Some(Undo::Move(m)) => m.compose.as_deref_mut().filter(|c| c.draft_id == draft),
+            _ => None,
+        })
+    }
+
+    /// A file is in the store with draft `draft`: it's part of the draft from now on, and
+    /// saved with it. One taken off meanwhile stays off (its bytes go with the draft).
+    fn file_attached(&mut self, draft: i64, file: DraftAttachment) {
+        let Some(c) = self.compose_for(draft) else { return };
+        let Some(f) = c.file_mut(file.id).filter(|f| f.state == FileState::Attaching) else { return };
+        f.file = file;
+        f.state = FileState::Attached;
+        // Saved shortly (one waiting in an Undo, when it's back).
+        c.dirty = true;
+        c.edits += 1;
+    }
+
+    fn attach_failed(&mut self, draft: i64, file: u32, error: String) {
+        if let Some(f) = self.compose_for(draft).and_then(|c| c.file_mut(file)).filter(|f| f.state == FileState::Attaching) {
+            f.state = FileState::Failed(error);
+        }
+    }
+
+    /// Draft `id` was saved without files whose bytes the store doesn't have (written to a draft
+    /// since gone): attached again where they came from is known, else taken off, saying so.
+    fn draft_files_missing(&mut self, id: i64, files: &[u32]) {
+        let Some(c) = self.compose.as_mut().filter(|c| c.draft_id == id) else { return };
+        let lost: Vec<String> = c.files.iter().filter(|f| files.contains(&f.file.id) && f.state == FileState::Attached && f.source.is_none()).map(|f| f.file.filename.clone()).collect();
+        c.files.retain(|f| !(files.contains(&f.file.id) && f.state == FileState::Attached && f.source.is_none()));
+        self.attach_again(|f| files.contains(&f.file.id) && f.state == FileState::Attached);
+        self.compose_edited();
+        if !lost.is_empty() {
+            self.toast(format!("Lost from this draft, attach again: {}", lost.join(", ")), true);
+        }
+    }
+
+    /// Demo mode's pretend reads that are done: the file's size from the disk, nothing stored.
+    fn finish_demo_reads(&mut self, clock: f64, tx: &mut Tx) -> bool {
+        let (done, waiting): (Vec<DemoRead>, Vec<DemoRead>) = std::mem::take(&mut self.demo_reads).into_iter().partition(|r| r.at <= clock);
+        self.demo_reads = waiting;
+        if let Some(next) = self.demo_reads.iter().map(|r| r.at).reduce(f64::min) {
+            tx.wake_after(std::time::Duration::from_secs_f64((next - clock).max(0.02)));
+        }
+        let mut changed = false;
+        for r in done {
+            let Some(f) = self.compose_for(r.draft).and_then(|c| c.file_mut(r.file)).filter(|f| f.state == FileState::Attaching) else { continue };
+            let Some(FileSource::Path(path)) = &f.source else { continue };
+            f.state = match std::fs::metadata(path) {
+                Ok(m) if m.is_dir() => FileState::Failed(format!("{} is a folder: attach the files in it", f.file.filename)),
+                Ok(m) if m.len() as usize > attach::LIMIT => FileState::Failed(attach::too_big(&f.file.filename, m.len() as usize, attach::LIMIT)),
+                Ok(m) => {
+                    f.file.size = m.len() as usize;
+                    FileState::Attached
+                }
+                Err(e) => FileState::Failed(format!("Couldn't read {}: {e}", f.file.filename)),
+            };
+            changed = true;
+        }
+        changed
     }
 
     // ── accounts ──
@@ -1904,6 +2179,10 @@ impl App {
                     self.send_compose();
                     return true;
                 }
+                Action::Attach => {
+                    self.attach_dialog(tx);
+                    return true;
+                }
                 Action::Close => {
                     if let Some(c) = &mut self.compose {
                         c.minimized = true;
@@ -1964,7 +2243,7 @@ impl App {
             Action::Settings => {
                 self.screen = if self.screen == Screen::Settings { Screen::Mail } else { Screen::Settings };
             }
-            Action::Send => return false,
+            Action::Send | Action::Attach => return false,
             Action::Close => {
                 if self.confirm_delete.is_some() {
                     self.confirm_delete = None;
@@ -2643,6 +2922,183 @@ mod tests {
         let c = app.compose.as_ref().expect("the composer");
         assert_eq!(c.subject.text, row.subject);
         assert!(c.to.text.contains("jordan@northwind.dev"));
+    }
+
+    // ── attachments ──
+
+    fn files(app: &App) -> Vec<(u32, String, FileState)> {
+        app.compose.as_ref().unwrap().files.iter().map(|f| (f.file.id, f.file.filename.clone(), f.state.clone())).collect()
+    }
+
+    fn sent_commands(app: &App, prefix: &str) -> Vec<String> {
+        app.sent.borrow().iter().filter(|c| c.starts_with(prefix)).cloned().collect()
+    }
+
+    fn file_in(id: u32, name: &str, size: usize) -> DraftAttachment {
+        DraftAttachment { id, filename: name.into(), mime: attach::type_for(name).into(), size }
+    }
+
+    /// A composer of the engine's (not demo mode's), with `a.pdf` and `b.png` attached.
+    fn composer_with_two_files(app: &mut App) -> i64 {
+        crate::demo::populate(app);
+        app.demo = false;
+        app.compose_new();
+        app.attach_paths(vec!["/files/a.pdf".into(), "/files/b.png".into()]);
+        let id = app.compose.as_ref().unwrap().draft_id;
+        app.apply(Event::FileAttached { draft: id, file: file_in(0, "a.pdf", 1000) }, &mut Tx::default());
+        app.apply(Event::FileAttached { draft: id, file: file_in(1, "b.png", 2000) }, &mut Tx::default());
+        id
+    }
+
+    #[test]
+    fn attached_files_show_at_once_and_join_the_draft_once_theyre_in() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        app.compose_new();
+        app.attach_paths(vec!["/files/Q3 report.pdf".into(), "/files/photo.png".into()]);
+        assert_eq!(files(&app), vec![(0, "Q3 report.pdf".into(), FileState::Attaching), (1, "photo.png".into(), FileState::Attaching)], "shown at once, as on their way");
+        let c = app.compose.as_ref().unwrap();
+        assert!(c.draft().attachments.is_empty(), "not in the draft until they're in the store");
+        // The draft is saved first, so the files have a draft to be kept with.
+        let sent = app.sent.borrow().clone();
+        let save = sent.iter().position(|c| c.starts_with("SaveDraft"));
+        let attach = sent.iter().position(|c| c.starts_with("AttachFiles"));
+        assert!(save.is_some() && save < attach, "{sent:?}");
+        let id = c.draft_id;
+        app.apply(Event::FileAttached { draft: id, file: file_in(0, "Q3 report.pdf", 48_000) }, &mut Tx::default());
+        app.apply(Event::AttachFailed { draft: id, file: 1, error: "Couldn't read photo.png: permission denied".into() }, &mut Tx::default());
+        let c = app.compose.as_ref().unwrap();
+        assert_eq!(c.draft().attachments, vec![file_in(0, "Q3 report.pdf", 48_000)]);
+        assert!(c.dirty, "and saved with it");
+        assert!(matches!(&c.files[1].state, FileState::Failed(why) if why.contains("permission denied")));
+        // An answer for another draft, or a file taken off meanwhile, changes nothing.
+        app.apply(Event::FileAttached { draft: id + 1, file: file_in(1, "photo.png", 1) }, &mut Tx::default());
+        assert!(matches!(app.compose.as_ref().unwrap().files[1].state, FileState::Failed(_)));
+    }
+
+    #[test]
+    fn a_file_taken_off_leaves_the_draft_and_its_id_isnt_reused() {
+        let mut app = App::new(true);
+        composer_with_two_files(&mut app);
+        let c = app.compose.as_mut().unwrap();
+        c.dirty = false;
+        app.remove_file(0);
+        let c = app.compose.as_ref().unwrap();
+        assert_eq!(c.draft().attachments, vec![file_in(1, "b.png", 2000)]);
+        assert!(c.dirty, "saved without it");
+        app.remove_file(1);
+        app.attach_paths(vec!["/files/c.txt".into()]);
+        assert_eq!(files(&app), vec![(2, "c.txt".into(), FileState::Attaching)], "a new id: bytes left with the draft are never another file's");
+    }
+
+    #[test]
+    fn sending_waits_for_every_file_and_refuses_too_much() {
+        let mut app = App::new(true);
+        let id = composer_with_two_files(&mut app);
+        app.compose.as_mut().unwrap().to = TextEdit::new("ana@x.com");
+        app.attach_paths(vec!["/files/slow.mov".into()]);
+        app.send_compose();
+        assert_eq!(app.compose.as_ref().unwrap().error.as_deref(), Some("Still attaching slow.mov…"));
+        app.apply(Event::AttachFailed { draft: id, file: 2, error: "slow.mov is 80.0 MB: more than a message can carry (25 MB)".into() }, &mut Tx::default());
+        app.send_compose();
+        assert_eq!(app.compose.as_ref().unwrap().error.as_deref(), Some("slow.mov isn't attached: remove it, or attach it again"));
+        app.remove_file(2);
+        // Two big ones that fit alone but not together.
+        app.attach_paths(vec!["/files/big1.mov".into(), "/files/big2.mov".into()]);
+        for (file, name) in [(3, "big1.mov"), (4, "big2.mov")] {
+            app.apply(Event::FileAttached { draft: id, file: file_in(file, name, 15 * 1024 * 1024) }, &mut Tx::default());
+        }
+        app.send_compose();
+        let error = app.compose.as_ref().unwrap().error.clone().unwrap();
+        assert!(error.starts_with("Attachments total 30.0 MB, over") && error.ends_with("Remove some to send."), "{error}");
+        assert!(sent_commands(&app, "Send").is_empty(), "nothing sent");
+        app.remove_file(4);
+        app.send_compose();
+        assert!(app.compose.is_none(), "sent");
+        let send = sent_commands(&app, "Send ");
+        assert!(send.len() == 1 && send[0].contains("a.pdf") && send[0].contains("b.png") && send[0].contains("big1.mov"), "with every file: {send:?}");
+    }
+
+    #[test]
+    fn forwarding_takes_the_originals_files_along() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let id = app.list.iter().find(|m| m.has_attachments).expect("a demo message with a file").id;
+        app.open_message(id);
+        let original = app.thread.iter().rev().find(|m| m.body.as_ref().is_some_and(|b| !b.attachments.is_empty())).unwrap().clone();
+        let names: Vec<String> = original.body.as_ref().unwrap().attachments.iter().map(|a| a.filename.clone()).collect();
+        // Demo mode: they're there at once.
+        app.compose_reply(Some(original.summary.id), false, true);
+        assert_eq!(app.compose.as_ref().unwrap().draft().attachments.iter().map(|a| a.filename.clone()).collect::<Vec<_>>(), names);
+        // With the engine: fetched into the draft, which is saved first.
+        app.demo = false;
+        app.compose = None;
+        app.compose_reply(Some(original.summary.id), false, true);
+        assert!(files(&app).iter().all(|(_, _, s)| *s == FileState::Attaching));
+        let fwd = sent_commands(&app, "AttachForwarded");
+        assert!(fwd.len() == 1 && fwd[0].contains(&format!("message: {}", original.summary.id)), "{fwd:?}");
+        assert!(app.compose.as_ref().unwrap().saved);
+        // A reply doesn't.
+        app.compose = None;
+        app.compose_reply(Some(original.summary.id), false, false);
+        assert!(app.compose.as_ref().unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn a_draft_carried_on_under_a_new_id_takes_its_files() {
+        let mut app = App::new(true);
+        let old = composer_with_two_files(&mut app);
+        let t = app.clock + 1.0;
+        app.tick(t, &mut Tx::default());
+        app.tick(t + SAVE_WHEN_IDLE + 0.1, &mut Tx::default());
+        app.attach_paths(vec!["/files/late.txt".into()]);
+        let rev = app.compose.as_ref().unwrap().submitted;
+        app.apply(Event::DraftSaveRefused { id: old, rev }, &mut Tx::default());
+        let c = app.compose.as_ref().unwrap();
+        assert_ne!(c.draft_id, old);
+        let saves = sent_commands(&app, "SaveDraftFrom");
+        assert!(saves.last().is_some_and(|s| s.contains(&format!("files_from: {old}")) && s.contains("a.pdf")), "{saves:?}");
+        let again = sent_commands(&app, "AttachFiles");
+        assert!(again.last().is_some_and(|a| a.contains(&format!("draft: {}", c.draft_id)) && a.contains("late.txt")), "the file on its way goes to the new draft: {again:?}");
+        // On close, unconfirmed, it's written with where its files are.
+        let unsaved = app.unsaved();
+        assert!(unsaved.iter().any(|u| matches!(u, Unsaved::Save { files_from: Some(f), .. } if *f == old)), "{unsaved:?}");
+    }
+
+    #[test]
+    fn files_the_store_lost_are_attached_again_or_taken_off() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let draft = Draft { account: "demo".into(), subject: "Plan".into(), attachments: vec![file_in(0, "plan.pdf", 10)], ..Draft::default() };
+        app.show_draft(5, draft, DraftRev::default(), false, None);
+        app.attach_paths(vec!["/files/notes.txt".into()]);
+        app.apply(Event::FileAttached { draft: 5, file: file_in(1, "notes.txt", 5) }, &mut Tx::default());
+        app.apply(Event::DraftFilesMissing { id: 5, files: vec![0, 1] }, &mut Tx::default());
+        assert_eq!(files(&app), vec![(1, "notes.txt".into(), FileState::Attaching)], "read again from where it came; the other can't be");
+        assert!(app.toasts.last().is_some_and(|t| t.error && t.text.contains("plan.pdf")));
+    }
+
+    #[test]
+    fn demo_mode_attaches_files_by_their_size_on_disk() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.compose_new();
+        let dir = std::env::temp_dir().join(format!("envoy-demo-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (small, big) = (dir.join("notes.txt"), dir.join("video.mov"));
+        std::fs::write(&small, b"hello").unwrap();
+        std::fs::File::create(&big).unwrap().set_len(attach::LIMIT as u64 + 1).unwrap();
+        app.attach_paths(vec![small, dir.clone(), big]);
+        assert!(files(&app).iter().all(|f| f.2 == FileState::Attaching));
+        let t = app.clock;
+        app.tick(t + 1.0, &mut Tx::default());
+        let c = app.compose.as_ref().unwrap();
+        assert_eq!((c.files[0].state.clone(), c.files[0].file.size), (FileState::Attached, 5));
+        assert!(matches!(&c.files[1].state, FileState::Failed(why) if why.contains("is a folder")));
+        assert!(matches!(&c.files[2].state, FileState::Failed(why) if why.contains("more than a message can carry")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

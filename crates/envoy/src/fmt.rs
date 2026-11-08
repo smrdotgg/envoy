@@ -42,13 +42,7 @@ pub fn full_date(ts: i64) -> String {
 }
 
 pub fn size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.0} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", bytes as f64 / 1048576.0)
-    }
+    envoy_core::attach::size_label(bytes)
 }
 
 pub fn initial(name: &str) -> String {

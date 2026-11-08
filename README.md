@@ -93,10 +93,27 @@ All rebindable under Settings → Keyboard (`mod` = ⌘ on macOS, Ctrl elsewhere
 | `s` | star | `esc` | close |
 | `u` | toggle read | `mod+,` | settings |
 | `mod+1/2/3` | inbox / starred / sent | `mod+shift+b` | toggle sidebar |
+| | | `mod+shift+a` | attach files (in the composer) |
 
 Search understands `from:`, `to:`, `subject:`, `is:unread`, `is:read`, `is:starred`,
 `has:attachment`, plus free text over subject, people and body (SQLite FTS5, instant,
 offline).
+
+## Attachments
+
+Attach files with the paperclip next to Send (or `mod+shift+a`), which opens your system's file
+picker (pick several at once), or drop files from anywhere onto the composer. Each file shows as
+a chip with its name and size, and an × to take it off; while a file is being read it says
+"Attaching…" (reading never holds up typing). Forwarding a message takes its attachments along,
+removable like any other.
+
+A message's attachments can add up to 25 MB, Gmail's limit, which most providers share: over
+it, the composer says so and won't send until some come off, rather than have the server bounce
+it later. A single file over 25 MB isn't attached at all. Files are kept with the draft on your
+computer, so they survive a crash or restart like its text, go to the Drafts folder with it,
+and are sent with it; Envoy never sends a message without a file it shows. A draft carrying big
+files is copied to the Drafts folder less often while you type (every couple of minutes at
+25 MB), since each copy sends them all again.
 
 ## How it's built
 
@@ -153,9 +170,13 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --a
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 2.0   # after z: message back, open
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png --at 2.8 # draft opened, edited, discarded: toast with Undo
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png --at 3.6 # after z: the composer back with the edit
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/attach.json --snap out.png --at 1.0 # files picked: "Attaching…"
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/attach.json --snap out.png --at 2.0 # attached, and a folder that can't be
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/attach.json --snap out.png --at 2.5 # a file dragged over the composer
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/attach.json --snap out.png --at 4.2 # dropped, and the folder taken off
 ```
 
-Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark`.
+Run from the repository root (the attach script picks files in it). Scenes: `open light dark compact bottom compose forward light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark`.
 
 HTML rendering is tested against the mail in `crates/envoy-core/tests/fixtures/html` (sources and
 licenses in its `LICENSES.md`).

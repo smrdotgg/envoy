@@ -223,6 +223,10 @@ const SCENES: &[Scene] = &[
         scene_open(s);
         s.compose_reply(None, false, false);
     }),
+    ("forward", |s| {
+        scene_open(s);
+        s.compose_reply(None, false, true);
+    }),
     ("settings", |s| s.screen = Screen::Settings),
     ("settings-keys", |s| {
         s.screen = Screen::Settings;
