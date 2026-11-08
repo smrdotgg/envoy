@@ -193,7 +193,7 @@ pub struct App {
     /// The pending list request is the user's (a search, another view): its rows show at once
     /// rather than animate in like a reload's.
     pub list_at_once: bool,
-    /// j/k pressed while the open row was below the first page of a list still coming in.
+    /// j/k waiting for the rest of a list whose first page doesn't reach where they go.
     pub pending_step: isize,
     /// The opened row (its newest message in conversation view).
     pub open: Option<MessageId>,
@@ -722,11 +722,18 @@ impl App {
     }
 
     pub fn step(&mut self, delta: isize, tx: &mut Tx) {
-        // The open row is below a first page whose rest is still coming: move on from it once
-        // the rest is here, rather than from the top.
-        if self.open.is_some() && self.index_of_open().is_none() && !self.list_complete {
-            self.pending_step += delta;
-            return;
+        // A first page whose rest is still coming: if the open row is below it, or the step
+        // would run past its end, move once the rest is here (from the open row, not the top
+        // or the page's last row). Steps after one that waits wait too, so they keep their order.
+        if !self.list_complete && self.open.is_some() {
+            let past = match self.index_of_open() {
+                Some(i) => i as isize + delta >= self.list.len() as isize,
+                None => true,
+            };
+            if past || self.pending_step != 0 {
+                self.pending_step += delta;
+                return;
+            }
         }
         if self.list.is_empty() {
             return;
@@ -1553,6 +1560,32 @@ mod tests {
         assert_eq!(app.open, Some(3));
         app.step(1, &mut tx);
         assert_eq!(app.open, Some(2), "j goes on to the next row, before any refresh");
+    }
+
+    #[test]
+    fn j_at_the_end_of_a_first_page_waits_for_the_rest() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let mut tx = Tx::default();
+        let all = long_list(&app, 500);
+        app.list = all.clone();
+        app.open = Some(100);
+        app.request_list();
+        let req = app.list_req;
+        // The open row is the first page's last: j has nowhere to go until the rest comes.
+        app.apply(Event::List { req, items: all[..100].to_vec(), more: true }, &mut tx);
+        app.step(1, &mut tx);
+        assert_eq!(app.open, Some(100), "j isn't swallowed by the page's end");
+        app.step(1, &mut tx);
+        app.apply(Event::List { req, items: all, more: false }, &mut tx);
+        assert_eq!(app.open, Some(102), "both presses count, from the open row");
+        // k inside the page needs no waiting.
+        app.request_list();
+        let req = app.list_req;
+        app.apply(Event::List { req, items: long_list(&app, 500)[..200].to_vec(), more: true }, &mut tx);
+        app.step(-1, &mut tx);
+        assert_eq!(app.open, Some(101));
     }
 
     fn move_key(app: &App) -> i64 {
