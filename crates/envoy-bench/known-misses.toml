@@ -16,183 +16,210 @@
 # Regenerate from CI result artifacts (budgets-<os>/*.json) with:
 #   envoy-bench misses --from store.json --from app.json --from size.json [...]
 # then review: drop entries that only failed under an older gate policy.
+#
+# Written 2026-11-08 from: store checks, 4 runs of each runner with today's statistics (search
+# p90 of 21, typing median of 5, open p95); app and size checks, 11 runs. The macOS runner's
+# ceilings are wide because that VM's speed varied up to 3x between runs; Linux and Windows
+# give the tighter tripwires. No entry means the check gates hard at its budget on that OS.
+
+# ── search (store) ──
+
+[[miss]]
+check = "search · archive: meeting"
+os = "linux"
+ceiling = 175
+seen = "75.6–115.9 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: meeting"
+os = "linux"
+ceiling = 89
+seen = "39.4–58.8 ms over 4 runs, over budget in 2"
+
+[[miss]]
+check = "search · inbox: typing \"from:alice\""
+os = "linux"
+ceiling = 305
+seen = "133.3–202.2 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: typing \"invoice\""
+os = "linux"
+ceiling = 250
+seen = "108.1–163.8 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · archive: from:alice"
+os = "macos"
+ceiling = 330
+seen = "42.0–218.0 ms over 4 runs, over budget in 3"
+
+[[miss]]
+check = "search · archive: is:unread"
+os = "macos"
+ceiling = 78
+seen = "34.2–51.5 ms over 4 runs, over budget in 1"
+
+[[miss]]
+check = "search · archive: meeting"
+os = "macos"
+ceiling = 265
+seen = "110.0–174.5 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: meeting"
+os = "macos"
+ceiling = 130
+seen = "50.8–85.8 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: typing \"from:alice\""
+os = "macos"
+ceiling = 285
+seen = "167.3–187.8 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: typing \"invoice\""
+os = "macos"
+ceiling = 285
+seen = "130.8–187.8 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · archive: from:alice"
+os = "windows"
+ceiling = 205
+seen = "96.1–134.0 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · archive: is:unread"
+os = "windows"
+ceiling = 160
+seen = "89.7–106.4 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · archive: meeting"
+os = "windows"
+ceiling = 385
+seen = "203.0–255.0 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: from:northwind"
+os = "windows"
+ceiling = 79
+seen = "39.2–52.1 ms over 4 runs, over budget in 1"
+
+[[miss]]
+check = "search · inbox: is:unread"
+os = "windows"
+ceiling = 82
+seen = "39.7–54.5 ms over 4 runs, over budget in 1"
+
+[[miss]]
+check = "search · inbox: meeting"
+os = "windows"
+ceiling = 210
+seen = "108.2–137.7 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: subject:lunch"
+os = "windows"
+ceiling = 87
+seen = "41.0–57.4 ms over 4 runs, over budget in 1"
+
+[[miss]]
+check = "search · inbox: to:maya"
+os = "windows"
+ceiling = 81
+seen = "35.7–53.6 ms over 4 runs, over budget in 1"
+
+[[miss]]
+check = "search · inbox: typing \"from:alice\""
+os = "windows"
+ceiling = 490
+seen = "290.1–325.5 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: typing \"invoice\""
+os = "windows"
+ceiling = 410
+seen = "247.0–272.5 ms over 4 runs, over budget in 4"
+
+# ── app, binary ──
 
 [[miss]]
 check = "app · cold start → list on screen"
 os = "linux"
-ceiling = 500
-seen = "246.9–331.2 ms over 4 runs, over budget in 4"
+ceiling = 560
+seen = "239.4–372.7 ms over 11 runs, over budget in 11"
 
 [[miss]]
 check = "app · idle memory"
 os = "linux"
-ceiling = 400
-seen = "304.6–318.8 MB over 4 runs, over budget in 4"
+ceiling = 405
+seen = "304.6–321.2 MB over 11 runs, over budget in 11"
 
 [[miss]]
 check = "app · keypress → frame"
 os = "linux"
-ceiling = 130
-seen = "56.2–86.6 ms over 4 runs, over budget in 4"
+ceiling = 160
+seen = "54.5–106.6 ms over 11 runs, over budget in 11"
 
 [[miss]]
 check = "app · search, end to end"
 os = "linux"
-ceiling = 195
-seen = "94.2–128.2 ms over 4 runs, over budget in 1"
+ceiling = 215
+seen = "89.6–142.7 ms over 11 runs, over budget in 8"
 
 [[miss]]
 check = "binary · size"
 os = "linux"
 ceiling = 38
-seen = "36.2–36.2 MB over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · archive: meeting"
-os = "linux"
-ceiling = 210
-seen = "86.9–138.9 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · inbox: meeting"
-os = "linux"
-ceiling = 84
-seen = "41.7–55.9 ms over 4 runs, over budget in 3"
-
-[[miss]]
-check = "search · inbox: typing \"from:alice\""
-os = "linux"
-ceiling = 290
-seen = "135.4–191.5 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · inbox: typing \"invoice\""
-os = "linux"
-ceiling = 230
-seen = "109.5–150.7 ms over 4 runs, over budget in 4"
+seen = "36.2–36.2 MB over 11 runs, over budget in 11"
 
 [[miss]]
 check = "app · cold start → list on screen"
 os = "macos"
-ceiling = 1365
-seen = "407.8–907.1 ms over 4 runs, over budget in 4"
+ceiling = 1725
+seen = "603.6–1150.0 ms over 11 runs, over budget in 11"
 
 [[miss]]
 check = "app · keypress → frame"
 os = "macos"
-ceiling = 48
-seen = "27.8–31.6 ms over 4 runs, over budget in 4"
+ceiling = 49
+seen = "24.8–32.6 ms over 11 runs, over budget in 11"
 
 [[miss]]
 check = "app · search, end to end"
 os = "macos"
 ceiling = 1260
-seen = "105.6–839.8 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · archive: from:alice"
-os = "macos"
-ceiling = 135
-seen = "46.9–89.2 ms over 4 runs, over budget in 3"
-
-[[miss]]
-check = "search · archive: is:unread"
-os = "macos"
-ceiling = 200
-seen = "35.3–130.3 ms over 4 runs, over budget in 3"
-
-[[miss]]
-check = "search · archive: meeting"
-os = "macos"
-ceiling = 510
-seen = "105.5–337.0 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · inbox: from:northwind"
-os = "macos"
-ceiling = 76
-seen = "14.9–50.3 ms over 4 runs, over budget in 1"
-
-[[miss]]
-check = "search · inbox: meeting"
-os = "macos"
-ceiling = 1380
-seen = "51.7–918.1 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · inbox: typing \"from:alice\""
-os = "macos"
-ceiling = 515
-seen = "197.3–340.5 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · inbox: typing \"invoice\""
-os = "macos"
-ceiling = 380
-seen = "167.7–252.9 ms over 4 runs, over budget in 4"
+seen = "101.5–839.8 ms over 11 runs, over budget in 11"
 
 [[miss]]
 check = "app · cold start → list on screen"
 os = "windows"
-ceiling = 2060
-seen = "821.9–1371.9 ms over 4 runs, over budget in 4"
+ceiling = 2460
+seen = "762.2–1639.2 ms over 11 runs, over budget in 11"
 
 [[miss]]
 check = "app · idle memory"
 os = "windows"
-ceiling = 220
-seen = "150.1–174.9 MB over 4 runs, over budget in 4"
+ceiling = 260
+seen = "145.0–204.0 MB over 11 runs, over budget in 8"
 
 [[miss]]
 check = "app · keypress → frame"
 os = "windows"
-ceiling = 605
-seen = "367.7–401.6 ms over 4 runs, over budget in 4"
+ceiling = 765
+seen = "367.7–509.3 ms over 11 runs, over budget in 11"
 
 [[miss]]
 check = "app · search, end to end"
 os = "windows"
-ceiling = 815
-seen = "332.8–541.5 ms over 4 runs, over budget in 1"
+ceiling = 1150
+seen = "332.8–764.5 ms over 11 runs, over budget in 8"
 
 [[miss]]
 check = "binary · size"
 os = "windows"
 ceiling = 35
-seen = "32.7–32.7 MB over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · archive: from:alice"
-os = "windows"
-ceiling = 145
-seen = "60.8–94.5 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · archive: is:unread"
-os = "windows"
-ceiling = 120
-seen = "61.0–79.4 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · archive: meeting"
-os = "windows"
-ceiling = 345
-seen = "147.0–227.7 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · inbox: meeting"
-os = "windows"
-ceiling = 310
-seen = "71.2–206.0 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · inbox: typing \"from:alice\""
-os = "windows"
-ceiling = 435
-seen = "190.9–289.5 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · inbox: typing \"invoice\""
-os = "windows"
-ceiling = 385
-seen = "149.9–256.4 ms over 4 runs, over budget in 4"
+seen = "32.7–32.7 MB over 11 runs, over budget in 11"
