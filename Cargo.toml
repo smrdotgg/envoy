@@ -9,7 +9,10 @@ license = "MIT"
 version = "0.1.0"
 
 [workspace.dependencies]
-rune = { path = "vendor/rune/crates/rune" }
+# Rune's default features less `svg` (SVG images and multicolour icons, rasterized by resvg:
+# Envoy's icons are single-colour and its mail images are decoded by envoy-core) and
+# `ogg-audio` (macOS Ogg/WebM playback): neither is used, both cost binary size.
+rune = { path = "vendor/rune/crates/rune", default-features = false, features = ["accessibility", "dbus", "embedded-fonts", "metal-backend"] }
 rune-kit = { path = "vendor/rune/crates/rune-kit", features = ["markdown"] }
 envoy-core = { path = "crates/envoy-core" }
 
@@ -26,6 +29,86 @@ incremental = true
 [profile.dist]
 inherits = "release"
 codegen-units = 1
-lto = "thin"
+lto = "fat"
 incremental = false
 strip = true
+
+# Code that never runs per frame or per keystroke is built for size (docs/NORTH_STAR.md: < 30 MB):
+# D-Bus and the AT-SPI bridge (Linux desktop integration), image decoders (remote images in
+# mail, off the UI thread), HTML parsing (once per message, then cached), mail parsing, IMAP,
+# SMTP, HTTP and TLS (network-bound), the engine's async runtime, the windowing system's event
+# plumbing (an event at a time), Wayland protocol tables and client-side decorations, clipboard,
+# URL parsing. Rune, wgpu, naga (shaders at startup), text shaping and rasterizing, layout,
+# SQLite, serde_json and accessibility tree updates stay at opt-level 3.
+[profile.dist.package]
+zbus = { opt-level = "s" }
+zvariant = { opt-level = "s" }
+zbus_names = { opt-level = "s" }
+accesskit_unix = { opt-level = "s" }
+accesskit_atspi_common = { opt-level = "s" }
+atspi = { opt-level = "s" }
+atspi-common = { opt-level = "s" }
+atspi-proxies = { opt-level = "s" }
+image = { opt-level = "s" }
+image-webp = { opt-level = "s" }
+zune-jpeg = { opt-level = "s" }
+zune-core = { opt-level = "s" }
+gif = { opt-level = "s" }
+png = { opt-level = "s" }
+fdeflate = { opt-level = "s" }
+miniz_oxide = { opt-level = "s" }
+flate2 = { opt-level = "s" }
+html5ever = { opt-level = "s" }
+markup5ever = { opt-level = "s" }
+markup5ever_rcdom = { opt-level = "s" }
+tendril = { opt-level = "s" }
+string_cache = { opt-level = "s" }
+htmd = { opt-level = "s" }
+html-escape = { opt-level = "s" }
+mail-parser = { opt-level = "s" }
+async-imap = { opt-level = "s" }
+imap-proto = { opt-level = "s" }
+nom = { opt-level = "s" }
+lettre = { opt-level = "s" }
+email-encoding = { opt-level = "s" }
+quoted_printable = { opt-level = "s" }
+ureq = { opt-level = "s" }
+ureq-proto = { opt-level = "s" }
+rustls = { opt-level = "s" }
+rustls-webpki = { opt-level = "s" }
+wayland-protocols = { opt-level = "s" }
+wayland-protocols-wlr = { opt-level = "s" }
+wayland-protocols-plasma = { opt-level = "s" }
+smithay-client-toolkit = { opt-level = "s" }
+sctk-adwaita = { opt-level = "s" }
+tokio = { opt-level = "s" }
+mio = { opt-level = "s" }
+futures-util = { opt-level = "s" }
+async-io = { opt-level = "s" }
+async-executor = { opt-level = "s" }
+async-process = { opt-level = "s" }
+async-broadcast = { opt-level = "s" }
+blocking = { opt-level = "s" }
+polling = { opt-level = "s" }
+winit = { opt-level = "s" }
+calloop = { opt-level = "s" }
+wayland-client = { opt-level = "s" }
+wayland-backend = { opt-level = "s" }
+wayland-cursor = { opt-level = "s" }
+x11rb = { opt-level = "s" }
+x11rb-protocol = { opt-level = "s" }
+xkbcommon-dl = { opt-level = "s" }
+xkeysym = { opt-level = "s" }
+arboard = { opt-level = "s" }
+wl-clipboard-rs = { opt-level = "s" }
+url = { opt-level = "s" }
+idna = { opt-level = "s" }
+idna_adapter = { opt-level = "s" }
+icu_normalizer = { opt-level = "s" }
+icu_properties = { opt-level = "s" }
+icu_collections = { opt-level = "s" }
+icu_provider = { opt-level = "s" }
+sha2 = { opt-level = "s" }
+rand = { opt-level = "s" }
+rand_chacha = { opt-level = "s" }
+env_logger = { opt-level = "s" }
