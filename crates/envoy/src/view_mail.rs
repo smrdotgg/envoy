@@ -306,9 +306,12 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
     let compact = t.compact;
     let preview_on = s.settings.bool("inbox.showPreview");
     let avatars = s.settings.bool("inbox.showAvatars");
-    let in_sent = matches!(&s.view, View::Role { role: Role::Sent, .. });
-    let who = if in_sent {
-        format!("To: {}", m.to.first().map(|a| a.display().to_owned()).unwrap_or_default())
+    let role = s.view_role();
+    let who = if matches!(role, Some(Role::Sent | Role::Drafts)) {
+        match m.to.first() {
+            None if role == Some(Role::Drafts) => "Draft".to_owned(),
+            first => format!("To: {}", first.map(|a| a.display().to_owned()).unwrap_or_default()),
+        }
     } else if m.thread_count > 1 && !m.participants.is_empty() {
         m.participants.clone()
     } else {

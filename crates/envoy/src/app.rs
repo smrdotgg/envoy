@@ -41,6 +41,66 @@ pub struct Compose {
     pub minimized: bool,
     pub error: Option<String>,
     pub from_open: bool,
+    /// The local draft this composer saves to: an id picked here, unique across runs.
+    pub draft_id: i64,
+    /// The draft is in the store: saved at least once, or opened from there.
+    pub saved: bool,
+    /// Edited since the last save.
+    pub dirty: bool,
+    /// Edits made, and how many of them [`App::tick`] has timed: a field reports an edit
+    /// before the frame that shows it reads the clock.
+    pub edits: u64,
+    pub timed: u64,
+    /// When (app clock) the first unsaved edit and the latest one were seen.
+    pub dirty_since: Option<f64>,
+    pub edited_at: f64,
+}
+
+/// Seconds after the last keystroke that the composer saves its draft, and the longest it
+/// goes without saving while typing continues.
+const SAVE_WHEN_IDLE: f64 = 0.8;
+const SAVE_AT_LEAST_EVERY: f64 = 3.0;
+
+impl Compose {
+    fn new(account: String, draft_id: i64) -> Compose {
+        Compose {
+            account,
+            to: TextEdit::new(""),
+            cc: TextEdit::new(""),
+            bcc: TextEdit::new(""),
+            subject: TextEdit::new(""),
+            body: TextEdit::new(""),
+            show_cc: false,
+            in_reply_to: String::new(),
+            references: String::new(),
+            reply_of: None,
+            title: "New message".into(),
+            minimized: false,
+            error: None,
+            from_open: false,
+            draft_id,
+            saved: false,
+            dirty: false,
+            edits: 0,
+            timed: 0,
+            dirty_since: None,
+            edited_at: 0.0,
+        }
+    }
+
+    pub fn draft(&self) -> Draft {
+        Draft {
+            account: self.account.clone(),
+            to: self.to.text.clone(),
+            cc: self.cc.text.clone(),
+            bcc: self.bcc.text.clone(),
+            subject: self.subject.text.clone(),
+            body: self.body.text.clone(),
+            in_reply_to: self.in_reply_to.clone(),
+            references: self.references.clone(),
+            reply_of: self.reply_of,
+        }
+    }
 }
 
 pub struct Toast {
@@ -58,6 +118,15 @@ pub enum Undo {
     Send(i64),
     /// An archive, delete or move that hasn't reached the server.
     Move(Box<MovedAway>),
+    /// A discarded composer.
+    Discard(Box<Discarded>),
+}
+
+/// A discarded composer, as it was, to put back.
+pub struct Discarded {
+    /// The key the engine holds the draft's discard under, if it had a saved draft to discard.
+    pub key: Option<i64>,
+    pub compose: Compose,
 }
 
 /// Enough to put moved messages back on screen at once, before the engine confirms.
@@ -210,8 +279,8 @@ pub struct App {
     pub compose: Option<Compose>,
     pub toasts: Vec<Toast>,
     pub toast_seq: u64,
-    /// The last undo key handed to the engine (keys must be unique across runs).
-    pub undo_key: i64,
+    /// The last stamp handed out ([`App::next_stamp`]).
+    pub last_stamp: i64,
     pub sidebar: PaneState,
     pub collapsed_sections: HashSet<String>,
     pub settings_ui: SettingsUi,
@@ -277,7 +346,7 @@ impl App {
             compose: None,
             toasts: Vec::new(),
             toast_seq: 0,
-            undo_key: 0,
+            last_stamp: 0,
             sidebar: PaneState::new(248.0).range(180.0, 420.0),
             collapsed_sections: HashSet::new(),
             settings_ui: SettingsUi {
@@ -472,7 +541,7 @@ impl App {
                 reload = true;
             }
             Event::Held { .. } => {}
-            Event::DraftOpened { .. } => {}
+            Event::DraftOpened { id, draft, restored } => self.show_draft(id, draft, restored),
         }
         reload
     }
@@ -596,7 +665,8 @@ impl App {
             req: self.list_req,
             view: self.view.clone(),
             query: self.applied_query.clone(),
-            conversations: self.conversations(),
+            // Drafts one by one: two replies drafted in one conversation are two things to finish.
+            conversations: self.conversations() && self.view_role() != Some(Role::Drafts),
             limit: 3000,
             stream: at_once,
         });
@@ -648,6 +718,10 @@ impl App {
     }
 
     pub fn open_message(&mut self, id: MessageId) {
+        if self.is_draft_row(id) {
+            self.open_draft(id);
+            return;
+        }
         if self.open == Some(id) && !self.thread.is_empty() {
             return;
         }
@@ -751,10 +825,11 @@ impl App {
         tx.instant();
     }
 
-    /// Ticks timers from `poll`: delayed mark-read, toast expiry, settings file changes.
+    /// Ticks timers from `poll`: draft autosave, delayed mark-read, toast expiry, settings file
+    /// changes.
     pub fn tick(&mut self, clock: f64, tx: &mut Tx) -> bool {
         self.clock = clock;
-        let mut changed = false;
+        let mut changed = self.autosave(clock, tx);
         if let Some((id, at)) = self.mark_read_at {
             if clock >= at {
                 if self.open == Some(id) {
@@ -865,6 +940,21 @@ impl App {
         self.mailboxes.get(account).and_then(|m| m.iter().find(|m| m.name == mailbox)).map_or(Role::Other, |m| m.role)
     }
 
+    /// What the mailbox (or role) on screen is for; None for Starred.
+    pub fn view_role(&self) -> Option<Role> {
+        match &self.view {
+            View::Role { role, .. } => Some(*role),
+            View::Mailbox { account, mailbox } => Some(self.role_of(account, mailbox)),
+            View::Starred { .. } => None,
+        }
+    }
+
+    /// A row of a Drafts list: it opens in the composer, not the reader. Local drafts the server
+    /// doesn't have yet have negative ids.
+    fn is_draft_row(&self, id: MessageId) -> bool {
+        id < 0 || self.list.iter().find(|s| s.id == id).is_some_and(|s| self.role_of(&s.account, &s.mailbox) == Role::Drafts)
+    }
+
     /// Moves messages off the list at once and tells the engine. While the undo window lasts,
     /// the toast offers Undo; deleting from Trash is for good and offers none.
     fn move_away(&mut self, ids: Vec<MessageId>, to: MoveTarget, label: String, tx: &mut Tx) {
@@ -875,7 +965,7 @@ impl App {
         };
         let forever = to == MoveTarget::Trash && in_trash;
         let window = self.settings.u32("behavior.undoSeconds");
-        let key = (window > 0 && !forever).then(|| self.next_undo_key());
+        let key = (window > 0 && !forever).then(|| self.next_stamp());
         let snapshot = key.map(|key| self.snapshot(key, &ids));
         self.send(Command::Move { ids: ids.clone(), to, thread: self.conversations(), undo: key });
         self.after_remove(&ids, tx);
@@ -904,12 +994,13 @@ impl App {
         }
     }
 
-    /// A key for [`Command::Move`]'s undo: microseconds since the epoch, so keys of held ops
-    /// left from a previous run never collide with this run's.
-    fn next_undo_key(&mut self) -> i64 {
+    /// A number no earlier run or earlier call handed out: microseconds since the epoch. For
+    /// [`Command::Move`]'s undo keys (held ops left from a previous run never collide with this
+    /// run's), draft ids, and the order of draft saves.
+    fn next_stamp(&mut self) -> i64 {
         let now = chrono::Utc::now().timestamp_micros();
-        self.undo_key = now.max(self.undo_key + 1);
-        self.undo_key
+        self.last_stamp = now.max(self.last_stamp + 1);
+        self.last_stamp
     }
 
     /// Undoes the newest action whose toast still offers Undo. False when there is none.
@@ -930,6 +1021,7 @@ impl App {
         match toast.undo {
             Some(Undo::Send(op)) => self.send(Command::UndoSend { op }),
             Some(Undo::Move(m)) => self.restore(*m, tx),
+            Some(Undo::Discard(d)) => self.undo_discard(*d),
             None => {}
         }
     }
@@ -1034,26 +1126,13 @@ impl App {
     }
 
     pub fn compose_new(&mut self) {
+        self.park_compose();
         let account = self.default_account();
         let sig = self.signature_for(&account);
-        let mut to = TextEdit::new("");
-        to.focused = true;
-        self.compose = Some(Compose {
-            account,
-            to,
-            cc: TextEdit::new(""),
-            bcc: TextEdit::new(""),
-            subject: TextEdit::new(""),
-            body: TextEdit::new(sig),
-            show_cc: false,
-            in_reply_to: String::new(),
-            references: String::new(),
-            reply_of: None,
-            title: "New message".into(),
-            minimized: false,
-            error: None,
-            from_open: false,
-        });
+        let mut c = Compose::new(account, self.next_stamp());
+        c.to.focused = true;
+        c.body = TextEdit::new(sig);
+        self.compose = Some(c);
     }
 
     /// Reply, reply all or forward the given message of the open conversation (default: the newest).
@@ -1117,31 +1196,189 @@ impl App {
             let refs = if mid.is_empty() { refs } else if refs.is_empty() { mid.clone() } else { format!("{refs} {mid}") };
             (primary.join(", "), cc_list.join(", "), format!("Re: {base}"), format!("{sig}{quoted}"), mid, refs)
         };
-        let mut body_edit = TextEdit::new(text);
-        let mut to_edit = TextEdit::new(to.clone());
+        let reply_of = if forward { None } else { Some(s.id) };
+        self.park_compose();
+        let mut c = Compose::new(account, self.next_stamp());
+        c.show_cc = !cc.is_empty();
+        c.to = TextEdit::new(to.clone());
+        c.cc = TextEdit::new(cc);
+        c.subject = TextEdit::new(subject.clone());
+        c.body = TextEdit::new(text);
         if forward || to.is_empty() {
-            to_edit.focused = true;
+            c.to.focused = true;
         } else {
-            body_edit.focused = true;
-            body_edit.anchor = 0;
-            body_edit.focus = 0;
+            c.body.focused = true;
+            c.body.anchor = 0;
+            c.body.focus = 0;
         }
-        self.compose = Some(Compose {
-            account,
-            show_cc: !cc.is_empty(),
-            to: to_edit,
-            cc: TextEdit::new(cc),
-            bcc: TextEdit::new(""),
-            subject: TextEdit::new(subject.clone()),
-            body: body_edit,
-            in_reply_to: irt,
-            references: refs,
-            reply_of: if forward { None } else { Some(s.id) },
-            title: subject,
-            minimized: false,
-            error: None,
-            from_open: false,
-        });
+        c.in_reply_to = irt;
+        c.references = refs;
+        c.reply_of = reply_of;
+        c.title = subject;
+        self.compose = Some(c);
+    }
+
+    /// A field of the composer was edited: its draft is saved shortly ([`App::autosave`]).
+    pub fn compose_edited(&mut self) {
+        if let Some(c) = &mut self.compose {
+            c.dirty = true;
+            c.edits += 1;
+        }
+    }
+
+    /// Saves the composer's draft once typing pauses, and every few seconds while it doesn't,
+    /// so a crash loses at most that much. Only hands the content to the engine: the frame never
+    /// waits on a write. True when the composer changed (it shows "Draft saved").
+    fn autosave(&mut self, clock: f64, tx: &mut Tx) -> bool {
+        let Some(c) = &mut self.compose else { return false };
+        if !c.dirty {
+            return false;
+        }
+        if c.timed != c.edits {
+            c.timed = c.edits;
+            c.edited_at = clock;
+            c.dirty_since.get_or_insert(clock);
+        }
+        let due = (c.edited_at + SAVE_WHEN_IDLE).min(c.dirty_since.unwrap_or(clock) + SAVE_AT_LEAST_EVERY);
+        if clock < due {
+            tx.wake_after(std::time::Duration::from_secs_f64(due - clock));
+            return false;
+        }
+        self.save_compose(true);
+        true
+    }
+
+    /// Saves the composer's content as its draft; `open`: it stays in the composer (and opens
+    /// again after a restart).
+    fn save_compose(&mut self, open: bool) {
+        let rev = self.next_stamp();
+        let Some(c) = &mut self.compose else { return };
+        c.dirty = false;
+        c.dirty_since = None;
+        c.saved = true;
+        let (id, draft) = (c.draft_id, c.draft());
+        self.send(Command::SaveDraft { id, draft, open, rev });
+        if self.view_role() == Some(Role::Drafts) {
+            self.request_list();
+        }
+    }
+
+    /// Puts the composer away so another can take its place: what's written in it stays in
+    /// Drafts.
+    fn park_compose(&mut self) {
+        let Some(c) = &self.compose else { return };
+        if c.dirty || c.saved {
+            self.save_compose(false);
+            self.toast("Saved to Drafts", false);
+        }
+        self.compose = None;
+    }
+
+    /// The window is closing: the composer's unsaved edits are written before the process can
+    /// exit, and it opens again on the next start.
+    pub fn on_close(&mut self) {
+        let rev = self.next_stamp();
+        let (Some(c), Some(engine)) = (&mut self.compose, &self.engine) else { return };
+        if !c.dirty {
+            return;
+        }
+        c.dirty = false;
+        if let Err(e) = engine.save_draft_now(c.draft_id, &c.draft(), true, rev) {
+            eprintln!("couldn't save the draft: {e:#}");
+        }
+    }
+
+    /// Discards the composer and its draft. What was written stays in the toast's Undo, which
+    /// brings the composer back as it was; the draft (here and on the server) goes when the
+    /// toast does. An untouched composer just closes.
+    pub fn discard_compose(&mut self, tx: &mut Tx) {
+        let Some(c) = self.compose.take() else { return };
+        if !c.dirty && !c.saved {
+            return;
+        }
+        let window = self.settings.u32("behavior.undoSeconds");
+        let key = (window > 0).then(|| self.next_stamp());
+        if c.saved {
+            self.send(Command::DiscardDraft { id: c.draft_id, undo: key });
+        }
+        let Some(key) = key else {
+            self.toast("Draft discarded", false);
+            return;
+        };
+        self.toast_seq += 1;
+        let undo = Undo::Discard(Box::new(Discarded { key: c.saved.then_some(key), compose: c }));
+        self.toasts.push(Toast { id: self.toast_seq, text: "Draft discarded".into(), undo: Some(undo), until: self.clock + window as f64, error: false, open_path: None });
+        while self.toasts.len() > 3 {
+            self.toasts.remove(0);
+        }
+        tx.wake_after(std::time::Duration::from_secs_f64(window as f64 + 0.05));
+    }
+
+    /// Undo for [`App::discard_compose`]: the composer comes back as it was, and is saved again
+    /// (which marks its draft as open in the composer).
+    fn undo_discard(&mut self, d: Discarded) {
+        if let Some(undo) = d.key {
+            self.send(Command::UndoMove { undo });
+        }
+        self.park_compose();
+        let mut c = d.compose;
+        c.minimized = false;
+        c.dirty = true;
+        c.edits += 1;
+        self.compose = Some(c);
+    }
+
+    /// Opens a Drafts row in the composer. The engine answers with the draft
+    /// ([`Event::DraftOpened`]).
+    fn open_draft(&mut self, id: MessageId) {
+        if self.demo {
+            if let Some(draft) = crate::demo::draft_for(id) {
+                self.show_draft(id, draft, false);
+            }
+            return;
+        }
+        self.send(Command::OpenDraft { id });
+    }
+
+    /// Shows a draft in the composer: opened from Drafts, back from an undone send, or
+    /// (`restored`, minimized) left there when the app last closed. The composer it replaces is
+    /// put away in Drafts, unless it's this same draft (it may have newer edits), or this is a
+    /// restore and the user already started another.
+    pub fn show_draft(&mut self, id: i64, draft: Draft, restored: bool) {
+        if let Some(c) = &mut self.compose {
+            if c.draft_id == id {
+                c.minimized &= restored;
+                return;
+            }
+            if restored {
+                return;
+            }
+        }
+        self.park_compose();
+        let mut c = Compose::new(draft.account.clone(), id);
+        c.title = if draft.subject.trim().is_empty() { "Draft".into() } else { draft.subject.clone() };
+        c.show_cc = !draft.cc.trim().is_empty() || !draft.bcc.trim().is_empty();
+        c.to = TextEdit::new(draft.to);
+        c.cc = TextEdit::new(draft.cc);
+        c.bcc = TextEdit::new(draft.bcc);
+        c.subject = TextEdit::new(draft.subject);
+        c.body = TextEdit::new(draft.body);
+        c.in_reply_to = draft.in_reply_to;
+        c.references = draft.references;
+        c.reply_of = draft.reply_of;
+        c.saved = true;
+        c.minimized = restored;
+        if !restored {
+            if c.to.text.trim().is_empty() {
+                c.to.focused = true;
+            } else {
+                // Where a reply starts too: above any quote and signature.
+                c.body.focused = true;
+                c.body.anchor = 0;
+                c.body.focus = 0;
+            }
+        }
+        self.compose = Some(c);
     }
 
     pub fn send_compose(&mut self) {
@@ -1156,23 +1393,17 @@ impl App {
                 return;
             }
         }
-        let draft = Draft {
-            account: c.account.clone(),
-            to: c.to.text.clone(),
-            cc: c.cc.text.clone(),
-            bcc: c.bcc.text.clone(),
-            subject: c.subject.text.clone(),
-            body: c.body.text.clone(),
-            in_reply_to: c.in_reply_to.clone(),
-            references: c.references.clone(),
-            reply_of: c.reply_of,
-        };
+        let (draft, draft_id) = (c.draft(), c.draft_id);
         self.compose = None;
         if self.demo {
             self.toast("Sent (demo mode — nothing left your computer)", false);
             return;
         }
-        self.send(Command::Send { draft, draft_id: None });
+        // The draft goes with it; undoing the send brings it back (Event::DraftOpened).
+        self.send(Command::Send { draft, draft_id: Some(draft_id) });
+        if self.view_role() == Some(Role::Drafts) {
+            self.request_list();
+        }
     }
 
     // ── accounts ──
@@ -1621,6 +1852,108 @@ mod tests {
         let key = move_key(&app);
         app.apply(Event::Held { undo: key, ops: 1 }, &mut tx);
         assert_eq!(move_key(&app), key);
+    }
+
+    fn type_into_body(app: &mut App, text: &str) {
+        app.compose.as_mut().unwrap().body.text.insert_str(0, text);
+        app.compose_edited();
+    }
+
+    #[test]
+    fn the_draft_saves_when_typing_pauses_and_while_it_doesnt() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        app.compose_new();
+        let dirty = |app: &App| app.compose.as_ref().unwrap().dirty;
+        app.tick(10.0, &mut tx);
+        assert!(!dirty(&app) && !app.compose.as_ref().unwrap().saved, "nothing typed, nothing saved");
+        // Typing steadily: saved within SAVE_AT_LEAST_EVERY even though it never pauses.
+        let mut t = 10.0;
+        while dirty(&app) || t == 10.0 {
+            type_into_body(&mut app, "a");
+            t += 0.25;
+            app.tick(t, &mut tx);
+            assert!(t < 10.0 + SAVE_AT_LEAST_EVERY + 0.3, "saved while typing continues");
+        }
+        assert!(t >= 10.0 + SAVE_AT_LEAST_EVERY, "but not on every keystroke (saved at {t})");
+        assert!(app.compose.as_ref().unwrap().saved);
+        // One more keystroke: saved once typing pauses.
+        type_into_body(&mut app, "b");
+        app.tick(t + 0.1, &mut tx);
+        assert!(dirty(&app));
+        app.tick(t + 0.1 + SAVE_WHEN_IDLE / 2.0, &mut tx);
+        assert!(dirty(&app), "still typing, as far as it knows");
+        app.tick(t + 0.1 + SAVE_WHEN_IDLE, &mut tx);
+        assert!(!dirty(&app), "saved after the pause");
+    }
+
+    #[test]
+    fn a_discarded_composer_comes_back_with_undo() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        // Untouched: just closes.
+        app.compose_new();
+        app.discard_compose(&mut tx);
+        assert!(app.compose.is_none() && app.toasts.is_empty());
+        // Written in: a toast with Undo, which brings it back as it was.
+        app.compose_new();
+        type_into_body(&mut app, "Dear Ana,");
+        let id = app.compose.as_ref().unwrap().draft_id;
+        app.discard_compose(&mut tx);
+        assert!(app.compose.is_none());
+        assert_eq!(app.toasts.last().map(|t| t.text.as_str()), Some("Draft discarded"));
+        assert!(app.undo_last(&mut tx));
+        let c = app.compose.as_ref().expect("back");
+        assert_eq!((c.draft_id, c.body.text.starts_with("Dear Ana,")), (id, true));
+        assert!(c.dirty, "saved again, as open in the composer");
+    }
+
+    #[test]
+    fn opening_a_draft_puts_the_composer_away_in_drafts() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.compose_new();
+        type_into_body(&mut app, "Unfinished");
+        let first = app.compose.as_ref().unwrap().draft_id;
+        let other = Draft { account: "demo".into(), subject: "Other".into(), body: "Other text".into(), ..Draft::default() };
+        app.show_draft(first + 1, other.clone(), false);
+        assert_eq!(app.toasts.last().map(|t| t.text.as_str()), Some("Saved to Drafts"));
+        let c = app.compose.as_ref().unwrap();
+        assert_eq!((c.draft_id, c.subject.text.as_str(), c.saved, c.minimized), (first + 1, "Other", true, false));
+        // The same draft again (say, Undo send while it's open): the composer keeps its edits.
+        type_into_body(&mut app, "More ");
+        app.show_draft(first + 1, other, false);
+        assert!(app.compose.as_ref().unwrap().body.text.starts_with("More "));
+    }
+
+    #[test]
+    fn the_draft_left_open_comes_back_minimized_unless_another_is_open() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let left = Draft { account: "demo".into(), subject: "Left open".into(), ..Draft::default() };
+        app.apply(Event::DraftOpened { id: 5, draft: left.clone(), restored: true }, &mut Tx::default());
+        let c = app.compose.as_ref().unwrap();
+        assert_eq!((c.draft_id, c.minimized), (5, true));
+        // Already writing something else: that stays; the restored one waits in Drafts.
+        app.compose_new();
+        let writing = app.compose.as_ref().unwrap().draft_id;
+        app.apply(Event::DraftOpened { id: 6, draft: left, restored: true }, &mut Tx::default());
+        assert_eq!(app.compose.as_ref().unwrap().draft_id, writing);
+    }
+
+    #[test]
+    fn a_drafts_row_opens_in_the_composer() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.go(View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() });
+        let row = app.list.first().expect("a sample draft").clone();
+        app.open_message(row.id);
+        assert_eq!(app.open, None, "not the reader");
+        let c = app.compose.as_ref().expect("the composer");
+        assert_eq!(c.subject.text, row.subject);
+        assert!(c.to.text.contains("jordan@northwind.dev"));
     }
 
     #[test]

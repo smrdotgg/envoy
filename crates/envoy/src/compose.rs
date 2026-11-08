@@ -30,6 +30,7 @@ fn plain_input(edit: &rune::TextEdit, placeholder: &str, key: &str, access: fn(&
         .placeholder(placeholder)
         .label(placeholder)
         .on_edit(move |s: &mut App| access(s))
+        .on_change(|s: &mut App, _: &mut Tx| s.compose_edited())
         .build(k)
         .key(key.to_owned())
 }
@@ -76,7 +77,7 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
                 .control_size(ControlSize::Small)
                 .label("Discard draft")
                 .help("Discard")
-                .on_press(|s: &mut App| s.compose = None)
+                .on_press_tx(|s: &mut App, tx: &mut Tx| s.discard_compose(tx))
                 .build(k)
                 .key("compose-close"),
         );
@@ -110,6 +111,7 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
                     c.account = id;
                     c.from_open = false;
                 }
+                s.compose_edited();
             })
             .build(k, layer);
         fields = fields.child(field_row(t, "From", select, None));
@@ -161,7 +163,8 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
                 .color(ink)
                 .placeholder("Write your message", k.c.text_faint)
                 .caret(ink, k.selection())
-                .on_edit(|s: &mut App| &mut c(s).body),
+                .on_edit(|s: &mut App| &mut c(s).body)
+                .on_input_change(|s: &mut App, _: &mut Tx| s.compose_edited()),
         );
 
     let send_label = key_label(&s.settings, "keys.send");
@@ -195,6 +198,17 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
         );
     if let Some(e) = &cm.error {
         footer = footer.child(text(e.clone()).font(k.ty.text_xsmall).color(k.c.danger.fg).truncate().grow(1.0).min_w(0.0));
+    } else if cm.saved && !cm.dirty {
+        footer = footer.child(
+            text("Draft saved")
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_faint)
+                .help("Saved on this computer, and to your Drafts folder on the server")
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0)
+                .key("compose-saved"),
+        );
     } else {
         footer = footer.child(el().grow(1.0));
     }
@@ -203,7 +217,7 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
             .variant(ButtonVariant::Ghost)
             .control_size(ControlSize::Regular)
             .icon(&icons::TRASH)
-            .on_press(|s: &mut App| s.compose = None)
+            .on_press_tx(|s: &mut App, tx: &mut Tx| s.discard_compose(tx))
             .build(k)
             .key("compose-discard"),
     );

@@ -230,7 +230,19 @@ const SCENES: &[Scene] = &[
         s.view = View::Role { account: Some("demo".into()), role: Role::Sent };
         s.list = demo::list_for(&s.view);
     }),
+    ("drafts", scene_drafts),
+    ("draft", |s| {
+        scene_drafts(s);
+        if let Some(id) = s.list.first().map(|m| m.id) {
+            s.open_message(id);
+        }
+    }),
 ];
+
+fn scene_drafts(s: &mut App) {
+    s.view = View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() };
+    s.list = demo::list_for(&s.view);
+}
 
 fn main() {
     bench::started();
@@ -246,5 +258,6 @@ fn main() {
         ..AppSpec::new("Envoy", (1280.0, 820.0), init, view)
     };
     let chrome = Chrome { full_size_content: true, traffic_lights: Some((16.0, 25.0)), drag_regions: true };
-    bench::attach(rune::App::new(spec).chrome(chrome)).run();
+    // Closing writes the composer's unsaved edits before the process can exit.
+    bench::attach(rune::App::new(spec).chrome(chrome).on_close(|s, _| s.on_close())).run();
 }
