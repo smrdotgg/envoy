@@ -122,15 +122,15 @@ jobs:
       # the entries are per check and per OS, and each has a ceiling.
       - name: "Budget: open a cached message < 50 ms"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/store.json" --from "$MAILBOX/app.json" --only "open · " --only "app · open message" --label "${{ matrix.os }}"
-      - name: "Budget: binary size < 30 MB (KNOWN BUDGET MISS on Linux, Windows)"
+      - name: "Budget: binary size < 30 MB (KNOWN BUDGET MISS on Linux)"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/size.json" --only "binary · " --label "${{ matrix.os }}"
-      - name: "Budget: local search < 50 ms (KNOWN BUDGET MISS: some queries)"
+      - name: "Budget: local search < 50 ms (KNOWN BUDGET MISS: end to end)"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/store.json" --from "$MAILBOX/app.json" --only "search · " --only "app · search, end to end" --label "${{ matrix.os }}"
       - name: "Budget: cold start above the OS launch floor < 100 ms (KNOWN BUDGET MISS)"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/app.json" --only "app · cold start" --label "${{ matrix.os }}"
       - name: "Budget: keypress → frame < 16 ms (KNOWN BUDGET MISS)"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/app.json" --only "app · keypress → frame" --label "${{ matrix.os }}"
-      - name: "Budget: idle memory < 150 MB (KNOWN BUDGET MISS on Linux, Windows)"
+      - name: "Budget: idle memory < 150 MB (KNOWN BUDGET MISS on Linux)"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/app.json" --only "app · idle memory" --label "${{ matrix.os }}"
 
       - name: Upload results and app logs

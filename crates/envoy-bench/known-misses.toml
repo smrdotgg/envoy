@@ -18,231 +18,88 @@
 # then review: drop entries that only failed under an older gate policy.
 #
 # Listed: every check that measured over its budget on that runner, or a store search/open
-# timing at 80% of its budget or more, where run-to-run swings of ±20% (the Windows runner's
-# Inbox is:unread median: 33–46 ms) would flake a hard gate. Near-budget entries will often
-# raise the promote warning: they pass some runs.
+# timing at 80% of its budget or more, where run-to-run swings of ±20% would flake a hard gate.
+# Near-budget entries will often raise the promote warning: they pass some runs.
 #
-# Written 2026-11-08 from: store checks, 11 runs of each runner with today's statistics (search
-# median of 21, typing median of 5 per keystroke, open p95 of 40); app and size checks, 18 runs. The macOS runner's
-# ceilings are wide because that VM's speed varied up to 3x between runs; Linux and Windows
-# give the tighter tripwires. No entry means the check gates hard at its budget on that OS.
+# Written 2026-11-08 from the perf branch's CI runs: app checks, 6 runs of each runner; cold
+# start, 9 runs (the startup code didn't change across them); store and size checks, 9 runs.
+# Every store search and open now passes with room on every runner (the worst query median:
+# 9 ms Linux, 12 ms macOS, 21 ms Windows), and so do Windows' binary size (29.8 MB) and idle
+# memory (131–133 MB): their entries are gone. What's left is the runners' software GPUs
+# (lavapipe on Linux, WARP on Windows, a paravirtualized one in the macOS VM): cold start above
+# the OS floor is mostly Rune's own start there (70–1070 ms; 4 ms on an M4 Pro), and frames wait
+# on software rasterizing. On the M4 Pro, cold start (8 ms above the floor), keypress → frame
+# (p95 15–16 ms) and open pass; search end to end (p95 55 ms on its 60 Hz display) and idle
+# memory don't (see the PR that wrote this). No entry means the check gates hard at its budget.
 
-# ── search (store) ──
+# ── cold start, above the OS's own launch floor ──
 
 [[miss]]
-check = "search · archive: from:alice"
+check = "app · cold start → list on screen, above OS floor"
 os = "linux"
-ceiling = 71
-seen = "29.3–47.1 ms over 11 runs, over or within 20% of budget in 5"
+ceiling = 475
+seen = "184.9–313.9 ms over 9 runs, over or within 20% of budget in 9"
 
 [[miss]]
-check = "search · archive: is:unread"
-os = "linux"
-ceiling = 61
-seen = "25.4–40.2 ms over 11 runs, over or within 20% of budget in 1"
-
-[[miss]]
-check = "search · archive: meeting"
-os = "linux"
-ceiling = 175
-seen = "71.0–115.2 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · inbox: meeting"
-os = "linux"
-ceiling = 84
-seen = "34.4–55.7 ms over 11 runs, over or within 20% of budget in 8"
-
-[[miss]]
-check = "search · inbox: typing \"from:alice\""
-os = "linux"
-ceiling = 305
-seen = "126.2–202.2 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · inbox: typing \"invoice\""
-os = "linux"
-ceiling = 250
-seen = "102.7–163.8 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · archive: from:alice"
+check = "app · cold start → list on screen, above OS floor"
 os = "macos"
-ceiling = 79
-seen = "35.7–52.5 ms over 11 runs, over or within 20% of budget in 8"
+ceiling = 1045
+seen = "256.4–695.9 ms over 9 runs, over or within 20% of budget in 9"
 
 [[miss]]
-check = "search · archive: is:unread"
-os = "macos"
-ceiling = 63
-seen = "29.4–41.4 ms over 11 runs, over or within 20% of budget in 1"
-
-[[miss]]
-check = "search · archive: meeting"
-os = "macos"
-ceiling = 230
-seen = "88.1–150.7 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · inbox: meeting"
-os = "macos"
-ceiling = 105
-seen = "40.9–69.9 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · inbox: typing \"from:alice\""
-os = "macos"
-ceiling = 340
-seen = "158.4–223.9 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · inbox: typing \"invoice\""
-os = "macos"
-ceiling = 285
-seen = "120.9–187.8 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · archive: from:alice"
+check = "app · cold start → list on screen, above OS floor"
 os = "windows"
-ceiling = 155
-seen = "71.2–100.0 ms over 11 runs, over or within 20% of budget in 11"
+ceiling = 1895
+seen = "740.2–1262.6 ms over 9 runs, over or within 20% of budget in 9"
+
+# ── frames ──
 
 [[miss]]
-check = "search · archive: is:unread"
-os = "windows"
-ceiling = 150
-seen = "66.3–96.8 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · archive: meeting"
-os = "windows"
-ceiling = 335
-seen = "146.4–223.1 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · inbox: from:alice"
-os = "windows"
-ceiling = 64
-seen = "30.1–42.4 ms over 11 runs, over or within 20% of budget in 1"
-
-[[miss]]
-check = "search · inbox: from:northwind"
-os = "windows"
-ceiling = 68
-seen = "31.7–45.3 ms over 11 runs, over or within 20% of budget in 5"
-
-[[miss]]
-check = "search · inbox: is:unread"
-os = "windows"
-ceiling = 70
-seen = "33.1–46.3 ms over 11 runs, over or within 20% of budget in 4"
-
-[[miss]]
-check = "search · inbox: meeting"
-os = "windows"
-ceiling = 180
-seen = "83.1–117.7 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · inbox: subject:lunch"
-os = "windows"
-ceiling = 71
-seen = "32.7–46.9 ms over 11 runs, over or within 20% of budget in 6"
-
-[[miss]]
-check = "search · inbox: to:maya"
-os = "windows"
-ceiling = 64
-seen = "29.8–42.3 ms over 11 runs, over or within 20% of budget in 3"
-
-[[miss]]
-check = "search · inbox: typing \"from:alice\""
-os = "windows"
-ceiling = 510
-seen = "238.2–336.9 ms over 11 runs, over or within 20% of budget in 11"
-
-[[miss]]
-check = "search · inbox: typing \"invoice\""
-os = "windows"
-ceiling = 415
-seen = "212.3–275.2 ms over 11 runs, over or within 20% of budget in 11"
-
-# ── app, binary ──
-
-[[miss]]
-check = "app · cold start → list on screen"
+check = "app · keypress → frame"
 os = "linux"
-ceiling = 560
-seen = "216.8–372.7 ms over 18 runs, over or within 20% of budget in 18"
+ceiling = 62
+seen = "22.0–41.1 ms over 6 runs, over or within 20% of budget in 6"
+
+[[miss]]
+check = "app · keypress → frame"
+os = "macos"
+ceiling = 33
+seen = "14.5–21.4 ms over 6 runs, over or within 20% of budget in 5"
+
+[[miss]]
+check = "app · keypress → frame"
+os = "windows"
+ceiling = 515
+seen = "276.4–341.2 ms over 6 runs, over or within 20% of budget in 6"
+
+[[miss]]
+check = "app · search, end to end"
+os = "linux"
+ceiling = 130
+seen = "40.8–85.7 ms over 6 runs, over or within 20% of budget in 3"
+
+[[miss]]
+check = "app · search, end to end"
+os = "macos"
+ceiling = 99
+seen = "57.5–65.5 ms over 6 runs, over or within 20% of budget in 6"
+
+[[miss]]
+check = "app · search, end to end"
+os = "windows"
+ceiling = 625
+seen = "257.8–413.5 ms over 6 runs, over or within 20% of budget in 6"
+
+# ── memory, binary ──
 
 [[miss]]
 check = "app · idle memory"
 os = "linux"
-ceiling = 405
-seen = "304.4–321.2 MB over 18 runs, over or within 20% of budget in 18"
-
-[[miss]]
-check = "app · keypress → frame"
-os = "linux"
-ceiling = 160
-seen = "51.0–106.6 ms over 18 runs, over or within 20% of budget in 18"
-
-[[miss]]
-check = "app · search, end to end"
-os = "linux"
-ceiling = 215
-seen = "85.2–142.7 ms over 18 runs, over or within 20% of budget in 15"
+ceiling = 325
+seen = "242.7–259.1 MB over 6 runs, over or within 20% of budget in 6"
 
 [[miss]]
 check = "binary · size"
 os = "linux"
-ceiling = 38
-seen = "36.2–36.2 MB over 18 runs, over or within 20% of budget in 18"
-
-[[miss]]
-check = "app · cold start → list on screen"
-os = "macos"
-ceiling = 1725
-seen = "425.9–1150.0 ms over 18 runs, over or within 20% of budget in 18"
-
-[[miss]]
-check = "app · keypress → frame"
-os = "macos"
-ceiling = 49
-seen = "24.8–32.6 ms over 18 runs, over or within 20% of budget in 18"
-
-[[miss]]
-check = "app · search, end to end"
-os = "macos"
-ceiling = 1260
-seen = "96.8–839.8 ms over 18 runs, over or within 20% of budget in 18"
-
-[[miss]]
-check = "app · cold start → list on screen"
-os = "windows"
-ceiling = 2460
-seen = "762.2–1639.2 ms over 18 runs, over or within 20% of budget in 18"
-
-[[miss]]
-check = "app · idle memory"
-os = "windows"
-ceiling = 260
-seen = "144.3–204.0 MB over 18 runs, over or within 20% of budget in 10"
-
-[[miss]]
-check = "app · keypress → frame"
-os = "windows"
-ceiling = 795
-seen = "358.4–528.1 ms over 18 runs, over or within 20% of budget in 18"
-
-[[miss]]
-check = "app · search, end to end"
-os = "windows"
-ceiling = 1150
-seen = "332.8–764.5 ms over 18 runs, over or within 20% of budget in 15"
-
-[[miss]]
-check = "binary · size"
-os = "windows"
-ceiling = 35
-seen = "32.7–32.7 MB over 18 runs, over or within 20% of budget in 18"
+ceiling = 33
+seen = "31.1–31.1 MB over 9 runs, over or within 20% of budget in 9"
