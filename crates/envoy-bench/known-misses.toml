@@ -103,3 +103,9 @@ check = "binary · size"
 os = "linux"
 ceiling = 33
 seen = "31.1–31.1 MB over 9 runs, over or within 20% of budget in 9"
+
+[[miss]]
+check = "binary · size"
+os = "windows"
+ceiling = 30.8
+seen = "30.31 MB after drafts (#3); main was 29.81 MB; tracked by a size-trim task"
