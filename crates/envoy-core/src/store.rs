@@ -167,6 +167,7 @@ DROP INDEX IF EXISTS messages_list;
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages (account, mailbox, date DESC, id DESC, flags, held_op, has_attachments, thread, message_id, from_email, from_name);
 CREATE INDEX IF NOT EXISTS messages_held ON messages (held_op) WHERE held_op != 0;
 CREATE INDEX IF NOT EXISTS messages_held_box ON messages (account, mailbox, flags, held_op) WHERE held_op != 0;
+CREATE INDEX IF NOT EXISTS messages_deleted_box ON messages (account, mailbox, flags, held_op) WHERE flags & 16 != 0;
 CREATE INDEX IF NOT EXISTS ops_batch ON ops (batch) WHERE batch != 0;
 ";
 
@@ -268,13 +269,23 @@ END;
 COMMIT;
 ";
 
-/// The server's counts minus messages waiting for a move (see [`Store::set_counts`]). Runs
-/// under the writer lock after every STATUS, so the subqueries must not scan the mailbox:
-/// they read only the few held rows, from messages_held_box.
+/// The server's counts minus messages waiting for a move, and messages flagged \Deleted (see
+/// [`Store::set_counts`]). Runs under the writer lock after every STATUS, so the subqueries
+/// must not scan the mailbox: they read only the few held or flagged rows, from
+/// messages_held_box and messages_deleted_box.
 const SET_COUNTS: &str = "UPDATE mailboxes SET
-    unread = MAX(0, ?3 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0 AND flags & 1 = 0)),
-    total = MAX(0, ?4 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0))
+    unread = MAX(0, ?3 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0 AND flags & 1 = 0)
+                       - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND flags & 16 != 0 AND held_op = 0 AND flags & 1 = 0)),
+    total = MAX(0, ?4 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0)
+                     - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND flags & 16 != 0 AND held_op = 0))
  WHERE account = ?1 AND name = ?2";
+
+/// Trims a mailbox's cache to its newest `?3` messages to show: neither held ones (waiting for
+/// a move) nor ones flagged \Deleted count, and held ones are never evicted. Flagged ones
+/// newer than the oldest kept stay (hidden; counted out of the server's counts). Walks the
+/// mailbox's UID index from the top: it reads the window, not the mailbox.
+const TRIM: &str = "DELETE FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op = 0 AND uid < (
+    SELECT uid FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op = 0 AND flags & 16 = 0 ORDER BY uid DESC LIMIT 1 OFFSET ?3 - 1)";
 
 fn has_autoincrement(conn: &Connection, table: &str) -> Result<bool> {
     let sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1", params![table], |r| r.get(0))?;
@@ -535,7 +546,8 @@ impl Store {
 
     /// Applies the server's counts. Messages waiting for a move to replay are still on the
     /// server, so they're in its counts, but they've already left this mailbox locally (and
-    /// undo adds them back): they're taken out here so nothing is counted twice.
+    /// undo adds them back): they're taken out here so nothing is counted twice. So are the
+    /// messages known to be flagged \Deleted, which STATUS counts but Envoy doesn't show.
     pub fn set_counts(&self, account: &str, name: &str, unread: u32, total: u32) -> Result<()> {
         self.conn.execute(SET_COUNTS, params![account, name, unread, total])?;
         Ok(())
@@ -713,13 +725,11 @@ impl Store {
             self.delete_uids(account, mailbox, &gone)?;
             changed = true;
         }
-        // Trim: keep the newest `window` visible messages. Messages waiting for a move to
+        // Trim: keep the newest `window` messages to show. Messages waiting for a move to
         // replay don't count and are never evicted: undo needs them, and a sync (which only
-        // fetches UIDs above the highest one cached) would never bring them back.
-        let trimmed = self.conn.execute(
-            "DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op = 0 ORDER BY uid DESC LIMIT -1 OFFSET ?3)",
-            params![account, mailbox, window],
-        )?;
+        // fetches UIDs above the highest one cached) would never bring them back. Messages
+        // flagged \Deleted don't count either.
+        let trimmed = self.conn.execute(TRIM, params![account, mailbox, window.max(1)])?;
         Ok(changed || trimmed > 0)
     }
 
@@ -730,11 +740,12 @@ impl Store {
         Ok(out)
     }
 
-    /// UIDs to download in full: the newest `limit` in the mailbox that have no body yet and
+    /// UIDs to download in full: of the newest `limit` in the mailbox to show (not held for a
+    /// move, not flagged \Deleted), the ones that have no body yet and
     /// are smaller than `max_size` bytes.
     pub fn missing_bodies(&self, account: &str, mailbox: &str, limit: u32, max_size: u32) -> Result<Vec<u32>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT uid FROM (SELECT uid, has_body, size FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op = 0 ORDER BY date DESC LIMIT ?3)
+            "SELECT uid FROM (SELECT uid, has_body, size FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op = 0 AND flags & 16 = 0 ORDER BY date DESC LIMIT ?3)
              WHERE has_body = 0 AND size <= ?4",
         )?;
         let rows = stmt.query_map(params![account, mailbox, limit, max_size], |r| r.get(0))?;
@@ -1917,6 +1928,69 @@ mod tests {
         assert!(s.summary(id).unwrap().is_none(), "the first move still owns it");
     }
 
+    /// Ten INBOX messages, UIDs 1 to 10, unread; the newest four flagged \Deleted.
+    fn with_deleted(s: &Store) {
+        s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        for uid in 1..=10u32 {
+            let fl = if uid > 6 { flags::DELETED } else { 0 };
+            s.upsert_header("a", "INBOX", uid, fl, 10, 0, &parsed("Hi", &format!("<{uid}@x>"), "", "Ana <ana@x.com>", uid)).unwrap();
+        }
+    }
+
+    #[test]
+    fn messages_flagged_deleted_dont_count_toward_the_window() {
+        let s = Store::memory();
+        with_deleted(&s);
+        let local = s.local_uids("a", "INBOX").unwrap();
+        let server: HashMap<u32, u32> = local.iter().copied().collect();
+        s.reconcile("a", "INBOX", &local, &server, 5).unwrap();
+        let shown: Vec<u32> = inbox(&s).iter().map(|m| m.uid).collect();
+        assert_eq!(shown, vec![6, 5, 4, 3, 2], "five to show, not two");
+    }
+
+    #[test]
+    fn trimming_reads_the_window_not_the_mailbox() {
+        let s = Store::memory();
+        s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        s.transaction(|st| {
+            for uid in 1..=5_000u32 {
+                st.conn.execute("INSERT INTO messages (account, mailbox, uid, date, flags) VALUES ('a', 'INBOX', ?1, ?1, ?2)", params![uid, if uid % 7 == 0 { 16 } else { 0 }])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        for stats in ["without statistics", "after ANALYZE"] {
+            if stats == "after ANALYZE" {
+                s.conn.execute_batch("ANALYZE").unwrap();
+            }
+            let plan: Vec<String> =
+                s.conn.prepare(&format!("EXPLAIN QUERY PLAN {TRIM}")).unwrap().query_map(params!["a", "INBOX", 100], |r| r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert!(plan.iter().all(|d| !d.starts_with("SCAN") && !d.contains("TEMP B-TREE")), "{stats}: {plan:?}");
+            assert!(plan.iter().filter(|d| d.starts_with("SEARCH messages USING") && d.contains("(account=? AND mailbox=?")).count() == 2, "{stats}: {plan:?}");
+        }
+        s.conn.execute(TRIM, params!["a", "INBOX", 100]).unwrap();
+        let shown: i64 = s.conn.query_row("SELECT COUNT(*) FROM messages WHERE flags & 16 = 0", [], |r| r.get(0)).unwrap();
+        assert_eq!(shown, 100);
+    }
+
+    #[test]
+    fn messages_flagged_deleted_arent_downloaded_ahead() {
+        let s = Store::memory();
+        with_deleted(&s);
+        let mut ahead = s.missing_bodies("a", "INBOX", 3, u32::MAX).unwrap();
+        ahead.sort();
+        assert_eq!(ahead, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn messages_flagged_deleted_arent_counted() {
+        let s = Store::memory();
+        with_deleted(&s);
+        // STATUS counts everything in the mailbox, flagged \Deleted or not.
+        s.set_counts("a", "INBOX", 10, 10).unwrap();
+        assert_eq!(counts(&s), (6, 6), "no phantom unread");
+    }
+
     #[test]
     fn server_counts_dont_scan_a_big_mailbox() {
         let s = Store::memory();
@@ -1946,8 +2020,9 @@ mod tests {
             }
             let plan = plan();
             let on_messages: Vec<&String> = plan.iter().filter(|d| d.contains(" messages ")).collect();
-            assert_eq!(on_messages.len(), 2, "{stats}: {plan:?}");
-            assert!(on_messages.iter().all(|d| d.starts_with("SEARCH") && d.contains("COVERING INDEX messages_held_box ")), "{stats}: {plan:?}");
+            assert_eq!(on_messages.len(), 4, "{stats}: {plan:?}");
+            let by = |index: &str| on_messages.iter().filter(|d| d.starts_with("SEARCH") && d.contains(&format!("COVERING INDEX {index} "))).count();
+            assert_eq!((by("messages_held_box"), by("messages_deleted_box")), (2, 2), "{stats}: {plan:?}");
         }
         s.set_counts("a", "INBOX", 2_500, 5_000).unwrap();
         let m = s.mailboxes("a").unwrap().remove(0);
