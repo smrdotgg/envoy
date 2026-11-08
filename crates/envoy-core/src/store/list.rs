@@ -4,7 +4,7 @@
 //! (`i`, `from:`, a common word in Archive). It never reads more than it shows:
 //!
 //! 1. Free text is looked up in the full-text index once, into a bitset of message ids.
-//! 2. Rows stream newest first, by the covering index `messages_list` (one ordered scan per
+//! 2. Rows stream newest first, by the covering index `messages_by_date` (one ordered scan per
 //!    mailbox of the view, merged by SQLite), reading only what grouping needs, and stop at the
 //!    first conversation past `limit`. A query whose words match only a few messages is driven
 //!    from those instead (fetched by id, then sorted), so a rare word in a big folder costs what
@@ -22,7 +22,14 @@ use rusqlite::{Row, params_from_iter};
 use super::{Query, SUMMARY_COLS, Store, fts_term, summary_row};
 use crate::model::{Address, Role, Summary, View, flags};
 
-/// What grouping reads, all in `messages_list`: the scan never touches the table.
+/// The list's order, in every query that feeds it: newest first, and among messages of the
+/// same second the newer id (stored later) first. Ids never change, so neither does the order
+/// of a row when its flags do; and the scan, the few-matches path and the thread pass all meet
+/// rows in this order, so which copy of a message stored twice counts (the first) can't
+/// depend on which of them read it.
+const ORDER: &str = "m.date DESC, m.id DESC";
+
+/// What grouping reads, all in `messages_by_date`: the scan never touches the table.
 const LIGHT_COLS: &str = "m.id, m.account, m.thread, m.message_id, m.date, m.flags, m.has_attachments, m.from_name, m.from_email";
 
 /// A query whose words match at most this many messages is driven from its matches.
@@ -267,35 +274,8 @@ impl Store {
         };
 
         // The scan, newest first.
-        let mut args: Vec<SqlValue> = Vec::new();
         let few = hits.as_ref().filter(|h| h.ids.len() <= FEW_HITS);
-        let sql = match (&scope, few) {
-            (_, Some(h)) => {
-                // Few matches: fetch them by id and sort; no need to scan the folder.
-                args.push(SqlValue::from(ids_json(&h.ids)));
-                args.extend(filter.args.iter().cloned());
-                let within = scope_sql(&scope, &mut args);
-                format!("SELECT {LIGHT_COLS} FROM messages m WHERE m.id IN (SELECT value FROM json_each(?)) AND {} AND {within} ORDER BY m.date DESC", filter.sql())
-            }
-            (Scope::Boxes(boxes), None) => {
-                // One ordered index scan per mailbox; SQLite merges them by date.
-                let arms: Vec<String> = boxes
-                    .iter()
-                    .map(|(a, b)| {
-                        args.push(a.clone().into());
-                        args.push(b.clone().into());
-                        args.extend(filter.args.iter().cloned());
-                        format!("SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_list WHERE m.account = ? AND m.mailbox = ? AND {}", filter.sql())
-                    })
-                    .collect();
-                if arms.len() == 1 { format!("{} ORDER BY m.date DESC", arms[0]) } else { format!("{} ORDER BY 5 DESC", arms.join(" UNION ALL ")) }
-            }
-            (Scope::Starred(_), None) => {
-                args.extend(filter.args.iter().cloned());
-                let within = scope_sql(&scope, &mut args);
-                format!("SELECT {LIGHT_COLS} FROM messages m WHERE {} AND {within} ORDER BY m.date DESC", filter.sql())
-            }
-        };
+        let (sql, args) = scan_sql(&scope, &filter, few);
         // One snapshot for the scan, the thread pass and the full reads, while sync writes.
         let _read = self.conn.unchecked_transaction()?;
         // Rows handed out already, and how many of `g.out` they came from.
@@ -358,7 +338,7 @@ impl Store {
                 Scope::Starred(_) => scope_sql(scope, &mut args),
             };
             let sql = format!(
-                "SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_thread WHERE m.account = ? AND m.thread IN (SELECT value FROM json_each(?)) AND {} AND {within} ORDER BY m.date DESC",
+                "SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_thread WHERE m.account = ? AND m.thread IN (SELECT value FROM json_each(?)) AND {} AND {within} ORDER BY {ORDER}",
                 filter.sql()
             );
             let mut stmt = self.conn.prepare(&sql)?;
@@ -401,6 +381,40 @@ impl Store {
     }
 }
 
+/// The scan's SQL and its arguments: a view's matches in [`ORDER`].
+fn scan_sql(scope: &Scope, filter: &Filter, few: Option<&Hits>) -> (String, Vec<SqlValue>) {
+    let mut args: Vec<SqlValue> = Vec::new();
+    let sql = match (scope, few) {
+        (_, Some(h)) => {
+            // Few matches: fetch them by id and sort; no need to scan the folder.
+            args.push(SqlValue::from(ids_json(&h.ids)));
+            args.extend(filter.args.iter().cloned());
+            let within = scope_sql(scope, &mut args);
+            format!("SELECT {LIGHT_COLS} FROM messages m WHERE m.id IN (SELECT value FROM json_each(?)) AND {} AND {within} ORDER BY {ORDER}", filter.sql())
+        }
+        (Scope::Boxes(boxes), None) => {
+            // One ordered index scan per mailbox; SQLite merges them by date.
+            let arms: Vec<String> = boxes
+                .iter()
+                .map(|(a, b)| {
+                    args.push(a.clone().into());
+                    args.push(b.clone().into());
+                    args.extend(filter.args.iter().cloned());
+                    format!("SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_by_date WHERE m.account = ? AND m.mailbox = ? AND {}", filter.sql())
+                })
+                .collect();
+            // Columns 5 and 1 of LIGHT_COLS: date, id.
+            if arms.len() == 1 { format!("{} ORDER BY {ORDER}", arms[0]) } else { format!("{} ORDER BY 5 DESC, 1 DESC", arms.join(" UNION ALL ")) }
+        }
+        (Scope::Starred(_), None) => {
+            args.extend(filter.args.iter().cloned());
+            let within = scope_sql(scope, &mut args);
+            format!("SELECT {LIGHT_COLS} FROM messages m WHERE {} AND {within} ORDER BY {ORDER}", filter.sql())
+        }
+    };
+    (sql, args)
+}
+
 /// `[1,2,3]`, for `json_each`.
 fn ids_json(ids: &[i64]) -> String {
     let mut s = String::with_capacity(ids.len() * 7 + 2);
@@ -440,6 +454,27 @@ fn scope_sql(scope: &Scope, args: &mut Vec<SqlValue>) -> String {
                 args.push(a.clone().into());
             }
             s
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scan reads the index in the list's order, one mailbox or several merged: no sort, so
+    /// it can stop at the limit.
+    #[test]
+    fn the_scan_reads_its_index_in_order() {
+        let st = Store::memory();
+        let filter = Filter::new(&Query::default());
+        for boxes in [vec![("a".to_owned(), "INBOX".to_owned())], vec![("a".to_owned(), "INBOX".to_owned()), ("b".to_owned(), "INBOX".to_owned())]] {
+            let n = boxes.len();
+            let (sql, args) = scan_sql(&Scope::Boxes(boxes), &filter, None);
+            let mut stmt = st.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan: Vec<String> = stmt.query_map(params_from_iter(args.iter()), |r| r.get::<_, String>(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert!(plan.iter().any(|p| p.contains("COVERING INDEX messages_by_date")), "{n} mailboxes: {plan:?}");
+            assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{n} mailboxes: {plan:?}");
         }
     }
 }
