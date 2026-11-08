@@ -1,16 +1,17 @@
 //! Draws an email's layout tree (`envoy_core::html::Doc`) as Rune elements: styled text runs
-//! with links, boxes and buttons, rows of cells, images.
+//! with links, boxes and buttons with borders and background pictures, table rows on their
+//! column grid, fluid columns that wrap, images.
 //!
 //! Colours adapt to the theme by default: near-white backgrounds drop away, near-black text
 //! becomes the theme's ink, dark accents brighten in dark mode. Coloured boxes (buttons,
-//! banners) keep their own colours and their text's. "Original" draws the mail as designed
-//! on a light page instead.
+//! banners, pictures) keep their own colours and their text's. "Original" draws the mail as
+//! designed on a light page instead.
 
 use std::collections::HashMap;
 
 use rune::{Color, El, Link, Span, Tx, col, el, rich, row, text};
 
-use envoy_core::html::{Align, BoxStyle, Doc, Img, Len, Node, Para, Rgba};
+use envoy_core::html::{Align, BoxStyle, Doc, Family, Img, Len, LineHeight, Node, Para, Rgba, VAlign};
 
 use crate::app::{App, ImageState};
 use crate::theme::Theme;
@@ -24,6 +25,13 @@ pub struct Ctx<'a> {
     pub max_w: f32,
 }
 
+/// The serif face for `font-family: Georgia, serif` and kin: one every install of the OS has
+/// (Rune falls back to the sans face when it's missing).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const SERIF: &str = "Georgia";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const SERIF: &str = "DejaVu Serif";
+
 #[derive(Clone, Copy)]
 struct Local {
     /// Inside a coloured box: colours are the author's, not adapted.
@@ -32,6 +40,8 @@ struct Local {
     tight: bool,
     /// Default text colour here.
     ink: Color,
+    /// The email's own background behind this point (before adapting), if it set one.
+    under: Option<Rgba>,
 }
 
 fn srgb8(r: u8, g: u8, b: u8) -> Color {
@@ -92,6 +102,13 @@ impl Ctx<'_> {
     fn ink_on(&self, fill: Color) -> Color {
         if lab(fill).0 > 0.6 { srgb8(0x1f, 0x1f, 0x1f) } else { Color::WHITE }
     }
+
+    fn picture(&self, url: &Option<String>) -> Option<&rune::Pixels> {
+        match self.images.get(url.as_deref()?) {
+            Some(ImageState::Ready(i)) => Some(i.pixels()),
+            _ => None,
+        }
+    }
 }
 
 fn link_handler(e: El, copy: bool) -> El {
@@ -104,11 +121,22 @@ fn link_handler(e: El, copy: bool) -> El {
     })
 }
 
+fn weight(w: u16) -> f32 {
+    if w >= 600 {
+        650.0
+    } else if w >= 500 {
+        520.0
+    } else {
+        400.0
+    }
+}
+
 fn para(cx: &Ctx, p: &Para, l: Local) -> El {
     let mut content = String::new();
     let mut spans = Vec::new();
     let mut links = Vec::new();
-    let base = p.runs.iter().filter_map(|r| r.size).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s)))).unwrap_or(14.0).clamp(10.0, 40.0);
+    let mut strikes = Vec::new();
+    let base = p.runs.iter().filter_map(|r| r.size).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s)))).unwrap_or(14.0).clamp(9.0, 64.0);
     for r in &p.runs {
         let start = content.len();
         content.push_str(&r.text);
@@ -117,18 +145,24 @@ fn para(cx: &Ctx, p: &Para, l: Local) -> El {
             continue;
         }
         let color = if r.href.is_some() && r.color.is_none() { cx.t.accent } else { cx.text_color(r.color, l) };
-        let mut s = Span::new(start, end).color(color).weight(if r.bold { 650.0 } else { 400.0 });
+        let mut s = Span::new(start, end).color(color).weight(weight(r.weight));
         if let Some(size) = r.size {
-            s = s.size(size.clamp(9.0, 48.0));
+            s = s.size(size.clamp(9.0, 64.0));
         }
         if r.italic {
             s = s.italic();
         }
-        if r.mono {
+        if r.mono && p.family != Family::Mono {
             s = s.mono();
         }
-        if r.underline || (r.href.is_some() && r.color.is_none()) {
+        if r.underline {
             s = s.underline(color.alpha(0.6));
+        }
+        if r.strike {
+            strikes.push((start, end, Some(color)));
+        }
+        if let Some(bg) = r.bg.and_then(|c| if l.on_color { Some(rgba(c)) } else { cx.fill(Some(c)) }) {
+            s = s.bg(bg, 2.0);
         }
         spans.push(s);
         if let Some(h) = &r.href {
@@ -140,7 +174,23 @@ fn para(cx: &Ctx, p: &Para, l: Local) -> El {
         Align::Center => rune::Align::Center,
         Align::Right => rune::Align::End,
     };
-    let mut e = rich(content, spans).font(rune::TextStyle::new(base, 400.0).lh((base * 1.45).round())).wrap().selectable(true).align(align);
+    let lh = match p.line_height {
+        Some(LineHeight::Mult(m)) => base * m,
+        Some(LineHeight::Px(px)) => px,
+        None => base * 1.45,
+    }
+    .clamp(base, base * 3.0)
+    .round();
+    let mut font = rune::TextStyle::new(base, 400.0).lh(lh).tracking(p.tracking);
+    font = match p.family {
+        Family::Sans => font,
+        Family::Serif => font.family(rune::Family::Named(SERIF)),
+        Family::Mono => font.mono(),
+    };
+    let mut e = rich(content, spans).font(font).wrap().selectable(true).align(align);
+    if !strikes.is_empty() {
+        e = e.strikes(strikes);
+    }
     if !l.tight {
         e = e.w_full();
     }
@@ -162,13 +212,15 @@ fn image(cx: &Ctx, img: &Img, l: Local) -> El {
             let ratio = pw.max(1) as f32 / ph.max(1) as f32;
             let w = img.width.unwrap_or(pw as f32).min(cx.max_w);
             let e = el().pixels(i.pixels());
-            // Small images get an exact box; wide ones fill the column up to their width.
-            if l.tight || w <= 320.0 { e.w(w).h(w / ratio) } else { e.w_full().max_w(w).aspect_ratio(ratio) }
+            // In a box sized by its content an image takes its own size; elsewhere it fills
+            // the column up to its width, scaling down when the column is narrower.
+            if l.tight { e.w(w).h(w / ratio) } else { e.w_full().max_w(w).aspect_ratio(ratio) }
         }
         Some(ImageState::Loading) if cx.load_images => {
             let (w, h) = (img.width.unwrap_or(0.0).min(cx.max_w), img.height.unwrap_or(0.0));
             if w > 0.0 && h > 0.0 {
-                el().w(w).h(h * (w / img.width.unwrap_or(w).max(1.0))).radius(4.0).fill(k.c.layer_01)
+                let e = el().radius(4.0).fill(k.c.layer_01);
+                if l.tight { e.w(w).h(h) } else { e.w_full().max_w(w).aspect_ratio(w / h) }
             } else {
                 el()
             }
@@ -194,39 +246,57 @@ fn items(a: Align) -> fn(El) -> El {
     }
 }
 
+/// A box's own look and content; its width and margins are the caller's.
 fn styled_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
-    let fill = cx.fill(s.bg);
-    // A box that keeps its author's colour keeps its text's colours too; a light box that
-    // was dropped or mapped to the theme hands its content back to the theme.
-    let authored = cx.adapt && fill.is_some() && s.bg.is_some_and(|c| lab(rgba(c)).1 >= 0.035 || lab(rgba(c)).0 < 0.8);
-    let (on_color, ink) = if !cx.adapt || s.bg.is_none() {
-        (l.on_color, l.ink)
-    } else if authored {
-        (true, cx.ink_on(fill.unwrap_or(Color::WHITE)))
+    let picture = cx.picture(&s.bg_image);
+    let own = s.bg.map(rgba);
+    // A box that keeps its author's colour (or picture) keeps its text's colours too, and so
+    // does everything inside it; a light box that was dropped or mapped to the theme hands
+    // its content back to the theme.
+    let (fill, on_color, ink) = if !cx.adapt {
+        (own, l.on_color, l.ink)
+    } else if l.on_color {
+        (own, true, own.map_or(l.ink, |f| cx.ink_on(f)))
+    } else if picture.is_some() {
+        (own, true, cx.ink_on(own.unwrap_or(Color::BLACK)))
+    } else if let Some(c) = s.bg {
+        let mut fill = cx.fill(Some(c));
+        // A near-white panel on a whiter card (an info box) stays a panel, in the theme's tone.
+        if fill.is_none() && l.under.is_some_and(|u| lab(rgba(u)).0 > lab(rgba(c)).0 + 0.01) {
+            fill = Some(cx.t.k.c.layer_01);
+        }
+        let (light, chroma) = lab(rgba(c));
+        if fill.is_some() && (chroma >= 0.035 || light < 0.8) { (fill, true, cx.ink_on(fill.unwrap_or(Color::BLACK))) } else { (fill, false, cx.t.k.c.text_base) }
     } else {
-        (false, cx.t.k.c.text_base)
+        (None, false, l.ink)
     };
-    let inner = Local { on_color, tight: s.tight || l.tight, ink };
+    let inner = Local { on_color, tight: s.tight || l.tight, ink, under: s.bg.or(l.under) };
     let mut e = items(s.align)(col()).pt(s.pad[0]).pr(s.pad[1]).pb(s.pad[2]).pl(s.pad[3]);
+    e = match s.valign {
+        VAlign::Top => e.justify_start(),
+        VAlign::Middle => e.justify_center(),
+        VAlign::Bottom => e.justify_end(),
+    };
     for n in children {
         e = e.child(node(cx, n, inner));
     }
     if let Some(f) = fill {
         e = e.fill(f);
     }
+    if let Some(p) = picture {
+        e = e.pixels_fit(p, rune::SurfaceFit::Fill);
+    }
     if s.radius > 0.0 {
         e = e.radius(s.radius);
     }
-    if let Some((w, c)) = s.border {
-        let c = if cx.adapt && lab(rgba(c)).1 < 0.035 { cx.t.k.c.border_base } else { rgba(c) };
-        e = e.border(w, c);
-    }
-    if !s.tight && !l.tight {
-        e = match s.width {
-            Some(Len::Px(w)) => e.w_full().max_w(w),
-            Some(Len::Pct(p)) if p < 95.0 => e.w_frac((p / 100.0).clamp(0.05, 1.0)),
-            _ => e.w_full(),
-        };
+    if let Some(b) = &s.border {
+        let c = if cx.adapt && !on_color && lab(rgba(b.color)).1 < 0.035 { cx.t.k.c.border_base } else { rgba(b.color) };
+        let w = b.widths;
+        e = if w.iter().all(|x| *x == w[0]) { e.border(w[0], c) } else { e.border_sides(w, c) };
+        if b.dashed {
+            let max = w.iter().fold(0.0f32, |a, x| a.max(*x));
+            e = e.border_dash((max * 3.0).max(3.0), (max * 2.0).max(2.0));
+        }
     }
     if let Some(h) = &s.href {
         e = e.href(h.clone()).cursor(rune::Cursor::Pointer).hover(Color::WHITE.alpha(0.08)).press(Color::BLACK.alpha(0.08));
@@ -234,18 +304,84 @@ fn styled_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
     e
 }
 
-fn cells(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], l: Local) -> El {
-    let mut r = row().w_full().gap(0.0);
+/// A box in a column of blocks: its width, then its margins.
+fn block_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
+    let mut e = styled_box(cx, s, children, l);
+    let tight = s.tight || l.tight;
+    if tight {
+        if let Some(Len::Px(w)) = s.width {
+            e = e.w_full().max_w(w);
+        }
+    } else {
+        e = match s.width {
+            Some(Len::Px(w)) => e.w_full().max_w(w),
+            Some(Len::Pct(p)) if p < 99.5 => e.w_frac((p / 100.0).clamp(0.05, 1.0)),
+            _ => e.w_full(),
+        };
+    }
+    if let Some(m) = s.max_width {
+        e = e.max_w(m.min(match s.width {
+            Some(Len::Px(w)) => w,
+            _ => f32::MAX,
+        }));
+    }
+    if s.min_width > 0.0 {
+        e = e.min_w(s.min_width.min(cx.max_w));
+    }
+    if s.margin != [0.0; 4] {
+        // Margins as padding round it, so a full-width box with margins still fits.
+        let wrap = items(s.align)(col()).pt(s.margin[0]).pr(s.margin[1]).pb(s.margin[2]).pl(s.margin[3]);
+        e = if tight { wrap.child(e) } else { wrap.w_full().child(e) };
+    }
+    e
+}
+
+fn cells(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], gap: f32, l: Local) -> El {
+    // Cells stretch to the row's height, as table cells do; `valign` places their content.
+    let mut r = row().w_full().gap(gap).items_stretch();
     for (s, kids) in cells {
-        let mut c = styled_box(cx, &BoxStyle { width: None, ..s.clone() }, kids, Local { tight: false, ..l });
+        let mut c = styled_box(cx, s, kids, Local { tight: false, ..l });
         c = match s.width {
             Some(Len::Px(w)) if kids.is_empty() => c.w(w.min(40.0)),
             Some(Len::Px(w)) => c.w(w).shrink(),
-            Some(Len::Pct(p)) => c.w_frac((p / 100.0).clamp(0.02, 1.0)).shrink(),
+            Some(Len::Pct(p)) => c.w_frac((p / 100.0).clamp(0.01, 1.0)).shrink(),
             None if s.tight => c,
             None => c.grow(1.0).min_w(0.0),
         };
-        c = if s.top { c.self_start() } else { c.self_center() };
+        if s.min_width > 0.0 {
+            c = c.min_w(s.min_width.min(cx.max_w));
+        }
+        r = r.child(c);
+    }
+    r
+}
+
+fn columns(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], align: Align, l: Local) -> El {
+    let mut r = row().w_full().flex_wrap().items_start();
+    r = match align {
+        Align::Left => r.justify_start(),
+        Align::Center => r.justify_center(),
+        Align::Right => r.justify_end(),
+    };
+    for (s, kids) in cells {
+        let mut c = styled_box(cx, s, kids, Local { tight: false, ..l });
+        // A hair under the exact share, so columns that add up to the row stay on one line.
+        c = match s.width {
+            Some(Len::Pct(p)) => c.w_frac((p / 100.0 - 0.001).clamp(0.05, 1.0)),
+            Some(Len::Px(w)) => c.w(w.min(cx.max_w)),
+            None => c.w_full(),
+        };
+        if let Some(m) = s.max_width {
+            c = c.max_w((m - 0.5).max(1.0));
+        }
+        if s.min_width > 0.0 {
+            c = c.min_w(s.min_width.min(cx.max_w));
+        }
+        c = match s.valign {
+            VAlign::Top => c.self_start(),
+            VAlign::Middle => c.self_center(),
+            VAlign::Bottom => c.self_end(),
+        };
         r = r.child(c);
     }
     r
@@ -255,25 +391,31 @@ fn node(cx: &Ctx, n: &Node, l: Local) -> El {
     let k = &cx.t.k;
     match n {
         Node::Para(p) => para(cx, p, l),
-        Node::Box { style, children } => styled_box(cx, style, children, l),
-        Node::Row { cells: c } => cells(cx, c, l),
+        Node::Box { style, children } => block_box(cx, style, children, l),
+        Node::Row { cells: c, gap } => cells(cx, c, *gap, l),
+        Node::Columns { cells: c, align } => columns(cx, c, *align, l),
         Node::Image(img) => image(cx, img, l),
         Node::Rule => el().h(1.0).w_full().my(10.0).fill(k.c.border_muted),
         Node::Space(h) => el().h(h.min(40.0)),
-        Node::List { ordered, items } => {
-            let mut c = col().w_full().gap(4.0).pl(4.0).my(4.0);
+        Node::Blank(h) => el().h(h.min(48.0)),
+        Node::List { ordered, marker, items } => {
+            let mut c = col().w_full().gap(4.0).pl(if *marker { 4.0 } else { 0.0 });
             for (i, it) in items.iter().enumerate() {
-                let bullet = if *ordered { format!("{}.", i + 1) } else { "•".to_owned() };
                 let mut body = col().grow(1.0).min_w(0.0);
                 for n in it {
                     body = body.child(node(cx, n, l));
                 }
-                c = c.child(row().w_full().gap(8.0).items_start().child(text(bullet).font(rune::TextStyle::new(14.0, 400.0).lh(20.0)).color(l.ink)).child(body));
+                let mut line = row().w_full().gap(8.0).items_start();
+                if *marker {
+                    let bullet = if *ordered { format!("{}.", i + 1) } else { "•".to_owned() };
+                    line = line.child(text(bullet).font(rune::TextStyle::new(14.0, 400.0).lh(20.0)).color(l.ink));
+                }
+                c = c.child(line.child(body));
             }
             c
         }
         Node::Quote(kids) => {
-            let mut c = col().w_full().pl(12.0).my(4.0).border_sides([2.0, 0.0, 0.0, 0.0], k.c.border_strong);
+            let mut c = col().w_full().pl(12.0).my(4.0).border_sides([0.0, 0.0, 0.0, 2.0], k.c.border_strong);
             for n in kids {
                 c = c.child(node(cx, n, Local { ink: k.c.text_muted, ..l }));
             }
@@ -294,7 +436,7 @@ fn node(cx: &Ctx, n: &Node, l: Local) -> El {
 pub fn render(cx: &Ctx, doc: &Doc) -> El {
     let original = !cx.adapt;
     let ink = if original { srgb8(0x22, 0x22, 0x22) } else { cx.t.k.c.text_base };
-    let l = Local { on_color: false, tight: false, ink };
+    let l = Local { on_color: false, tight: false, ink, under: doc.background };
     let mut c = col().key("html").w_full().max_w(cx.max_w);
     for n in &doc.nodes {
         c = c.child(node(cx, n, l));
