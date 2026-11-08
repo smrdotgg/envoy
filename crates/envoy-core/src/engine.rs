@@ -15,7 +15,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::accounts::{self, Account, AuthKind};
 use crate::imap::{self, Credential, Session};
-use crate::model::{Draft, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
+use crate::model::{Draft, DraftNotice, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use crate::settings::Settings;
 use crate::store::{LocalDraft, Op, Query, Store};
 use crate::{drafts, oauth, paths, secrets, smtp};
@@ -104,8 +104,10 @@ pub enum Event {
     Image { url: String, width: u32, height: u32, rgba: Arc<[u8]> },
     ImageFailed { url: String },
     /// A draft for the composer: opened from Drafts, or back from an undone send, or, with
-    /// `restored`, the one left in the composer when the app last closed.
-    DraftOpened { id: i64, draft: Draft, restored: bool },
+    /// `restored`, the one left in the composer when the app last closed. `notice`: what to
+    /// tell the user about a draft from the server; with [`DraftNotice::Copy`] it's an unsaved
+    /// copy and `id` is 0, for the app to pick one.
+    DraftOpened { id: i64, draft: Draft, restored: bool, notice: Option<DraftNotice> },
 }
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -323,11 +325,11 @@ fn reply(shared: &Shared, reply: &Reply) -> Result<()> {
             let messages = shared.reader.lock().map_err(|_| anyhow!("store poisoned"))?.thread(id, conversations)?;
             shared.emit(Event::Thread { req, id, messages });
         }
-        Reply::Draft(id) => {
-            if let Opening::Ready(d) = open_draft(shared, id, now())? {
-                shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false });
-            }
-        }
+        Reply::Draft(id) => match open_draft(shared, id, now())? {
+            Opening::Ready(d, notice) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false, notice }),
+            Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, restored: false, notice: Some(DraftNotice::Copy(why)) }),
+            _ => {}
+        },
     }
     Ok(())
 }
@@ -342,7 +344,7 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
     }
     // What was being written when the app last closed (or crashed) goes back in the composer.
     match shared.with_writer(|st| st.draft_to_restore()) {
-        Ok(Some(d)) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: true }),
+        Ok(Some(d)) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: true, notice: None }),
         Ok(None) => {}
         Err(e) => log::warn!("couldn't read drafts: {e:#}"),
     }
@@ -469,7 +471,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 if let Some(id) = draft_id
                     && let Ok(Some(d)) = shared.with_writer(|st| st.draft_unsent(id, &draft, now()))
                 {
-                    shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false });
+                    shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false, notice: None });
                 }
                 return Err(e);
             }
@@ -485,7 +487,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             shared.emit(Event::Toast(if cancelled { "Sending undone".into() } else { "Too late — it was already sent".into() }));
             if let Some(d) = back {
                 let account = d.account.clone();
-                shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false });
+                shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false, notice: None });
                 shared.emit(Event::Changed { account: account.clone() });
                 wake(workers, &account);
             }
@@ -498,7 +500,8 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             }
         }
         Command::OpenDraft { id } => match open_draft(shared, id, now())? {
-            Opening::Ready(d) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false }),
+            Opening::Ready(d, notice) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false, notice }),
+            Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, restored: false, notice: Some(DraftNotice::Copy(why)) }),
             Opening::Download { account, mailbox, uid } => poke(workers, &account, Job::Bodies { mailbox, uids: vec![uid], reply: Some(Reply::Draft(id)) }),
             // Sent or discarded meanwhile: the list catches up.
             Opening::Gone => shared.emit(Event::Changed { account: String::new() }),
@@ -676,7 +679,13 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
 /// composer's draft waiting alongside it (hidden from Drafts) until it's out.
 fn queue_send(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, draft: &Draft, draft_id: Option<i64>) -> Result<()> {
     let account = shared.account(&draft.account).ok_or_else(|| anyhow!("Choose an account to send from"))?;
-    let built = smtp::build(&account, draft)?;
+    // Never sent without a file the draft lists.
+    let files = match draft_id {
+        _ if draft.attachments.is_empty() => Vec::new(),
+        Some(d) => shared.with_writer(|st| st.draft_files(d, &draft.attachments))?,
+        None => return Err(anyhow!("The attached files aren't saved with this message")),
+    };
+    let built = smtp::build(&account, draft, &files)?;
     let undo = shared.setting_u32("compose.undoSendSeconds");
     let (sent_mailbox, reply_of) = shared.with_writer(|st| {
         let sent = if account.is_gmail() { None } else { st.mailbox_for_role(&account.id, Role::Sent)? };
@@ -808,7 +817,9 @@ fn undo_move(shared: &Shared, undo: i64) -> Result<()> {
 
 /// Where [`open_draft`] got.
 enum Opening {
-    Ready(Box<LocalDraft>),
+    Ready(Box<LocalDraft>, Option<DraftNotice>),
+    /// A server draft that can't be edited in place (`why`): an unsaved copy to start from.
+    Copy(Box<Draft>, String),
     /// A server draft not downloaded yet: fetch it, then try again.
     Download { account: String, mailbox: String, uid: u32 },
     /// Nothing to open (sent, discarded, or deleted meanwhile).
@@ -825,19 +836,21 @@ fn open_draft(shared: &Shared, id: MessageId, now: i64) -> Result<Opening> {
             None => st.draft_of_message(id)?,
         };
         let opening = match local {
-            Some(d) if d.visible => Opening::Ready(Box::new(d)),
+            Some(d) if d.visible => Opening::Ready(Box::new(d), None),
             Some(_) => Opening::Gone,
             None if id < 0 => Opening::Gone,
             None => match (st.summary(id)?, st.raw(id)?) {
                 (None, _) => Opening::Gone,
                 (Some(s), None) => Opening::Download { account: s.account, mailbox: s.mailbox, uid: s.uid },
-                (Some(_), Some(raw)) => match crate::mime::draft_from_raw(&raw) {
-                    Some(draft) => st.adopt_draft(id, &draft, now)?.map_or(Opening::Gone, |d| Opening::Ready(Box::new(d))),
+                (Some(s), Some(raw)) => match crate::mime::server_draft(&raw) {
+                    // Left as it is on the server: the copy becomes a draft of its own if edited.
+                    Some(crate::mime::ServerDraft { draft, notice: Some(DraftNotice::Copy(why)), .. }) => Opening::Copy(Box::new(Draft { account: s.account, ..draft }), why),
+                    Some(found) => st.adopt_draft(id, &found.draft, &found.files, now)?.map_or(Opening::Gone, |d| Opening::Ready(Box::new(d), found.notice)),
                     None => Opening::Gone,
                 },
             },
         };
-        if let Opening::Ready(d) = &opening {
+        if let Opening::Ready(d, _) = &opening {
             st.set_draft_open(d.id, true)?;
         }
         Ok(opening)
@@ -1473,8 +1486,9 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
         Op::SaveDraft { draft } => {
             let Some(mailbox) = drafts_mailbox(shared, id)? else { return Ok(()) };
             let Some(up) = shared.with_writer(|st| st.draft_upload(id, *draft))? else { return Ok(()) };
-            // A draft that can't be built won't build on a retry either.
-            let raw = smtp::build_draft(account, &up.draft, &up.message_id).map_err(|e| imap::Refused(format!("{e:#}")))?;
+            // A draft that can't be built (or lost a file) won't do better on a retry.
+            let files = shared.with_writer(|st| st.draft_files(*draft, &up.draft.attachments)).map_err(|e| imap::Refused(format!("{e:#}")))?;
+            let raw = smtp::build_draft(account, &up.draft, &up.message_id, &files).map_err(|e| imap::Refused(format!("{e:#}")))?;
             // The copy on record is replaced by UID; one in another mailbox (the Drafts role
             // moved) is left to the search.
             let previous = up.previous.filter(|(m, _, _)| *m == mailbox).map(|(_, validity, uid)| (validity, uid));
@@ -2142,7 +2156,7 @@ mod tests {
         let op = rx.try_iter().find_map(|e| if let Event::Sent { op, .. } = e { Some(op) } else { None }).expect("queued");
         handle(&shared, &mut HashMap::new(), Command::UndoSend { op }).await.unwrap();
         let events: Vec<Event> = rx.try_iter().collect();
-        let opened = events.iter().find_map(|e| if let Event::DraftOpened { id, draft, restored } = e { Some((*id, draft.subject.clone(), *restored)) } else { None });
+        let opened = events.iter().find_map(|e| if let Event::DraftOpened { id, draft, restored, .. } = e { Some((*id, draft.subject.clone(), *restored)) } else { None });
         assert_eq!(opened, Some((7, "hello, edited".to_owned(), false)), "the composer gets it back as it was sent");
         let list = drafts_list(&shared, "");
         assert_eq!(list.len(), 1, "one draft, not two");
@@ -2219,7 +2233,7 @@ mod tests {
         assert_eq!(rows.iter().map(|r| (r.id, r.subject.as_str())).collect::<Vec<_>>(), vec![(copy, "edited since")], "one row, the newest content");
         // Opening the copy opens the local draft, not the stale server version.
         match open_draft(&shared, copy, now()).unwrap() {
-            Opening::Ready(d) => assert_eq!((d.id, d.draft.subject.as_str()), (7, "edited since")),
+            Opening::Ready(d, _) => assert_eq!((d.id, d.draft.subject.as_str()), (7, "edited since")),
             _ => panic!("should open"),
         }
     }
@@ -2233,7 +2247,8 @@ mod tests {
         let id = shared.with_writer(|st| st.upsert_header("a", "Drafts", 5, flags::DRAFT, 10, 0, &p)).unwrap();
         assert!(matches!(open_draft(&shared, id, now()).unwrap(), Opening::Download { uid: 5, .. }));
         shared.with_writer(|st| st.set_body(id, raw, &crate::mime::parse(raw, false).unwrap())).unwrap();
-        let Opening::Ready(d) = open_draft(&shared, id, now()).unwrap() else { panic!("should open") };
+        let Opening::Ready(d, notice) = open_draft(&shared, id, now()).unwrap() else { panic!("should open") };
+        assert_eq!(notice, None, "plain text: nothing lost editing it");
         assert_eq!(d.message_id, "<laptop@x>", "keeps its Message-ID, so a save replaces it");
         assert_eq!(d.draft.to, "\"Lima, Ana\" <ana@x.com>");
         assert_eq!(d.draft.bcc, "bo@x.com");
@@ -2249,6 +2264,93 @@ mod tests {
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(server.drafts(), vec![(6, "From the laptop".to_owned())]);
         assert!(shared.with_writer(|st| st.summary(id)).unwrap().is_none(), "the laptop's copy is gone from the cache too");
+    }
+
+    const PDF: &[u8] = b"%PDF-1.4 not really, but binary enough \x00\x01\x02\xff";
+
+    /// A draft written elsewhere: text, an HTML version if `html`, and a PDF.
+    fn draft_with_pdf(html: bool) -> Vec<u8> {
+        use base64::Engine as _;
+        let pdf = base64::engine::general_purpose::STANDARD.encode(PDF);
+        let text = if html {
+            "Content-Type: multipart/alternative; boundary=\"alt\"\r\n\r\n--alt\r\nContent-Type: text/plain\r\n\r\nPlan attached.\r\n--alt\r\nContent-Type: text/html\r\n\r\n<p>Plan <b>attached</b>.</p>\r\n--alt--\r\n"
+        } else {
+            "Content-Type: text/plain\r\n\r\nPlan attached.\r\n"
+        };
+        format!(
+            "From: a@x.com\r\nTo: bo@x.com\r\nSubject: The plan\r\nMessage-ID: <laptop@x>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"mix\"\r\n\r\n--mix\r\n{text}--mix\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"plan.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{pdf}\r\n--mix--\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// Caches a draft from the server, downloaded, as Drafts message `uid`.
+    fn server_copy(shared: &Shared, uid: u32, raw: &[u8]) -> MessageId {
+        let p = crate::mime::parse(raw, false).unwrap();
+        shared
+            .with_writer(|st| {
+                let id = st.upsert_header("a", "Drafts", uid, flags::DRAFT | flags::SEEN, raw.len() as u32, 0, &p)?;
+                st.set_body(id, raw, &p)?;
+                Ok(id)
+            })
+            .unwrap()
+    }
+
+    fn files_of(raw: &[u8]) -> Vec<Vec<u8>> {
+        crate::mime::server_draft(raw).unwrap().files
+    }
+
+    #[tokio::test]
+    async fn editing_and_sending_a_server_draft_keeps_its_attachments() {
+        let (shared, _rx) = drafts_engine();
+        shared.settings.write().unwrap().set("compose.undoSendSeconds", serde_json::json!(0)).unwrap();
+        let raw = draft_with_pdf(false);
+        let id = server_copy(&shared, 5, &raw);
+        let Opening::Ready(d, notice) = open_draft(&shared, id, now()).unwrap() else { panic!("should open") };
+        assert_eq!(notice, None);
+        assert_eq!(d.draft.attachments.iter().map(|a| (a.filename.as_str(), a.size)).collect::<Vec<_>>(), vec![("plan.pdf", PDF.len())], "the composer shows it");
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        server.drafts.push((5, "<laptop@x>".into(), raw.clone()));
+        server.next_uid = 6;
+        // Edited: the autosave's upload replaces the original, attachment and all.
+        let edited = Draft { body: "Plan attached, see page 2.".into(), ..d.draft.clone() };
+        shared.with_writer(|st| drafts::save(st, d.id, &edited, true, 1, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(server.drafts.len(), 1);
+        let (_, _, copy) = &server.drafts[0];
+        assert_eq!(files_of(copy), vec![PDF.to_vec()], "the attachment survives the edit");
+        assert!(crate::mime::server_draft(copy).unwrap().draft.body.contains("page 2"));
+        // Sent: with the attachment.
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: edited, draft_id: Some(d.id) }).await.unwrap();
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        let Some(Op::Send { raw_b64, .. }) = server.ran.iter().find(|op| matches!(op, Op::Send { .. })) else { panic!("not sent") };
+        let sent = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.decode(raw_b64).unwrap()
+        };
+        assert_eq!(files_of(&sent), vec![PDF.to_vec()], "and goes with the message");
+    }
+
+    #[test]
+    fn a_formatted_server_draft_keeps_its_attachments_and_says_what_goes() {
+        let (shared, _rx) = drafts_engine();
+        let id = server_copy(&shared, 5, &draft_with_pdf(true));
+        let Opening::Ready(d, notice) = open_draft(&shared, id, now()).unwrap() else { panic!("should open") };
+        assert_eq!(notice, Some(DraftNotice::PlainText));
+        assert_eq!(d.draft.body.trim_end(), "Plan attached.");
+        assert_eq!(shared.with_writer(|st| st.draft_files(d.id, &d.draft.attachments)).unwrap()[0].1, PDF.to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_draft_envoy_cant_edit_in_place_opens_as_a_copy_and_stays() {
+        let (shared, _rx) = drafts_engine();
+        let raw = b"From: a@x.com\r\nTo: bo@x.com\r\nSubject: Signed\r\nMessage-ID: <signed@x>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/signed; protocol=\"application/pgp-signature\"; boundary=\"s\"\r\n\r\n--s\r\nContent-Type: text/plain\r\n\r\nSigned words.\r\n--s\r\nContent-Type: application/pgp-signature\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\nxyz\r\n-----END PGP SIGNATURE-----\r\n--s--\r\n";
+        let id = server_copy(&shared, 5, raw);
+        let Opening::Copy(copy, why) = open_draft(&shared, id, now()).unwrap() else { panic!("a copy") };
+        assert!(why.contains("signed"), "{why}");
+        assert_eq!((copy.account.as_str(), copy.subject.as_str()), ("a", "Signed"));
+        assert!(copy.body.contains("Signed words."));
+        assert!(shared.with_writer(|st| st.drafts(None)).unwrap().is_empty(), "nothing adopted: the original isn't Envoy's to replace");
+        assert_eq!(drafts_list(&shared, "").iter().map(|r| r.id).collect::<Vec<_>>(), vec![id], "it stays in Drafts");
     }
 
     #[test]

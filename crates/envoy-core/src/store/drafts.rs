@@ -25,7 +25,7 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 use super::{Op, Store, json};
-use crate::model::{Draft, MessageId};
+use crate::model::{Draft, DraftAttachment, MessageId};
 
 /// A local draft.
 #[derive(Clone, Debug, PartialEq)]
@@ -166,10 +166,11 @@ impl Store {
     }
 
     /// Makes a draft found on the server (written elsewhere, or by Envoy on another computer) a
-    /// local draft, so it can be edited. It keeps the copy's Message-ID, so its first save
-    /// replaces that copy. A copy without one gets a Message-ID of its own: it's uploaded again
-    /// at once, and the old copy is deleted (hidden meanwhile). None if the message is gone.
-    pub fn adopt_draft(&self, message: MessageId, draft: &Draft, now: i64) -> Result<Option<LocalDraft>> {
+    /// local draft, so it can be edited, with its attachments' bytes, `files` (in the order of
+    /// `draft.attachments`). It keeps the copy's Message-ID, so its first save replaces that
+    /// copy. A copy without one gets a Message-ID of its own: it's uploaded again at once, and
+    /// the old copy is deleted (hidden meanwhile). None if the message is gone.
+    pub fn adopt_draft(&self, message: MessageId, draft: &Draft, files: &[Vec<u8>], now: i64) -> Result<Option<LocalDraft>> {
         self.transaction(|st| {
             let Some((account, mailbox, uid)) = st.location(message)? else { return Ok(None) };
             let message_id: String = st.conn.query_row("SELECT message_id FROM messages WHERE id = ?1", params![message], |r| r.get(0))?;
@@ -181,6 +182,9 @@ impl Store {
                 "INSERT INTO drafts (id, account, content, message_id, updated, version, server_version, appended, open) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, 1)",
                 params![id, account, json(&draft), message_id, now, if fresh { 0 } else { 1 }],
             )?;
+            for (a, data) in draft.attachments.iter().zip(files) {
+                st.conn.execute("INSERT OR REPLACE INTO draft_files (draft, id, data) VALUES (?1, ?2, ?3)", params![id, a.id, data])?;
+            }
             if fresh {
                 let op = st.enqueue(&account, &Op::Expunge { mailbox, uid })?;
                 st.hide_local(message, op)?;
@@ -188,6 +192,19 @@ impl Store {
             }
             st.draft(id)
         })
+    }
+
+    /// The bytes of a draft's attachments, with them. An error if any is missing: a draft is
+    /// never sent or saved without a file it lists.
+    pub fn draft_files(&self, id: i64, attachments: &[DraftAttachment]) -> Result<Vec<(DraftAttachment, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT data FROM draft_files WHERE draft = ?1 AND id = ?2")?;
+        attachments
+            .iter()
+            .map(|a| {
+                let data: Option<Vec<u8>> = stmt.query_row(params![id, a.id], |r| r.get(0)).optional()?;
+                data.map(|d| (a.clone(), d)).ok_or_else(|| anyhow::anyhow!("The attached file {} is missing from this draft", a.filename))
+            })
+            .collect()
     }
 
     /// Whether the draft has changes the server's copy lacks, and should get them (it isn't on

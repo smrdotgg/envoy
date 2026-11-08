@@ -7,7 +7,7 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::accounts::Account;
 use crate::imap::Credential;
-use crate::model::Draft;
+use crate::model::{Draft, DraftAttachment};
 
 /// Parses a comma/semicolon separated recipient list (`Ana <a@x.com>, b@y.com`).
 pub fn parse_recipients(list: &str) -> Result<Vec<LMailbox>> {
@@ -56,10 +56,30 @@ fn sender(account: &Account) -> Result<LMailbox> {
     ))
 }
 
+/// A draft's files, with their bytes, as [`build`] and [`build_draft`] take them.
+pub type Files = [(DraftAttachment, Vec<u8>)];
+
+/// The body: the text, and the attachments after it (multipart/mixed) if there are any.
+fn with_body(b: lettre::message::MessageBuilder, text: &str, files: &Files) -> Result<Message> {
+    use lettre::message::{Attachment, MultiPart, SinglePart};
+    let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    if files.is_empty() {
+        return Ok(b.header(header::ContentType::TEXT_PLAIN).body(text)?);
+    }
+    let mut parts = MultiPart::mixed().singlepart(SinglePart::builder().header(header::ContentType::TEXT_PLAIN).body(text));
+    for (a, data) in files {
+        // Text files were read as UTF-8, whatever they were in.
+        let mime = if a.mime.starts_with("text/") { format!("{}; charset=utf-8", a.mime) } else { a.mime.clone() };
+        let kind = header::ContentType::parse(&mime).or_else(|_| header::ContentType::parse("application/octet-stream"))?;
+        parts = parts.singlepart(Attachment::new(a.filename.clone()).body(data.clone(), kind));
+    }
+    Ok(b.multipart(parts)?)
+}
+
 /// A draft's copy for the Drafts mailbox, with the draft's own Message-ID (see
-/// `store/drafts.rs`). Unlike a message being sent it may have no recipients, or half-typed
-/// ones (kept as typed), and it keeps Bcc, so it opens again as it was written.
-pub fn build_draft(account: &Account, draft: &Draft, message_id: &str) -> Result<Vec<u8>> {
+/// `store/drafts.rs`) and its `files`. Unlike a message being sent it may have no recipients,
+/// or half-typed ones (kept as typed), and it keeps Bcc, so it opens again as it was written.
+pub fn build_draft(account: &Account, draft: &Draft, message_id: &str, files: &Files) -> Result<Vec<u8>> {
     use lettre::address::Envelope;
     use lettre::message::header::{HeaderName, HeaderValue};
     let from = sender(account)?;
@@ -95,11 +115,12 @@ pub fn build_draft(account: &Account, draft: &Draft, message_id: &str) -> Result
     if !draft.references.is_empty() {
         b = b.references(draft.references.clone());
     }
-    let msg = b.header(header::ContentType::TEXT_PLAIN).body(draft.body.replace("\r\n", "\n").replace('\n', "\r\n")).context("couldn't build the draft")?;
+    let msg = with_body(b, &draft.body, files).context("couldn't build the draft")?;
     Ok(msg.formatted())
 }
 
-pub fn build(account: &Account, draft: &Draft) -> Result<Built> {
+/// The message to send, with the draft's `files` attached.
+pub fn build(account: &Account, draft: &Draft, files: &Files) -> Result<Built> {
     let from = sender(account)?;
     let to = parse_recipients(&draft.to)?;
     let cc = parse_recipients(&draft.cc)?;
@@ -126,7 +147,7 @@ pub fn build(account: &Account, draft: &Draft) -> Result<Built> {
         b = b.references(draft.references.clone());
     }
     b = b.user_agent("Envoy".into());
-    let msg = b.header(header::ContentType::TEXT_PLAIN).body(draft.body.replace("\r\n", "\n").replace('\n', "\r\n")).context("couldn't build the message")?;
+    let msg = with_body(b, &draft.body, files).context("couldn't build the message")?;
     let envelope = msg.envelope();
     let to_addrs = envelope.to().iter().map(|a| a.to_string()).collect();
     // Bcc must not appear in the stored copy: lettre's `formatted` already omits it.
@@ -199,10 +220,12 @@ mod tests {
             in_reply_to: "<orig@x>".into(),
             references: "<root@x> <orig@x>".into(),
             reply_of: None,
+            attachments: vec![],
         };
-        let raw = build_draft(&account(), &draft, "<7.abc.draft@envoy>").unwrap();
-        let back = crate::mime::draft_from_raw(&raw).unwrap();
-        assert_eq!(Draft { account: "a".into(), ..back }, draft, "{}", String::from_utf8_lossy(&raw));
+        let raw = build_draft(&account(), &draft, "<7.abc.draft@envoy>", &[]).unwrap();
+        let back = crate::mime::server_draft(&raw).unwrap();
+        assert_eq!(back.notice, None, "nothing lost editing it");
+        assert_eq!(Draft { account: "a".into(), ..back.draft }, draft, "{}", String::from_utf8_lossy(&raw));
         let p = crate::mime::parse(&raw, true).unwrap();
         assert_eq!(p.message_id, "<7.abc.draft@envoy>");
     }
@@ -210,10 +233,26 @@ mod tests {
     #[test]
     fn a_draft_copy_keeps_half_typed_recipients() {
         let draft = Draft { to: "ana@x.com, bo@".into(), subject: "Hi".into(), ..Draft::default() };
-        let raw = String::from_utf8(build_draft(&account(), &draft, "<1.a.draft@envoy>").unwrap()).unwrap();
+        let raw = String::from_utf8(build_draft(&account(), &draft, "<1.a.draft@envoy>", &[]).unwrap()).unwrap();
         assert!(raw.contains("To: ana@x.com, bo@"), "{raw}");
-        let empty = build_draft(&account(), &Draft::default(), "<2.a.draft@envoy>").unwrap();
-        assert!(crate::mime::draft_from_raw(&empty).is_some(), "no recipients, subject or text: still a draft");
+        let empty = build_draft(&account(), &Draft::default(), "<2.a.draft@envoy>", &[]).unwrap();
+        assert!(crate::mime::server_draft(&empty).is_some(), "no recipients, subject or text: still a draft");
+    }
+
+    #[test]
+    fn attachments_go_with_the_draft_and_the_message() {
+        let pdf: Vec<u8> = (0..=255u8).cycle().take(3000).collect();
+        let files = vec![
+            (DraftAttachment { id: 0, filename: "plan.pdf".into(), mime: "application/pdf".into(), size: pdf.len() }, pdf.clone()),
+            (DraftAttachment { id: 1, filename: "notes.txt".into(), mime: "text/plain".into(), size: 6 }, "café\n".as_bytes().to_vec()),
+        ];
+        let draft = Draft { to: "ana@x.com".into(), subject: "Plans".into(), body: "See attached.".into(), attachments: files.iter().map(|(a, _)| a.clone()).collect(), ..Draft::default() };
+        for raw in [build_draft(&account(), &draft, "<3.a.draft@envoy>", &files).unwrap(), build(&account(), &draft, &files).unwrap().raw] {
+            let back = crate::mime::server_draft(&raw).unwrap();
+            assert_eq!(back.draft.body.trim_end(), "See attached.");
+            assert_eq!(back.draft.attachments.iter().map(|a| (a.filename.as_str(), a.mime.as_str())).collect::<Vec<_>>(), vec![("plan.pdf", "application/pdf"), ("notes.txt", "text/plain")]);
+            assert_eq!(back.files, vec![pdf.clone(), "café\n".as_bytes().to_vec()], "the bytes, exactly");
+        }
     }
 
     #[test]
