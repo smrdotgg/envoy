@@ -113,26 +113,30 @@ impl Store {
             None => {}
         }
         let content = json(draft);
-        type Row = (String, String, String, i64, bool, Option<(String, u32, u32)>, bool);
+        type Row = (String, String, String, i64, bool, Option<(String, u32, u32)>, bool, bool);
         let old: Option<Row> = self
             .conn
             .query_row(
-                "SELECT account, content, message_id, rev, appended != 0, server_mailbox, server_validity, server_uid, server_account = account, unconfirmed != 0 FROM drafts WHERE id = ?1",
+                "SELECT account, content, message_id, rev, appended != 0, server_mailbox, server_validity, server_uid, server_account = account, unconfirmed != 0,
+                     sending != 0 OR sent != 0
+                 FROM drafts WHERE id = ?1",
                 params![id],
                 |r| {
                     let copy = (r.get::<_, u32>(7)? != 0 && r.get::<_, bool>(8)?).then(|| Ok::<_, rusqlite::Error>((r.get(5)?, r.get(6)?, r.get(7)?))).transpose()?;
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, copy, r.get(9)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, copy, r.get(9)?, r.get(10)?))
                 },
             )
             .optional()?;
-        let Some((account, old_content, message_id, old_rev, appended, copy, unconfirmed)) = old else {
+        let Some((account, old_content, message_id, old_rev, appended, copy, unconfirmed, outbox)) = old else {
             self.conn.execute(
                 "INSERT INTO drafts (id, account, content, message_id, rev, updated, version, open) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
                 params![id, draft.account, content, new_message_id(id), rev.unwrap_or(0), now, open],
             )?;
             return Ok(Some(true));
         };
-        if rev.is_some_and(|r| r <= old_rev) {
+        // In the outbox (or sent), the draft is what was sent, for Undo send to give back: a
+        // save (say, a retry of an older one) can't change it.
+        if rev.is_some_and(|r| r <= old_rev) || (outbox && rev.is_some()) {
             return Ok(None);
         }
         let moved = account != draft.account;
@@ -594,6 +598,19 @@ mod tests {
         s.draft_unsent(1, &draft("hello"), 2, 102).unwrap();
         assert!(!s.draft(1).unwrap().unwrap().visible, "still in the outbox");
         assert_eq!(s.draft_to_restore().unwrap(), None);
+    }
+
+    #[test]
+    fn a_save_cant_touch_a_draft_in_the_outbox() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("old text"), true, 1, 100).unwrap();
+        let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
+        s.transaction(|st| st.draft_sending(1, &draft("sent text"), send, 101)).unwrap();
+        // A retry of a failed save of older text arrives, stamped later.
+        assert!(!s.save_draft(1, &draft("old text"), true, 50, 102).unwrap());
+        assert!(s.cancel_send(send).unwrap());
+        let back = s.unsend_draft(send, 103).unwrap().unwrap();
+        assert_eq!(back.draft.subject, "sent text", "Undo send gives back what was sent");
     }
 
     #[test]

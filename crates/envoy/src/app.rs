@@ -1637,6 +1637,9 @@ impl App {
         // (Event::SendFailed), and written as a draft if the window closes first.
         let stamp = self.next_stamp();
         self.pending_sends.push((draft_id, draft.clone(), stamp));
+        // What was sent supersedes saves still waiting (a failed one's retry would write older
+        // text over the draft kept for Undo send).
+        self.pending_saves.retain(|p| p.id != draft_id);
         // The draft goes with it; undoing the send brings it back (Event::DraftOpened).
         self.send(Command::Send { draft, draft_id: Some(draft_id) });
         if self.view_role() == Some(Role::Drafts) {
@@ -2166,6 +2169,23 @@ mod tests {
         app.apply(Event::DraftSaved { id, rev: again }, &mut Tx::default());
         let c = app.compose.as_ref().unwrap();
         assert!(c.shows_saved() && c.save_error.is_none());
+    }
+
+    #[test]
+    fn a_failed_save_isnt_retried_once_the_message_is_sent() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let (id, rev) = typed_and_saved(&mut app, "Old text");
+        app.apply(Event::DraftSaveFailed { id, rev, error: "disk full".into() }, &mut Tx::default());
+        // Newer text is sent before the retry comes due.
+        app.compose.as_mut().unwrap().body = TextEdit::new("Newer text");
+        app.compose.as_mut().unwrap().to = TextEdit::new("ana@x.com");
+        app.send_compose();
+        let t = app.clock;
+        app.tick(t + SAVE_RETRY + 1.0, &mut Tx::default());
+        assert!(app.pending_saves.iter().all(|p| p.id != id), "the old text isn't saved over what was sent");
+        assert!(matches!(&app.unsaved()[..], [Unsaved::Unsent { draft, .. }] if draft.body == "Newer text"));
     }
 
     #[test]
