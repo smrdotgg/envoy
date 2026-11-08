@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>Your weekly summary</title>
+<style>
+  :root { color-scheme: light dark; supported-color-schemes: light dark; }
+  body { margin: 0; padding: 0; background-color: #ffffff; }
+  .container { max-width: 560px; }
+  .card { background-color: #f4f6fb; border-radius: 12px; }
+  .title { color: #111827; font-size: 24px; line-height: 32px; font-weight: 700; }
+  .body-text { color: #374151; font-size: 15px; line-height: 24px; }
+  .stat { color: #4f46e5; font-size: 30px; font-weight: 800; line-height: 36px; }
+  .label { color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .logo-dark { display: none; }
+
+  @media (prefers-color-scheme: dark) {
+    body, .bg { background-color: #0b0f19 !important; }
+    .card { background-color: #1f2937 !important; }
+    .title { color: #f9fafb !important; }
+    .body-text { color: #d1d5db !important; }
+    .logo-light { display: none !important; }
+    .logo-dark { display: block !important; }
+  }
+  [data-ogsc] .title { color: #f9fafb !important; }
+  [data-ogsb] .card { background-color: #1f2937 !important; }
+</style>
+</head>
+<body class="bg">
+<div style="display:none;max-height:0;overflow:hidden;">You closed 14 tasks this week, 3 more than last week.</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="bg">
+<tr><td align="center" style="padding: 24px 16px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="container">
+    <tr><td style="padding-bottom: 16px;">
+      <img class="logo-light" src="https://img.example.org/tally/logo-light.png" width="88" height="24" alt="Tally">
+      <img class="logo-dark" src="https://img.example.org/tally/logo-dark.png" width="88" height="24" alt="Tally">
+    </td></tr>
+    <tr><td class="card" style="padding: 28px;">
+      <div class="title">Your week in review</div>
+      <p class="body-text" style="margin: 8px 0 20px 0;">Nice work, Kim. Here is how the week went across your three projects.</p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td width="50%" valign="top"><div class="stat">14</div><div class="label">Tasks closed</div></td>
+          <td width="50%" valign="top"><div class="stat">5.5h</div><div class="label">Focus time</div></td>
+        </tr>
+      </table>
+    </td></tr>
+    <tr><td style="padding-top: 16px;">
+      <p class="body-text" style="font-size: 12px; color: #9ca3af; margin: 0;">Sent by Tally · <a href="https://tally.example.org/settings/email" style="color: #9ca3af;">Email settings</a></p>
+    </td></tr>
+  </table>
+</td></tr>
+</table>
+</body>
+</html>

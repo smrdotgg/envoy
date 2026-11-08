@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Launch week</title>
+<style>
+  @font-face { font-family: "Brand Sans"; src: url("https://cdn.example.com/fonts/brand.woff2") format("woff2"); }
+  body { margin: 0; font-family: "Brand Sans", system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+  .hero { position: relative; height: 360px; overflow: hidden; background: linear-gradient(135deg, #6366f1 0%, #ec4899 100%); }
+  .hero h1 { position: absolute; left: 40px; bottom: 40px; font-size: 48px; margin: 0; transform: rotate(-2deg); }
+  .badge { position: absolute; top: 24px; right: 24px; background: #facc15; color: #111; padding: 6px 12px; border-radius: 999px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 24px; }
+  .tile { display: flex; flex-direction: column; justify-content: space-between; background: #1e293b; border-radius: 12px; padding: 16px; min-height: 140px; }
+  .float-img { float: right; margin: 0 0 12px 12px; }
+  .sticky { position: sticky; top: 0; }
+  form { padding: 24px; background: #1e293b; }
+  input[type=email] { padding: 8px; border-radius: 6px; border: 0; }
+</style>
+<script>window.dataLayer = window.dataLayer || []; dataLayer.push({event: "open"});</script>
+</head>
+<body>
+<div class="sticky" style="background:#020617;padding:8px 24px;font-size:12px;">Launch week · Day 3 of 5</div>
+<div class="hero">
+  <span class="badge">New</span>
+  <h1>Ship faster with Relay</h1>
+  <svg width="600" height="360" viewBox="0 0 600 360" style="position:absolute;top:0;left:0;opacity:0.4"><circle cx="480" cy="80" r="120" fill="#fff"/><path d="M0 300 Q 300 200 600 320" stroke="#fff" stroke-width="4" fill="none"/></svg>
+</div>
+<div class="grid">
+  <div class="tile"><b>Edge caching</b><span>Cut latency by 40% with zero config.</span></div>
+  <div class="tile"><b>Preview deploys</b><span>Every branch gets a URL.</span></div>
+  <div class="tile"><b>Usage alerts</b><span>Know before the bill does.</span></div>
+</div>
+<div style="padding: 0 24px;">
+  <img class="float-img" src="https://cdn.example.com/relay/chart.png" width="200" height="140" alt="Latency chart">
+  <p>Here is what changed this week. The chart shows p95 latency before and after the rollout, measured across all regions.</p>
+  <svg width="560" height="120" role="img" aria-label="Latency by region"><rect x="0" y="20" width="400" height="20" fill="#6366f1"/><rect x="0" y="60" width="260" height="20" fill="#ec4899"/><text x="410" y="35" fill="#fff">us-east 120ms</text><text x="270" y="75" fill="#fff">eu-west 78ms</text></svg>
+</div>
+<form action="https://relay.example.com/subscribe" method="post">
+  <label>Get the day 4 announcement first: <input type="email" name="email" placeholder="you@company.com"></label>
+  <button type="submit">Notify me</button>
+</form>
+<iframe src="https://www.example.com/embed/launch-video" width="560" height="315"></iframe>
+<video src="https://cdn.example.com/relay/teaser.mp4" width="560" controls poster="https://cdn.example.com/relay/poster.jpg"></video>
+<div style="position:fixed;bottom:0;left:0;right:0;background:#111;padding:12px;">Fixed footer bar</div>
+</body>
+</html>
