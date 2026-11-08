@@ -3,11 +3,18 @@
 //!
 //! - Search: `Query::parse` + `Store::list(view, query, conversations = true, limit = 3000, me)`,
 //!   exactly what one keystroke in the search field costs (search runs as you type). Each query
-//!   runs once cold (first time in this process) and then `REPEAT` more times.
+//!   runs once cold (first time in this process) and then `REPEAT` more times; the gate is the
+//!   p90 of those 21 runs (the 3rd worst). Every prefix typed on the way to two queries runs 5
+//!   times; the gate is the worst keystroke's median.
 //! - Open: `Store::thread(id, conversations = true)`: reads the conversation, its bodies,
 //!   converts HTML to Markdown on first open (and writes it back, as the engine does), and
 //!   parses the HTML into the layout tree the reader draws. Each sample is a different message,
-//!   so "first open" is really first.
+//!   so "first open" is really first; the gate is the p95 of the samples (the 3rd worst of 40).
+//!
+//! Why not the single worst run: on the macOS runner (a VM) one run in a few dozen stalls for up
+//! to 1.4 s (a query with a 53 ms median measured 1423 ms once), which measures the hypervisor,
+//! and would fail any passing check at random. A high quantile ignores a couple of stalls and
+//! still catches code that got slower. Every row also prints the true worst.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -18,9 +25,10 @@ use envoy_core::model::{Role, View};
 use envoy_core::store::{Query, Store};
 
 use crate::mailbox::{ACCOUNT, ME};
-use crate::report::{Check, budget, p50_max};
+use crate::report::{Check, budget, p50_max, quantile};
 
-const REPEAT: usize = 10;
+const REPEAT: usize = 20;
+const TYPED_RUNS: usize = 5;
 const LIMIT: u32 = 3000; // what `App::request_list` asks for
 
 fn inbox() -> View {
@@ -101,26 +109,48 @@ fn run_search(st: &Store, me: &HashSet<String>, checks: &mut Vec<Check>) -> Resu
             runs.push(time_query(st, &view, q, me)?.0);
         }
         let (p50, max) = p50_max(&runs);
-        lines.push(format!("  {v:>7}  {q:<22} {n:>5} rows  cold {cold:7.2} ms  p50 {p50:7.2} ms  max {max:7.2} ms"));
+        let p90 = quantile(&runs, 0.9);
+        lines.push(format!("  {v:>7}  {q:<22} {n:>5} rows  cold {cold:7.2} ms  p50 {p50:7.2} ms  p90 {p90:7.2} ms  max {max:7.2} ms"));
         all.extend(runs);
-        checks.push(Check::gated("search", format!("{v}: {q}"), max, "ms", budget::SEARCH_MS, 1.0, format!("worst of {}; p50 {p50:.2} ms, {n} rows", REPEAT + 1)));
+        checks.push(Check::gated(
+            "search",
+            format!("{v}: {q}"),
+            p90,
+            "ms",
+            budget::SEARCH_MS,
+            1.0,
+            format!("p90 of {} (p50 {p50:.2}, cold {cold:.2}, max {max:.2}); {n} rows", REPEAT + 1),
+        ));
     }
     let mut typed_all = Vec::new();
     for (v, q) in TYPED {
         let view = view_of(v);
-        let mut worst = (0.0f64, String::new());
+        let mut worst = (0.0f64, String::new(), 0.0f64);
         for end in 1..=q.chars().count() {
             let prefix: String = q.chars().take(end).collect();
-            let (cold, _) = time_query(st, &view, &prefix, me)?;
-            let (warm, n) = time_query(st, &view, &prefix, me)?;
-            let ms = cold.max(warm);
-            typed_all.push(ms);
-            lines.push(format!("  {v:>7}  {:<22} {n:>5} rows  cold {cold:7.2} ms  warm {warm:7.2} ms   (typing)", format!("{prefix:?}")));
-            if ms > worst.0 {
-                worst = (ms, prefix);
+            let mut runs = Vec::new();
+            let mut n = 0;
+            for _ in 0..TYPED_RUNS {
+                let (ms, rows) = time_query(st, &view, &prefix, me)?;
+                runs.push(ms);
+                n = rows;
+            }
+            let (median, max) = p50_max(&runs);
+            typed_all.extend(runs.iter().copied());
+            lines.push(format!("  {v:>7}  {:<22} {n:>5} rows  cold {:7.2} ms  p50 {median:7.2} ms  max {max:7.2} ms   (typing)", format!("{prefix:?}"), runs[0]));
+            if median > worst.0 {
+                worst = (median, prefix, max);
             }
         }
-        checks.push(Check::gated("search", format!("{v}: typing {q:?}"), worst.0, "ms", budget::SEARCH_MS, 1.0, format!("worst keystroke {:?} of {}", worst.1, q.chars().count())));
+        checks.push(Check::gated(
+            "search",
+            format!("{v}: typing {q:?}"),
+            worst.0,
+            "ms",
+            budget::SEARCH_MS,
+            1.0,
+            format!("worst keystroke {:?} of {} (median of {TYPED_RUNS}, max {:.2})", worst.1, q.chars().count(), worst.2),
+        ));
     }
     println!("\nsearch (Store::list, conversations, limit {LIMIT}):");
     for l in &lines {
@@ -128,7 +158,7 @@ fn run_search(st: &Store, me: &HashSet<String>, checks: &mut Vec<Check>) -> Resu
     }
     all.extend(typed_all);
     let (p50, max) = p50_max(&all);
-    checks.push(Check::gated("search", "all queries", max, "ms", budget::SEARCH_MS, 1.0, format!("worst of {} runs; p50 {p50:.2} ms", all.len())));
+    checks.push(Check::info("search", "all queries", max, "ms", format!("the single worst of {} runs (p50 {p50:.2} ms); each query gates on its own", all.len())));
     Ok(())
 }
 
@@ -165,8 +195,9 @@ fn run_open(db: &Path, st: &Store, checks: &mut Vec<Check>) -> Result<()> {
             msgs += thread.len();
         }
         let (p50, max) = p50_max(&runs);
-        println!("  open {name:<18} {:>3} samples  p50 {p50:7.2} ms  max {max:7.2} ms  ({:.1} messages each)", runs.len(), msgs as f64 / runs.len() as f64);
-        checks.push(Check::gated("open", name.to_string(), max, "ms", budget::OPEN_MS, 1.0, format!("worst of {} {what}; p50 {p50:.2} ms", runs.len())));
+        let p95 = quantile(&runs, 0.95);
+        println!("  open {name:<18} {:>3} samples  p50 {p50:7.2} ms  p95 {p95:7.2} ms  max {max:7.2} ms  ({:.1} messages each)", runs.len(), msgs as f64 / runs.len() as f64);
+        checks.push(Check::gated("open", name.to_string(), p95, "ms", budget::OPEN_MS, 1.0, format!("p95 of {} {what} (p50 {p50:.2}, max {max:.2})", runs.len())));
         Ok(())
     };
     println!("\nopen (Store::thread, conversations):");

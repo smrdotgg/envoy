@@ -92,7 +92,8 @@ pub fn parse(text: &str) -> Result<Vec<Miss>> {
 /// matches one of `only` but wasn't measured become INVALID checks. Returns the promotions.
 pub fn apply(checks: &mut Vec<Check>, misses: &[Miss], os: &str, only: &[String]) -> Vec<String> {
     let mut promote = Vec::new();
-    let ids: HashSet<String> = checks.iter().map(Check::id).collect();
+    // Only gated checks can be known misses; an entry for an info row is stale too.
+    let ids: HashSet<String> = checks.iter().filter(|c| c.gate.is_some() || c.outcome == Outcome::Invalid).map(Check::id).collect();
     for c in checks.iter_mut() {
         let Some(m) = misses.iter().find(|m| m.os == os && m.check == c.id()) else { continue };
         let (Some(measured), Some(gate)) = (c.measured, c.gate) else { continue };
