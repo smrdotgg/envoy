@@ -1152,11 +1152,12 @@ impl Store {
         Ok(out)
     }
 
-    /// Seconds until the next delayed op is due, if any.
+    /// Seconds until the account's next op is due, if it has any waiting: 0 or less for one
+    /// that already is (it came due after the replay pass that left it, during a sync, say).
     pub fn next_op_due(&self, account: &str, now: i64) -> Result<Option<i64>> {
         Ok(self
             .conn
-            .query_row("SELECT MIN(not_before) FROM ops WHERE account = ?1 AND not_before > ?2", params![account, now], |r| r.get::<_, Option<i64>>(0))?
+            .query_row("SELECT MIN(not_before) FROM ops WHERE account = ?1 AND claimed = 0", params![account], |r| r.get::<_, Option<i64>>(0))?
             .map(|t| t - now))
     }
 
@@ -2095,6 +2096,10 @@ mod tests {
         assert!(s.ops("a", 99).unwrap().is_empty(), "not replayed during the window");
         assert_eq!(s.next_op_due("a", 95).unwrap(), Some(5), "the worker wakes when it ends");
         assert_eq!(s.ops("a", 100).unwrap().len(), 1, "replayed once it ends");
+        // Come due while the worker was busy after its replay pass: due now, not forgotten
+        // until something else wakes the worker.
+        assert_eq!(s.next_op_due("a", 101).unwrap(), Some(-1));
+        assert_eq!(s.next_op_due("b", 101).unwrap(), None, "another account's ops are its own");
     }
 
     #[test]
