@@ -4,6 +4,7 @@ use rune::{Color, Cursor, Cx, El, ScrollSpec, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Markdown, MarkdownStyle, Spinner};
 
 use envoy_core::engine::{Command, MoveTarget};
+use envoy_core::html::Verdict;
 use envoy_core::model::{Role, ThreadMessage, View};
 
 use crate::app::App;
@@ -133,7 +134,11 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
         let ready = doc.images.iter().filter(|u| matches!(s.images.get(*u), Some(crate::app::ImageState::Ready(_)))).count();
         let version = (t.dark, cx.adapt, cx.load_images, cx.copy_links, max_w as u32, ready, std::sync::Arc::as_ptr(doc) as usize);
         let rendered = rune::memo(format!("html-{id}"), version, || crate::html_view::render(&cx, doc));
-        let mut out = col().key(format!("body-{id}")).w_full().max_w(max_w + 32.0).gap(8.0).child(rendered);
+        let mut out = col().key(format!("body-{id}")).w_full().max_w(max_w + 32.0).gap(8.0);
+        if doc.fidelity.verdict() == Verdict::Poor && !s.layout_note_dismissed.contains(&id) {
+            out = out.child(layout_note(t, id));
+        }
+        out = out.child(rendered);
         out = attachments(out, t, b, id);
         return out;
     }
@@ -180,6 +185,45 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
         }
     }
     attachments(out, t, b, id)
+}
+
+/// A quiet line over mail the native renderer can't lay out as designed (positioned layers,
+/// CSS grid, drawings, embedded media: `html::Verdict::Poor`), offering the original. Opening
+/// it is the user's choice; nothing loads until they do. Dismissed per message.
+fn layout_note(t: &Theme, id: i64) -> El {
+    let k = &t.k;
+    row()
+        .key(format!("layout-note-{id}"))
+        .w_full()
+        .gap(8.0)
+        .pl(10.0)
+        .pr(4.0)
+        .py(2.0)
+        .center_y()
+        .radius(8.0)
+        .fill(k.c.layer_01)
+        .child(icon(&icons::LAYERS, 14.0).color(k.c.icon_faint))
+        .child(text("Some of this message's layout can't be shown here.").font(k.ty.text_small).color(k.c.text_muted).wrap().grow(1.0).min_w(0.0))
+        .child(
+            Button::new("Open in browser")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut App| s.send(Command::OpenOriginal { id }))
+                .build(k)
+                .key(format!("layout-note-open-{id}")),
+        )
+        .child(
+            IconButton::new(&icons::CLOSE)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .label("Dismiss")
+                .help("Dismiss")
+                .on_press(move |s: &mut App| {
+                    s.layout_note_dismissed.insert(id);
+                })
+                .build(k)
+                .key(format!("layout-note-close-{id}")),
+        )
 }
 
 fn attachments(mut out: El, t: &Theme, b: &envoy_core::model::Body, id: i64) -> El {
