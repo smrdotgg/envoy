@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Your order has shipped</title>
+<style type="text/css">
+  body { margin: 0; background: #f2f2f2; font-family: Verdana, Geneva, sans-serif; color: #333333; }
+  .wrap { width: 640px; background: #ffffff; }
+  .brand { background: #0b3d91; color: #ffffff; font-size: 20px; font-weight: bold; padding: 18px 24px; }
+  .section-title { font-size: 13px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; color: #0b3d91; border-bottom: 2px solid #0b3d91; padding: 6px 0; }
+  table.items th { font-size: 12px; color: #666666; text-align: left; border-bottom: 1px solid #cccccc; }
+  table.items td { font-size: 13px; vertical-align: top; border-bottom: 1px solid #eeeeee; }
+  table.items td.price, table.items th.price { text-align: right; white-space: nowrap; }
+  .muted { color: #888888; font-size: 11px; }
+  .totals td { font-size: 13px; }
+  .totals .grand td { font-size: 16px; font-weight: bold; border-top: 2px solid #333333; }
+  #track a { background-color: #f5a623; color: #1a1a1a; font-weight: bold; text-decoration: none; padding: 10px 22px; border-radius: 4px; display: inline-block; }
+</style>
+</head>
+<body>
+<table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f2f2f2">
+<tr><td align="center" style="padding: 20px 0;">
+<table class="wrap" cellpadding="0" cellspacing="0" border="0">
+  <tr><td class="brand">Harbor &amp; Pine Outfitters</td></tr>
+  <tr><td style="padding: 24px;">
+    <h1 style="font-size: 22px; margin: 0 0 8px 0; font-weight: normal;">Good news, Sam — your order is on its way.</h1>
+    <p style="margin: 0 0 16px 0; font-size: 13px; line-height: 20px;">Order <b>#HP-58213</b> left our warehouse on March 4 and should arrive by <b>Friday, March 7</b>.</p>
+    <p id="track" style="margin: 0 0 24px 0;"><a href="https://track.example.net/HP-58213">Track your package</a></p>
+
+    <div class="section-title">Shipment details</div>
+    <table width="100%" cellpadding="6" cellspacing="0" border="0" style="margin: 8px 0 24px 0; font-size: 13px;">
+      <tr>
+        <td width="25%" valign="top" style="color: #666666;">Carrier</td>
+        <td width="25%" valign="top">Coastline Express</td>
+        <td width="25%" valign="top" style="color: #666666;">Ship to</td>
+        <td width="25%" valign="top" rowspan="3">Sam Rivera<br>14 Quay Street<br>Portsmouth PO1 2AB<br>United Kingdom</td>
+      </tr>
+      <tr>
+        <td valign="top" style="color: #666666;">Tracking no.</td>
+        <td valign="top" style="font-family: 'Courier New', Courier, monospace;">CX 4471 0092 18</td>
+        <td></td>
+      </tr>
+      <tr>
+        <td valign="top" style="color: #666666;">Service</td>
+        <td valign="top" colspan="2">Standard (2–3 working days)</td>
+      </tr>
+    </table>
+
+    <div class="section-title">In this shipment</div>
+    <table class="items" width="100%" cellpadding="8" cellspacing="0" border="0" style="margin-top: 8px;">
+      <tr>
+        <th colspan="2">Item</th>
+        <th>Qty</th>
+        <th class="price">Price</th>
+      </tr>
+      <tr>
+        <td width="64"><img src="https://img.example.net/hp/jacket-64.jpg" width="56" height="56" alt="Jacket" style="display:block; border: 1px solid #eeeeee;"></td>
+        <td>Tidewater rain jacket<br><span class="muted">Navy · M · SKU 20931</span></td>
+        <td width="40">1</td>
+        <td class="price" width="80">£89.00</td>
+      </tr>
+      <tr>
+        <td width="64"><img src="https://img.example.net/hp/socks-64.jpg" width="56" height="56" alt="Socks" style="display:block; border: 1px solid #eeeeee;"></td>
+        <td>Merino hiking socks, 2-pack<br><span class="muted">Charcoal · 6–8 · SKU 11804</span></td>
+        <td>2</td>
+        <td class="price">£28.00</td>
+      </tr>
+      <tr>
+        <td colspan="4" style="background-color: #fff8e6; font-size: 12px;"><b>Heads up:</b> your water bottle is coming separately and will ship within 5 days.</td>
+      </tr>
+    </table>
+
+    <table class="totals" width="100%" cellpadding="6" cellspacing="0" border="0" style="margin-top: 12px;">
+      <tr><td width="70%" align="right">Subtotal</td><td align="right">£117.00</td></tr>
+      <tr><td align="right">Shipping</td><td align="right">£0.00</td></tr>
+      <tr class="grand"><td align="right">Total</td><td align="right">£117.00</td></tr>
+    </table>
+  </td></tr>
+  <tr><td style="padding: 16px 24px; background: #f7f7f7; font-size: 11px; color: #888888; line-height: 16px; border-top: 1px solid #e5e5e5;">
+    Questions? Reply to this email or call 0800 000 0000. Harbor &amp; Pine Outfitters Ltd, Unit 3, Dock Road, Southampton.
+  </td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

@@ -182,6 +182,18 @@ fn scene_open(s: &mut App) {
     }
 }
 
+/// The open conversation full width with only its newest message expanded: with
+/// `ENVOY_DEMO_HTML=mail.html` and a tall `--size`, a whole HTML email in one snapshot.
+fn scene_html(s: &mut App, theme: &str) {
+    let _ = s.settings.set("appearance.theme", serde_json::json!(theme));
+    let _ = s.settings.set("inbox.readingPane", serde_json::json!("off"));
+    scene_open(s);
+    s.expanded.clear();
+    if let Some(m) = s.thread.last() {
+        s.expanded.insert(m.summary.id);
+    }
+}
+
 type Scene = (&'static str, fn(&mut App));
 
 const SCENES: &[Scene] = &[
@@ -226,6 +238,8 @@ const SCENES: &[Scene] = &[
         s.mailboxes.clear();
         s.screen = Screen::AddAccount;
     }),
+    ("html", |s| scene_html(s, "light")),
+    ("html-dark", |s| scene_html(s, "dark")),
     ("sent", |s| {
         s.view = View::Role { account: Some("demo".into()), role: Role::Sent };
         s.list = demo::list_for(&s.view);
