@@ -48,12 +48,6 @@ ceiling = 38
 seen = "36.2–36.2 MB over 4 runs, over budget in 4"
 
 [[miss]]
-check = "search · all queries"
-os = "linux"
-ceiling = 290
-seen = "135.4–191.5 ms over 4 runs, over budget in 4"
-
-[[miss]]
 check = "search · archive: meeting"
 os = "linux"
 ceiling = 210
@@ -94,12 +88,6 @@ check = "app · search, end to end"
 os = "macos"
 ceiling = 1260
 seen = "105.6–839.8 ms over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · all queries"
-os = "macos"
-ceiling = 1380
-seen = "209.8–918.1 ms over 4 runs, over budget in 4"
 
 [[miss]]
 check = "search · archive: from:alice"
@@ -172,12 +160,6 @@ check = "binary · size"
 os = "windows"
 ceiling = 35
 seen = "32.7–32.7 MB over 4 runs, over budget in 4"
-
-[[miss]]
-check = "search · all queries"
-os = "windows"
-ceiling = 435
-seen = "190.9–289.5 ms over 4 runs, over budget in 4"
 
 [[miss]]
 check = "search · archive: from:alice"
