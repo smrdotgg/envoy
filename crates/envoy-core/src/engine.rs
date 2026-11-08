@@ -536,8 +536,12 @@ fn move_and_hold(shared: &Shared, ids: Vec<MessageId>, to: &MoveTarget, thread: 
     // exactly the window) never outlives the hold, whatever the clocks' rounding.
     let hold = undo.filter(|_| window > 0).map(|key| (now + window as i64 + 1, key));
     let mut moved = shared.with_writer(|st| st.transaction(|st| move_local(st, &ids, to, hold)))?;
-    if let Some((_, key)) = hold {
-        shared.emit(Event::Held { undo: key, ops: moved.held });
+    match hold {
+        Some((_, key)) => shared.emit(Event::Held { undo: key, ops: moved.held }),
+        // Without an undo key nobody hears about a move that did nothing; the UI took its
+        // rows away optimistically, so tell it to reload.
+        None if moved.touched.is_empty() => shared.emit(Event::Changed { account: String::new() }),
+        None => {}
     }
     if let Some((_, key)) = hold
         && moved.held > 0
@@ -1271,6 +1275,19 @@ mod tests {
     // The undo window has just run out (the op is due) while the toast is still up.
     fn due_move(shared: &Shared, ids: Vec<MessageId>, key: i64) {
         move_and_hold(shared, ids, &MoveTarget::Archive, false, Some(key), now() - 10).unwrap();
+    }
+
+    #[test]
+    fn a_move_that_does_nothing_tells_the_ui() {
+        let st = setup();
+        let a = message(&st, "Archive", 1, "<1@x>", "", 0);
+        let (shared, rx) = engine_with(st);
+        // Undoable: acknowledged with no ops held (the app reloads and drops its Undo).
+        move_and_hold(&shared, vec![a], &MoveTarget::Archive, false, Some(3), now()).unwrap();
+        assert!(rx.try_iter().any(|e| matches!(e, Event::Held { undo: 3, ops: 0 })));
+        // Undo turned off: a plain reload request.
+        move_and_hold(&shared, vec![a], &MoveTarget::Archive, false, None, now()).unwrap();
+        assert!(rx.try_iter().any(|e| matches!(e, Event::Changed { .. })));
     }
 
     #[test]
