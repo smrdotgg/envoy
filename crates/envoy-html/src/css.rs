@@ -118,51 +118,44 @@ struct Rule {
     order: u32,
     block: u32,
     ua: bool,
-    /// Classes and ids its ancestor compounds need ([`Bloom`]): a rule whose bits an element's
-    /// ancestors lack can't match it, and is skipped without spending budget.
-    need: Bloom,
 }
 
 /// A 512-bit Bloom filter of class and id names.
 pub type Bloom = [u64; 8];
 
-fn bloom_bit(name: &str) -> (usize, u64) {
-    // FNV-1a.
+/// The filter bit for a class (`kind` '.') or id ('#'): FNV-1a of the two, mod 512.
+fn bloom_bit(kind: char, name: &str) -> u16 {
     let mut h: u32 = 0x811c_9dc5;
-    for b in name.bytes() {
+    for b in std::iter::once(kind as u8).chain(name.bytes()) {
         h = (h ^ b as u32).wrapping_mul(0x0100_0193);
     }
-    let bit = (h % 512) as usize;
-    (bit / 64, 1 << (bit % 64))
+    (h % 512) as u16
 }
 
 /// Adds a class (`.name`) or id (`#name`) to a filter.
 pub fn bloom_add(bloom: &mut Bloom, kind: char, name: &str) {
-    let mut key = String::with_capacity(name.len() + 1);
-    key.push(kind);
-    key.push_str(name);
-    let (word, bit) = bloom_bit(&key);
-    bloom[word] |= bit;
+    let bit = bloom_bit(kind, name);
+    bloom[bit as usize / 64] |= 1 << (bit % 64);
 }
 
-fn bloom_has(have: &Bloom, need: &Bloom) -> bool {
-    have.iter().zip(need).all(|(h, n)| h & n == *n)
+/// Up to four filter bits a rule's ancestors must have (`NO_BIT` for none).
+type Need = [u16; 4];
+const NO_BIT: u16 = u16::MAX;
+
+fn bloom_has(have: &Bloom, need: &Need) -> bool {
+    need.iter().all(|&b| b == NO_BIT || have[b as usize / 64] & (1 << (b % 64)) != 0)
 }
 
 /// What a selector's ancestor compounds need, when it reaches them only by descendant and
 /// child combinators (siblings aren't ancestors).
-fn needs(sel: &Selector) -> Bloom {
-    let mut need = [0u64; 8];
+fn needs(sel: &Selector) -> Need {
+    let mut need = [NO_BIT; 4];
     if sel.combs.iter().any(|c| matches!(c, Comb::Adjacent | Comb::Sibling)) {
         return need;
     }
-    for c in &sel.parts[1..] {
-        for cl in &c.classes {
-            bloom_add(&mut need, '.', cl);
-        }
-        if let Some(id) = &c.id {
-            bloom_add(&mut need, '#', id);
-        }
+    let bits = sel.parts[1..].iter().flat_map(|c| c.classes.iter().map(|cl| bloom_bit('.', cl)).chain(c.id.iter().map(|id| bloom_bit('#', id))));
+    for (slot, bit) in need.iter_mut().zip(bits) {
+        *slot = bit;
     }
     need
 }
@@ -208,6 +201,8 @@ pub struct SheetStats {
 #[derive(Default)]
 pub struct Sheet {
     rules: Vec<Rule>,
+    /// Each rule's ancestor filter bits, beside the rules so the hot loop stays in cache.
+    need: Vec<Need>,
     blocks: Vec<Vec<Decl>>,
     by_id: HashMap<String, Vec<u32>>,
     by_class: HashMap<String, Vec<u32>>,
@@ -321,8 +316,8 @@ impl Sheet {
             } else {
                 self.universal.push(idx);
             }
-            let need = needs(&sel);
-            self.rules.push(Rule { sel, spec, order: self.order, block, ua, need });
+            self.need.push(needs(&sel));
+            self.rules.push(Rule { sel, spec, order: self.order, block, ua });
         }
     }
 
@@ -330,28 +325,17 @@ impl Sheet {
     /// from the end ([`get`]).
     pub fn cascade(&mut self, els: &[Elem], i: u32, inline: Option<&str>) -> Styles {
         let e = &els[i as usize];
-        let mut cands: Vec<u32> = Vec::new();
-        if let Some(v) = e.id.as_ref().and_then(|id| self.by_id.get(id)) {
-            cands.extend(v);
-        }
-        for c in &e.classes {
-            if let Some(v) = self.by_class.get(c) {
-                cands.extend(v);
-            }
-        }
-        if let Some(v) = self.by_tag.get(&e.tag) {
-            cands.extend(v);
-        }
-        cands.extend(&self.universal);
-        cands.sort_unstable();
-        cands.dedup();
+        // Each rule sits in one bucket, and an element's classes are distinct: no rule comes
+        // up twice.
+        let empty: &[u32] = &[];
+        let id = e.id.as_ref().and_then(|id| self.by_id.get(id)).map_or(empty, |v| v.as_slice());
+        let tag = self.by_tag.get(&e.tag).map_or(empty, |v| v.as_slice());
+        let classes = e.classes.iter().filter_map(|c| self.by_class.get(c)).flat_map(|v| v.iter());
+        let cands: Vec<u32> = id.iter().chain(classes).chain(tag).chain(&self.universal).copied().filter(|&r| bloom_has(&e.ancestors, &self.need[r as usize])).collect();
         // (layer, specificity, order, block)
         let mut hits: Vec<(u8, u32, u32, u32)> = Vec::new();
         for r in cands {
             let rule = &self.rules[r as usize];
-            if !bloom_has(&e.ancestors, &rule.need) {
-                continue;
-            }
             if !rule.ua && self.budget == 0 {
                 self.stats.exhausted = true;
                 continue;
@@ -426,7 +410,26 @@ fn parse_decls(block: &str, out: &mut Vec<Decl>) {
 }
 
 fn push(out: &mut Vec<Decl>, name: &str, value: &str, important: bool) {
-    out.push(Decl { name: name.into(), value: value.into(), important });
+    if known(name) {
+        out.push(Decl { name: name.into(), value: value.into(), important });
+    }
+}
+
+/// The properties the renderer reads: the rest (`mso-*`, `-webkit-*`, `-premailer-*`,
+/// transitions…) are dropped as they're read, so lookups scan short lists. (Everything is kept
+/// in this crate's unit tests, which use made-up names.)
+fn known(name: &str) -> bool {
+    cfg!(test)
+        || matches!(
+            name,
+            "color" | "background-color" | "background-image" | "display" | "visibility" | "opacity" | "overflow" | "height" | "max-height" | "width" | "max-width" | "min-width"
+                | "padding-top" | "padding-right" | "padding-bottom" | "padding-left" | "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
+                | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" | "border-top-style" | "border-right-style"
+                | "border-bottom-style" | "border-left-style" | "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color"
+                | "border-radius" | "border-top-left-radius" | "border-collapse" | "border-spacing" | "font-family" | "font-size" | "font-style" | "font-weight"
+                | "line-height" | "letter-spacing" | "text-align" | "text-decoration" | "text-decoration-line" | "text-transform" | "vertical-align" | "white-space"
+                | "list-style" | "list-style-type" | "float" | "position" | "transform" | "clip-path" | "mix-blend-mode" | "filter" | "columns" | "column-count" | "content"
+        )
 }
 
 const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];

@@ -361,7 +361,9 @@ impl Builder {
             index += 1;
             let attrs: Vec<(String, String)> = attrs.borrow().iter().map(|a| (a.name.local.as_ref().to_ascii_lowercase(), a.value.to_string())).collect();
             let id = attrs.iter().find(|(k, _)| k == "id").map(|(_, v)| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty());
-            let classes: Vec<String> = attrs.iter().find(|(k, _)| k == "class").map(|(_, v)| v.split_whitespace().map(|c| c.to_ascii_lowercase()).collect()).unwrap_or_default();
+            let mut classes: Vec<String> = attrs.iter().find(|(k, _)| k == "class").map(|(_, v)| v.split_whitespace().map(|c| c.to_ascii_lowercase()).collect()).unwrap_or_default();
+            classes.sort_unstable();
+            classes.dedup();
             let i = self.els.len() as u32;
             let mut inner = ancestors;
             for cl in &classes {
@@ -686,7 +688,11 @@ fn border_width(v: &str, size: f32) -> f32 {
     }
 }
 
-const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+const PADDING: [&str; 4] = ["padding-top", "padding-right", "padding-bottom", "padding-left"];
+const MARGIN: [&str; 4] = ["margin-top", "margin-right", "margin-bottom", "margin-left"];
+const BORDER_STYLE: [&str; 4] = ["border-top-style", "border-right-style", "border-bottom-style", "border-left-style"];
+const BORDER_WIDTH: [&str; 4] = ["border-top-width", "border-right-width", "border-bottom-width", "border-left-width"];
+const BORDER_COLOR: [&str; 4] = ["border-top-color", "border-right-color", "border-bottom-color", "border-left-color"];
 
 fn box_style(h: &Handle, t: &str, st: &[(Rc<str>, Rc<str>)], ctx: &mut Ctx, cellpadding: f32) -> BoxStyle {
     let mut b = BoxStyle { align: ctx.align, ..BoxStyle::default() };
@@ -721,11 +727,11 @@ fn box_style(h: &Handle, t: &str, st: &[(Rc<str>, Rc<str>)], ctx: &mut Ctx, cell
     {
         b.bg_image = Some(u);
     }
-    for (i, s) in SIDES.iter().enumerate() {
-        b.pad[i] = style(st, &format!("padding-{s}")).and_then(|v| length(v, size)).unwrap_or(cellpadding).clamp(0.0, 80.0);
+    for (i, k) in PADDING.iter().enumerate() {
+        b.pad[i] = style(st, k).and_then(|v| length(v, size)).unwrap_or(cellpadding).clamp(0.0, 80.0);
     }
     for i in [1, 3] {
-        b.margin[i] = style(st, &format!("margin-{}", SIDES[i])).and_then(|v| length(v, size)).unwrap_or(0.0).clamp(0.0, 64.0);
+        b.margin[i] = style(st, MARGIN[i]).and_then(|v| length(v, size)).unwrap_or(0.0).clamp(0.0, 64.0);
     }
     b.width = style(st, "width").and_then(len_attr).or_else(|| if t == "td" || t == "th" || t == "table" || t == "img" || t == "col" { attr(h, "width").as_deref().and_then(len_attr) } else { None });
     b.max_width = style(st, "max-width").and_then(|v| match len_attr(v) {
@@ -745,16 +751,16 @@ fn box_style(h: &Handle, t: &str, st: &[(Rc<str>, Rc<str>)], ctx: &mut Ctx, cell
     let mut widths = [0.0f32; 4];
     let mut color = None;
     let mut dashed = false;
-    for (i, s) in SIDES.iter().enumerate() {
-        let st_ = style(st, &format!("border-{s}-style")).unwrap_or("none");
+    for i in 0..4 {
+        let st_ = style(st, BORDER_STYLE[i]).unwrap_or("none");
         if matches!(st_, "none" | "hidden") {
             continue;
         }
-        let w = style(st, &format!("border-{s}-width")).map_or(3.0, |v| border_width(v, size)).min(24.0);
+        let w = style(st, BORDER_WIDTH[i]).map_or(3.0, |v| border_width(v, size)).min(24.0);
         if w <= 0.0 {
             continue;
         }
-        let c = match style(st, &format!("border-{s}-color")) {
+        let c = match style(st, BORDER_COLOR[i]) {
             Some("currentcolor") | None => ctx.color.or(Some([0, 0, 0, 255])),
             Some(v) => parse_color(v),
         };
@@ -1466,10 +1472,13 @@ impl Builder {
         }
         let mut inner: Vec<Node> = caption;
         if ncols <= 1 {
-            if !declared {
+            if !declared && grid.iter().all(|r| r.cells.iter().all(|c| c.decl.is_none())) {
                 // Tables shrink to their content: a button, a badge, a logo.
-                let (_, hi) = table::estimate(&grid.iter().flat_map(|r| r.cells.iter().map(|c| Node::Box { style: c.style.clone(), children: c.nodes.clone() })).collect::<Vec<_>>());
-                tstyle.tight = hi < twidth * 0.6 && grid.iter().all(|r| r.cells.iter().all(|c| c.decl.is_none()));
+                let cap = twidth * 0.6;
+                tstyle.tight = grid.iter().flat_map(|r| &r.cells).all(|c| {
+                    let edge = c.style.pad[1] + c.style.pad[3] + c.style.border.as_ref().map_or(0.0, |b| b.widths[1] + b.widths[3]);
+                    table::estimate_capped(&c.nodes, cap).1 + edge < cap
+                });
             }
             // A layout table: each row is its cell.
             for row in grid {
@@ -1669,7 +1678,7 @@ fn push_box(out: &mut Vec<Node>, style: BoxStyle, children: Vec<Node>) {
         }
         return;
     }
-    if let [Node::Box { style: inner, children: kids }] = children.as_slice()
+    if let [Node::Box { style: inner, .. }] = children.as_slice()
         && !style.has_visuals()
         && (inner.width.is_none() || style.width.is_none())
         && (style.align == Align::Left || (inner.width.is_none() && inner.max_width.is_none() && !inner.tight))
@@ -1677,6 +1686,7 @@ fn push_box(out: &mut Vec<Node>, style: BoxStyle, children: Vec<Node>) {
         && !(inner.tight && (style.width.is_some() || style.max_width.is_some() || style.min_width > 0.0))
     {
         // A wrapper with only padding, margins or a width: fold it into the box it holds.
+        let Some(Node::Box { style: inner, children: kids }) = children.into_iter().next() else { unreachable!() };
         let mut merged = inner.clone();
         for i in 0..4 {
             if inner.has_visuals() {
@@ -1692,7 +1702,7 @@ fn push_box(out: &mut Vec<Node>, style: BoxStyle, children: Vec<Node>) {
             (a, b) => a.or(b),
         };
         merged.min_width = merged.min_width.max(style.min_width);
-        out.push(Node::Box { style: merged, children: kids.clone() });
+        out.push(Node::Box { style: merged, children: kids });
         return;
     }
     let mut children = children;
