@@ -1,0 +1,21 @@
+[package]
+name = "envoy-bench"
+description = "Envoy's latency budgets, measured against a large synthetic mailbox (see docs/NORTH_STAR.md)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+envoy-core = { workspace = true }
+# Same version and features as envoy-core's, so it's the same build: only to pick sample ids.
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

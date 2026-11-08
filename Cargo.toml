@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/envoy-core", "crates/envoy"]
+members = ["crates/envoy-core", "crates/envoy", "crates/envoy-bench"]
 exclude = ["vendor"]
 
 [workspace.package]
