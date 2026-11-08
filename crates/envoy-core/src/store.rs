@@ -321,6 +321,7 @@ impl Store {
     }
 
     /// Inserts (or refreshes the flags of) a message from its headers. Returns its id.
+    #[allow(clippy::too_many_arguments)] // one per IMAP FETCH item
     pub fn upsert_header(&self, account: &str, mailbox: &str, uid: u32, fl: u32, size: u32, internal_date: i64, p: &Parsed) -> Result<MessageId> {
         let thread = mime::thread_id(&p.message_id, &p.in_reply_to, &p.references);
         let thread = if thread.is_empty() { format!("uid:{mailbox}:{uid}") } else { thread };
@@ -469,7 +470,7 @@ impl Store {
     /// Applies a flag change locally; returns the message's location for queuing the op.
     pub fn change_flags(&self, id: MessageId, add: u32, remove: u32) -> Result<Option<(String, String, u32)>> {
         self.conn.execute("UPDATE messages SET flags = (flags | ?2) & ~?3 WHERE id = ?1", params![id, add, remove])?;
-        Ok(self.location(id)?)
+        self.location(id)
     }
 
     pub fn location(&self, id: MessageId) -> Result<Option<(String, String, u32)>> {
