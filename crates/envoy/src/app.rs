@@ -186,6 +186,8 @@ pub struct App {
     pub list: Vec<Summary>,
     pub list_req: u64,
     pub list_loaded: bool,
+    /// False while `list` is the top of a longer list whose rest is on its way.
+    pub list_complete: bool,
     /// The opened row (its newest message in conversation view).
     pub open: Option<MessageId>,
     pub thread: Vec<ThreadMessage>,
@@ -247,6 +249,7 @@ impl App {
             list: Vec::new(),
             list_req: 0,
             list_loaded: false,
+            list_complete: true,
             open: None,
             thread: Vec::new(),
             thread_req: 0,
@@ -339,10 +342,11 @@ impl App {
             Event::Mailboxes { account, mailboxes } => {
                 self.mailboxes.insert(account, mailboxes);
             }
-            Event::List { req, items } => {
+            Event::List { req, items, more } => {
                 if req == self.list_req {
                     self.list = items;
                     self.list_loaded = true;
+                    self.list_complete = !more;
                 }
             }
             Event::Thread { req, id, messages } if req == self.thread_req && messages.is_empty() => {

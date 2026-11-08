@@ -1,12 +1,16 @@
 //! Search and open, timed on the engine's own code path: the same `Store` calls, arguments and
 //! connection setup the engine thread makes for `Command::List` and `Command::Open`.
 //!
-//! - Search: `Query::parse` + `Store::list(view, query, conversations = true, limit = 3000, me)`,
-//!   exactly what one keystroke in the search field costs (search runs as you type). Each query
-//!   runs once cold (first time in this process) and then `REPEAT` more times; the gate is the
-//!   median of those 21 runs, with the p90, the cold run and the worst printed beside it. Every
-//!   prefix typed on the way to two queries runs 5 times; the gate is the worst keystroke's
-//!   median.
+//! - Search: `Query::parse` + `Store::list_paged(view, query, conversations = true, limit =
+//!   3000, me, engine::FIRST_PAGE)`, exactly what one keystroke in the search field costs
+//!   (search runs as you type), timed to the rows the user sees: the engine sends the first
+//!   page of a long list (the top `FIRST_PAGE` rows, final) as soon as it's read and the rest
+//!   after it (law 1 of docs/NORTH_STAR.md: what can't meet the budget streams in), so that's
+//!   the first page's time, or the whole list's when it's short. The whole list's time is
+//!   printed beside it. Each query runs once cold (first time in this process) and then
+//!   `REPEAT` more times; the gate is the median of those 21 runs, with the p90, the cold run
+//!   and the worst printed beside it. Every prefix typed on the way to two queries runs 5 times;
+//!   the gate is the worst keystroke's median.
 //! - Open: `Store::thread(id, conversations = true)`: reads the conversation, its bodies,
 //!   converts HTML to Markdown on first open (and writes it back, as the engine does), and
 //!   parses the HTML into the layout tree the reader draws. Each sample is a different message,
@@ -25,6 +29,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
+use envoy_core::engine::FIRST_PAGE;
 use envoy_core::model::{Role, View};
 use envoy_core::store::{Query, Store};
 
@@ -72,11 +77,22 @@ fn view_of(name: &str) -> View {
     if name == "archive" { archive() } else { inbox() }
 }
 
-fn time_query(st: &Store, view: &View, q: &str, me: &HashSet<String>) -> Result<(f64, usize)> {
+/// One keystroke: (ms to the rows shown first, ms to the whole list, rows in the whole list).
+fn timed(st: &Store, view: &View, q: &str, me: &HashSet<String>) -> Result<(f64, f64, usize)> {
     let t = Instant::now();
     let query = Query::parse(q);
-    let rows = st.list(view, &query, true, LIMIT, me)?;
-    Ok((t.elapsed().as_secs_f64() * 1000.0, rows.len()))
+    let mut first = None;
+    let rows = st.list_paged(view, &query, true, LIMIT, me, FIRST_PAGE, &mut |_| {
+        first.get_or_insert(t.elapsed());
+    })?;
+    let whole = t.elapsed();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    Ok((ms(first.unwrap_or(whole)), ms(whole), rows.len()))
+}
+
+fn time_query(st: &Store, view: &View, q: &str, me: &HashSet<String>) -> Result<(f64, usize)> {
+    let (shown, _, n) = timed(st, view, q, me)?;
+    Ok((shown, n))
 }
 
 pub fn run(home: &Path, checks: &mut Vec<Check>, search: bool, open: bool) -> Result<()> {
@@ -88,10 +104,10 @@ pub fn run(home: &Path, checks: &mut Vec<Check>, search: bool, open: bool) -> Re
     let t = Instant::now();
     let st = Store::open(&db)?;
     let opened = t.elapsed().as_secs_f64() * 1000.0;
-    let (first_list, rows) = time_query(&st, &inbox(), "", &me)?;
+    let (first_list, first_whole, rows) = timed(&st, &inbox(), "", &me)?;
     let total: i64 = rusqlite::Connection::open(&db)?.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
     checks.push(Check::info("store", "open cache", opened, "ms", format!("{total} messages in {}", human_size(std::fs::metadata(&db)?.len()))));
-    checks.push(Check::info("store", "first inbox list", first_list, "ms", format!("{rows} conversations (startup's query, first run in this process)")));
+    checks.push(Check::info("store", "first inbox list", first_list, "ms", format!("startup's query, first run in this process: its first {FIRST_PAGE} rows; all {rows} in {first_whole:.1} ms")));
 
     if search {
         run_search(&st, &me, checks)?;
@@ -105,16 +121,21 @@ pub fn run(home: &Path, checks: &mut Vec<Check>, search: bool, open: bool) -> Re
 fn run_search(st: &Store, me: &HashSet<String>, checks: &mut Vec<Check>) -> Result<()> {
     let mut all = Vec::new();
     let mut lines = Vec::new();
+    let mut worst_whole = 0.0f64;
     for (v, q) in QUERIES {
         let view = view_of(v);
-        let (cold, n) = time_query(st, &view, q, me)?;
-        let mut runs = vec![cold];
+        let (cold, cold_whole, n) = timed(st, &view, q, me)?;
+        let (mut runs, mut wholes) = (vec![cold], vec![cold_whole]);
         for _ in 0..REPEAT {
-            runs.push(time_query(st, &view, q, me)?.0);
+            let (shown, whole, _) = timed(st, &view, q, me)?;
+            runs.push(shown);
+            wholes.push(whole);
         }
         let (p50, max) = p50_max(&runs);
         let p90 = quantile(&runs, 0.9);
-        lines.push(format!("  {v:>7}  {q:<22} {n:>5} rows  cold {cold:7.2} ms  p50 {p50:7.2} ms  p90 {p90:7.2} ms  max {max:7.2} ms"));
+        let whole50 = p50_max(&wholes).0;
+        worst_whole = worst_whole.max(whole50);
+        lines.push(format!("  {v:>7}  {q:<22} {n:>5} rows  cold {cold:7.2} ms  p50 {p50:7.2} ms  p90 {p90:7.2} ms  max {max:7.2} ms  (whole list p50 {whole50:7.2} ms)"));
         all.extend(runs);
         checks.push(Check::gated(
             "search",
@@ -123,7 +144,7 @@ fn run_search(st: &Store, me: &HashSet<String>, checks: &mut Vec<Check>) -> Resu
             "ms",
             budget::SEARCH_MS,
             1.0,
-            format!("median of {} (p90 {p90:.2}, cold {cold:.2}, max {max:.2}); {n} rows", REPEAT + 1),
+            format!("median of {} (p90 {p90:.2}, cold {cold:.2}, max {max:.2}); {n} rows, the whole list in {whole50:.2}", REPEAT + 1),
         ));
     }
     let mut typed_all = Vec::new();
@@ -156,13 +177,20 @@ fn run_search(st: &Store, me: &HashSet<String>, checks: &mut Vec<Check>) -> Resu
             format!("worst keystroke {:?} of {} (median of {TYPED_RUNS}, max {:.2})", worst.1, q.chars().count(), worst.2),
         ));
     }
-    println!("\nsearch (Store::list, conversations, limit {LIMIT}):");
+    println!("\nsearch (Store::list_paged, conversations, limit {LIMIT}, first page {FIRST_PAGE}; timed to the rows shown first):");
     for l in &lines {
         println!("{l}");
     }
     all.extend(typed_all);
     let (p50, max) = p50_max(&all);
     checks.push(Check::info("search", "all queries", max, "ms", format!("the single worst of {} runs (p50 {p50:.2} ms); each query gates on its own", all.len())));
+    checks.push(Check::info(
+        "search",
+        "  whole lists",
+        worst_whole,
+        "ms",
+        format!("the slowest query's median to its whole list (up to {LIMIT} rows); the first {FIRST_PAGE} show before it"),
+    ));
     Ok(())
 }
 
