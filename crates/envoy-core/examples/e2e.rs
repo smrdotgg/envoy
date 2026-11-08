@@ -44,8 +44,13 @@ const IMAPS: u16 = 3993;
 const PASSWORD: &str = "pw";
 const ACCOUNT: &str = "me";
 
-/// How long an undoable move or send is held: the 5 s window and its second of grace.
-const HOLD: Duration = Duration::from_secs(6);
+/// Seconds an undoable move (or draft discard) waits before it may reach the server: the 5 s
+/// window and its second of grace. A send waits the 5 s.
+const MOVE_HOLD: i64 = 6;
+const SEND_HOLD: i64 = 5;
+/// How long after its deadline a held op may take to reach the server. The worker wakes on the
+/// deadline, so it's a second or so; the rest is slack for a slow CI runner.
+const LATE: f64 = 15.0;
 
 /// Sent by the Envoy that's killed while it waits out the undo window ([`hold`]).
 const QUEUED: &str = "Queued before a crash";
@@ -248,25 +253,26 @@ fn scenario(pass: Pass) {
 
     // ── Moves, held for the undo window ──
     // Spam, undone within the window: back in the inbox, and the server never moves it.
-    let mark = d.mark();
+    let (mark, before) = (d.mark(), epoch());
     d.send(Command::Move { ids: vec![digest.id], to: MoveTarget::Junk, thread: false, undo: Some(1) });
     d.wait(mark, "the move held", 5, |e| matches!(e, Event::Held { undo: 1, ops: 1 }).then_some(()));
+    let due = deadline("batch = 1");
+    assert_hold("the spam move", due, before, epoch(), MOVE_HOLD);
     assert!(!d.list(&inbox, "", false).iter().any(|s| s.id == digest.id), "gone from the inbox at once");
     d.send(Command::UndoMove { undo: 1 });
     assert!(d.list(&inbox, "", false).iter().any(|s| s.id == digest.id), "back after undo");
-    std::thread::sleep(HOLD + Duration::from_secs(1));
-    assert_eq!(probe.live("Junk").len(), 3, "the server never saw the undone move");
-    assert!(probe.live("INBOX").contains(&digest.subject));
-    println!("✓ spam undone: message back, server untouched");
+    untouched_until(&mut d, "the server saw the undone move", due as f64 + 3.0, || probe.live("Junk").len() == 3 && probe.live("INBOX").contains(&digest.subject));
+    println!("✓ spam undone: message back, server untouched past the window");
 
     // Archive the conversation, undoable: it waits out the window, then reaches the server.
-    let t_archive = Instant::now();
+    let (mark, before) = (d.mark(), epoch());
     d.send(Command::Move { ids: vec![plans.id], to: MoveTarget::Archive, thread: true, undo: Some(2) });
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(probe.live("Archive").is_empty(), "held during the undo window");
-    assert_eq!(probe.live("INBOX").len(), 3, "still in the inbox on the server");
-    d.until("the archive on the server", 20, |_| (probe.live("Archive").len() == 2 && probe.live("INBOX").len() == 1).then_some(()));
-    println!("✓ archived conversation: 2 messages in Archive after the window ({:?})", t_archive.elapsed());
+    d.wait(mark, "the move held", 5, |e| matches!(e, Event::Held { undo: 2, ops: 2 }).then_some(()));
+    let due = deadline("batch = 2");
+    assert_hold("the archive", due, before, epoch(), MOVE_HOLD);
+    watch_holds(&mut d, vec![Hold { what: "the archive", deadline: due, on_server: Box::new(|| !probe.live("Archive").is_empty() || probe.live("INBOX").len() != 3) }]);
+    d.until("the whole conversation in Archive", 10, |_| (probe.live("Archive").len() == 2 && probe.live("INBOX").len() == 1).then_some(()));
+    println!("✓ archived conversation: 2 messages in Archive, after the window and not before");
     assert_eq!(d.list(&inbox, "", false).len(), 1, "inbox shows one message locally");
     let mark = d.mark();
     d.send(Command::UndoMove { undo: 2 });
@@ -287,39 +293,45 @@ fn scenario(pass: Pass) {
     println!("✓ new mail pushed via IDLE in {:?}", t_push.elapsed());
 
     // Moved to a folder whose name has a space, undoable: it lands after the window.
-    let mark = d.mark();
+    let (mark, before) = (d.mark(), epoch());
     d.send(Command::Move { ids: vec![ping.id], to: MoveTarget::Mailbox("Old Projects".into()), thread: false, undo: Some(3) });
     d.wait(mark, "the move held", 5, |e| matches!(e, Event::Held { undo: 3, ops: 1 }).then_some(()));
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(probe.live("Old Projects").is_empty() && probe.live("INBOX").contains(&ping.subject), "held during the undo window");
-    d.until("the move on the server", 20, |_| (probe.live("Old Projects") == [ping.subject.clone()] && !probe.live("INBOX").contains(&ping.subject)).then_some(()));
-    println!("✓ moved to \"Old Projects\" after the window");
+    let due = deadline("batch = 3");
+    assert_hold("the move", due, before, epoch(), MOVE_HOLD);
+    watch_holds(&mut d, vec![Hold { what: "the move", deadline: due, on_server: Box::new(|| !probe.live("Old Projects").is_empty() || !probe.live("INBOX").contains(&ping.subject)) }]);
+    d.until("the move on the server", 10, |_| (probe.live("Old Projects") == [ping.subject.clone()] && !probe.live("INBOX").contains(&ping.subject)).then_some(()));
+    println!("✓ moved to \"Old Projects\", after the window and not before");
 
     // ── Sending, with undo ──
-    let mark = d.mark();
+    let (mark, before) = (d.mark(), epoch());
     d.send(Command::Send { draft: Draft { account: ACCOUNT.into(), to: user.into(), subject: "Take this back".into(), body: "Oops.".into(), ..Draft::default() }, draft_id: None });
     let op = d.wait(mark, "the send queued", 10, |e| match e {
         Event::Sent { op, undo_secs: 5, draft_id: None } => Some(*op),
         _ => None,
     });
+    let undone = deadline(&format!("id = {op}"));
+    assert_hold("the send", undone, before, epoch(), SEND_HOLD);
     let mark = d.mark();
     d.send(Command::UndoSend { op });
     d.wait(mark, "send undone", 5, |e| matches!(e, Event::Toast(t) if t == "Sending undone").then_some(()));
     // Sent through the engine (to ourselves), with an Answered flag on the original.
-    let t_send = Instant::now();
     let reply = Draft { account: ACCOUNT.into(), to: format!("Me <{user}>"), subject: "Sent from Envoy".into(), body: "Hello from the e2e test.".into(), reply_of: Some(digest.id), ..Draft::default() };
-    let mark = d.mark();
+    let (mark, before) = (d.mark(), epoch());
     d.send(Command::Send { draft: reply, draft_id: None });
-    d.wait(mark, "the send queued", 10, |e| matches!(e, Event::Sent { undo_secs: 5, .. }).then_some(()));
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(probe.live("Sent").is_empty() && !probe.live("INBOX").iter().any(|s| s == "Sent from Envoy"), "held during the undo window");
+    let op = d.wait(mark, "the send queued", 10, |e| match e {
+        Event::Sent { op, undo_secs: 5, .. } => Some(*op),
+        _ => None,
+    });
+    let due = deadline(&format!("id = {op}"));
+    assert_hold("the send", due, before, epoch(), SEND_HOLD);
+    watch_holds(&mut d, vec![Hold { what: "the send", deadline: due, on_server: Box::new(|| !probe.live("Sent").is_empty() || probe.live("INBOX").iter().any(|s| s == "Sent from Envoy")) }]);
     d.wait(mark, "sent toast", 30, |e| matches!(e, Event::Toast(t) if t == "Message sent").then_some(()));
     d.until("the message received back", 20, |d| d.list(&inbox, "", false).iter().any(|s| s.subject == "Sent from Envoy").then_some(()));
-    println!("✓ sent via SMTP after the undo window, received back in {:?}", t_send.elapsed());
+    println!("✓ sent via SMTP after the undo window and not before, received back");
     d.until("a copy in Sent, and the original answered", 15, |_| {
         (probe.live("Sent") == ["Sent from Envoy"] && probe.flags("INBOX", &digest.subject).is_some_and(|f| f & flags::ANSWERED != 0)).then_some(())
     });
-    assert!(!probe.live("INBOX").iter().any(|s| s == "Take this back"), "the undone send never went out");
+    untouched_until(&mut d, "the undone send went out", undone as f64 + 3.0, || !probe.live("INBOX").iter().any(|s| s == "Take this back"));
     println!("✓ copy appended to Sent, original marked answered; the undone send never went out");
 
     // ── Drafts: saved as they're typed, on the server in Drafts, one copy however many edits ──
@@ -359,12 +371,14 @@ fn scenario(pass: Pass) {
     // Sent (to us only: GreenMail has no Bob), then undone: back in the composer, and its copy in
     // Drafts never goes, all through the window.
     draft.bcc.clear();
-    let mark = d.mark();
+    let (mark, before) = (d.mark(), epoch());
     d.send(Command::Send { draft: draft.clone(), draft_id: Some(1) });
     let op = d.wait(mark, "the send queued", 10, |e| match e {
         Event::Sent { op, draft_id: Some(1), .. } => Some(*op),
         _ => None,
     });
+    let undone = deadline(&format!("id = {op}"));
+    assert_hold("the draft's send", undone, before, epoch(), SEND_HOLD);
     let mark = d.mark();
     d.send(Command::UndoSend { op });
     let back = d.wait(mark, "the draft back in the composer", 5, |e| match e {
@@ -372,43 +386,48 @@ fn scenario(pass: Pass) {
         _ => None,
     });
     assert_eq!(back.subject, "Draft one, edited");
-    let until = Instant::now() + HOLD + Duration::from_secs(1);
-    while Instant::now() < until {
-        d.pump();
-        assert!(!probe.drafts().is_empty(), "the undone send's draft left Drafts");
-        assert!(!probe.live("INBOX").iter().any(|s| s == "Draft one, edited"), "the undone send went out");
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    untouched_until(&mut d, "the undone send went out, or its draft left Drafts", undone as f64 + 3.0, || {
+        !probe.drafts().is_empty() && !probe.live("INBOX").iter().any(|s| s == "Draft one, edited")
+    });
     d.until("one copy in Drafts", 20, |_| (probe.drafts().len() == 1).then_some(()));
     println!("✓ undo send: the draft back, its copy kept in Drafts, nothing sent");
     // Sent for good: the message goes out and the draft leaves Drafts.
-    let mark = d.mark();
+    let (mark, before) = (d.mark(), epoch());
     d.send(Command::Send { draft: draft.clone(), draft_id: Some(1) });
-    d.wait(mark, "the send queued", 10, |e| matches!(e, Event::Sent { draft_id: Some(1), .. }).then_some(()));
-    d.until("the draft sent, and gone from Drafts", 30, |_| (probe.live("INBOX").iter().any(|s| s == "Draft one, edited") && probe.drafts().is_empty()).then_some(()));
+    let op = d.wait(mark, "the send queued", 10, |e| match e {
+        Event::Sent { op, draft_id: Some(1), .. } => Some(*op),
+        _ => None,
+    });
+    let due = deadline(&format!("id = {op}"));
+    assert_hold("the draft's send", due, before, epoch(), SEND_HOLD);
+    watch_holds(&mut d, vec![Hold { what: "the draft's send", deadline: due, on_server: Box::new(|| probe.live("INBOX").iter().any(|s| s == "Draft one, edited")) }]);
+    d.until("the sent draft gone from Drafts", 20, |_| probe.drafts().is_empty().then_some(()));
     println!("✓ sending the draft removed it from Drafts");
     // Discarded, then undone within the window: the server never loses it. Then discarded for good.
     let other = Draft { account: ACCOUNT.into(), subject: "Never mind".into(), body: "Scratch that.".into(), ..Draft::default() };
     d.send(Command::SaveDraft { id: 2, draft: other, open: false, rev: 1, lifecycle: 0 });
     d.until("the draft in Drafts", 30, |_| (probe.drafts().iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>() == ["Never mind"]).then_some(()));
+    let before = epoch();
     d.send(Command::DiscardDraft { id: 2, undo: Some(4) });
     assert!(!subjects(&d.list(&drafts_view, "", false)).contains(&"Never mind"), "gone from the list at once");
+    let undone = deadline("batch = 4");
+    assert_hold("the discard", undone, before, epoch(), MOVE_HOLD);
     d.send(Command::UndoMove { undo: 4 });
     assert!(subjects(&d.list(&drafts_view, "", false)).contains(&"Never mind"), "back after undo");
-    std::thread::sleep(HOLD + Duration::from_secs(1));
-    assert_eq!(probe.drafts().len(), 1, "the server never saw the undone discard");
+    untouched_until(&mut d, "the server saw the undone discard", undone as f64 + 3.0, || probe.drafts().len() == 1);
     d.send(Command::DiscardDraft { id: 2, undo: None });
     d.until("the discarded draft gone from Drafts", 30, |_| probe.drafts().is_empty().then_some(()));
     println!("✓ discarding a draft: undone, server untouched; then gone from Drafts");
 
     // ── Trash, then delete forever ──
-    let mark = d.mark();
+    let (mark, before) = (d.mark(), epoch());
     d.send(Command::Move { ids: vec![digest.id], to: MoveTarget::Trash, thread: false, undo: Some(5) });
     d.wait(mark, "the move held", 5, |e| matches!(e, Event::Held { undo: 5, ops: 1 }).then_some(()));
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(probe.live("Trash").is_empty() && probe.live("INBOX").contains(&digest.subject), "held during the undo window");
-    d.until("in Trash on the server", 20, |_| (probe.live("Trash") == [digest.subject.clone()] && !probe.live("INBOX").contains(&digest.subject)).then_some(()));
-    println!("✓ deleted to Trash after the window");
+    let due = deadline("batch = 5");
+    assert_hold("the delete", due, before, epoch(), MOVE_HOLD);
+    watch_holds(&mut d, vec![Hold { what: "the delete", deadline: due, on_server: Box::new(|| !probe.live("Trash").is_empty() || !probe.live("INBOX").contains(&digest.subject)) }]);
+    d.until("in Trash on the server", 10, |_| (probe.live("Trash") == [digest.subject.clone()] && !probe.live("INBOX").contains(&digest.subject)).then_some(()));
+    println!("✓ deleted to Trash, after the window and not before");
     let trash = View::Role { account: Some(ACCOUNT.into()), role: Role::Trash };
     d.send(Command::Watch { view: trash.clone() });
     let trashed = d.until("the message in Trash here", 20, |d| d.list(&trash, "", false).into_iter().find(|s| s.subject == digest.subject));
@@ -434,7 +453,11 @@ fn scenario(pass: Pass) {
     // ── Killed while moves and a send wait out their window: they happen on the next start ──
     drop(d);
     std::thread::sleep(Duration::from_secs(1));
-    kill_mid_hold(pass);
+    let [move_before, move_after, send_before, send_after] = kill_mid_hold(pass);
+    let move_due = deadline("batch = 100");
+    let send_due = deadline("op LIKE '{\"kind\":\"send\"%'");
+    assert_hold("the move held at the kill", move_due, move_before, move_after, MOVE_HOLD);
+    assert_hold("the send held at the kill", send_due, send_before, send_after, SEND_HOLD);
     assert!(probe.live("INBOX").iter().any(|s| s == "Sent from Envoy") && !probe.live("Archive").iter().any(|s| s == "Sent from Envoy"), "the held move stayed off the server");
     assert!(!probe.live("INBOX").iter().any(|s| s == QUEUED), "the held send stayed unsent");
     println!("✓ killed mid-hold: nothing reached the server");
@@ -443,11 +466,18 @@ fn scenario(pass: Pass) {
     let items = d.list(&inbox, "", false);
     println!("✓ restart: {} inbox messages from the cache in {:?} (before any network)", items.len(), t_cold.elapsed());
     assert_eq!(subjects(&items), ["Draft one, edited"], "the held message stays hidden across the restart");
-    d.until("the held move after the restart", 30, |_| {
-        (probe.live("Archive").iter().any(|s| s == "Sent from Envoy") && !probe.live("INBOX").iter().any(|s| s == "Sent from Envoy")).then_some(())
-    });
-    d.until("the held send after the restart", 30, |_| (probe.live("INBOX").iter().any(|s| s == QUEUED) && probe.live("Sent").iter().any(|s| s == QUEUED)).then_some(()));
-    println!("✓ the held move and send went through after the restart");
+    // What's left of each window is waited out after the restart, not skipped.
+    let restarted = epoch();
+    assert!(restarted + 1.0 < send_due.min(move_due) as f64, "restarted {:.1} s before the first deadline: too late to watch the rest of the windows", send_due.min(move_due) as f64 - restarted);
+    watch_holds(
+        &mut d,
+        vec![
+            Hold { what: "the move held across the restart", deadline: move_due, on_server: Box::new(|| probe.live("Archive").iter().any(|s| s == "Sent from Envoy") || !probe.live("INBOX").iter().any(|s| s == "Sent from Envoy")) },
+            Hold { what: "the send held across the restart", deadline: send_due, on_server: Box::new(|| probe.live("INBOX").iter().any(|s| s == QUEUED) || probe.live("Sent").iter().any(|s| s == QUEUED)) },
+        ],
+    );
+    d.until("the held send's copy in Sent", 15, |_| (probe.live("INBOX").iter().any(|s| s == QUEUED) && probe.live("Sent").iter().any(|s| s == QUEUED)).then_some(()));
+    println!("✓ the held move and send went through after the restart, at the end of their windows");
     d.until("an empty queue", 30, |d| d.events.iter().rev().find_map(|e| if let Event::Pending(n) = e { Some(*n) } else { None }).filter(|n| *n == 0));
     println!("✓ nothing left queued");
 
@@ -485,13 +515,15 @@ fn scenario(pass: Pass) {
 fn hold(pass: Pass) {
     let mut d = Driver::new(Engine::start(|| {}, settings()).expect("engine"));
     let target = d.list(&inbox_view(), "", false).into_iter().find(|s| s.subject == "Sent from Envoy").expect("\"Sent from Envoy\" in the cache");
-    let mark = d.mark();
+    let (mark, move_before) = (d.mark(), epoch());
     d.send(Command::Move { ids: vec![target.id], to: MoveTarget::Archive, thread: false, undo: Some(100) });
     d.wait(mark, "the move held", 10, |e| matches!(e, Event::Held { undo: 100, ops: 1 }).then_some(()));
+    let (move_after, send_before) = (epoch(), epoch());
     let queued = Draft { account: ACCOUNT.into(), to: pass.user().into(), subject: QUEUED.into(), body: "Still sent.".into(), ..Draft::default() };
     d.send(Command::Send { draft: queued, draft_id: None });
     d.wait(mark, "the send queued", 10, |e| matches!(e, Event::Sent { undo_secs: 5, .. }).then_some(()));
-    println!("HELD");
+    // When each was issued, for the deadlines' check.
+    println!("HELD {move_before} {move_after} {send_before} {}", epoch());
     std::io::stdout().flush().unwrap();
     loop {
         std::thread::sleep(Duration::from_millis(100));
@@ -500,8 +532,8 @@ fn hold(pass: Pass) {
 }
 
 /// Runs [`hold`] and kills it (SIGKILL: no shutdown, as in a crash or a force quit) once its
-/// ops are held.
-fn kill_mid_hold(pass: Pass) {
+/// ops are held. Returns when it issued the move and the send (from, to: [`epoch`]s).
+fn kill_mid_hold(pass: Pass) -> [f64; 4] {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap()).args(["hold", pass.name()]).stdout(Stdio::piped()).spawn().unwrap();
     let out = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -511,18 +543,19 @@ fn kill_mid_hold(pass: Pass) {
         }
     });
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
+    let issued = loop {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(line) if line == "HELD" => break,
+            Ok(line) if line.starts_with("HELD ") => break line[5..].split(' ').map(|t| t.parse().unwrap()).collect::<Vec<f64>>(),
             Ok(line) => println!("  [killed Envoy] {line}"),
             Err(_) => {
                 let _ = child.kill();
                 panic!("the Envoy to kill never held its ops");
             }
         }
-    }
+    };
     child.kill().unwrap();
     child.wait().unwrap();
+    issued.try_into().unwrap()
 }
 
 /// The engine, and every event it has sent, in order.
@@ -598,6 +631,78 @@ impl Driver {
             Event::List { req: r, items, more: false } if *r == req => Some(items.clone()),
             _ => None,
         })
+    }
+}
+
+/// Now, in Unix seconds: the clock the engine's deadlines are on.
+fn epoch() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()
+}
+
+/// The deadline (`not_before`, Unix seconds) the store keeps for the queued ops `which` (an SQL
+/// condition on the ops table) picks: the same for each of them.
+fn deadline(which: &str) -> i64 {
+    let db = rusqlite::Connection::open_with_flags(envoy_core::paths::database_file(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let found: Vec<i64> = db.prepare(&format!("SELECT not_before FROM ops WHERE {which}")).unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    assert!(!found.is_empty() && found.iter().all(|t| *t == found[0]), "the deadlines of the ops where {which}: {found:?}");
+    found[0]
+}
+
+/// A held op's deadline is `hold` seconds after it was issued, which was between `before` and
+/// `after` ([`epoch`]s).
+fn assert_hold(what: &str, deadline: i64, before: f64, after: f64, hold: i64) {
+    let range = before.floor() as i64 + hold..=after.floor() as i64 + hold;
+    assert!(range.contains(&deadline), "{what}: held until {deadline}, issued between {before:.2} and {after:.2}, for {hold} s");
+}
+
+/// A held op to watch on the server ([`watch_holds`]).
+struct Hold<'a> {
+    what: &'a str,
+    deadline: i64,
+    /// Any of it is on the server.
+    on_server: Box<dyn FnMut() -> bool + 'a>,
+}
+
+/// Watches the server through held ops' undo windows: each must be absent from every look that
+/// ended before its deadline (one of them less than 2 s before it), and on the server within
+/// [`LATE`] after it.
+fn watch_holds(d: &mut Driver, mut holds: Vec<Hold>) {
+    let mut last_absent = vec![f64::NEG_INFINITY; holds.len()];
+    let mut landed = vec![false; holds.len()];
+    while landed.contains(&false) {
+        d.pump();
+        for (i, h) in holds.iter_mut().enumerate() {
+            if landed[i] {
+                continue;
+            }
+            let there = (h.on_server)();
+            let (at, deadline) = (epoch(), h.deadline as f64);
+            if there {
+                assert!(at >= deadline, "{}: on the server {:.2} s before its undo window ended", h.what, deadline - at);
+                assert!(deadline - last_absent[i] < 2.0, "{}: the server wasn't watched up to its deadline", h.what);
+                println!("  {}: on the server {:.1} s after its deadline, and not before", h.what, at - deadline);
+                landed[i] = true;
+            } else {
+                if at < deadline {
+                    last_absent[i] = at;
+                }
+                assert!(at < deadline + LATE, "{}: not on the server {LATE} s after its deadline", h.what);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Watches the server until `until` ([`epoch`]): `untouched` holds on every look. For undone
+/// ops, past the deadline they had, when they'd have gone.
+fn untouched_until(d: &mut Driver, what: &str, until: f64, mut untouched: impl FnMut() -> bool) {
+    loop {
+        d.pump();
+        assert!(untouched(), "{what}");
+        if epoch() > until {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
