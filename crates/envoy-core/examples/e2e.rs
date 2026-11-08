@@ -818,7 +818,15 @@ impl Proxy {
                         // Either side hanging up ends both.
                         tokio::select! {
                             _ = relay(client_r, server_w, |line| refuse(line, &all, &bad)) => {}
-                            _ = relay(server_r, client_w, strip) => {}
+                            _ = relay(server_r, client_w, |line| {
+                                let out = strip(line);
+                                // What goes to Envoy has nothing left to take out.
+                                let sent = out.as_deref().unwrap_or(line);
+                                if strip(sent).is_some() {
+                                    bad.lock().unwrap().push(format!("passed on: {}", String::from_utf8_lossy(sent).trim_end()));
+                                }
+                                out
+                            }) => {}
                         }
                     });
                 }
@@ -882,24 +890,93 @@ fn refuse(line: &[u8], all: &Mutex<Vec<String>>, bad: &Mutex<Vec<String>>) -> Op
     Some(format!("{tag} XREFUSED-BY-E2E-PROXY\r\n").into_bytes())
 }
 
-/// What GreenMail says, without UIDPLUS and MOVE: out of its CAPABILITY, and no APPENDUID or
-/// COPYUID (UIDPLUS's response codes) in its answers.
+/// What GreenMail says, without UIDPLUS and MOVE: out of its capability lists (`* CAPABILITY`,
+/// and the `[CAPABILITY ..]` code of a greeting or an OK), and no APPENDUID or COPYUID codes
+/// (UIDPLUS's). None leaves the line as it is.
 fn strip(line: &[u8]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(line).ok()?;
-    let caps = text.starts_with("* CAPABILITY ") || text.contains("[CAPABILITY ");
-    if !caps && !text.contains("[APPENDUID ") && !text.contains("[COPYUID ") {
+    let body = std::str::from_utf8(line).ok()?.trim_end_matches(['\r', '\n']);
+    let (head, rest) = body.split_once(' ')?;
+    let (word, after) = rest.split_once(' ').unwrap_or((rest, ""));
+    let out = if head == "*" && word.eq_ignore_ascii_case("CAPABILITY") {
+        format!("* {word} {}", without_uidplus_move(after))
+    } else if ["OK", "NO", "BAD", "PREAUTH", "BYE"].iter().any(|s| word.eq_ignore_ascii_case(s)) && after.starts_with('[') {
+        // A response code: up to the first ']' (none has one inside).
+        let end = after.find(']')?;
+        let (code, text) = (&after[1..end], &after[end + 1..]);
+        let (name, args) = code.split_once(' ').unwrap_or((code, ""));
+        if name.eq_ignore_ascii_case("CAPABILITY") {
+            format!("{head} {word} [{name} {}]{text}", without_uidplus_move(args))
+        } else if name.eq_ignore_ascii_case("APPENDUID") || name.eq_ignore_ascii_case("COPYUID") {
+            let text = text.trim_start();
+            format!("{head} {word} {}", if text.is_empty() { "done" } else { text })
+        } else {
+            return None;
+        }
+    } else {
         return None;
+    };
+    (out != body).then(|| format!("{out}\r\n").into_bytes())
+}
+
+fn without_uidplus_move(capabilities: &str) -> String {
+    capabilities.split_ascii_whitespace().filter(|c| !c.eq_ignore_ascii_case("UIDPLUS") && !c.eq_ignore_ascii_case("MOVE")).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stripped(line: &str) -> String {
+        let out = strip(format!("{line}\r\n").as_bytes()).map_or_else(|| line.to_owned(), |o| String::from_utf8(o).unwrap().trim_end().to_owned());
+        assert_eq!(strip(format!("{out}\r\n").as_bytes()), None, "nothing left to take out of {out:?}");
+        out
     }
-    let mut out = text.trim_end().to_owned();
-    for code in ["[APPENDUID ", "[COPYUID "] {
-        while let Some(start) = out.find(code) {
-            let end = out[start..].find(']').map_or(out.len(), |e| start + e + 1);
-            let end = if out[end..].starts_with(' ') { end + 1 } else { end };
-            out.replace_range(start..end, "");
+
+    #[test]
+    fn uidplus_and_move_leave_every_capability_list() {
+        for (line, want) in [
+            ("* CAPABILITY IMAP4rev1 LITERAL+ UIDPLUS SORT IDLE MOVE QUOTA", "* CAPABILITY IMAP4rev1 LITERAL+ SORT IDLE QUOTA"),
+            ("* CAPABILITY IMAP4rev1 MOVE", "* CAPABILITY IMAP4rev1"),
+            ("* CAPABILITY UIDPLUS IMAP4rev1 move", "* CAPABILITY IMAP4rev1"),
+            // A greeting's, and a login's.
+            ("* OK [CAPABILITY IMAP4rev1 UIDPLUS MOVE] ready", "* OK [CAPABILITY IMAP4rev1] ready"),
+            ("* OK [CAPABILITY MOVE IMAP4rev1 UIDPLUS] GreenMail ready", "* OK [CAPABILITY IMAP4rev1] GreenMail ready"),
+            ("* PREAUTH [CAPABILITY IMAP4rev1 IDLE MOVE] logged in", "* PREAUTH [CAPABILITY IMAP4rev1 IDLE] logged in"),
+            ("A0001 OK [CAPABILITY IMAP4rev1 IDLE UIDPLUS] LOGIN completed.", "A0001 OK [CAPABILITY IMAP4rev1 IDLE] LOGIN completed."),
+            // UIDPLUS's answers.
+            ("A0002 OK [APPENDUID 7 21] APPEND completed.", "A0002 OK APPEND completed."),
+            ("A0003 OK [COPYUID 7 3 9] COPY completed.", "A0003 OK COPY completed."),
+            ("* OK [COPYUID 7 3 9]", "* OK done"),
+        ] {
+            assert_eq!(stripped(line), want);
         }
     }
-    if caps {
-        out = out.split(' ').filter(|w| !matches!(*w, "UIDPLUS" | "MOVE")).collect::<Vec<_>>().join(" ");
+
+    #[test]
+    fn everything_else_goes_through_as_it_is() {
+        for line in ["* OK [UIDNEXT 7] ok", "* OK [PERMANENTFLAGS (\\Seen \\*)] ok", "A0004 OK MOVE completed [MOVE]", "* 3 FETCH (FLAGS (\\Seen) UID 4)", "* SEARCH 1 2", "* LIST () \".\" \"MOVE\"", "+ idling"] {
+            assert_eq!(strip(format!("{line}\r\n").as_bytes()), None, "{line}");
+        }
     }
-    Some(format!("{out}\r\n").into_bytes())
+
+    #[test]
+    fn what_that_server_lacks_is_refused() {
+        let (all, bad) = (Mutex::default(), Mutex::default());
+        for line in ["A1 UID MOVE 3 \"Archive\"", "A2 MOVE 1:2 Archive", "A3 UID EXPUNGE 3", "A4 EXPUNGE", "a5 close"] {
+            let out = refuse(format!("{line}\r\n").as_bytes(), &all, &bad).expect(line);
+            assert!(String::from_utf8(out).unwrap().ends_with(" XREFUSED-BY-E2E-PROXY\r\n"));
+        }
+        for line in ["A6 UID COPY 3 \"Archive\"", "A7 UID STORE 3 +FLAGS.SILENT (\\Deleted)", "A8 UID SEARCH UNDELETED HEADER Message-ID \"<x@y>\"", "DONE", "A9 IDLE"] {
+            assert_eq!(refuse(format!("{line}\r\n").as_bytes(), &all, &bad), None, "{line}");
+        }
+        assert_eq!(bad.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn literals_are_found() {
+        assert_eq!(literal(b"* 1 FETCH (UID 4 BODY[] {12}\r\n"), Some(12));
+        assert_eq!(literal(b"A1 APPEND \"Drafts\" (\\Draft) {5+}\r\n"), Some(5));
+        assert_eq!(literal(b"* 1 FETCH (FLAGS ())\r\n"), None);
+        assert_eq!(literal(b"A1 LOGIN {x}\r\n"), None);
+    }
 }
