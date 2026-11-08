@@ -400,32 +400,7 @@ pub async fn sync_mailbox(session: &mut Session, store: &Mutex<Store>, account: 
             timed("FETCH flags", async { session.uid_fetch(format!("{min_uid}:{max_uid}"), "(UID FLAGS)").await?.try_collect::<Vec<_>>().await })
                 .await??;
         let server: std::collections::HashMap<u32, u32> = flags.iter().filter_map(|f| Some((f.uid?, flag_bits(f.flags())))).collect();
-        let st = store.lock().map_err(|_| anyhow!("store poisoned"))?;
-        let mut gone = Vec::new();
-        st.transaction(|st| {
-            for (uid, local_flags) in &local {
-                match server.get(uid) {
-                    None => gone.push(*uid),
-                    Some(&f) if f != *local_flags => {
-                        st.set_flags_by_uid(account, mailbox, *uid, f)?;
-                        changed = true;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(())
-        })?;
-        if !gone.is_empty() {
-            st.delete_uids(account, mailbox, &gone)?;
-            changed = true;
-        }
-        // Trim to the window: drop the oldest beyond it.
-        let all = st.local_uids(account, mailbox)?;
-        if all.len() > window as usize {
-            let excess: Vec<u32> = all.iter().take(all.len() - window as usize).map(|(u, _)| *u).collect();
-            st.delete_uids(account, mailbox, &excess)?;
-            changed = true;
-        }
+        changed |= store.lock().map_err(|_| anyhow!("store poisoned"))?.reconcile(account, mailbox, &local, &server, window)?;
     }
     store.lock().map_err(|_| anyhow!("store poisoned"))?.mark_synced(account, mailbox)?;
     Ok(SyncOutcome { changed, new_messages })

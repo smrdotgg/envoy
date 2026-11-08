@@ -776,21 +776,30 @@ impl App {
     /// and the reload that follows confirms it.
     fn restore(&mut self, m: MovedAway, tx: &mut Tx) {
         self.send(Command::UndoMove { undo: m.key });
-        if self.view != m.view || self.screen != Screen::Mail {
+        if !self.restore_rows(&m) {
             return;
-        }
-        for row in m.rows {
-            if self.list.iter().any(|s| s.id == row.id) {
-                continue;
-            }
-            // Newest first, like the list.
-            let at = self.list.iter().position(|s| s.date < row.date).unwrap_or(self.list.len());
-            self.list.insert(at, row);
         }
         if let Some(id) = m.open {
             self.open_message(id);
             tx.scroll_into_view(row_key(id));
         }
+    }
+
+    /// Re-inserts moved rows into the list if it still shows what they were moved from.
+    /// False when it doesn't (the engine's reload will sort it out).
+    fn restore_rows(&mut self, m: &MovedAway) -> bool {
+        if self.view != m.view || self.screen != Screen::Mail {
+            return false;
+        }
+        for row in &m.rows {
+            if self.list.iter().any(|s| s.id == row.id) {
+                continue;
+            }
+            // Newest first, like the list.
+            let at = self.list.iter().position(|s| s.date < row.date).unwrap_or(self.list.len());
+            self.list.insert(at, row.clone());
+        }
+        true
     }
 
     pub fn delete(&mut self, ids: Vec<MessageId>, tx: &mut Tx) {
