@@ -493,12 +493,15 @@ fn list_header(s: &App, t: &Theme) -> El {
     let k = &t.k;
     let unread: u32 = s.list.iter().filter(|m| m.thread_unread).count() as u32;
     let noun = if s.conversations() { "conversations" } else { "messages" };
+    // While the rest of a long list is on its way (a frame or two), its counts are "at least".
+    let more = if s.list_complete { "" } else { "+" };
+    let n = s.list.len();
     let sub = if !s.applied_query.is_empty() {
-        format!("{} results for \u{201c}{}\u{201d}", s.list.len(), s.applied_query)
+        format!("{n}{more} results for \u{201c}{}\u{201d}", s.applied_query)
     } else if unread > 0 {
-        format!("{unread} unread · {} {noun}", s.list.len())
+        format!("{unread}{more} unread · {n}{more} {noun}")
     } else {
-        format!("{} {noun}", s.list.len())
+        format!("{n}{more} {noun}")
     };
     row()
         .key("list-header")

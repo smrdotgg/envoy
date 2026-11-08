@@ -61,7 +61,9 @@ pub enum Command {
 pub enum Event {
     Accounts(Vec<Account>),
     Mailboxes { account: String, mailboxes: Vec<Mailbox> },
-    List { req: u64, items: Vec<Summary> },
+    /// A list's rows. `more`: these are the top of a longer list, whose whole (starting with
+    /// the same rows) follows in another `List` with the same `req`.
+    List { req: u64, items: Vec<Summary>, more: bool },
     Thread { req: u64, id: MessageId, messages: Vec<ThreadMessage> },
     /// Something in this account's local copy changed: reload what's on screen.
     Changed { account: String },
@@ -85,6 +87,10 @@ pub enum Event {
 }
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
+
+/// How many rows of a long list are sent ahead of the rest: more than a screenful, and what
+/// the list mounts around it, but a small part of the work.
+pub const FIRST_PAGE: u32 = 100;
 
 pub struct Engine {
     tx: mpsc::UnboundedSender<Command>,
@@ -305,9 +311,11 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             tokio::task::spawn_blocking(move || {
                 let me = shared.me();
                 let q = Query::parse(&query);
-                let items = shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| st.list(&view, &q, conversations, limit, &me));
+                // The top of a long list goes out first, and the rest when it's read.
+                let mut first = |items| shared.emit(Event::List { req, items, more: true });
+                let items = shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| st.list_paged(&view, &q, conversations, limit, &me, FIRST_PAGE, &mut first));
                 match items {
-                    Ok(items) => shared.emit(Event::List { req, items }),
+                    Ok(items) => shared.emit(Event::List { req, items, more: false }),
                     Err(e) => shared.emit(Event::Error(format!("search failed: {e}"))),
                 }
             });
