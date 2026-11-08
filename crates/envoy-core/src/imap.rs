@@ -364,6 +364,28 @@ fn store_header(store: &Store, account: &str, mailbox: &str, f: &Fetch) -> Resul
 pub struct SyncOutcome {
     pub changed: bool,
     pub new_messages: u32,
+    /// The mailbox as the sync found it, for [`changed_since`].
+    pub contents: Contents,
+}
+
+/// What a SELECT tells of a mailbox's contents: when it differs, mail came or went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Contents {
+    pub exists: u32,
+    pub uid_next: Option<u32>,
+}
+
+impl Contents {
+    fn of(mb: &async_imap::types::Mailbox) -> Contents {
+        Contents { exists: mb.exists, uid_next: mb.uid_next }
+    }
+}
+
+/// Selects `mailbox` and says whether its contents changed since `synced` (what its last sync
+/// found): mail delivered after that sync, which an IDLE started now would never report.
+pub async fn changed_since(session: &mut async_imap::Session<impl Io>, mailbox: &str, synced: Option<Contents>) -> Result<bool> {
+    let mb = timed("SELECT", session.select(mailbox)).await??;
+    Ok(synced != Some(Contents::of(&mb)))
 }
 
 /// Brings one mailbox's local copy up to date: new messages' headers, flag changes and
@@ -391,6 +413,7 @@ fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[
 /// each chunk of a first download lands, so the UI can show it.
 pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, window: u32, progress: &(dyn Fn() + Send + Sync)) -> Result<SyncOutcome> {
     let mb = timed("SELECT", session.select(mailbox)).await??;
+    let contents = Contents::of(&mb);
     let uidvalidity = mb.uid_validity.unwrap_or(0);
     let mut changed = false;
     let mut new_messages = 0;
@@ -410,7 +433,7 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
             store.lock().map_err(|_| anyhow!("store poisoned"))?.delete_uids(account, mailbox, &uids)?;
             changed = true;
         }
-        return Ok(SyncOutcome { changed, new_messages });
+        return Ok(SyncOutcome { changed, new_messages, contents });
     }
 
     if local.is_empty() {
@@ -455,7 +478,7 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
         changed |= store.lock().map_err(|_| anyhow!("store poisoned"))?.reconcile(account, mailbox, &local, &server, window)?;
     }
     store.lock().map_err(|_| anyhow!("store poisoned"))?.mark_synced(account, mailbox)?;
-    Ok(SyncOutcome { changed, new_messages })
+    Ok(SyncOutcome { changed, new_messages, contents })
 }
 
 /// Unread and total counts for the sidebar.
@@ -859,6 +882,27 @@ mod tests {
             .collect();
         shown.sort_unstable();
         assert_eq!(shown, vec![102, 103, 104, 105, 106], "five messages to show, not one");
+    }
+
+    #[tokio::test]
+    async fn mail_delivered_after_a_sync_is_noticed_before_idle() {
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Nothing flagged \Deleted (there's no message 0).
+        let (d, inner) = (delivered.clone(), mailbox_server(10, 0..=0));
+        let (mut s, _log) = fake::session(move |c| {
+            if c.starts_with("SELECT") && d.load(std::sync::atomic::Ordering::SeqCst) {
+                return Some("* 11 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 112] ok\r\nTAG OK [READ-WRITE] done\r\n".into());
+            }
+            inner(c)
+        })
+        .await;
+        let store = Mutex::new(Store::memory());
+        store.lock().unwrap().upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        let synced = sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await.unwrap().contents;
+        assert!(!changed_since(&mut s, "INBOX", Some(synced)).await.unwrap(), "nothing came since");
+        delivered.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(changed_since(&mut s, "INBOX", Some(synced)).await.unwrap(), "a message delivered after the sync");
+        assert!(changed_since(&mut s, "INBOX", None).await.unwrap(), "never synced");
     }
 
     fn caps(uidplus: bool) -> Caps {
