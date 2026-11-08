@@ -290,7 +290,7 @@ fn main() {
     let mut d = Draft { account: "alice".into(), to: "Alice <alice@localhost>".into(), bcc: "bob@localhost".into(), subject: "Draft one".into(), ..Draft::default() };
     for (rev, words) in [(1, "First words."), (2, "First words, more."), (3, "First words, more, and the last.")] {
         d.body = words.into();
-        engine.send(Command::SaveDraft { id: 1, draft: d.clone(), open: true, rev });
+        engine.send(Command::SaveDraft { id: 1, draft: d.clone(), open: true, rev, lifecycle: 0 });
     }
     let on_server = |want: &str| {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -308,7 +308,7 @@ fn main() {
     println!("✓ three quick saves: one copy in Drafts, the newest ({:?})", t_draft.elapsed());
     // Edited and put away: replaced, not added, and at once.
     d.subject = "Draft one, edited".into();
-    engine.send(Command::SaveDraft { id: 1, draft: d.clone(), open: false, rev: 4 });
+    engine.send(Command::SaveDraft { id: 1, draft: d.clone(), open: false, rev: 4, lifecycle: 0 });
     on_server("Draft one, edited");
     println!("✓ an edit replaces the copy in Drafts");
     let drafts_view = View::Role { account: Some("alice".into()), role: Role::Drafts };
@@ -332,7 +332,7 @@ fn main() {
     println!("✓ sending the draft removed it from Drafts");
     // Discarded: gone from the server too.
     let other = Draft { account: "alice".into(), subject: "Never mind".into(), body: "Scratch that.".into(), ..Draft::default() };
-    engine.send(Command::SaveDraft { id: 2, draft: other, open: false, rev: 1 });
+    engine.send(Command::SaveDraft { id: 2, draft: other, open: false, rev: 1, lifecycle: 0 });
     on_server("Never mind");
     engine.send(Command::DiscardDraft { id: 2, undo: None });
     let deadline = Instant::now() + Duration::from_secs(30);

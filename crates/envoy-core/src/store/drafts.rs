@@ -14,11 +14,13 @@
 //!   for a discarded or sent draft. A discard waits out the undo window, and undo
 //!   ([`Store::undo_batch`]) shows the draft again.
 //!
-//! Once a draft is gone for good (sent, purged, discarded), a tombstone remembers when, for 90
-//! days: a write that was on its way from before that (a queued save, the app's copy of a
-//! message it sent, written as the window closed) can't bring it back. Ids are never reused,
-//! so a save stamped after the tombstone is a real edit (a too-late Undo put the draft back in
-//! the composer) and starts it again.
+//! Writes are ordered without clocks. Each draft has a `lifecycle`, bumped when it's sent and
+//! when Undo send brings it back. The app learns it with the draft, and each write carries the
+//! lifecycle it was made in ([`DraftRev`]), so a write made before a send can't change what was
+//! sent, or the draft Undo send gave back. Within a lifecycle the app's stamps (`rev`) order
+//! saves. Once a draft is gone for good (sent, purged, discarded), `draft_ends` keeps its id:
+//! no write from its life brings it back. Such a write is refused, never taken for saved: the
+//! app keeps its text as a new draft. Only a send (which comes after everything) starts it again.
 //!
 //! `version` counts content changes and `server_version` is the one the server has, so an
 //! upload knows whether there's anything to do. `appended` says an upload was started: the
@@ -33,6 +35,14 @@ use rusqlite::{OptionalExtension, params};
 use super::{Op, Store, json};
 use crate::model::{Draft, DraftAttachment, MessageId};
 
+/// Where a write to a draft stands: the draft's lifecycle it was made in, and the writer's
+/// stamp, which orders saves within it ([`Store::save_draft`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DraftRev {
+    pub lifecycle: i64,
+    pub rev: i64,
+}
+
 /// A local draft.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalDraft {
@@ -44,6 +54,9 @@ pub struct LocalDraft {
     pub updated: i64,
     /// Neither being sent nor discarded.
     pub visible: bool,
+    /// Its lifecycle, for writes to carry, and the newest save's stamp (the app's stamps go on
+    /// from above it, whatever its clock says).
+    pub at: DraftRev,
 }
 
 /// A draft version for the worker to upload.
@@ -62,7 +75,7 @@ pub struct DraftUpload {
     pub maybe_strays: bool,
 }
 
-const COLS: &str = "d.id, d.account, d.content, d.message_id, d.updated, d.sending = 0 AND d.purge_op = 0";
+const COLS: &str = "d.id, d.account, d.content, d.message_id, d.updated, d.sending = 0 AND d.purge_op = 0, d.lifecycle, d.rev";
 
 /// Runs for every Drafts list: it must read only the Drafts mailboxes, never a whole account
 /// (messages has no index on message_id). CROSS JOIN fixes the order: Drafts mailboxes, then
@@ -76,7 +89,8 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<LocalDraft> {
     let account: String = r.get(1)?;
     let mut draft: Draft = serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
     draft.account = account.clone();
-    Ok(LocalDraft { id: r.get(0)?, account, draft, message_id: r.get(3)?, updated: r.get(4)?, visible: r.get(5)? })
+    let at = DraftRev { lifecycle: r.get(6)?, rev: r.get(7)? };
+    Ok(LocalDraft { id: r.get(0)?, account, draft, message_id: r.get(3)?, updated: r.get(4)?, visible: r.get(5)?, at })
 }
 
 /// A Message-ID for a new draft. The angle brackets make a search for it (a substring match in
@@ -86,58 +100,64 @@ fn new_message_id(id: i64) -> String {
 }
 
 impl Store {
-    /// Saves the composer's content as draft `id`, creating it on the first save. `rev` orders
-    /// saves (the app stamps each one): a save no newer than the last one applied, such as a
-    /// queued save overtaken by the one made as the window closed, changes nothing. `open`: it's
-    /// in the composer, to be opened again after a restart.
+    /// Saves the composer's content as draft `id`, creating it on the first save. `at` orders
+    /// it. A save from another lifecycle of the draft (made before it was sent, or before Undo
+    /// send gave it back), or for a draft gone for good, is refused: None, it isn't saved, and
+    /// the caller must keep its content some other way. A save no newer than the last one
+    /// applied, such as a queued save overtaken by the one made as the window closed, changes
+    /// nothing. `open`: it's in the composer, to be opened again after a restart.
     ///
     /// Saving shows a draft whose discard is on its way to the server (a too-late undo put it
     /// back in the composer; [`Store::draft_purged`] keeps it). Moving a draft to another
     /// account queues the deletion of its copies on the old account's server. Returns whether
     /// the content changed.
-    pub fn save_draft(&self, id: i64, draft: &Draft, open: bool, rev: i64, now: i64) -> Result<bool> {
-        self.transaction(|st| Ok(st.put_draft(id, draft, open, Some(rev), rev, now)?.unwrap_or(false)))
+    pub fn save_draft(&self, id: i64, draft: &Draft, open: bool, at: DraftRev, now: i64) -> Result<Option<bool>> {
+        self.transaction(|st| st.put_draft(id, draft, open, Some(at.lifecycle), Some(at.rev), now))
     }
 
-    /// [`Store::save_draft`]; `rev: None` writes whatever the stored rev. `stamp`: when the
-    /// write was made, against the draft's tombstone. None when it was too old.
-    /// Call inside a transaction.
-    fn put_draft(&self, id: i64, draft: &Draft, open: bool, rev: Option<i64>, stamp: i64, now: i64) -> Result<Option<bool>> {
-        // Gone for good since before this write was made: stays gone.
-        let gone: Option<i64> = self.conn.query_row("SELECT gone FROM draft_tombstones WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
-        match gone {
-            Some(at) if stamp <= at => return Ok(None),
-            Some(_) => {
-                self.conn.execute("DELETE FROM draft_tombstones WHERE id = ?1", params![id])?;
+    /// [`Store::save_draft`]. `lifecycle: None` writes in whatever lifecycle: the send itself,
+    /// which comes after everything (it starts a draft gone for good again). `rev: None` writes
+    /// whatever the stored rev. Call inside a transaction.
+    fn put_draft(&self, id: i64, draft: &Draft, open: bool, lifecycle: Option<i64>, rev: Option<i64>, now: i64) -> Result<Option<bool>> {
+        // Gone for good: no write from its life brings it back.
+        let ended: Option<i64> = self.conn.query_row("SELECT lifecycle FROM draft_ends WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+        if ended.is_some() {
+            if lifecycle.is_some() {
+                return Ok(None);
             }
-            None => {}
+            self.conn.execute("DELETE FROM draft_ends WHERE id = ?1", params![id])?;
         }
         let content = json(draft);
-        type Row = (String, String, String, i64, bool, Option<(String, u32, u32)>, bool, bool, i64);
+        type Row = (String, String, String, i64, bool, Option<(String, u32, u32)>, bool, bool, i64, i64);
         let old: Option<Row> = self
             .conn
             .query_row(
                 "SELECT account, content, message_id, rev, appended != 0, server_mailbox, server_validity, server_uid, server_account = account, unconfirmed != 0,
-                     sending != 0 OR sent != 0, upload_gen
+                     sending != 0 OR sent != 0, upload_gen, lifecycle
                  FROM drafts WHERE id = ?1",
                 params![id],
                 |r| {
                     let copy = (r.get::<_, u32>(7)? != 0 && r.get::<_, bool>(8)?).then(|| Ok::<_, rusqlite::Error>((r.get(5)?, r.get(6)?, r.get(7)?))).transpose()?;
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, copy, r.get(9)?, r.get(10)?, r.get(11)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, copy, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?))
                 },
             )
             .optional()?;
-        let Some((account, old_content, message_id, old_rev, appended, copy, unconfirmed, outbox, generation)) = old else {
+        let Some((account, old_content, message_id, old_rev, appended, copy, unconfirmed, outbox, generation, old_lifecycle)) = old else {
+            // Started again by a send: a lifecycle after every earlier one.
+            let lifecycle = lifecycle.or(ended.map(|l| l + 1)).unwrap_or(0);
             self.conn.execute(
-                "INSERT INTO drafts (id, account, content, message_id, rev, updated, version, open) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
-                params![id, draft.account, content, new_message_id(id), rev.unwrap_or(0), now, open],
+                "INSERT INTO drafts (id, account, content, message_id, rev, updated, version, open, lifecycle) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)",
+                params![id, draft.account, content, new_message_id(id), rev.unwrap_or(0), now, open, lifecycle],
             )?;
             return Ok(Some(true));
         };
-        // In the outbox (or sent), the draft is what was sent, for Undo send to give back: a
-        // save (say, a retry of an older one) can't change it.
-        if rev.is_some_and(|r| r <= old_rev) || (outbox && rev.is_some()) {
+        // From another lifecycle: refused. So is any write to a draft in the outbox (or sent):
+        // it's what was sent, for Undo send to give back.
+        if lifecycle.is_some_and(|l| l != old_lifecycle) || (outbox && lifecycle.is_some()) {
             return Ok(None);
+        }
+        if rev.is_some_and(|r| r <= old_rev) {
+            return Ok(Some(false));
         }
         let moved = account != draft.account;
         if moved && appended {
@@ -210,7 +230,7 @@ impl Store {
         self.transaction(|st| {
             let Some((account, mailbox, uid)) = st.location(message)? else { return Ok(None) };
             let message_id: String = st.conn.query_row("SELECT message_id FROM messages WHERE id = ?1", params![message], |r| r.get(0))?;
-            let id: i64 = st.conn.query_row("SELECT MAX(COALESCE(MAX(id), 0) + 1, ?1) FROM drafts", params![now.saturating_mul(1_000_000)], |r| r.get(0))?;
+            let id = st.fresh_draft_id(now)?;
             let draft = Draft { account: account.clone(), ..draft.clone() };
             let fresh = message_id.is_empty();
             let message_id = if fresh { new_message_id(id) } else { message_id };
@@ -228,6 +248,16 @@ impl Store {
             }
             st.draft(id)
         })
+    }
+
+    /// An id for a draft the engine starts (the app picks its own): used by no draft, here or
+    /// gone, and like the app's ids, microseconds since the epoch where the clock allows.
+    pub fn fresh_draft_id(&self, now: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(COALESCE((SELECT MAX(id) FROM drafts), 0) + 1, COALESCE((SELECT MAX(id) FROM draft_ends), 0) + 1, ?1)",
+            params![now.saturating_mul(1_000_000)],
+            |r| r.get(0),
+        )?)
     }
 
     /// The bytes of a draft's attachments, with them. An error if any is missing: a draft is
@@ -411,32 +441,41 @@ impl Store {
     /// is undone ([`Store::unsend_draft`]). Creates the draft if the composer never saved it.
     /// Call inside a transaction.
     pub fn draft_sending(&self, id: i64, draft: &Draft, op: i64, now: i64) -> Result<()> {
-        // Being sent now: whatever came before.
-        self.put_draft(id, draft, false, None, i64::MAX, now)?;
-        self.conn.execute("UPDATE drafts SET sending = ?2 WHERE id = ?1", params![id, op])?;
+        // Being sent now, after whatever came before; in a lifecycle of its own, so nothing
+        // written before it can change what was sent.
+        self.put_draft(id, draft, false, None, None, now)?;
+        self.conn.execute("UPDATE drafts SET sending = ?2, lifecycle = lifecycle + 1 WHERE id = ?1", params![id, op])?;
         Ok(())
     }
 
     /// Keeps a message that wasn't sent as a draft, in the composer, with what was being sent:
-    /// its send couldn't be queued, or the window closed before the engine confirmed it.
-    /// `stamp`: when it was sent. A draft whose send is queued, or went out (gone since), is
-    /// left alone.
-    pub fn draft_unsent(&self, id: i64, draft: &Draft, stamp: i64, now: i64) -> Result<Option<LocalDraft>> {
+    /// its send couldn't be queued, or the window closed before the engine confirmed it. `at`:
+    /// the composer's when it sent; None for the engine's own copy, written as the send failed,
+    /// which nothing came after. True when that's dealt with: kept, or its send is queued or
+    /// went out (nothing to keep). False when refused like a save ([`Store::save_draft`]): the
+    /// draft ended without being sent, or moved on, and the caller must keep the text.
+    pub fn draft_unsent(&self, id: i64, draft: &Draft, at: Option<DraftRev>, now: i64) -> Result<bool> {
         self.transaction(|st| {
-            let on_its_way: bool = st.conn.query_row("SELECT sending != 0 OR sent != 0 FROM drafts WHERE id = ?1", params![id], |r| r.get(0)).optional()?.unwrap_or(false);
-            if !on_its_way {
-                st.put_draft(id, draft, true, None, stamp, now)?;
+            let on_its_way: bool = st.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM drafts WHERE id = ?1 AND (sending != 0 OR sent != 0)) OR EXISTS (SELECT 1 FROM draft_ends WHERE id = ?1 AND sent != 0)",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if on_its_way {
+                return Ok(true);
             }
-            st.draft(id)
+            Ok(st.put_draft(id, draft, true, at.map(|a| a.lifecycle), None, now)?.is_some())
         })
     }
 
     /// Brings back the draft whose send (op `op`) was undone, in the composer, queuing the
-    /// upload it skipped while it waited. Call inside a transaction, with the cancel.
+    /// upload it skipped while it waited. It's in a new lifecycle (the composer gets it with
+    /// the draft): nothing written before the send can touch it. Call inside a transaction,
+    /// with the cancel.
     pub fn unsend_draft(&self, op: i64, now: i64) -> Result<Option<LocalDraft>> {
         let id: Option<i64> = self.conn.query_row("SELECT id FROM drafts WHERE sending = ?1 AND sending != 0", params![op], |r| r.get(0)).optional()?;
         let Some(id) = id else { return Ok(None) };
-        self.conn.execute("UPDATE drafts SET sending = 0, open = 1 WHERE id = ?1", params![id])?;
+        self.conn.execute("UPDATE drafts SET sending = 0, open = 1, lifecycle = lifecycle + 1 WHERE id = ?1", params![id])?;
         let back = self.draft(id)?;
         if let Some(d) = &back
             && self.draft_needs_upload(id)?
@@ -535,6 +574,11 @@ impl Store {
 mod tests {
     use super::*;
 
+    /// A write from the draft's first lifecycle, stamped `rev`.
+    fn at(rev: i64) -> DraftRev {
+        DraftRev { lifecycle: 0, rev }
+    }
+
     fn draft(subject: &str) -> Draft {
         Draft { account: "a".into(), to: "bo@x.com".into(), subject: subject.into(), body: "hi".into(), ..Draft::default() }
     }
@@ -555,11 +599,12 @@ mod tests {
     #[test]
     fn saves_apply_in_order_and_only_changes_count() {
         let s = Store::memory();
-        assert!(s.save_draft(1, &draft("A"), true, 10, 100).unwrap(), "created");
-        assert!(!s.save_draft(1, &draft("A"), true, 11, 101).unwrap(), "same content: nothing to upload");
-        assert!(s.save_draft(1, &draft("B"), true, 12, 102).unwrap());
-        // A queued save the one made as the window closed overtook arrives late: ignored.
-        assert!(!s.save_draft(1, &draft("stale"), true, 11, 103).unwrap());
+        assert_eq!(s.save_draft(1, &draft("A"), true, at(10), 100).unwrap(), Some(true), "created");
+        assert_eq!(s.save_draft(1, &draft("A"), true, at(11), 101).unwrap(), Some(false), "same content: nothing to upload");
+        assert_eq!(s.save_draft(1, &draft("B"), true, at(12), 102).unwrap(), Some(true));
+        // A queued save the one made as the window closed overtook arrives late: ignored, but
+        // what it holds is saved (the newer save has it too).
+        assert_eq!(s.save_draft(1, &draft("stale"), true, at(11), 103).unwrap(), Some(false));
         let d = s.draft(1).unwrap().unwrap();
         assert_eq!((d.draft.subject.as_str(), d.updated, d.visible), ("B", 102, true));
         assert!(d.message_id.starts_with("<1.") && d.message_id.ends_with("@envoy>"), "{}", d.message_id);
@@ -570,8 +615,8 @@ mod tests {
         let (dir, db) = temp_db("restore");
         {
             let s = Store::open(&db).unwrap();
-            s.save_draft(1, &draft("put away"), false, 1, 100).unwrap();
-            s.save_draft(2, &draft("being written"), true, 2, 200).unwrap();
+            s.save_draft(1, &draft("put away"), false, at(1), 100).unwrap();
+            s.save_draft(2, &draft("being written"), true, at(2), 200).unwrap();
             // The app dies here: no clean close.
         }
         let s = Store::open(&db).unwrap();
@@ -584,10 +629,10 @@ mod tests {
     #[test]
     fn edits_while_an_upload_waits_coalesce_into_it() {
         let s = Store::memory();
-        s.save_draft(1, &draft("v1"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("v1"), true, at(1), 100).unwrap();
         assert!(s.queue_draft_upload("a", 1, 105).unwrap());
         for (rev, v) in [(2, "v2"), (3, "v3")] {
-            s.save_draft(1, &draft(v), true, rev, 100).unwrap();
+            s.save_draft(1, &draft(v), true, at(rev), 100).unwrap();
             assert!(!s.queue_draft_upload("a", 1, 105).unwrap(), "one upload is already waiting");
         }
         assert_eq!(queued(&s, "a"), vec![Op::SaveDraft { draft: 1 }]);
@@ -598,7 +643,7 @@ mod tests {
         let claimed = s.claim_due("a", 100).unwrap();
         let up = s.draft_upload("a", 1).unwrap().unwrap();
         assert_eq!(up.draft.subject, "v3");
-        s.save_draft(1, &draft("v4"), true, 4, 101).unwrap();
+        s.save_draft(1, &draft("v4"), true, at(4), 101).unwrap();
         assert!(s.queue_draft_upload("a", 1, 106).unwrap());
         s.draft_uploaded(1, &up, "Drafts", Some((1, 1)), true).unwrap();
         s.op_done(claimed[0].id).unwrap();
@@ -609,11 +654,11 @@ mod tests {
     #[test]
     fn a_failed_upload_and_one_queued_meanwhile_become_one() {
         let s = Store::memory();
-        s.save_draft(1, &draft("v1"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("v1"), true, at(1), 100).unwrap();
         s.queue_draft_upload("a", 1, 100).unwrap();
         let on_the_wire = s.claim_due("a", 100).unwrap()[0].id;
         // Edited while it's on the wire: an upload of its own, due in a few seconds.
-        s.save_draft(1, &draft("v2"), true, 2, 101).unwrap();
+        s.save_draft(1, &draft("v2"), true, at(2), 101).unwrap();
         assert!(s.queue_draft_upload("a", 1, 106).unwrap());
         // The first fails, and would retry in 15 s.
         s.op_failed(on_the_wire, "NO [UNAVAILABLE]", 15, 101).unwrap();
@@ -626,7 +671,7 @@ mod tests {
     #[test]
     fn a_sent_draft_waits_with_the_message_then_goes() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         s.draft_upload("a", 1).unwrap(); // it may be on the server now
         let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
         s.transaction(|st| st.draft_sending(1, &draft("hello, final"), send, 101)).unwrap();
@@ -646,13 +691,14 @@ mod tests {
     fn an_unsent_message_is_kept_unless_its_send_is_queued() {
         let s = Store::memory();
         // The window closed before the engine got to the send: kept, in the composer.
-        let kept = s.draft_unsent(1, &draft("hello"), 1, 100).unwrap().unwrap();
+        assert!(s.draft_unsent(1, &draft("hello"), Some(at(1)), 100).unwrap());
+        let kept = s.draft(1).unwrap().unwrap();
         assert!(kept.visible && kept.draft.subject == "hello");
         assert_eq!(s.draft_to_restore().unwrap().map(|d| d.id), Some(1));
         // It did get to it: left to go out.
         let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
         s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
-        s.draft_unsent(1, &draft("hello"), 2, 102).unwrap();
+        assert!(s.draft_unsent(1, &draft("hello"), Some(at(2)), 102).unwrap(), "nothing to keep");
         assert!(!s.draft(1).unwrap().unwrap().visible, "still in the outbox");
         assert_eq!(s.draft_to_restore().unwrap(), None);
     }
@@ -660,50 +706,91 @@ mod tests {
     #[test]
     fn a_save_cant_touch_a_draft_in_the_outbox() {
         let s = Store::memory();
-        s.save_draft(1, &draft("old text"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("old text"), true, at(1), 100).unwrap();
         let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
         s.transaction(|st| st.draft_sending(1, &draft("sent text"), send, 101)).unwrap();
         // A retry of a failed save of older text arrives, stamped later.
-        assert!(!s.save_draft(1, &draft("old text"), true, 50, 102).unwrap());
+        assert_eq!(s.save_draft(1, &draft("old text"), true, at(50), 102).unwrap(), None, "refused");
         assert!(s.cancel_send(send).unwrap());
         let back = s.unsend_draft(send, 103).unwrap().unwrap();
         assert_eq!(back.draft.subject, "sent text", "Undo send gives back what was sent");
+        // And after Undo send too: the save was made before the send.
+        assert_eq!(s.save_draft(1, &draft("old text"), true, at(51), 104).unwrap(), None);
+        assert_eq!(s.draft(1).unwrap().unwrap().draft.subject, "sent text");
+        // The composer that got it back saves in its new lifecycle.
+        assert_eq!(s.save_draft(1, &draft("edited"), true, DraftRev { rev: 52, ..back.at }, 105).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn a_sent_draft_stays_gone_whatever_the_clocks_say() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap(); // never uploaded
+        let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 100).unwrap();
+        s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
+        s.op_done(send).unwrap();
+        // The app's copy of what it sent arrives late, stamped by a clock ahead of the
+        // database's (or the system clock stepped back since): no clock is consulted.
+        assert!(s.draft_unsent(1, &draft("hello"), Some(at(i64::MAX - 1)), 102).unwrap(), "it went out: nothing to keep");
+        assert_eq!(s.save_draft(1, &draft("hello"), true, at(i64::MAX), 103).unwrap(), None, "refused");
+        assert_eq!(s.draft(1).unwrap(), None, "not brought back to life");
     }
 
     #[test]
     fn a_draft_that_went_out_stays_gone() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap(); // never uploaded
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap(); // never uploaded
         let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 100).unwrap();
         s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
         s.op_done(send).unwrap(); // out, before the app heard (undo send off)
         assert_eq!(s.draft(1).unwrap(), None);
         // The window closes: the app's copy of what it sent, and a save from before, arrive late.
-        s.draft_unsent(1, &draft("hello"), 2, 102).unwrap();
-        s.save_draft(1, &draft("hello"), true, 2, 103).unwrap();
+        assert!(s.draft_unsent(1, &draft("hello"), Some(at(2)), 102).unwrap());
+        assert_eq!(s.save_draft(1, &draft("hello"), true, at(2), 103).unwrap(), None);
         assert_eq!(s.draft(1).unwrap(), None, "not brought back to life");
     }
 
     #[test]
-    fn a_purged_draft_stays_gone_until_edited_again() {
+    fn an_earlier_builds_clock_tombstones_give_way() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.conn
+            .execute_batch(
+                "CREATE TABLE draft_tombstones (id INTEGER PRIMARY KEY, gone INTEGER NOT NULL);
+                 CREATE TRIGGER drafts_tombstone AFTER DELETE ON drafts BEGIN
+                     INSERT OR REPLACE INTO draft_tombstones (id, gone) VALUES (old.id, CAST(unixepoch('subsec') * 1000000 AS INTEGER));
+                 END;",
+            )
+            .unwrap();
+        crate::store::migrate(&s.conn).unwrap();
+        let left: i64 = s.conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('draft_tombstones', 'drafts_tombstone')", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
+        s.discard_draft(1, None).unwrap();
+        assert_eq!(s.save_draft(1, &draft("hello"), true, at(2), 101).unwrap(), None, "ended, by id");
+    }
+
+    #[test]
+    fn a_purged_draft_stays_gone() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         s.draft_upload("a", 1).unwrap();
         s.discard_draft(1, None).unwrap();
         s.draft_purged(1, 110).unwrap();
         assert_eq!(s.draft(1).unwrap(), None);
-        s.save_draft(1, &draft("hello"), true, 2, 111).unwrap();
-        assert_eq!(s.draft(1).unwrap(), None, "a save from before the discard changes nothing");
-        // A too-late Undo put it back in the composer, and it's edited: a save made now counts.
-        let now = chrono::Utc::now().timestamp_micros() + 1_000_000;
-        s.save_draft(1, &draft("hello again"), true, now, 112).unwrap();
-        assert_eq!(s.draft(1).unwrap().map(|d| d.draft.subject), Some("hello again".into()));
+        // A save from before the discard, or after a too-late Undo, whatever its stamp:
+        // refused, never taken for saved (the app keeps it as a new draft).
+        assert_eq!(s.save_draft(1, &draft("hello"), true, at(2), 111).unwrap(), None);
+        assert_eq!(s.save_draft(1, &draft("hello again"), true, at(i64::MAX), 112).unwrap(), None);
+        assert_eq!(s.draft(1).unwrap(), None);
+        // Nor does an unsent copy: it wasn't sent, so it's for the caller to keep.
+        assert!(!s.draft_unsent(1, &draft("hello"), Some(at(3)), 113).unwrap());
+        // A new draft gets an id no draft had.
+        assert!(s.fresh_draft_id(0).unwrap() > 1);
     }
 
     #[test]
     fn a_sent_draft_never_comes_back() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         s.draft_upload("a", 1).unwrap();
         let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
         s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
@@ -714,14 +801,14 @@ mod tests {
         assert!(!s.draft(1).unwrap().unwrap().visible, "still on its way out");
         assert!(matches!(&queued(&s, "a")[..], [Op::PurgeDraft { draft: Some(1), .. }]));
         // A late save (the window closing as it was sent) doesn't bring it back either.
-        s.save_draft(1, &draft("hello"), true, 9, 102).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(9), 102).unwrap();
         assert!(!s.draft(1).unwrap().unwrap().visible);
     }
 
     #[test]
     fn a_sent_draft_that_never_reached_the_server_just_goes() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
         s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
         s.op_done(send).unwrap();
@@ -732,7 +819,7 @@ mod tests {
     #[test]
     fn undoing_a_send_brings_the_same_draft_back() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 105).unwrap();
         s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
         assert!(s.cancel_send(send).unwrap());
@@ -746,7 +833,7 @@ mod tests {
     #[test]
     fn a_discard_waits_out_its_undo_window() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         assert_eq!(s.discard_draft(1, Some((110, 7))).unwrap(), Some("a".into()));
         assert!(!s.draft(1).unwrap().unwrap().visible);
         assert_eq!(s.discard_draft(1, Some((110, 8))).unwrap(), None, "already on its way out");
@@ -766,7 +853,7 @@ mod tests {
     #[test]
     fn without_undo_a_draft_the_server_never_had_goes_at_once() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         s.discard_draft(1, None).unwrap();
         assert_eq!(s.draft(1).unwrap(), None);
         assert!(queued(&s, "a").is_empty());
@@ -775,14 +862,14 @@ mod tests {
     #[test]
     fn a_draft_saved_after_a_too_late_undo_survives_its_purge() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         let up = s.draft_upload("a", 1).unwrap().unwrap();
         assert!(s.draft_uploaded(1, &up, "Drafts", Some((1, 1)), true).unwrap());
         s.discard_draft(1, Some((110, 7))).unwrap();
         s.claim_due("a", 110).unwrap(); // the purge is on the wire: undo is too late
         assert_eq!(s.undo_batch(7).unwrap().in_flight, 1);
         // The app put the composer back anyway, and it saves.
-        s.save_draft(1, &draft("hello again"), true, 2, 111).unwrap();
+        s.save_draft(1, &draft("hello again"), true, at(2), 111).unwrap();
         s.draft_purged(1, 112).unwrap();
         let d = s.draft(1).unwrap().expect("kept");
         assert_eq!(d.draft.subject, "hello again");
@@ -804,7 +891,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         for stats in ["without statistics", "after ANALYZE"] {
             if stats == "after ANALYZE" {
                 s.conn.execute_batch("ANALYZE").unwrap();
@@ -829,11 +916,11 @@ mod tests {
     #[test]
     fn an_upload_that_finishes_after_a_move_is_fenced_off() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         let up = s.draft_upload("a", 1).unwrap().unwrap();
         // While it's on the wire, the draft moves to b.
         let moved = Draft { account: "b".into(), ..draft("hello") };
-        s.save_draft(1, &moved, true, 2, 101).unwrap();
+        s.save_draft(1, &moved, true, at(2), 101).unwrap();
         let mid = s.draft(1).unwrap().unwrap().message_id;
         assert!(!s.draft_uploaded(1, &up, "Drafts", Some((7, 21)), true).unwrap(), "not recorded");
         assert_eq!(s.draft_copy(1).unwrap(), None, "the draft has no copy on b");
@@ -846,12 +933,12 @@ mod tests {
     #[test]
     fn moving_a_draft_to_another_account_purges_the_old_copies() {
         let s = Store::memory();
-        s.save_draft(1, &draft("hello"), true, 1, 100).unwrap();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
         let mid = s.draft(1).unwrap().unwrap().message_id;
         let up = s.draft_upload("a", 1).unwrap().unwrap();
         assert!(s.draft_uploaded(1, &up, "Drafts", Some((1, 1)), true).unwrap());
         let moved = Draft { account: "b".into(), ..draft("hello") };
-        assert!(s.save_draft(1, &moved, true, 2, 101).unwrap());
+        assert_eq!(s.save_draft(1, &moved, true, at(2), 101).unwrap(), Some(true));
         assert_eq!(queued(&s, "a"), vec![Op::PurgeDraft { message_id: mid, draft: None, copy: Some(("Drafts".into(), 1, 1)), exact: true, left_by: Some((1, 0)) }], "the copy on record, by UID");
         assert!(s.draft_upload("a", 1).unwrap().is_none(), "not uploaded to the old account");
         assert!(s.draft_upload("b", 1).unwrap().is_some(), "but to the new one");

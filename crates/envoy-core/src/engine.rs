@@ -17,7 +17,7 @@ use crate::accounts::{self, Account, AuthKind};
 use crate::imap::{self, Credential, Session};
 use crate::model::{Draft, DraftNotice, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use crate::settings::Settings;
-use crate::store::{LocalDraft, Op, Query, Store};
+use crate::store::{DraftRev, LocalDraft, Op, Query, Store};
 use crate::{drafts, oauth, paths, secrets, smtp};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,9 +54,11 @@ pub enum Command {
     Send { draft: Draft, draft_id: Option<i64> },
     UndoSend { op: i64 },
     /// Saves the composer's content as draft `id` (an id the app picks, unique across runs) and
-    /// queues its upload to the Drafts mailbox. `rev` orders saves ([`Store::save_draft`]);
-    /// `open`: it's still in the composer.
-    SaveDraft { id: i64, draft: Draft, open: bool, rev: i64 },
+    /// queues its upload to the Drafts mailbox. `lifecycle` (the draft's, as the app last heard)
+    /// and `rev` order saves ([`Store::save_draft`]); `open`: it's still in the composer.
+    /// Answered with [`Event::DraftSaved`], [`Event::DraftSaveFailed`] or
+    /// [`Event::DraftSaveRefused`].
+    SaveDraft { id: i64, draft: Draft, open: bool, rev: i64, lifecycle: i64 },
     /// Opens a row of a Drafts list in the composer: answered with [`Event::DraftOpened`].
     OpenDraft { id: MessageId },
     /// Discards draft `id`, here and on the server. `undo` as in [`Command::Move`].
@@ -101,6 +103,9 @@ pub enum Event {
     DraftSaved { id: i64, rev: i64 },
     /// Save `rev` of draft `id` couldn't be written: it isn't saved, and should be tried again.
     DraftSaveFailed { id: i64, rev: i64, error: String },
+    /// Save `rev` of draft `id` was refused: the draft moved on without it (gone for good, or
+    /// sent, since it was made). It isn't saved, and a retry won't be: keep it as a new draft.
+    DraftSaveRefused { id: i64, rev: i64 },
     /// How many ops an undoable [`Command::Move`] actually held. 0 means it had nothing to do
     /// (the messages were already moving, or already there), so there's nothing to undo.
     Held { undo: i64, ops: usize },
@@ -117,8 +122,9 @@ pub enum Event {
     /// A draft for the composer: opened from Drafts, or back from an undone send, or, with
     /// `restored`, the one left in the composer when the app last closed. `notice`: what to
     /// tell the user about a draft from the server; with [`DraftNotice::Copy`] it's an unsaved
-    /// copy and `id` is 0, for the app to pick one.
-    DraftOpened { id: i64, draft: Draft, restored: bool, notice: Option<DraftNotice> },
+    /// copy and `id` is 0, for the app to pick one. `at`: the draft's lifecycle, for its saves
+    /// to carry, and its newest save's stamp.
+    DraftOpened { id: i64, draft: Draft, at: DraftRev, restored: bool, notice: Option<DraftNotice> },
     /// Draft `id` was discarded from the Drafts list ([`Command::DiscardDraftRow`]), under
     /// `undo`: a composer holding it closes.
     DraftDiscarded { id: i64, undo: Option<i64> },
@@ -202,17 +208,18 @@ impl Engine {
     /// [`Command::SaveDraft`], done on the calling thread before returning: for when the window
     /// closes, since the process may exit before the engine gets to a queued command. Waits only
     /// for the store; the upload goes out on the next start if not before.
-    pub fn save_draft_now(&self, id: i64, draft: &Draft, open: bool, rev: i64) -> Result<()> {
+    /// False when the store refused it ([`Store::save_draft`]): it isn't saved.
+    pub fn save_draft_now(&self, id: i64, draft: &Draft, open: bool, at: DraftRev) -> Result<bool> {
         let st = self.writer.lock().map_err(|_| anyhow!("store poisoned"))?;
-        drafts::save(&st, id, draft, open, rev, now()).map(|_| ())
+        Ok(drafts::save(&st, id, draft, open, at, now())?.is_some())
     }
 
-    /// Keeps a message the composer sent (stamped `stamp`) as a draft, on the calling thread,
-    /// unless its send was queued (or went out): for when the window closes before the engine
-    /// confirmed it.
-    pub fn keep_unsent_now(&self, id: i64, draft: &Draft, stamp: i64) -> Result<()> {
+    /// Keeps a message the composer sent (at `at`) as a draft, on the calling thread, unless
+    /// its send was queued (or went out): for when the window closes before the engine
+    /// confirmed it. False when the store refused it ([`Store::draft_unsent`]).
+    pub fn keep_unsent_now(&self, id: i64, draft: &Draft, at: DraftRev) -> Result<bool> {
         let st = self.writer.lock().map_err(|_| anyhow!("store poisoned"))?;
-        st.draft_unsent(id, draft, stamp, now()).map(|_| ())
+        st.draft_unsent(id, draft, Some(at), now())
     }
 
     pub fn drain(&self) -> Vec<Event> {
@@ -348,8 +355,8 @@ fn reply(shared: &Shared, reply: &Reply) -> Result<()> {
             shared.emit(Event::Thread { req, id, messages });
         }
         Reply::Draft(id) => match open_draft(shared, id, now())? {
-            Opening::Ready(d, notice) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false, notice }),
-            Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, restored: false, notice: Some(DraftNotice::Copy(why)) }),
+            Opening::Ready(d, notice) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: false, notice }),
+            Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, at: DraftRev::default(), restored: false, notice: Some(DraftNotice::Copy(why)) }),
             _ => {}
         },
     }
@@ -372,7 +379,7 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
     }
     // What was being written when the app last closed (or crashed) goes back in the composer.
     match shared.with_writer(|st| st.draft_to_restore()) {
-        Ok(Some(d)) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: true, notice: None }),
+        Ok(Some(d)) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: true, notice: None }),
         Ok(None) => {}
         Err(e) => log::warn!("couldn't read drafts: {e:#}"),
     }
@@ -498,7 +505,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 // Not sent: kept as a draft here, and back in the composer, so nothing written is
                 // lost.
                 if let Some(id) = draft_id
-                    && let Err(e) = shared.with_writer(|st| st.draft_unsent(id, &draft, chrono::Utc::now().timestamp_micros(), now()))
+                    && let Err(e) = shared.with_writer(|st| st.draft_unsent(id, &draft, None, now()))
                 {
                     log::warn!("couldn't keep an unsent draft: {e:#}");
                 }
@@ -517,14 +524,14 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             shared.emit(Event::Toast(if cancelled { "Sending undone".into() } else { "Too late — it was already sent".into() }));
             if let Some(d) = back {
                 let account = d.account.clone();
-                shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false, notice: None });
+                shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: false, notice: None });
                 shared.emit(Event::Changed { account: account.clone() });
                 wake(workers, &account);
             }
             shared.emit_pending();
         }
-        Command::SaveDraft { id, draft, open, rev } => match shared.with_writer(|st| drafts::save(st, id, &draft, open, rev, now())) {
-            Ok(queued) => {
+        Command::SaveDraft { id, draft, open, rev, lifecycle } => match shared.with_writer(|st| drafts::save(st, id, &draft, open, DraftRev { lifecycle, rev }, now())) {
+            Ok(Some(queued)) => {
                 // Only now is it saved: the app shows "Draft saved", and drops its own copy.
                 shared.emit(Event::DraftSaved { id, rev });
                 if queued {
@@ -532,11 +539,12 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                     wake(workers, &draft.account);
                 }
             }
+            Ok(None) => shared.emit(Event::DraftSaveRefused { id, rev }),
             Err(e) => shared.emit(Event::DraftSaveFailed { id, rev, error: format!("{e:#}") }),
         },
         Command::OpenDraft { id } => match open_draft(shared, id, now())? {
-            Opening::Ready(d, notice) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, restored: false, notice }),
-            Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, restored: false, notice: Some(DraftNotice::Copy(why)) }),
+            Opening::Ready(d, notice) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: false, notice }),
+            Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, at: DraftRev::default(), restored: false, notice: Some(DraftNotice::Copy(why)) }),
             Opening::Download { account, mailbox, uid } => poke(workers, &account, Job::Bodies { mailbox, uids: vec![uid], reply: Some(Reply::Draft(id)) }),
             // Sent or discarded meanwhile: the list catches up.
             Opening::Gone => shared.emit(Event::Changed { account: String::new() }),
@@ -1992,10 +2000,15 @@ mod tests {
         Draft { account: "a".into(), to: "Bo <bo@x.com>".into(), subject: subject.into(), body: format!("About {subject}."), ..Draft::default() }
     }
 
+    /// A save from the draft's first lifecycle, stamped `rev`.
+    fn at(rev: i64) -> DraftRev {
+        DraftRev { lifecycle: 0, rev }
+    }
+
     /// Saves the composer's content as the app does while typing, `rev` ordering the saves.
     /// The save is dated in the past, so its upload is due now.
     fn type_draft(shared: &Shared, id: i64, rev: i64, subject: &str) {
-        shared.with_writer(|st| drafts::save(st, id, &draft(subject), true, rev, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+        shared.with_writer(|st| drafts::save(st, id, &draft(subject), true, at(rev), now() - drafts::UPLOAD_DELAY - 1)).unwrap();
     }
 
     fn drafts_engine() -> (Arc<Shared>, std::sync::mpsc::Receiver<Event>) {
@@ -2079,7 +2092,7 @@ mod tests {
         // The user picks another From while a's upload is on the wire.
         let mut a = FakeServer::new(&shared, |s: &Shared| {
             let moved = Draft { account: "b".into(), ..draft("from b") };
-            s.with_writer(|st| drafts::save(st, 7, &moved, true, 2, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+            s.with_writer(|st| drafts::save(st, 7, &moved, true, at(2), now() - drafts::UPLOAD_DELAY - 1)).unwrap();
         });
         replay_with(&shared, &account("a"), &mut a).await.unwrap();
         // Both servers number their Drafts alike: a's UID must mean nothing on b.
@@ -2103,7 +2116,7 @@ mod tests {
         a.unsure = false;
         // Moved to b: a's copy goes, found by Message-ID; the first try fails and backs off.
         let to_b = Draft { account: "b".into(), ..draft("v2") };
-        shared.with_writer(|st| drafts::save(st, 7, &to_b, true, 2, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+        shared.with_writer(|st| drafts::save(st, 7, &to_b, true, at(2), now() - drafts::UPLOAD_DELAY - 1)).unwrap();
         a.fail = true;
         replay_with(&shared, &account("a"), &mut a).await.unwrap();
         a.fail = false;
@@ -2115,6 +2128,19 @@ mod tests {
         replay_times(&shared, &mut a, 2).await;
         assert_eq!(a.drafts().into_iter().map(|(_, s)| s).collect::<Vec<_>>(), vec!["v3".to_owned()], "a ends up with the draft");
         assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty(), "and nothing left to do on a");
+    }
+
+    #[tokio::test]
+    async fn a_save_the_store_refuses_is_never_reported_saved() {
+        let (shared, rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "hello");
+        shared.with_writer(|st| st.discard_draft(7, None)).unwrap(); // gone for good
+        // A too-late Undo put it back in the composer, which saves it, stamped by a clock
+        // behind the database's.
+        handle(&shared, &mut HashMap::new(), Command::SaveDraft { id: 7, draft: draft("hello again"), open: true, rev: 2, lifecycle: 0 }).await.unwrap();
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(!events.iter().any(|e| matches!(e, Event::DraftSaved { id: 7, rev: 2 })), "not saved, so not acked: {events:?}");
+        assert!(events.iter().any(|e| matches!(e, Event::DraftSaveRefused { id: 7, rev: 2 })), "told it's refused: {events:?}");
     }
 
     #[tokio::test]
@@ -2328,7 +2354,7 @@ mod tests {
     #[tokio::test]
     async fn a_draft_save_is_confirmed_only_once_written() {
         let (shared, rx) = drafts_engine();
-        handle(&shared, &mut HashMap::new(), Command::SaveDraft { id: 7, draft: draft("hello"), open: true, rev: 5 }).await.unwrap();
+        handle(&shared, &mut HashMap::new(), Command::SaveDraft { id: 7, draft: draft("hello"), open: true, rev: 5, lifecycle: 0 }).await.unwrap();
         assert!(rx.try_iter().any(|e| matches!(e, Event::DraftSaved { id: 7, rev: 5 })));
         // The disk fills up: the app hears it wasn't saved, never that it was.
         shared
@@ -2337,7 +2363,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        handle(&shared, &mut HashMap::new(), Command::SaveDraft { id: 7, draft: draft("hello again"), open: true, rev: 6 }).await.unwrap();
+        handle(&shared, &mut HashMap::new(), Command::SaveDraft { id: 7, draft: draft("hello again"), open: true, rev: 6, lifecycle: 0 }).await.unwrap();
         let events: Vec<Event> = rx.try_iter().collect();
         assert!(events.iter().any(|e| matches!(e, Event::DraftSaveFailed { id: 7, rev: 6, .. })), "{events:?}");
         assert!(!events.iter().any(|e| matches!(e, Event::DraftSaved { rev: 6, .. })));
@@ -2347,7 +2373,7 @@ mod tests {
     async fn deleting_a_local_drafts_row_discards_it() {
         let (shared, rx) = drafts_engine();
         // Not uploaded yet: its row is the draft itself (a negative id).
-        shared.with_writer(|st| drafts::save(st, 7, &draft("only here"), true, 1, now())).unwrap();
+        shared.with_writer(|st| drafts::save(st, 7, &draft("only here"), true, at(1), now())).unwrap();
         let row = drafts::list_id(7);
         assert_eq!(drafts_list(&shared, "").iter().map(|r| r.id).collect::<Vec<_>>(), vec![row]);
         // What Delete used to send: a message move, which can't touch a draft.
@@ -2473,7 +2499,7 @@ mod tests {
         server.drafts.push((5, "<laptop@x>".into(), raw.to_vec()));
         server.next_uid = 6;
         let edited = Draft { body: "Finished.".into(), ..d.draft.clone() };
-        shared.with_writer(|st| drafts::save(st, d.id, &edited, true, 1, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+        shared.with_writer(|st| drafts::save(st, d.id, &edited, true, at(1), now() - drafts::UPLOAD_DELAY - 1)).unwrap();
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(server.drafts(), vec![(6, "From the laptop".to_owned())]);
         assert!(shared.with_writer(|st| st.summary(id)).unwrap().is_none(), "the laptop's copy is gone from the cache too");
@@ -2526,7 +2552,7 @@ mod tests {
         server.next_uid = 6;
         // Edited: the autosave's upload replaces the original, attachment and all.
         let edited = Draft { body: "Plan attached, see page 2.".into(), ..d.draft.clone() };
-        shared.with_writer(|st| drafts::save(st, d.id, &edited, true, 1, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+        shared.with_writer(|st| drafts::save(st, d.id, &edited, true, at(1), now() - drafts::UPLOAD_DELAY - 1)).unwrap();
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(server.drafts.len(), 1);
         let (_, _, copy) = &server.drafts[0];
