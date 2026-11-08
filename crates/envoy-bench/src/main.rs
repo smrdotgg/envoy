@@ -12,24 +12,30 @@
 //! envoy-bench size  --bin target/dist/envoy                 shipped binary size
 //! envoy-bench all   --home DIR --bin target/dist/envoy      gen (if needed) + store + app + size
 //! envoy-bench check --from OUT.json [--from ..] --only TEXT [--only ..]   gate earlier results
+//!                   [--known-misses crates/envoy-bench/known-misses.toml]
+//! envoy-bench misses --from OUT.json [--from ..]           known-misses.toml entries for every
+//!                                                           check over budget in those runs
 //!
 //! common: --json OUT.json   --markdown OUT.md (appends; e.g. $GITHUB_STEP_SUMMARY)
-//!         --allow-skip      a check that can't run here (no window) doesn't fail the run
-//!         --measure-only    print and save, exit 0 whatever the results (gate later with check)
+//!         --measure-only    print and save; exit 0 unless a measurement is INVALID (gate later
+//!                           with check)
 //! ```
 //!
-//! `check` lets CI measure once and gate each budget in its own step, so a budget that's
-//! known to be missed today can sit in a step allowed to fail without hiding the others.
+//! `check` lets CI measure once and gate each budget in its own step. Every check passes its
+//! gate unless known-misses.toml lists it for this OS, with a ceiling it mustn't reach (see
+//! misses.rs). INVALID measurements (the app couldn't run or exited badly, a step timed out,
+//! missing or miscounted samples) always fail.
 //!
-//! Two margins multiply a gate (never the budget), for wall-clock checks that shared CI runners
-//! and their software GPUs distort: `--wall-margin` for cold start and keypress→frame,
-//! `--frame-margin` for open and search end to end (whose store-side work is gated hard by
-//! `store`). Search, open (store), memory and size are always gated at the budget. The table
-//! always shows the true measurement, the budget and the gate.
+//! Margins multiply a gate (never the budget) for wall-clock checks that shared CI runners and
+//! their software GPUs distort: `--frame-margin` for open end to end (whose store-side work is
+//! gated hard by `store`), `--wall-margin` for cold start and keypress→frame (1 today: they miss
+//! on real hardware). Search, open (store), memory and size are always gated at the budget. The
+//! table always shows the true measurement, the budget and the gate.
 
 mod app_bench;
 mod mailbox;
 mod mem;
+mod misses;
 mod report;
 mod store_bench;
 
@@ -51,7 +57,7 @@ struct Opts {
     frame_margin: f64,
     json: Option<PathBuf>,
     markdown: Option<PathBuf>,
-    allow_skip: bool,
+    known_misses: Option<PathBuf>,
     measure_only: bool,
     from: Vec<PathBuf>,
     only: Vec<String>,
@@ -72,7 +78,7 @@ fn parse() -> Result<Opts> {
         frame_margin: 1.0,
         json: None,
         markdown: None,
-        allow_skip: false,
+        known_misses: None,
         measure_only: false,
         from: Vec::new(),
         only: Vec::new(),
@@ -90,7 +96,7 @@ fn parse() -> Result<Opts> {
             "--frame-margin" => o.frame_margin = val()?.parse::<f64>()?.max(1.0),
             "--json" => o.json = Some(val()?.into()),
             "--markdown" => o.markdown = Some(val()?.into()),
-            "--allow-skip" => o.allow_skip = true,
+            "--known-misses" => o.known_misses = Some(val()?.into()),
             "--measure-only" => o.measure_only = true,
             "--from" => o.from.push(val()?.into()),
             "--only" => o.only.push(val()?),
@@ -140,7 +146,7 @@ fn main() {
     let o = match parse() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("envoy-bench: {e:#}\n\nusage: envoy-bench gen|store|search|open|app|size|all --home DIR --bin PATH (see the source header)");
+            eprintln!("envoy-bench: {e:#}\n\nusage: envoy-bench gen|store|search|open|app|size|all|check|misses --home DIR --bin PATH (see the source header)");
             std::process::exit(2);
         }
     };
@@ -161,6 +167,27 @@ fn main() {
                     checks.extend(report::from_json(&v["checks"]).into_iter().filter(|c| o.only.iter().any(|p| c.id().contains(p.as_str()))));
                 }
                 anyhow::ensure!(!checks.is_empty(), "no check in {:?} matches {:?}", o.from, o.only);
+                if let Some(path) = &o.known_misses {
+                    let list = misses::load(path)?;
+                    for p in misses::apply(&mut checks, &list, std::env::consts::OS, &o.only) {
+                        println!("PROMOTE: {p}");
+                        if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                            println!("::warning title=Known budget miss now passes::{p}");
+                        }
+                    }
+                }
+            }
+            "misses" => {
+                anyhow::ensure!(!o.from.is_empty(), "--from is required");
+                let mut runs = Vec::new();
+                for from in &o.from {
+                    let text = std::fs::read_to_string(from).with_context(|| format!("reading {}", from.display()))?;
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    let os = v["os"].as_str().with_context(|| format!("{} has no \"os\" (made by an older envoy-bench?)", from.display()))?;
+                    runs.push((os.to_string(), report::from_json(&v["checks"])));
+                }
+                print!("{}", misses::suggest(&runs));
+                return Ok(());
             }
             "all" => {
                 gen_if_needed(&o, false)?;
@@ -187,18 +214,21 @@ fn main() {
         }
     }
     if let Some(p) = &o.json {
-        let _ = std::fs::write(p, serde_json::to_string_pretty(&serde_json::json!({ "label": o.label, "cmd": o.cmd, "checks": report::json(&checks) })).unwrap_or_default());
+        let _ = std::fs::write(p, serde_json::to_string_pretty(&serde_json::json!({ "label": o.label, "os": std::env::consts::OS, "cmd": o.cmd, "checks": report::json(&checks) })).unwrap_or_default());
     }
-    let failed: Vec<&Check> = checks.iter().filter(|c| c.outcome == Outcome::Fail).collect();
-    let skipped: Vec<&Check> = checks.iter().filter(|c| c.outcome == Outcome::Skipped).collect();
-    for c in &failed {
-        println!("OVER BUDGET: {} · {}", c.group, c.name);
+    let of = |o: Outcome| checks.iter().filter(move |c| c.outcome == o);
+    for c in of(Outcome::KnownMiss) {
+        println!("KNOWN MISS: {} (under its ceiling)", c.id());
     }
-    for c in &skipped {
-        println!("NOT MEASURED: {} · {}: {}", c.group, c.name, c.detail);
+    for c in of(Outcome::Fail) {
+        println!("OVER BUDGET: {}", c.id());
     }
-    let bad = r.is_err() || !failed.is_empty() || (!skipped.is_empty() && !o.allow_skip);
-    if o.measure_only && r.is_ok() {
+    for c in of(Outcome::Invalid) {
+        println!("INVALID MEASUREMENT: {}: {}", c.id(), c.detail);
+    }
+    let invalid = of(Outcome::Invalid).next().is_some();
+    let bad = r.is_err() || invalid || of(Outcome::Fail).next().is_some();
+    if o.measure_only && r.is_ok() && !invalid {
         println!("\nmeasured (--measure-only: gated in separate steps)");
         std::process::exit(0);
     }

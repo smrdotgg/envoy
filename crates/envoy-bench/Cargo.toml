@@ -13,6 +13,7 @@ envoy-core = { workspace = true }
 # Same version and features as envoy-core's, so it's the same build: only to pick sample ids.
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

@@ -150,8 +150,11 @@ fn run_open(db: &Path, st: &Store, checks: &mut Vec<Check>) -> Result<()> {
     let threads = ids(
         "SELECT MAX(m.id) FROM messages m WHERE m.account = ?1 GROUP BY m.thread HAVING COUNT(*) >= 6 ORDER BY MAX(m.date) DESC LIMIT 30",
     )?;
-    let mut time_open = |name: &str, ids: &[i64], what: &str| -> Result<()> {
-        anyhow::ensure!(!ids.is_empty(), "no {name} messages in the mailbox");
+    let mut time_open = |name: &str, ids: &[i64], want: usize, what: &str| -> Result<()> {
+        if ids.len() != want {
+            checks.push(Check::invalid("open", name.to_string(), Some(budget::OPEN_MS), "ms", format!("found {} {what} to open, expected {want}: the mailbox isn't the one this harness generates", ids.len())));
+            return Ok(());
+        }
         let mut runs = Vec::new();
         let mut msgs = 0;
         for &id in ids {
@@ -167,10 +170,10 @@ fn run_open(db: &Path, st: &Store, checks: &mut Vec<Check>) -> Result<()> {
         Ok(())
     };
     println!("\nopen (Store::thread, conversations):");
-    time_open("plain text", &plain, "single messages")?;
-    time_open("HTML, first open", &html, "newsletters (HTML → Markdown + layout tree)")?;
-    time_open("HTML, reopen", &html, "newsletters, Markdown cached")?;
-    time_open("conversation ≥6", &threads, "conversations, all bodies")?;
+    time_open("plain text", &plain, 40, "single messages")?;
+    time_open("HTML, first open", &html, 40, "newsletters (HTML → Markdown + layout tree)")?;
+    time_open("HTML, reopen", &html, 40, "newsletters, Markdown cached")?;
+    time_open("conversation ≥6", &threads, 30, "conversations, all bodies")?;
     Ok(())
 }
 

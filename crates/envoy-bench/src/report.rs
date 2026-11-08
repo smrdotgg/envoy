@@ -16,12 +16,16 @@ pub mod budget {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
     Pass,
+    /// Over its gate (or over its known-miss ceiling).
     Fail,
-    /// Measured and shown, not gated (a breakdown, or a number the method can't stand behind).
+    /// Measured and shown, not gated (a breakdown).
     Info,
-    /// Couldn't be measured here (no window, unsupported platform). Fails the run unless
-    /// `allow_skip`.
-    Skipped,
+    /// The measurement itself isn't valid: the app couldn't run or exited badly, a step timed
+    /// out, samples are missing or the sample count is wrong. Always fails, whatever
+    /// known-misses.toml says: a number that wasn't measured can't be forgiven.
+    Invalid,
+    /// Over its budget but under the ceiling known-misses.toml allows on this OS.
+    KnownMiss,
 }
 
 #[derive(Clone, Debug)]
@@ -31,8 +35,12 @@ pub struct Check {
     pub measured: Option<f64>,
     pub unit: &'static str,
     pub budget: Option<f64>,
-    /// The threshold actually enforced: the budget, or budget × a documented margin.
+    /// The threshold for passing: the budget, or budget × a documented margin.
     pub gate: Option<f64>,
+    /// For a known miss: the most it may measure before it fails.
+    pub ceiling: Option<f64>,
+    /// A known miss that passed its gate: its known-misses.toml entry should go.
+    pub promote: bool,
     pub detail: String,
     pub outcome: Outcome,
 }
@@ -48,22 +56,47 @@ impl Check {
             unit,
             budget: Some(budget),
             gate: Some(gate),
+            ceiling: None,
+            promote: false,
             detail: detail.into(),
             outcome: if measured < gate { Outcome::Pass } else { Outcome::Fail },
         }
     }
 
     pub fn info(group: impl Into<String>, name: impl Into<String>, measured: f64, unit: &'static str, detail: impl Into<String>) -> Check {
-        Check { group: group.into(), name: name.into(), measured: Some(measured), unit, budget: None, gate: None, detail: detail.into(), outcome: Outcome::Info }
+        Check {
+            group: group.into(),
+            name: name.into(),
+            measured: Some(measured),
+            unit,
+            budget: None,
+            gate: None,
+            ceiling: None,
+            promote: false,
+            detail: detail.into(),
+            outcome: Outcome::Info,
+        }
     }
 
-    /// "group · name", what `check --only` matches against.
+    /// A check whose measurement isn't valid (see [`Outcome::Invalid`]).
+    pub fn invalid(group: impl Into<String>, name: impl Into<String>, budget: Option<f64>, unit: &'static str, why: impl Into<String>) -> Check {
+        Check {
+            group: group.into(),
+            name: name.into(),
+            measured: None,
+            unit,
+            budget,
+            gate: None,
+            ceiling: None,
+            promote: false,
+            detail: why.into(),
+            outcome: Outcome::Invalid,
+        }
+    }
+
+    /// "group · name": what `check --only` matches and known-misses.toml names.
     pub fn id(&self) -> String {
         format!("{} · {}", self.group, self.name.trim())
-    }
-
-    pub fn skipped(group: impl Into<String>, name: impl Into<String>, budget: Option<f64>, unit: &'static str, why: impl Into<String>) -> Check {
-        Check { group: group.into(), name: name.into(), measured: None, unit, budget, gate: None, detail: why.into(), outcome: Outcome::Skipped }
     }
 }
 
@@ -76,20 +109,26 @@ fn num(v: Option<f64>, unit: &str) -> String {
     }
 }
 
-fn result(c: &Check) -> &'static str {
+pub fn result(c: &Check) -> &'static str {
     match c.outcome {
+        Outcome::Pass if c.promote => "PASS (promote)",
         Outcome::Pass => "PASS",
         Outcome::Fail => "FAIL",
         Outcome::Info => "info",
-        Outcome::Skipped => "SKIP",
+        Outcome::Invalid => "INVALID",
+        Outcome::KnownMiss => "KNOWN MISS",
     }
 }
 
 fn gate_text(c: &Check) -> String {
-    match (c.budget, c.gate) {
+    let gate = match (c.budget, c.gate) {
         (Some(b), Some(g)) if (g - b).abs() > 1e-9 => format!("{} (×{:.1})", num(Some(g), c.unit), g / b),
         (_, Some(g)) => num(Some(g), c.unit),
         _ => "—".into(),
+    };
+    match c.ceiling {
+        Some(x) => format!("{gate}, ceiling {}", num(Some(x), c.unit)),
+        None => gate,
     }
 }
 
@@ -110,7 +149,13 @@ pub fn print_table(title: &str, checks: &[Check]) {
         for (i, cell) in cells.iter().enumerate() {
             if i < 5 {
                 let pad = w[i] - cell.chars().count();
-                if i == 0 { s.push_str(cell); s.push_str(&" ".repeat(pad)); } else { s.push_str(&" ".repeat(pad)); s.push_str(cell); }
+                if i == 0 {
+                    s.push_str(cell);
+                    s.push_str(&" ".repeat(pad));
+                } else {
+                    s.push_str(&" ".repeat(pad));
+                    s.push_str(cell);
+                }
                 s.push_str("  ");
             } else {
                 s.push_str(cell);
@@ -130,10 +175,12 @@ pub fn markdown(title: &str, checks: &[Check]) -> String {
     let mut s = format!("### {title}\n\n| check | measured | budget | gate | result | detail |\n|---|--:|--:|--:|:-:|---|\n");
     for c in checks {
         let r = match c.outcome {
+            Outcome::Pass if c.promote => "✅ pass — promote",
             Outcome::Pass => "✅ pass",
             Outcome::Fail => "❌ FAIL",
             Outcome::Info => "info",
-            Outcome::Skipped => "⚠️ skip",
+            Outcome::Invalid => "❌ INVALID",
+            Outcome::KnownMiss => "⚠️ known miss",
         };
         let _ = writeln!(s, "| {} · {} | {} | {} | {} | {} | {} |", c.group, c.name, num(c.measured, c.unit), num(c.budget, c.unit), gate_text(c), r, c.detail.replace('|', "\\|"));
     }
@@ -148,7 +195,7 @@ pub fn json(checks: &[Check]) -> serde_json::Value {
             .map(|c| {
                 serde_json::json!({
                     "group": c.group, "name": c.name, "measured": c.measured, "unit": c.unit,
-                    "budget": c.budget, "gate": c.gate, "result": result(c), "detail": c.detail,
+                    "budget": c.budget, "gate": c.gate, "ceiling": c.ceiling, "result": result(c), "detail": c.detail,
                 })
             })
             .collect(),
@@ -163,25 +210,36 @@ fn unit_of(s: &str) -> &'static str {
     }
 }
 
-/// Checks back from `json`'s output.
+/// Checks back from `json`'s output, as they were measured (before any known-miss ruling).
 pub fn from_json(v: &serde_json::Value) -> Vec<Check> {
     v.as_array()
         .into_iter()
         .flatten()
-        .map(|c| Check {
-            group: c["group"].as_str().unwrap_or_default().to_string(),
-            name: c["name"].as_str().unwrap_or_default().to_string(),
-            measured: c["measured"].as_f64(),
-            unit: unit_of(c["unit"].as_str().unwrap_or_default()),
-            budget: c["budget"].as_f64(),
-            gate: c["gate"].as_f64(),
-            detail: c["detail"].as_str().unwrap_or_default().to_string(),
-            outcome: match c["result"].as_str() {
-                Some("PASS") => Outcome::Pass,
-                Some("FAIL") => Outcome::Fail,
-                Some("SKIP") => Outcome::Skipped,
-                _ => Outcome::Info,
-            },
+        .map(|c| {
+            let measured = c["measured"].as_f64();
+            let gate = c["gate"].as_f64();
+            let outcome = match c["result"].as_str() {
+                Some("info") => Outcome::Info,
+                Some("INVALID") | Some("SKIP") => Outcome::Invalid,
+                // Re-derive from the numbers, so a saved ruling never carries over.
+                _ => match (measured, gate) {
+                    (Some(m), Some(g)) if m < g => Outcome::Pass,
+                    (Some(_), Some(_)) => Outcome::Fail,
+                    _ => Outcome::Invalid,
+                },
+            };
+            Check {
+                group: c["group"].as_str().unwrap_or_default().to_string(),
+                name: c["name"].as_str().unwrap_or_default().to_string(),
+                measured,
+                unit: unit_of(c["unit"].as_str().unwrap_or_default()),
+                budget: c["budget"].as_f64(),
+                gate,
+                ceiling: None,
+                promote: false,
+                detail: c["detail"].as_str().unwrap_or_default().to_string(),
+                outcome,
+            }
         })
         .collect()
 }

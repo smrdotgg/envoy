@@ -1,0 +1,216 @@
+# Checks that miss their latency budget today (docs/NORTH_STAR.md), per check and per OS.
+#
+# CI (`envoy-bench check --known-misses`) gates every check at its budget except these, which
+# must stay under their ceiling: a known miss that gets meaningfully worse fails the build. One
+# that passes its budget raises a "promote" warning annotation: delete its entry once it passes
+# reliably (on real hardware too). Entries for checks that weren't measured, ceilings at or
+# under the budget, unknown keys and duplicates are all errors. INVALID measurements are never
+# forgiven by an entry.
+#
+# check:   the check's id exactly as the table prints it ("group · name")
+# os:      linux | macos | windows (the GitHub runner the CI job uses)
+# ceiling: same unit as the check; fails at or above. Worst seen × 1.05 (binary size),
+#          × 1.25 (memory), × 1.5 (timings), rounded up
+# seen:    what CI measured when the entry was written
+#
+# Regenerate from CI result artifacts (budgets-<os>/*.json) with:
+#   envoy-bench misses --from store.json --from app.json --from size.json [...]
+# then review: drop entries that only failed under an older gate policy.
+
+[[miss]]
+check = "app · cold start → list on screen"
+os = "linux"
+ceiling = 500
+seen = "246.9–331.2 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · idle memory"
+os = "linux"
+ceiling = 400
+seen = "304.6–318.8 MB over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · keypress → frame"
+os = "linux"
+ceiling = 130
+seen = "56.2–86.6 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · search, end to end"
+os = "linux"
+ceiling = 195
+seen = "94.2–128.2 ms over 4 runs, over budget in 1"
+
+[[miss]]
+check = "binary · size"
+os = "linux"
+ceiling = 38
+seen = "36.2–36.2 MB over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · all queries"
+os = "linux"
+ceiling = 290
+seen = "135.4–191.5 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · archive: meeting"
+os = "linux"
+ceiling = 210
+seen = "86.9–138.9 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: meeting"
+os = "linux"
+ceiling = 84
+seen = "41.7–55.9 ms over 4 runs, over budget in 3"
+
+[[miss]]
+check = "search · inbox: typing \"from:alice\""
+os = "linux"
+ceiling = 290
+seen = "135.4–191.5 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: typing \"invoice\""
+os = "linux"
+ceiling = 230
+seen = "109.5–150.7 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · cold start → list on screen"
+os = "macos"
+ceiling = 1365
+seen = "407.8–907.1 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · keypress → frame"
+os = "macos"
+ceiling = 48
+seen = "27.8–31.6 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · search, end to end"
+os = "macos"
+ceiling = 1260
+seen = "105.6–839.8 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · all queries"
+os = "macos"
+ceiling = 1380
+seen = "209.8–918.1 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · archive: from:alice"
+os = "macos"
+ceiling = 135
+seen = "46.9–89.2 ms over 4 runs, over budget in 3"
+
+[[miss]]
+check = "search · archive: is:unread"
+os = "macos"
+ceiling = 200
+seen = "35.3–130.3 ms over 4 runs, over budget in 3"
+
+[[miss]]
+check = "search · archive: meeting"
+os = "macos"
+ceiling = 510
+seen = "105.5–337.0 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: from:northwind"
+os = "macos"
+ceiling = 76
+seen = "14.9–50.3 ms over 4 runs, over budget in 1"
+
+[[miss]]
+check = "search · inbox: meeting"
+os = "macos"
+ceiling = 1380
+seen = "51.7–918.1 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: typing \"from:alice\""
+os = "macos"
+ceiling = 515
+seen = "197.3–340.5 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: typing \"invoice\""
+os = "macos"
+ceiling = 380
+seen = "167.7–252.9 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · cold start → list on screen"
+os = "windows"
+ceiling = 2060
+seen = "821.9–1371.9 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · idle memory"
+os = "windows"
+ceiling = 220
+seen = "150.1–174.9 MB over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · keypress → frame"
+os = "windows"
+ceiling = 605
+seen = "367.7–401.6 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "app · search, end to end"
+os = "windows"
+ceiling = 815
+seen = "332.8–541.5 ms over 4 runs, over budget in 1"
+
+[[miss]]
+check = "binary · size"
+os = "windows"
+ceiling = 35
+seen = "32.7–32.7 MB over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · all queries"
+os = "windows"
+ceiling = 435
+seen = "190.9–289.5 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · archive: from:alice"
+os = "windows"
+ceiling = 145
+seen = "60.8–94.5 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · archive: is:unread"
+os = "windows"
+ceiling = 120
+seen = "61.0–79.4 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · archive: meeting"
+os = "windows"
+ceiling = 345
+seen = "147.0–227.7 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: meeting"
+os = "windows"
+ceiling = 310
+seen = "71.2–206.0 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: typing \"from:alice\""
+os = "windows"
+ceiling = 435
+seen = "190.9–289.5 ms over 4 runs, over budget in 4"
+
+[[miss]]
+check = "search · inbox: typing \"invoice\""
+os = "windows"
+ceiling = 385
+seen = "149.9–256.4 ms over 4 runs, over budget in 4"
