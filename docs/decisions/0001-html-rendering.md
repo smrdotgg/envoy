@@ -35,7 +35,7 @@ A feasibility study of live child web views concluded against them:
    (`colspan`, `rowspan` down an edge), inline-block fluid columns that wrap, line height,
    weights, families, letter spacing, text transform, per-side borders, margins, background
    pictures — and records what it dropped or approximated in a local
-   [`Fidelity`](../../crates/envoy-core/src/html/fidelity.rs) score. A 22-mail fixture corpus
+   [`Fidelity`](../../crates/envoy-html/src/fidelity.rs) score. A 22-mail fixture corpus
    (`crates/envoy-core/tests/fixtures/html`) keeps it honest.
 2. **The reader offers the original only when it matters.** When the score says the layout
    likely can't be reproduced (`Verdict::Poor`: positioned layers, CSS grid or flex layouts,
@@ -60,10 +60,13 @@ A feasibility study of live child web views concluded against them:
   author's partial dark rules (often only backgrounds and some text) on top of that gives
   results neither the author nor the adaptation intended. Applying them properly would also make
   the cached tree depend on the theme.
-- **No CSS crates.** The cascade is hand-written (`html/css.rs`, about 1,200 lines with its tests): the
+- **No CSS crates.** The cascade is hand-written (`crates/envoy-html/src/css.rs`, about 1,250 lines with its tests): the
   subset email uses, with no new dependencies, for the binary budget. Selector matching is
-  indexed by id, class and tag and capped per message (`MATCH_BUDGET`); past the cap the
-  sheets stop applying and the classifier notes it.
+  indexed by id, class and tag, pre-filtered by a Bloom filter of each element's ancestors'
+  classes and ids, and capped per message (`MATCH_BUDGET`); past the cap the sheets stop
+  applying and the classifier notes it. The renderer is its own crate (`envoy-html`), built at
+  opt-level "s" like html5ever under it: it runs once per message, off the UI thread. It adds
+  about 50 KB to the macOS binary.
 - **Families map to generic faces.** Sans → the app's sans, mono → its mono, serif → a system
   serif by name (Georgia; DejaVu Serif on Linux). Rune only registers its bundled faces and a
   few system families (symbols, CJK, mono), so the serif request falls back to the sans face
