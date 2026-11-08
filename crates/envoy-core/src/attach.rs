@@ -50,11 +50,12 @@ pub fn size_label(bytes: usize) -> String {
 pub fn read_file(path: &Path, id: u32, limit: usize) -> Result<(DraftAttachment, Vec<u8>), String> {
     let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
     let gone = |e: std::io::Error| format!("Couldn't read {filename}: {e}");
-    let mut file = std::fs::File::open(path).map_err(gone)?;
-    let meta = file.metadata().map_err(gone)?;
+    // Asked of the path, before opening: Windows won't open a folder as a file.
+    let meta = std::fs::metadata(path).map_err(gone)?;
     if meta.is_dir() {
         return Err(format!("{filename} is a folder: attach the files in it"));
     }
+    let mut file = std::fs::File::open(path).map_err(gone)?;
     let too_big = |size: usize| too_big(&filename, size, limit);
     let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
     if len > limit {
