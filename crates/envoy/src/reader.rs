@@ -123,11 +123,12 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
     let copy_links = s.settings.bool("behavior.copyLinks");
     let doc = b.doc.as_ref().filter(|d| !d.nodes.is_empty() && (!prefer_plain || b.text.as_ref().is_none_or(|t| t.trim().is_empty())));
     if let Some(doc) = doc {
+        let remote = s.remote_images(m);
         let cx = crate::html_view::Ctx {
             t,
             images: &s.images,
             adapt: s.settings.str("reading.htmlColors") != "original",
-            load_images: s.settings.str("reading.loadImages") == "always",
+            load_images: remote,
             copy_links: s.settings.bool("behavior.copyLinks"),
             max_w,
         };
@@ -135,6 +136,10 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
         let version = (t.dark, cx.adapt, cx.load_images, cx.copy_links, max_w as u32, ready, std::sync::Arc::as_ptr(doc) as usize);
         let rendered = rune::memo(format!("html-{id}"), version, || crate::html_view::render(&cx, doc));
         let mut out = col().key(format!("body-{id}")).w_full().max_w(max_w + 32.0).gap(8.0);
+        let has_remote = doc.images.iter().any(|u| u.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")));
+        if has_remote && !remote && s.settings.str("reading.loadImages") == "ask" {
+            out = out.child(images_bar(t, id, &m.summary.from.email));
+        }
         if doc.fidelity.verdict() == Verdict::Poor && !s.layout_note_dismissed.contains(&id) {
             out = out.child(layout_note(t, id));
         }
@@ -185,6 +190,44 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
         }
     }
     attachments(out, t, b, id)
+}
+
+/// A quiet line over mail whose remote images are hidden (`reading.loadImages` "ask" and a
+/// sender not in `reading.imagesFrom`): load them for this message, or always from the sender.
+fn images_bar(t: &Theme, id: i64, sender: &str) -> El {
+    let k = &t.k;
+    let mut bar = row()
+        .key(format!("images-bar-{id}"))
+        .w_full()
+        .gap(8.0)
+        .pl(10.0)
+        .pr(4.0)
+        .py(2.0)
+        .center_y()
+        .radius(8.0)
+        .fill(k.c.layer_01)
+        .child(icon(&icons::IMAGE, 14.0).color(k.c.icon_faint))
+        .child(text("Images hidden").font(k.ty.text_small).color(k.c.text_muted).grow(1.0).min_w(0.0))
+        .child(
+            Button::new("Load images")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut App| s.load_images(id))
+                .build(k)
+                .key(format!("images-load-{id}")),
+        );
+    if !sender.trim().is_empty() {
+        let sender = sender.trim().to_lowercase();
+        bar = bar.child(
+            Button::new(format!("Always load from {sender}"))
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut App| s.allow_images_from(&sender))
+                .build(k)
+                .key(format!("images-always-{id}")),
+        );
+    }
+    bar
 }
 
 /// A quiet line over mail the native renderer can't lay out as designed (positioned layers,

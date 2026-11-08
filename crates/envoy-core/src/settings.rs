@@ -25,6 +25,8 @@ pub enum Kind {
     Text { multiline: bool },
     /// One or more chords separated by commas: `"e"`, `"mod+enter"`, `"delete, #"`.
     Keybinding,
+    /// A list of strings (a JSON array), trimmed, lowercased and without repeats.
+    List,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,6 +34,7 @@ pub enum DefaultValue {
     Bool(bool),
     Num(f64),
     Str(&'static str),
+    List(&'static [&'static str]),
 }
 
 impl DefaultValue {
@@ -40,6 +43,7 @@ impl DefaultValue {
             DefaultValue::Bool(b) => Value::Bool(b),
             DefaultValue::Num(n) => serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number),
             DefaultValue::Str(s) => Value::String(s.to_owned()),
+            DefaultValue::List(l) => Value::Array(l.iter().map(|s| Value::String((*s).to_owned())).collect()),
         }
     }
 }
@@ -65,7 +69,7 @@ const fn def(
     SettingDef { key, category, title, description, kind, default }
 }
 
-use self::DefaultValue::{Bool as B, Num as N, Str as S};
+use self::DefaultValue::{Bool as B, List as L, Num as N, Str as S};
 
 pub const CATEGORIES: &[&str] = &["Appearance", "Inbox", "Reading", "Compose", "Sync", "Behavior", "Keyboard"];
 
@@ -111,8 +115,11 @@ pub const SCHEMA: &[SettingDef] = &[
         Kind::Enum(&[("immediately", "Immediately"), ("delay", "After a delay"), ("never", "Only when I mark it")]), S("immediately")),
     def("reading.markAsReadDelay", "Reading", "Mark as read delay", "Seconds a message stays open before it is marked read (with 'After a delay').",
         Kind::Number { min: 0.5, max: 30.0, step: 0.5 }, N(2.0)),
-    def("reading.loadImages", "Reading", "Show images", "Download pictures in HTML mail. Tracking pixels (tiny images) are never loaded. Off shows a placeholder instead.",
-        Kind::Enum(&[("always", "Always"), ("never", "Never")]), S("always")),
+    def("reading.loadImages", "Reading", "Load remote images",
+        "Pictures HTML mail loads from the internet, which can tell the sender you opened it. Ask: hidden, with a bar to load them once or always from that sender. Pictures embedded in the message always show; tracking pixels never load.",
+        Kind::Enum(&[("ask", "Ask (load from senders I allow)"), ("always", "Always"), ("never", "Never")]), S("ask")),
+    def("reading.imagesFrom", "Reading", "Load images from", "Senders whose remote images load without asking. One per line: an address, or a domain such as example.com (its subdomains too).",
+        Kind::List, L(&[])),
     def("reading.htmlColors", "Reading", "HTML mail colors", "Adapt colors to the current theme, or show mail exactly as designed on a light page.",
         Kind::Enum(&[("adapt", "Adapt to theme"), ("original", "Original (light page)")]), S("adapt")),
     def("reading.preferPlainText", "Reading", "Prefer plain text", "Show the plain-text version of a message when it has one, instead of its formatted version.",
@@ -293,6 +300,34 @@ impl Settings {
         }
     }
 
+    pub fn list(&self, key: &str) -> Vec<String> {
+        match self.value(key) {
+            Value::Array(a) => a.into_iter().filter_map(|v| v.as_str().map(str::to_owned)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether remote images in mail from `sender` load without asking: `reading.loadImages`
+    /// is "always", or "ask" with the sender (or its domain) in `reading.imagesFrom`.
+    pub fn remote_images_from(&self, sender: &str) -> bool {
+        match self.str("reading.loadImages").as_str() {
+            "always" => true,
+            "ask" => {
+                let sender = sender.trim().to_lowercase();
+                let domain = sender.rsplit_once('@').map_or("", |(_, d)| d);
+                self.list("reading.imagesFrom").iter().any(|e| {
+                    let e = e.trim_start_matches('@');
+                    if e.contains('@') {
+                        *e == sender
+                    } else {
+                        !domain.is_empty() && (domain == e || domain.strip_suffix(e).is_some_and(|sub| sub.ends_with('.')))
+                    }
+                })
+            }
+            _ => false,
+        }
+    }
+
     /// The user's overrides, for "show only modified".
     pub fn overrides(&self) -> impl Iterator<Item = &str> {
         self.user.keys().map(String::as_str)
@@ -349,6 +384,17 @@ fn validate(d: &SettingDef, v: &Value) -> Result<Value, String> {
             }
         }
         Kind::Text { .. } | Kind::Keybinding => v.as_str().map(|s| Value::String(s.to_owned())).ok_or_else(|| "expected a string".into()),
+        Kind::List => {
+            let items = v.as_array().ok_or("expected a list of strings")?;
+            let mut out: Vec<Value> = Vec::new();
+            for item in items {
+                let s = item.as_str().ok_or("expected a list of strings")?.trim().to_lowercase();
+                if !s.is_empty() && !out.iter().any(|o| o.as_str() == Some(s.as_str())) {
+                    out.push(Value::String(s));
+                }
+            }
+            Ok(Value::Array(out))
+        }
     }
 }
 
@@ -396,6 +442,26 @@ mod tests {
         assert_eq!(s.f64("sync.intervalSeconds"), 15.0, "clamped to min");
         assert_eq!(s.problems.len(), 1);
         assert!(s.bool("inbox.showPreview"));
+    }
+
+    #[test]
+    fn remote_images_are_blocked_by_default_and_allowed_per_sender() {
+        // The North Star: remote content blocked by default; remote images per-sender opt-in.
+        let mut s = Settings::default();
+        assert_eq!(s.str("reading.loadImages"), "ask");
+        assert!(!s.remote_images_from("news@shop.example"));
+        s.set("reading.imagesFrom", serde_json::json!([" News@Shop.Example ", "example.org", "news@shop.example", "", "@corp.example"])).unwrap();
+        assert_eq!(s.list("reading.imagesFrom"), ["news@shop.example", "example.org", "@corp.example"], "trimmed, lowercased, once each");
+        assert!(s.remote_images_from("NEWS@shop.example"));
+        assert!(!s.remote_images_from("other@shop.example"), "an address entry is that address only");
+        assert!(s.remote_images_from("a@example.org") && s.remote_images_from("a@mail.example.org"), "a domain and its subdomains");
+        assert!(!s.remote_images_from("a@badexample.org") && !s.remote_images_from("example.org"), "not lookalikes, not a bare domain");
+        assert!(s.remote_images_from("hr@corp.example"));
+        s.set("reading.loadImages", serde_json::json!("never")).unwrap();
+        assert!(!s.remote_images_from("news@shop.example"), "never means never");
+        s.set("reading.loadImages", serde_json::json!("always")).unwrap();
+        assert!(s.remote_images_from("anyone@anywhere.example"));
+        assert!(s.set("reading.imagesFrom", serde_json::json!("a@b.c")).is_err(), "a list, not a string");
     }
 
     #[test]

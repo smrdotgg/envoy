@@ -364,6 +364,8 @@ pub struct App {
     pub show_quoted: HashSet<MessageId>,
     /// Messages whose "layout can't be shown here" note the user dismissed (this session).
     pub layout_note_dismissed: HashSet<MessageId>,
+    /// Messages whose remote images the user chose to load ("Load images", this session).
+    pub images_shown: HashSet<MessageId>,
     pub search: TextEdit,
     pub applied_query: String,
     pub compose: Option<Compose>,
@@ -436,6 +438,7 @@ impl App {
             expanded: HashSet::new(),
             show_quoted: HashSet::new(),
             layout_note_dismissed: HashSet::new(),
+            images_shown: HashSet::new(),
             search: TextEdit::new(""),
             applied_query: String::new(),
             compose: None,
@@ -653,20 +656,54 @@ impl App {
         reload
     }
 
-    /// Starts downloading the open conversation's images (once per URL per session).
-    pub fn request_images(&mut self) {
-        if self.settings.str("reading.loadImages") != "always" {
-            return;
-        }
-        let mut wanted = Vec::new();
+    /// Whether a message's remote images load: the setting allows its sender, or the user
+    /// chose "Load images" for it (never when the setting is "never").
+    pub fn remote_images(&self, m: &ThreadMessage) -> bool {
+        self.settings.remote_images_from(&m.summary.from.email) || self.images_shown.contains(&m.summary.id) && self.settings.str("reading.loadImages") != "never"
+    }
+
+    /// The open conversation's images to fetch now: embedded (`cid:`) ones always, remote
+    /// ones only where [`Self::remote_images`] allows; each URL once per session.
+    pub fn wanted_images(&self) -> Vec<(String, MessageId)> {
+        let mut wanted: Vec<(String, MessageId)> = Vec::new();
         for m in &self.thread {
             let Some(doc) = m.body.as_ref().and_then(|b| b.doc.as_ref()) else { continue };
+            let remote = self.remote_images(m);
             for url in &doc.images {
-                if !self.images.contains_key(url) {
+                let embedded = url.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("cid:"));
+                if (embedded || remote) && !self.images.contains_key(url) && !wanted.iter().any(|(u, _)| u == url) {
                     wanted.push((url.clone(), m.summary.id));
                 }
             }
         }
+        wanted
+    }
+
+    /// "Load images": this message's remote images, this session.
+    pub fn load_images(&mut self, id: MessageId) {
+        self.images_shown.insert(id);
+        self.request_images();
+    }
+
+    /// "Always load from …": adds the sender to `reading.imagesFrom` and loads its images.
+    pub fn allow_images_from(&mut self, sender: &str) {
+        self.allow_sender(sender);
+        self.request_images();
+    }
+
+    /// Adds `sender` to `reading.imagesFrom` (saved to settings.json outside demo mode).
+    fn allow_sender(&mut self, sender: &str) {
+        let sender = sender.trim().to_lowercase();
+        let mut list = self.settings.list("reading.imagesFrom");
+        if !sender.is_empty() && !list.contains(&sender) {
+            list.push(sender);
+            self.set_setting("reading.imagesFrom", serde_json::json!(list));
+        }
+    }
+
+    /// Starts downloading the open conversation's images (once per URL per session).
+    pub fn request_images(&mut self) {
+        let wanted = self.wanted_images();
         // Keep memory bounded: forget decoded images once the session has seen a lot of them.
         if self.images.len() > 400 {
             self.images.retain(|_, st| !matches!(st, ImageState::Ready(_)));
@@ -972,6 +1009,7 @@ impl App {
 
     pub fn apply_settings(&mut self, s: Settings) {
         let conv_changed = s.bool("inbox.conversationView") != self.settings.bool("inbox.conversationView");
+        let images_changed = s.value("reading.loadImages") != self.settings.value("reading.loadImages") || s.value("reading.imagesFrom") != self.settings.value("reading.imagesFrom");
         self.list_width = s.f32("inbox.listWidth");
         self.list_height = s.f32("inbox.listHeight");
         self.keys = parse_keys(&s);
@@ -980,6 +1018,9 @@ impl App {
         self.send(Command::Settings(Box::new(self.settings.clone())));
         if conv_changed {
             self.reload();
+        }
+        if images_changed {
+            self.request_images();
         }
     }
 
@@ -1980,6 +2021,45 @@ mod tests {
                 assert!(part.trim().parse::<rune::Chord>().is_ok(), "{}: {part:?}", d.key);
             }
         }
+    }
+
+    #[test]
+    fn remote_images_wait_for_the_reader_to_allow_them() {
+        // Remote content is blocked by default (North Star); embedded pictures always show.
+        let mut app = App::new(true); // demo: settings.json is never written
+        crate::demo::populate(&mut app);
+        let id = app.list[0].id;
+        let mut thread = crate::demo::thread_for(id);
+        let m = thread.last_mut().unwrap();
+        m.summary.from.email = "News@Shop.example".into();
+        m.body.as_mut().unwrap().doc = Some(std::sync::Arc::new(envoy_core::html::parse(
+            r#"<img src="https://img.example/a.png" width="80" height="40"><img src="cid:logo@shop" width="80" height="40">
+               <div style="background:url(https://img.example/hero.jpg)">Hi</div><td width=1 height=1 background="https://t.example/open"></td>"#,
+        )));
+        let mid = m.summary.id;
+        app.thread = thread;
+        let urls = |app: &App| app.wanted_images().into_iter().map(|(u, _)| u).collect::<Vec<_>>();
+        let all = ["https://img.example/a.png", "cid:logo@shop", "https://img.example/hero.jpg"];
+        assert_eq!(urls(&app), ["cid:logo@shop"], "by default only the embedded picture");
+        // "Load images": this message's, this session.
+        app.images_shown.insert(mid);
+        assert_eq!(urls(&app), all);
+        app.images_shown.clear();
+        // "Always load from <sender>": saved in reading.imagesFrom. (Nothing open meanwhile:
+        // a changed image setting fetches at once, and demo mode fetches inline.)
+        let thread = std::mem::take(&mut app.thread);
+        app.allow_sender("News@Shop.example");
+        app.thread = thread;
+        assert_eq!(app.settings.list("reading.imagesFrom"), ["news@shop.example"]);
+        assert_eq!(urls(&app), all);
+        // "Never" means never; "Always", always.
+        let _ = app.settings.set("reading.loadImages", serde_json::json!("never"));
+        app.images_shown.insert(mid);
+        assert_eq!(urls(&app), ["cid:logo@shop"]);
+        let _ = app.settings.set("reading.loadImages", serde_json::json!("always"));
+        let _ = app.settings.set("reading.imagesFrom", serde_json::json!([]));
+        app.images_shown.clear();
+        assert_eq!(urls(&app), all);
     }
 
     #[test]
