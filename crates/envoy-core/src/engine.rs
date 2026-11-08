@@ -31,7 +31,10 @@ pub enum MoveTarget {
 
 #[derive(Debug)]
 pub enum Command {
-    List { req: u64, view: View, query: String, conversations: bool, limit: u32 },
+    /// `stream`: send the top of a long list ahead of the rest ([`Event::List`]'s `more`), for a
+    /// list the user is waiting on (a new view, a search). A list already on screen being read
+    /// again (new mail, a sync) goes in one piece, so it never shrinks under the reader.
+    List { req: u64, view: View, query: String, conversations: bool, limit: u32, stream: bool },
     Open { req: u64, id: MessageId, conversations: bool },
     /// Read a conversation ahead (the list's neighbours of the open one), so the UI can show it
     /// the moment it's opened. Answered with [`Event::Prefetched`]; downloads nothing.
@@ -311,14 +314,15 @@ fn poke(workers: &HashMap<String, Worker>, account: &str, job: Job) {
 
 async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd: Command) -> Result<()> {
     match cmd {
-        Command::List { req, view, query, conversations, limit } => {
+        Command::List { req, view, query, conversations, limit, stream } => {
             let shared = shared.clone();
             tokio::task::spawn_blocking(move || {
                 let me = shared.me();
                 let q = Query::parse(&query);
                 // The top of a long list goes out first, and the rest when it's read.
                 let mut first = |items| shared.emit(Event::List { req, items, more: true });
-                let items = shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| st.list_paged(&view, &q, conversations, limit, &me, FIRST_PAGE, &mut first));
+                let page = if stream { FIRST_PAGE } else { 0 };
+                let items = shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| st.list_paged(&view, &q, conversations, limit, &me, page, &mut first));
                 match items {
                     Ok(items) => shared.emit(Event::List { req, items, more: false }),
                     Err(e) => shared.emit(Event::Error(format!("search failed: {e}"))),
