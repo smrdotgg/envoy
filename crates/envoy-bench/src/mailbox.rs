@@ -150,22 +150,45 @@ const CONTENT: &[&str] = &[
 
 const VOCAB_SIZE: usize = 40_000;
 
+/// The content vocabulary, by Zipf rank: `VOCAB_SIZE` distinct tokens. Made-up words fill the
+/// ranks, shortest (most frequent) first, each from a bijective syllable code within its length
+/// and checked against every other token; the real content words then take their fixed ranks.
 fn vocab() -> &'static [String] {
     static V: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     V.get_or_init(|| {
         const SYL: &[&str] = &["ka", "lo", "mi", "ren", "to", "sa", "vel", "dor", "ni", "pa", "qu", "ri", "zan", "bo", "ti", "lu", "mer", "sha", "go", "fe"];
-        let mut v: Vec<String> = (0..VOCAB_SIZE)
-            .map(|r| {
-                let mut n = r as u64 * 7919 + 13;
-                let len = 2 + r % 3;
-                (0..len).map(|_| { let s = SYL[(n % 20) as usize]; n /= 20; s }).collect()
-            })
-            .collect();
+        let mut used: std::collections::HashSet<String> = FUNCTION.iter().chain(CONTENT).map(|w| w.to_string()).collect();
+        let mut v: Vec<String> = Vec::with_capacity(VOCAB_SIZE);
+        'fill: for len in 2..=5u32 {
+            let class = 20u64.pow(len);
+            for i in 0..class {
+                if v.len() == VOCAB_SIZE {
+                    break 'fill;
+                }
+                // 7919 is prime and shares no factor with 20^len: a permutation of the class.
+                let mut n = (i * 7919 + 13) % class;
+                let w: String = (0..len)
+                    .map(|_| {
+                        let s = SYL[(n % 20) as usize];
+                        n /= 20;
+                        s
+                    })
+                    .collect();
+                if used.insert(w.clone()) {
+                    v.push(w);
+                }
+            }
+        }
         for (i, w) in CONTENT.iter().enumerate() {
-            v[10 + i + (10.0 * 1.06f64.powi(i as i32)) as usize] = w.to_string();
+            v[content_rank(i)] = w.to_string();
         }
         v
     })
+}
+
+/// Where the `i`th content word sits in the vocabulary.
+fn content_rank(i: usize) -> usize {
+    10 + i + (10.0 * 1.06f64.powi(i as i32)) as usize
 }
 
 #[derive(Clone)]
@@ -656,19 +679,66 @@ mod tests {
     }
 
     #[test]
-    fn same_seed_same_mailbox_and_it_has_the_promised_shape() {
-        let dir = std::env::temp_dir().join(format!("envoy-bench-gen-{}", std::process::id()));
+    fn vocabulary_is_as_large_as_claimed() {
+        let v = vocab();
+        assert_eq!(v.len(), VOCAB_SIZE);
+        let distinct: std::collections::HashSet<&String> = v.iter().collect();
+        assert_eq!(distinct.len(), VOCAB_SIZE, "every rank is a different token");
+        assert!(content_rank(CONTENT.len() - 1) < VOCAB_SIZE);
+        for (i, w) in CONTENT.iter().enumerate() {
+            assert_eq!(&v[content_rank(i)], w);
+        }
+        for w in v {
+            assert!(w.chars().all(|c| c.is_ascii_lowercase()), "{w:?} would split into several FTS tokens");
+        }
+    }
+
+    #[test]
+    fn same_seed_same_mailbox() {
+        let dir = std::env::temp_dir().join(format!("envoy-bench-det-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (a, b) = (dir.join("a"), dir.join("b"));
-        let s = generate(&a, 3000, 7).unwrap();
-        generate(&b, 3000, 7).unwrap();
+        generate(&a, 1500, 7).unwrap();
+        generate(&b, 1500, 7).unwrap();
         assert_eq!(digest(&a.join("mail.sqlite")), digest(&b.join("mail.sqlite")));
-        assert_eq!(s.messages, 3000);
-        assert!(s.html > 200 && s.with_attachments > 100 && s.replies > 500 && s.unread > 20, "{} html, {} att, {} replies, {} unread", s.html, s.with_attachments, s.replies, s.unread);
-        let st = Store::open(&a.join("mail.sqlite")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mailbox_has_the_promised_shape() {
+        let dir = std::env::temp_dir().join(format!("envoy-bench-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let n = 6000;
+        let s = generate(&dir, n, 1).unwrap();
+        assert_eq!(s.messages, n);
+        let frac = |x: usize| x as f64 / n as f64;
+        assert!((0.10..0.25).contains(&frac(s.html)), "{} HTML", s.html);
+        assert!((0.04..0.15).contains(&frac(s.with_attachments)), "{} with attachments", s.with_attachments);
+        assert!((0.25..0.40).contains(&frac(s.replies)), "{} replies", s.replies);
+        assert!(s.unread > 50, "{} unread", s.unread);
+
+        // Document frequencies: what the search queries' "common / medium / rare" rely on.
+        let c = rusqlite::Connection::open(dir.join("mail.sqlite")).unwrap();
+        let df = |word: &str| -> f64 {
+            let k: i64 = c.query_row("SELECT COUNT(*) FROM fts WHERE fts MATCH ?1", [format!("body:{word}")], |r| r.get(0)).unwrap();
+            k as f64 / n as f64
+        };
+        let (meeting, invoice, pancakes) = (df("meeting"), df("invoice"), df("pancakes"));
+        eprintln!("document frequency: meeting {:.1}%, invoice {:.1}%, pancakes {:.2}%", meeting * 100.0, invoice * 100.0, pancakes * 100.0);
+        assert!((0.15..0.40).contains(&meeting), "meeting in {:.1}% of messages", meeting * 100.0);
+        assert!((0.01..0.08).contains(&invoice), "invoice in {:.1}% of messages", invoice * 100.0);
+        assert!(pancakes < 0.005, "pancakes in {:.2}% of messages", pancakes * 100.0);
+        let distinct: i64 = {
+            c.execute_batch("CREATE VIRTUAL TABLE terms USING fts5vocab(fts, 'row')").unwrap();
+            c.query_row("SELECT COUNT(*) FROM terms", [], |r| r.get(0)).unwrap()
+        };
+        eprintln!("{distinct} distinct terms indexed in {n} messages");
+        assert!(distinct > 10_000, "only {distinct} distinct terms indexed");
+
+        let st = Store::open(&dir.join("mail.sqlite")).unwrap();
         let me: std::collections::HashSet<String> = [ME.to_string()].into();
         let inbox = envoy_core::model::View::Role { account: None, role: Role::Inbox };
-        for q in ["invoice", "from:alice", "is:unread", "has:attachment"] {
+        for q in ["meeting", "from:alice", "is:unread", "has:attachment"] {
             let rows = st.list(&inbox, &envoy_core::store::Query::parse(q), true, 3000, &me).unwrap();
             assert!(!rows.is_empty(), "{q} found nothing");
         }
