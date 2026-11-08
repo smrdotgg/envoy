@@ -1350,7 +1350,8 @@ async fn session_loop(
         let due = shared.with_writer(|st| st.next_op_due(&id, now()))?;
         let mut wait = last_full.map_or(Duration::ZERO, |t| interval.saturating_sub(t.elapsed()));
         if let Some(d) = due {
-            wait = wait.min(Duration::from_secs(d.max(1) as u64));
+            // One already due goes now.
+            wait = wait.min(Duration::from_secs(d.max(0) as u64));
         }
         // Retry failed ops soon.
         let failed_due = shared.with_writer(|st| st.ops(&id, now() + 3600).map(|o| !o.is_empty()))?;
