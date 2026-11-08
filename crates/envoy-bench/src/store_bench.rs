@@ -4,17 +4,21 @@
 //! - Search: `Query::parse` + `Store::list(view, query, conversations = true, limit = 3000, me)`,
 //!   exactly what one keystroke in the search field costs (search runs as you type). Each query
 //!   runs once cold (first time in this process) and then `REPEAT` more times; the gate is the
-//!   p90 of those 21 runs (the 3rd worst). Every prefix typed on the way to two queries runs 5
-//!   times; the gate is the worst keystroke's median.
+//!   median of those 21 runs, with the p90, the cold run and the worst printed beside it. Every
+//!   prefix typed on the way to two queries runs 5 times; the gate is the worst keystroke's
+//!   median.
 //! - Open: `Store::thread(id, conversations = true)`: reads the conversation, its bodies,
 //!   converts HTML to Markdown on first open (and writes it back, as the engine does), and
 //!   parses the HTML into the layout tree the reader draws. Each sample is a different message,
 //!   so "first open" is really first; the gate is the p95 of the samples (the 3rd worst of 40).
 //!
-//! Why not the single worst run: on the macOS runner (a VM) one run in a few dozen stalls for up
-//! to 1.4 s (a query with a 53 ms median measured 1423 ms once), which measures the hypervisor,
-//! and would fail any passing check at random. A high quantile ignores a couple of stalls and
-//! still catches code that got slower. Every row also prints the true worst.
+//! Why search gates on the median: on the macOS runner (a VM) runs stall for up to 2 s, sometimes
+//! several within one query's 21 runs (Archive "meeting": p50 151 ms, p90 287 ms, worst 2032
+//! ms; another query with a 53 ms median measured 1423 ms once). The worst or even the p90 then
+//! measures the hypervisor and fails passing checks at random; the median measures the code and
+//! still moves when the code gets slower. Open samples are each one distinct first open, taking
+//! well under a millisecond, so a stall hits at most one of them: the p95 (3rd worst of 40)
+//! ignores it.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -115,11 +119,11 @@ fn run_search(st: &Store, me: &HashSet<String>, checks: &mut Vec<Check>) -> Resu
         checks.push(Check::gated(
             "search",
             format!("{v}: {q}"),
-            p90,
+            p50,
             "ms",
             budget::SEARCH_MS,
             1.0,
-            format!("p90 of {} (p50 {p50:.2}, cold {cold:.2}, max {max:.2}); {n} rows", REPEAT + 1),
+            format!("median of {} (p90 {p90:.2}, cold {cold:.2}, max {max:.2}); {n} rows", REPEAT + 1),
         ));
     }
     let mut typed_all = Vec::new();

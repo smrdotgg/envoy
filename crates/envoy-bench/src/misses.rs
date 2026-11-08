@@ -21,9 +21,9 @@
 //! ```
 //!
 //! `envoy-bench misses --from results.json ...` prints entries for every check over its gate in
-//! any of the given runs, or for a timing within 10% of it (at the budget on that runner, where
-//! ordinary run-to-run swings exceed 10% and would flake a hard gate), with ceiling = worst seen
-//! × a factor: 1.05 for binary size (it only
+//! any of the given runs, or for a store search/open timing at 80% of its budget or more (at the
+//! budget on that runner, where run-to-run swings of ±20% would flake a hard gate), with
+//! ceiling = worst seen × a factor: 1.05 for binary size (it only
 //! moves with code), 1.25 for memory, 1.5 for timings. The worst seen already includes each
 //! runner's slow days (the macOS runner's speed varied up to 3× between runs), so its ceilings
 //! are wide; Linux and Windows give the tighter tripwires.
@@ -37,8 +37,10 @@ use crate::report::{Check, Outcome};
 
 pub const OSES: &[&str] = &["linux", "macos", "windows"];
 
-/// `suggest` lists a check measured at or above this fraction of its gate.
-const NEAR: f64 = 0.9;
+/// `suggest` lists a store timing measured at or above this fraction of its budget: on the
+/// Windows runner the same query's median spans about ±20% between runs (Inbox is:unread 33–46
+/// ms), so a hard gate any closer than that flakes.
+const NEAR: f64 = 0.8;
 
 #[derive(Clone, Debug)]
 pub struct Miss {
@@ -157,8 +159,11 @@ pub fn suggest(runs: &[(String, Vec<Check>)]) -> String {
             let (Some(m), Some(_)) = (c.measured, c.gate) else { continue };
             let e = by.entry((os.clone(), c.id())).or_insert((Vec::new(), 0, c.unit));
             e.0.push(m);
-            // Near the budget only counts for timings: size and memory don't swing run to run.
-            if c.outcome == Outcome::Fail || (c.unit == "ms" && c.gate.is_some_and(|g| m >= NEAR * g)) {
+            // Near the budget only counts for the store timings, gated at the budget: size and
+            // memory don't swing run to run, and the app's wall-clock checks either miss or
+            // already have a documented margin.
+            let store_timing = matches!(c.group.as_str(), "search" | "open");
+            if c.outcome == Outcome::Fail || (store_timing && c.gate.is_some_and(|g| m >= NEAR * g)) {
                 e.1 += 1;
             }
         }
@@ -172,7 +177,7 @@ pub fn suggest(runs: &[(String, Vec<Check>)]) -> String {
         let hi = v.iter().copied().fold(0.0, f64::max);
         let ceiling = round_up(hi * factor(&id, unit));
         s.push_str(&format!(
-            "[[miss]]\ncheck = {id:?}\nos = {os:?}\nceiling = {ceiling}\nseen = \"{lo:.1}–{hi:.1} {unit} over {} runs, over or within 10% of budget in {over}\"\n\n",
+            "[[miss]]\ncheck = {id:?}\nos = {os:?}\nceiling = {ceiling}\nseen = \"{lo:.1}–{hi:.1} {unit} over {} runs, over or within 20% of budget in {over}\"\n\n",
             v.len()
         ));
     }
