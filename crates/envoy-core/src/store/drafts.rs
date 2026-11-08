@@ -782,6 +782,49 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_that_ends_after_newer_ones_keeps_its_fence() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap(); // started long ago, never uploaded
+        // 10,000 drafts started after it ended before it.
+        s.conn.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1000 UNION ALL SELECT x + 1 FROM n WHERE x < 10999) INSERT INTO draft_ends (id, lifecycle, sent) SELECT x, 0, 0 FROM n").unwrap();
+        let send = s.enqueue_at("a", &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 100).unwrap();
+        s.transaction(|st| st.draft_sending(1, &draft("hello"), send, 101)).unwrap();
+        s.op_done(send).unwrap();
+        // The close-time copy of what was sent arrives late.
+        assert!(s.draft_unsent(1, &draft("hello"), Some(at(2)), 102).unwrap());
+        assert_eq!(s.draft(1).unwrap(), None, "still fenced off");
+        let kept: i64 = s.conn.query_row("SELECT COUNT(*) FROM draft_ends", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 10_000, "the latest 10,000 ends kept");
+    }
+
+    #[test]
+    fn an_earlier_builds_draft_ends_are_carried_over_in_order() {
+        let s = Store::memory();
+        // As the build before kept them: by draft id, pruned by id.
+        s.conn
+            .execute_batch(
+                "DROP TRIGGER drafts_ended;
+                 DROP TABLE draft_ends;
+                 CREATE TABLE draft_ends (id INTEGER PRIMARY KEY, lifecycle INTEGER NOT NULL, sent INTEGER NOT NULL);
+                 CREATE TRIGGER drafts_end AFTER DELETE ON drafts BEGIN
+                     INSERT OR REPLACE INTO draft_ends (id, lifecycle, sent) VALUES (old.id, old.lifecycle, old.sending != 0 OR old.sent != 0);
+                     DELETE FROM draft_ends WHERE id < (SELECT id FROM draft_ends ORDER BY id DESC LIMIT 1 OFFSET 9999);
+                 END;
+                 INSERT INTO draft_ends (id, lifecycle, sent) VALUES (5, 1, 1);",
+            )
+            .unwrap();
+        crate::store::migrate(&s.conn).unwrap();
+        assert!(crate::store::has_autoincrement(&s.conn, "draft_ends").unwrap());
+        let triggers: Vec<String> =
+            s.conn.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'drafts_end%'").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(triggers, vec!["drafts_ended".to_owned()]);
+        assert!(s.draft_on_its_way(5).unwrap(), "its ends kept");
+        s.save_draft(1, &draft("hello"), true, at(1), 100).unwrap();
+        s.discard_draft(1, None).unwrap();
+        assert_eq!(s.save_draft(1, &draft("hello"), true, at(2), 101).unwrap(), None, "and new ones recorded");
+    }
+
+    #[test]
     fn an_earlier_builds_clock_tombstones_give_way() {
         let s = Store::memory();
         s.conn
