@@ -139,7 +139,7 @@ has an Undo too. Opening another composer keeps the current one in Drafts.
 
 ```sh
 cargo test                                      # unit tests
-cargo run -p envoy-core --example e2e           # engine against a local GreenMail server (see the file header)
+cargo run -p envoy-core --example e2e           # engine against a local GreenMail server (below)
 ENVOY_DEMO=1 target/debug/envoy --snap out.png --scene open     # headless screenshot
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/flow.json --snap out.png --at 3.6
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 1.0   # archive: toast with Undo
@@ -149,6 +149,26 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png -
 ```
 
 Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice`.
+
+**End to end.** CI's `e2e` job runs the engine against a real IMAP/SMTP server,
+[GreenMail](https://greenmail-mail-test.github.io/greenmail/): initial sync, new mail by IDLE,
+flags both ways, archive, spam, trash and moves with the undo window (off the server during it,
+untouched by an undo, there after it), delete forever, sending with undo send, drafts (saved,
+edited, sent, undone, discarded), and moves and a send held across a kill and a restart. It runs
+twice: against GreenMail as it is (UIDPLUS, MOVE, IDLE), then through a proxy that takes UIDPLUS
+and MOVE away, so the fallbacks run too, and fails if Envoy sends a command that server lacks,
+or one that would expunge mail it didn't delete. To run it locally (the second pass needs
+`openssl`):
+
+```sh
+docker run -d --rm --name envoy-greenmail \
+  -e GREENMAIL_OPTS='-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=alice:pw@localhost,erin:pw@localhost -Dgreenmail.users.login=email' \
+  -p 3025:3025 -p 3143:3143 -p 3465:3465 -p 3993:3993 greenmail/standalone:2.1.3
+cargo run -p envoy-core --example e2e           # both passes, ~3 minutes; `-- full` or `-- plain` runs one
+docker stop envoy-greenmail
+```
+
+Each pass empties its GreenMail user's mailboxes first, so it can run again against the same server.
 
 **Latency budgets** ([`docs/NORTH_STAR.md`](docs/NORTH_STAR.md)) are checked in CI on all three OSes
 against a generated 100k-message mailbox; each check prints measured vs budget and fails over budget.

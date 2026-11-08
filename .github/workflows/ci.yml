@@ -49,6 +49,39 @@ jobs:
       - name: Clippy
         run: cargo clippy -p envoy -p envoy-core -p envoy-bench --all-targets --locked -- -D warnings
 
+  # The engine against a real IMAP/SMTP server, GreenMail (crates/envoy-core/examples/e2e.rs):
+  # sync, IDLE, flags, moves and sends with their undo windows, drafts, and ops held across a
+  # kill. Twice: against GreenMail as it is (UIDPLUS, MOVE, IDLE), then through a proxy that
+  # takes UIDPLUS and MOVE away, for the fallbacks. GreenMail's log is in "Stop containers".
+  e2e:
+    name: End to end (GreenMail)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      greenmail:
+        image: greenmail/standalone:2.1.3
+        env:
+          GREENMAIL_OPTS: -Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=alice:pw@localhost,erin:pw@localhost -Dgreenmail.users.login=email
+        ports:
+          - 3025:3025
+          - 3143:3143
+          - 3465:3465
+          - 3993:3993
+    env:
+      RUST_LOG: envoy_core=debug
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p envoy-core --example e2e --locked
+      # Each pass waits for GreenMail to answer, and empties its user's mailboxes first.
+      - name: "Pass 1: GreenMail as it is (UIDPLUS, MOVE, IDLE)"
+        run: target/debug/examples/e2e full
+      - name: "Pass 2: a server without UIDPLUS and MOVE"
+        run: target/debug/examples/e2e plain
+
   # Latency budgets (docs/NORTH_STAR.md), against a generated 100k-message mailbox, on the
   # binary we ship (--profile dist). Measure once (tables in the job summary), then gate each
   # budget in its own step. Every check must pass its budget, except the per-check, per-OS
