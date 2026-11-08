@@ -7,6 +7,16 @@
 //!   and accounts, opening SQLite, the first list query, window and GPU setup, layout and the
 //!   first draws. The OS file cache is warm (the mailbox was just written or read): a truly cold
 //!   disk needs root to simulate and isn't measured.
+//!
+//!   It is gated above the OS's own launch floor (docs/NORTH_STAR.md): every OS charges any
+//!   app a fixed price to start a process and put a window on screen (exec and dynamic loading,
+//!   macOS's and Windows Defender's per-launch checks, window server round trips, the first
+//!   present), which no app can avoid. `floor-window` (src/bin) is the lightest window we can
+//!   show on each OS: winit + softbuffer drawing "Hello World" with CPU pixels, no GPU and no
+//!   Rune. Each run of Envoy is paired with a run of it, launched the same way and timed to its
+//!   first presented frame the same way; the gate is Envoy's median minus the floor's median.
+//!   `floor-rune`, the smallest Rune app, splits what's left into Rune's own start (GPU, fonts,
+//!   first layout) and Envoy's. The total is always printed beside it.
 //! - Keypress → frame: `j` handed to the UI thread → the first frame showing it.
 //! - Open, end to end: the same press → the first frame showing the opened conversation.
 //! - Search, end to end: a search edit → the first frame showing its results.
@@ -44,11 +54,24 @@ struct Run {
     samples: Vec<(u64, u64)>,
 }
 
-fn one_run(home: &Path, bin: &Path, k: usize) -> Result<Run> {
-    let report_path = home.join(format!("bench-run-{k}.json"));
+/// The launch floors built beside this executable (src/bin).
+const FLOORS: [&str; 2] = ["floor-window", "floor-rune"];
+/// The gated cold-start check: Envoy's launch above the OS's own floor.
+const COLD: &str = "cold start → list on screen, above OS floor";
+
+fn floor_bin(name: &str) -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("finding envoy-bench's own path")?;
+    let bin = exe.with_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    anyhow::ensure!(bin.exists(), "no {} beside envoy-bench (build it: cargo build -p envoy-bench builds every launch floor)", bin.display());
+    Ok(bin)
+}
+
+/// `tag` names the run's files (`bench-run-{tag}{k}.*`): "" for Envoy, else the floor's name.
+fn one_run(home: &Path, bin: &Path, k: usize, tag: &str) -> Result<Run> {
+    let report_path = home.join(format!("bench-run-{tag}{k}.json"));
     let _ = std::fs::remove_file(&report_path);
-    let out = std::fs::File::create(home.join(format!("bench-run-{k}.out")))?;
-    let err_path = home.join(format!("bench-run-{k}.err"));
+    let out = std::fs::File::create(home.join(format!("bench-run-{tag}{k}.out")))?;
+    let err_path = home.join(format!("bench-run-{tag}{k}.err"));
     let err = std::fs::File::create(&err_path)?;
     let mut cmd = Command::new(bin);
     cmd.env("ENVOY_HOME", home)
@@ -125,9 +148,38 @@ fn sample(runs: &[Run], list: &str, field: &str, per_run: usize, what: &str) -> 
 pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin: f64, checks: &mut Vec<Check>) -> Result<()> {
     anyhow::ensure!(home.join("mail.sqlite").exists(), "no mailbox at {} (run `envoy-bench gen` first)", home.display());
     let bin: PathBuf = bin.canonicalize().with_context(|| format!("no binary at {}", bin.display()))?;
+    // A floor that's missing or fails makes cold start INVALID (it can't be taken off), and
+    // nothing else.
+    let mut floor_problem: Option<String> = None;
+    let floor_bins: Vec<PathBuf> = match FLOORS.iter().map(|n| floor_bin(n)).collect::<Result<Vec<_>>>() {
+        Ok(b) => b,
+        Err(e) => {
+            floor_problem = Some(format!("{e:#}"));
+            Vec::new()
+        }
+    };
+    let mut floors: [Vec<Run>; 2] = Default::default();
     let mut done = Vec::new();
     for k in 0..runs {
-        match one_run(home, &bin, k) {
+        // Each floor runs just before each run of Envoy, so a runner whose speed drifts over the
+        // job moves both alike.
+        if floor_problem.is_none() {
+            for (i, fb) in floor_bins.iter().enumerate() {
+                match one_run(home, fb, k, &format!("{}-", FLOORS[i])) {
+                    Ok(r) => {
+                        println!("{} run {}/{runs}: first frame {:.1} ms after spawn", FLOORS[i], k + 1, ms(r.spawn_ns, r.report["first_frame_ns"].as_u64().unwrap_or(0)));
+                        floors[i].push(r);
+                    }
+                    Err(e) => {
+                        let why = format!("{e:#}");
+                        println!("{} run {}/{runs} failed: {why}", FLOORS[i], k + 1);
+                        floor_problem = Some(format!("{} run {} of {runs} failed: {}", FLOORS[i], k + 1, why.lines().next().unwrap_or_default()));
+                        break;
+                    }
+                }
+            }
+        }
+        match one_run(home, &bin, k, "") {
             Ok(r) => {
                 let cold = ms(r.spawn_ns, r.report["first_list_ns"].as_u64().unwrap_or(0));
                 println!("app run {}/{runs}: first list frame {cold:.1} ms after spawn", k + 1);
@@ -138,7 +190,7 @@ pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin:
                 println!("app run {}/{runs} failed: {why}", k + 1);
                 let short = why.lines().next().unwrap_or_default().to_string();
                 for (name, b, unit) in [
-                    ("cold start → list on screen", budget::COLD_START_MS, "ms"),
+                    (COLD, budget::COLD_START_MS, "ms"),
                     ("keypress → frame", budget::KEY_TO_FRAME_MS, "ms"),
                     ("open message, end to end", budget::OPEN_MS, "ms"),
                     ("search, end to end", budget::SEARCH_MS, "ms"),
@@ -159,16 +211,42 @@ pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin:
     let first: Vec<f64> = done.iter().map(|r| ms(r.spawn_ns, r.report["first_frame_ns"].as_u64().unwrap_or(0))).collect();
     let rows = done[0].report["first_list_rows"].as_u64().unwrap_or(0);
     let (c50, cmax) = p50_max(&cold);
-    let cmin = cold.iter().copied().fold(f64::INFINITY, f64::min);
-    checks.push(Check::gated(
-        "app",
-        "cold start → list on screen",
-        c50,
-        "ms",
-        budget::COLD_START_MS,
-        wall_margin,
-        format!("median of {} runs (min {cmin:.1}, max {cmax:.1}); {rows} rows{}", cold.len(), margin_note(wall_margin)),
-    ));
+    let spread = |v: &[f64]| (v.iter().copied().fold(f64::INFINITY, f64::min), p50_max(v).1);
+    let cmin = spread(&cold).0;
+    match &floor_problem {
+        Some(why) => checks.push(Check::invalid("app", COLD, Some(budget::COLD_START_MS), "ms", format!("can't take the OS launch floor off: {why}"))),
+        None => {
+            let launch = |runs: &[Run]| -> Vec<f64> { runs.iter().map(|r| ms(r.spawn_ns, r.report["first_frame_ns"].as_u64().unwrap_or(0))).collect() };
+            let (window, rune) = (launch(&floors[0]), launch(&floors[1]));
+            let (a50, b50) = (p50_max(&window).0, p50_max(&rune).0);
+            let ((amin, amax), (bmin, bmax)) = (spread(&window), spread(&rune));
+            checks.push(Check::gated(
+                "app",
+                COLD,
+                (c50 - a50).max(0.0),
+                "ms",
+                budget::COLD_START_MS,
+                wall_margin,
+                format!("Envoy's share: spawn → list frame {c50:.1} ms − the OS launch floor {a50:.1} ms (medians of {} runs each){}", cold.len(), margin_note(wall_margin)),
+            ));
+            checks.push(Check::info("app", "  total: spawn → list on screen", c50, "ms", format!("median of {} runs (min {cmin:.1}, max {cmax:.1}); {rows} rows", cold.len())));
+            checks.push(Check::info(
+                "app",
+                "  OS launch floor",
+                a50,
+                "ms",
+                format!("median (min {amin:.1}, max {amax:.1}): floor-window, a bare window drawing Hello World (winit + softbuffer, no GPU), spawn → first frame"),
+            ));
+            checks.push(Check::info(
+                "app",
+                "  Rune's own start",
+                b50 - a50,
+                "ms",
+                format!("floor-rune, the smallest Rune app, {b50:.1} ms (min {bmin:.1}, max {bmax:.1}), minus the floor: GPU device, pipeline, fonts, first layout"),
+            ));
+            checks.push(Check::info("app", "  Envoy's own start", c50 - b50, "ms", "the total minus floor-rune: settings, the cache and its first list, Envoy's views"));
+        }
+    }
     checks.push(Check::info("app", "  spawn → main()", p50_max(&main).0, "ms", "median: exec, loader, Rust runtime"));
     checks.push(Check::info("app", "  spawn → first frame", p50_max(&first).0, "ms", "median: window, GPU, first layout (list maybe still loading)"));
     let list_wait: Vec<f64> = done.iter().map(|r| ms(r.report["first_frame_ns"].as_u64().unwrap_or(0), r.report["first_list_ns"].as_u64().unwrap_or(0))).collect();
@@ -286,6 +364,26 @@ pub fn run(home: &Path, bin: &Path, runs: usize, wall_margin: f64, frame_margin:
                 1.0,
                 format!("{} at idle, worst ({name}) over {} runs: {}; peak while busy {peak_all:.0} MB", mem::METRIC, done.len(), details.join(", ")),
             ));
+        }
+    }
+    // What the floors hold at idle: the bare window's is the OS's per-window cost, the Rune
+    // app's is the least any app on Rune holds (its GPU device, surface and atlases included).
+    if floor_problem.is_none() {
+        for (i, label) in [(0, "  floor-window idle memory"), (1, "  floor-rune idle memory")] {
+            let peaks: Vec<f64> = floors[i]
+                .iter()
+                .filter_map(|r| {
+                    let w = r.report["idle"].as_array()?.first()?;
+                    let (a, b) = (w["start_ns"].as_u64()?, w["end_ns"].as_u64()?);
+                    r.samples.iter().filter(|(t, _)| *t >= a && *t <= b).map(|s| s.1).max()
+                })
+                .map(|b| b as f64 / 1e6)
+                .collect();
+            if peaks.len() == floors[i].len() && !peaks.is_empty() {
+                let worst = peaks.iter().copied().fold(0.0, f64::max);
+                let what = if i == 0 { "the bare window" } else { "the smallest Rune app: Rune, the GPU driver and a surface" };
+                checks.push(Check::info("app", label, worst, "MB", format!("{} at idle, worst of {} runs: {what}", mem::METRIC, peaks.len())));
+            }
         }
     }
     Ok(())

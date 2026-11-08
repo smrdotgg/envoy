@@ -147,7 +147,9 @@ target/dist/envoy-bench search --home /tmp/envoy-mailbox                        
 ```
 
 `app` opens a real window five times; on a headless Linux box run it under `xvfb-run -a` with
-`libxkbcommon-x11-0` installed and the `VK_ICD_FILENAMES` above. `crates/envoy-bench/src/main.rs`
-says what each number measures.
+`libxkbcommon-x11-0` installed and the `VK_ICD_FILENAMES` above. Each run is paired with runs of
+two launch floors built beside `envoy-bench` (`floor-window`, a bare Hello World window, and
+`floor-rune`, the smallest Rune app): cold start is gated on Envoy's time above the bare window's.
+`crates/envoy-bench/src/main.rs` says what each number measures.
 
 `RUST_LOG=envoy_core=debug` shows what the sync workers are doing.
