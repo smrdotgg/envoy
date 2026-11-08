@@ -329,8 +329,12 @@ impl App {
                     && !self.accounts.iter().any(|a| &a.id == account)
                 {
                     self.view = View::Role { account: None, role: Role::Inbox };
+                    reload = true;
                 }
-                reload = true;
+                // The first report is the accounts the engine started with, which the list
+                // asked for at start was already read with: reloading would read it twice.
+                // (Adding or removing one sends AccountAdded or Changed, which reload too.)
+                reload |= had;
             }
             Event::Mailboxes { account, mailboxes } => {
                 self.mailboxes.insert(account, mailboxes);

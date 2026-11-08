@@ -92,24 +92,36 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Starts the engine thread and returns at once: the cache is opened (and an old one
+    /// migrated) on that thread, never the caller's, so a UI can start its window meanwhile.
+    /// Commands sent before it's open wait their turn. If the cache can't be opened, the engine
+    /// reports an [`Event::Error`] and stops; later commands are dropped.
     pub fn start(waker: impl Fn() + Send + Sync + 'static, settings: Settings) -> Result<Engine> {
         let (tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, rx) = std::sync::mpsc::channel();
-        let db = paths::database_file();
-        let writer = Arc::new(Mutex::new(Store::open(&db)?));
-        let reader = Arc::new(Mutex::new(Store::open(&db)?));
-        let shared = Arc::new(Shared {
-            writer,
-            reader,
-            events: Mutex::new(ev_tx),
-            waker: Arc::new(waker),
-            settings: RwLock::new(settings),
-            tokens: Mutex::new(HashMap::new()),
-            accounts: RwLock::new(accounts::load()),
-            watched: Mutex::new(HashSet::new()),
-            undo_keys: Mutex::new(HashMap::new()),
-        });
+        let waker: Waker = Arc::new(waker);
         std::thread::Builder::new().name("envoy-engine".into()).spawn(move || {
+            let db = paths::database_file();
+            let stores = Store::open(&db).and_then(|writer| Ok((writer, Store::open(&db)?)));
+            let (writer, reader) = match stores {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = ev_tx.send(Event::Error(format!("Couldn't open the mail cache: {e:#}")));
+                    waker();
+                    return;
+                }
+            };
+            let shared = Arc::new(Shared {
+                writer: Arc::new(Mutex::new(writer)),
+                reader: Arc::new(Mutex::new(reader)),
+                events: Mutex::new(ev_tx),
+                waker,
+                settings: RwLock::new(settings),
+                tokens: Mutex::new(HashMap::new()),
+                accounts: RwLock::new(accounts::load()),
+                watched: Mutex::new(HashSet::new()),
+                undo_keys: Mutex::new(HashMap::new()),
+            });
             let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("envoy-io").build() {
                 Ok(rt) => rt,
                 Err(e) => {
