@@ -1,7 +1,7 @@
 //! Sample mail for `--demo` and for headless screenshots: the whole UI without an account.
 
 use envoy_core::accounts::{Account, AuthKind};
-use envoy_core::model::{Address, Attachment, Body, Draft, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
+use envoy_core::model::{Address, Attachment, Body, Draft, DraftAttachment, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 
 use crate::app::App;
 
@@ -37,7 +37,7 @@ const SAMPLES: &[Sample] = &[
     Sample { from: ("Hacker Newsletter", "kale@hackernewsletter.com"), subject: "Hacker Newsletter #712", preview: "The best articles from Hacker News this week: native UI is back, SQLite in production, and a love letter to IMAP.", hours_ago: 200, unread: false, starred: false, count: 1, attach: false, mailbox: "INBOX" },
     Sample { from: ("Jordan Lee", "jordan@northwind.dev"), subject: "Offsite agenda", preview: "Draft agenda for the offsite. Day one is planning, day two is hack day. Let me know what's missing.", hours_ago: 260, unread: false, starred: false, count: 2, attach: true, mailbox: "INBOX" },
     Sample { from: ("You", "you@gmail.com"), subject: "Re: Design review moved to Thursday", preview: "Thursday works. I'll bring the prototype on my laptop.", hours_ago: 0, unread: false, starred: false, count: 1, attach: false, mailbox: "[Gmail]/Sent Mail" },
-    Sample { from: ("You", "you@gmail.com"), subject: "Offsite travel plan", preview: "Thinking we take the 8:10 train on Thursday and share a car from the station. Could you check whether the hotel does early check-in?", hours_ago: 3, unread: false, starred: false, count: 1, attach: false, mailbox: DRAFTS },
+    Sample { from: ("You", "you@gmail.com"), subject: "Offsite travel plan", preview: "Thinking we take the 8:10 train on Thursday and share a car from the station. Could you check whether the hotel does early check-in?", hours_ago: 3, unread: false, starred: false, count: 1, attach: true, mailbox: DRAFTS },
 ];
 
 const DRAFTS: &str = "[Gmail]/Drafts";
@@ -133,6 +133,7 @@ pub fn draft_for(id: MessageId) -> Option<Draft> {
         to: format!("{} <{}>", DRAFT_TO.0, DRAFT_TO.1),
         subject: s.subject.into(),
         body: format!("Hi Jordan,\n\n{}\n\nThanks!", s.preview),
+        attachments: vec![DraftAttachment { id: 0, filename: "train-times.pdf".into(), mime: "application/pdf".into(), size: 182_400 }],
         ..Draft::default()
     })
 }

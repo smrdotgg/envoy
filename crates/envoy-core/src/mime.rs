@@ -92,9 +92,27 @@ pub fn parse(raw: &[u8], headers_only: bool) -> Option<Parsed> {
     Some(p)
 }
 
-/// A draft from the server (one Envoy saved, or another client), as the composer edits it.
-/// The account is left for the caller.
-pub fn draft_from_raw(raw: &[u8]) -> Option<crate::model::Draft> {
+/// A draft from the server (one Envoy saved, or another client's), as the composer edits it.
+pub struct ServerDraft {
+    /// Its account is left for the caller.
+    pub draft: crate::model::Draft,
+    /// The attachments' bytes, in the order of `draft.attachments`.
+    pub files: Vec<Vec<u8>>,
+    /// What the composer should say: whether editing it in place loses anything.
+    pub notice: Option<crate::model::DraftNotice>,
+}
+
+/// Reads a draft from the server for editing: recipients, subject, plain text, threading, and
+/// every attachment (inline pictures and attached messages too). What Envoy can't write back is
+/// flagged rather than lost: an HTML version ([`DraftNotice::PlainText`]); or a draft that
+/// can't be edited in place at all ([`DraftNotice::Copy`]: signed or encrypted, only a formatted
+/// version, text in several pieces), which comes back as a copy without attachments, for the
+/// original to stay as it is.
+///
+/// [`DraftNotice::PlainText`]: crate::model::DraftNotice::PlainText
+/// [`DraftNotice::Copy`]: crate::model::DraftNotice::Copy
+pub fn server_draft(raw: &[u8]) -> Option<ServerDraft> {
+    use crate::model::{Draft, DraftAttachment, DraftNotice};
     let msg = MessageParser::default().parse(raw)?;
     // As typed into a recipients field: names that would split it are quoted.
     let field = |v: Option<&mail_parser::Address>| {
@@ -104,8 +122,24 @@ pub fn draft_from_raw(raw: &[u8]) -> Option<crate::model::Draft> {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let mime_of = |p: &mail_parser::MessagePart| {
+        p.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")).to_ascii_lowercase()).unwrap_or_else(|| "application/octet-stream".into())
+    };
+    let part = |i: &u32| msg.parts.get(*i as usize);
+    let has_html = msg.html_body.iter().any(|i| part(i).is_some_and(|p| p.is_text_html()));
+    let texts = msg.text_body.iter().filter(|i| part(i).is_some_and(|p| p.is_text() && !p.is_text_html())).count();
+    let root = mime_of(msg.root_part());
+    let copy = if matches!(root.as_str(), "multipart/signed" | "multipart/encrypted" | "application/pkcs7-mime" | "application/x-pkcs7-mime") {
+        Some("it's signed or encrypted")
+    } else if has_html && texts == 0 {
+        Some("it only has a formatted version")
+    } else if texts > 1 {
+        Some("its text is in several pieces")
+    } else {
+        None
+    };
     let refs: Vec<String> = ids(msg.references()).into_iter().map(|s| angle(&s)).collect();
-    Some(crate::model::Draft {
+    let mut draft = Draft {
         account: String::new(),
         to: field(msg.to()),
         cc: field(msg.cc()),
@@ -115,7 +149,23 @@ pub fn draft_from_raw(raw: &[u8]) -> Option<crate::model::Draft> {
         in_reply_to: ids(msg.in_reply_to()).first().map(|s| angle(s)).unwrap_or_default(),
         references: refs.join(" "),
         reply_of: None,
-    })
+        attachments: Vec::new(),
+    };
+    if let Some(why) = copy {
+        return Some(ServerDraft { draft, files: Vec::new(), notice: Some(DraftNotice::Copy(why.into())) });
+    }
+    let mut files = Vec::new();
+    for (i, p) in msg.attachments().enumerate() {
+        let data = p.contents().to_vec();
+        draft.attachments.push(DraftAttachment {
+            id: i as u32,
+            filename: p.attachment_name().map(str::to_owned).unwrap_or_else(|| format!("attachment-{}", i + 1)),
+            mime: mime_of(p),
+            size: data.len(),
+        });
+        files.push(data);
+    }
+    Some(ServerDraft { draft, files, notice: has_html.then_some(DraftNotice::PlainText) })
 }
 
 /// Writes attachment `index` of a raw message to `dir`, returning the file path.
@@ -344,6 +394,20 @@ mod tests {
         assert_eq!(p.subject, "Lunch?");
         assert_eq!(thread_id(&p.message_id, &p.in_reply_to, &p.references), "<root@x>");
         assert_eq!(preview(p.text.as_deref(), None), "Are you free at noon?");
+    }
+
+    #[test]
+    fn server_drafts_say_what_editing_them_in_place_would_lose() {
+        use crate::model::DraftNotice;
+        let plain = b"From: a@x.com\r\nSubject: Hi\r\nContent-Type: text/plain\r\n\r\nHello\r\n";
+        assert_eq!(server_draft(plain).unwrap().notice, None);
+        let html_only = b"From: a@x.com\r\nSubject: Hi\r\nContent-Type: text/html\r\n\r\n<p>Hello <b>there</b></p>\r\n";
+        let d = server_draft(html_only).unwrap();
+        assert!(matches!(d.notice, Some(DraftNotice::Copy(ref why)) if why.contains("formatted")), "{:?}", d.notice);
+        assert!(d.draft.body.contains("Hello"), "the copy starts from its text");
+        // Text, a picture, more text (as Apple Mail writes): one text field can't hold it.
+        let pieces = b"From: a@x.com\r\nSubject: Hi\r\nContent-Type: multipart/mixed; boundary=\"m\"\r\n\r\n--m\r\nContent-Type: text/plain\r\n\r\nBefore\r\n--m\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\n\r\nPNG\r\n--m\r\nContent-Type: text/plain\r\n\r\nAfter\r\n--m--\r\n";
+        assert!(matches!(server_draft(pieces).unwrap().notice, Some(DraftNotice::Copy(_))));
     }
 
     #[test]

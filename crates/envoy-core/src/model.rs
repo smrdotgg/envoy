@@ -213,6 +213,31 @@ pub struct Draft {
     pub references: String,
     /// The message this replies to, to mark it answered after sending.
     pub reply_of: Option<MessageId>,
+    /// Files that go with it. Their bytes live in the store with the draft (`draft_files`),
+    /// written once, so saving the text as it's typed never rewrites them.
+    pub attachments: Vec<DraftAttachment>,
+}
+
+/// A file attached to a draft: what the composer shows. The bytes are in the store, under the
+/// draft's id and this `id`.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DraftAttachment {
+    pub id: u32,
+    pub filename: String,
+    /// `type/subtype`.
+    pub mime: String,
+    pub size: usize,
+}
+
+/// What the composer should say about a draft opened from the server.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DraftNotice {
+    /// It has a formatted (HTML) version: an edit keeps its text and attachments, not that.
+    PlainText,
+    /// It can't be edited in place without losing something (`why`): the composer has an
+    /// unsaved copy, saved as a new draft, and the original stays in Drafts as it is.
+    Copy(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -126,9 +126,12 @@ after you pause, every few seconds while you don't, and when the window closes),
 that was open when Envoy quit or crashed comes back, minimized, on the next start. A few seconds
 later the draft is copied to the account's Drafts folder through the same queue (offline, it
 waits), each save replacing the previous copy, so other devices see one draft. Opening a message
-in Drafts opens it in the composer. Sending removes the draft, and Undo send brings the composer
-back as it was; discarding a draft has an Undo too. Opening another composer keeps the current
-one in Drafts.
+in Drafts opens it in the composer, attachments and all; they go with it when it's saved and
+sent. Envoy writes plain text, so editing a draft with formatting keeps its text and attachments
+but not the formatting (the composer says so), and a draft it can't edit in place without losing
+something (signed, encrypted, formatted only) opens as a copy, leaving the original as it is.
+Sending removes the draft, and Undo send brings the composer back as it was; discarding a draft
+has an Undo too. Opening another composer keeps the current one in Drafts.
 
 ## Testing
 
@@ -143,7 +146,7 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png -
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png --at 3.6 # after z: the composer back with the edit
 ```
 
-Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent drafts draft`.
+Scenes: `open light dark compact bottom compose light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice`.
 
 **Latency budgets** ([`docs/NORTH_STAR.md`](docs/NORTH_STAR.md)) are checked in CI on all three OSes
 against a generated 100k-message mailbox; each check prints measured vs budget and fails over budget.

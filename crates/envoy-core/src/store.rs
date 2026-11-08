@@ -109,6 +109,15 @@ CREATE TABLE IF NOT EXISTS drafts (
     unconfirmed INTEGER NOT NULL DEFAULT 0,
     sent INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS draft_files (
+    draft INTEGER NOT NULL,
+    id INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    PRIMARY KEY (draft, id)
+);
+CREATE TRIGGER IF NOT EXISTS drafts_files_delete AFTER DELETE ON drafts BEGIN
+    DELETE FROM draft_files WHERE draft = old.id;
+END;
 "#;
 
 /// Columns added after the first release, for caches created before them. Each runs once,

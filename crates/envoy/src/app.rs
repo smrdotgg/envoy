@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use envoy_core::accounts::{Account, AuthKind};
 use envoy_core::engine::{Command, Engine, Event, MoveTarget};
-use envoy_core::model::{Draft, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
+use envoy_core::model::{Draft, DraftAttachment, DraftNotice, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use envoy_core::settings::Settings;
 
 use crate::fmt;
@@ -41,6 +41,11 @@ pub struct Compose {
     pub minimized: bool,
     pub error: Option<String>,
     pub from_open: bool,
+    /// Files that go with it (kept with the draft in the store).
+    pub attachments: Vec<DraftAttachment>,
+    /// What the user should know about it: a draft from the server that can't be edited
+    /// without losing something.
+    pub notice: Option<String>,
     /// The local draft this composer saves to: an id picked here, unique across runs.
     pub draft_id: i64,
     /// The draft is in the store: saved at least once, or opened from there.
@@ -78,6 +83,8 @@ impl Compose {
             minimized: false,
             error: None,
             from_open: false,
+            attachments: Vec::new(),
+            notice: None,
             draft_id,
             saved: false,
             dirty: false,
@@ -99,6 +106,7 @@ impl Compose {
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
             reply_of: self.reply_of,
+            attachments: self.attachments.clone(),
         }
     }
 }
@@ -541,7 +549,7 @@ impl App {
                 reload = true;
             }
             Event::Held { .. } => {}
-            Event::DraftOpened { id, draft, restored } => self.show_draft(id, draft, restored),
+            Event::DraftOpened { id, draft, restored, notice } => self.show_draft(id, draft, restored, notice),
         }
         reload
     }
@@ -1333,7 +1341,7 @@ impl App {
     fn open_draft(&mut self, id: MessageId) {
         if self.demo {
             if let Some(draft) = crate::demo::draft_for(id) {
-                self.show_draft(id, draft, false);
+                self.show_draft(id, draft, false, None);
             }
             return;
         }
@@ -1343,8 +1351,11 @@ impl App {
     /// Shows a draft in the composer: opened from Drafts, back from an undone send, or
     /// (`restored`, minimized) left there when the app last closed. The composer it replaces is
     /// put away in Drafts, unless it's this same draft (it may have newer edits), or this is a
-    /// restore and the user already started another.
-    pub fn show_draft(&mut self, id: i64, draft: Draft, restored: bool) {
+    /// restore and the user already started another. With [`DraftNotice::Copy`] it's an unsaved
+    /// copy of a server draft that stays as it is, and gets an id of its own here.
+    pub fn show_draft(&mut self, id: i64, draft: Draft, restored: bool, notice: Option<DraftNotice>) {
+        let copy = matches!(notice, Some(DraftNotice::Copy(_)));
+        let id = if copy { self.next_stamp() } else { id };
         if let Some(c) = &mut self.compose {
             if c.draft_id == id {
                 c.minimized &= restored;
@@ -1366,7 +1377,12 @@ impl App {
         c.in_reply_to = draft.in_reply_to;
         c.references = draft.references;
         c.reply_of = draft.reply_of;
-        c.saved = true;
+        c.attachments = draft.attachments;
+        c.notice = notice.map(|n| match n {
+            DraftNotice::PlainText => "This draft has formatting Envoy doesn't write: saving an edit keeps its text and attachments, not the formatting.".to_owned(),
+            DraftNotice::Copy(why) => format!("Envoy can't edit this draft in place ({why}), so it stays in Drafts as it is. This is a copy, without its attachments: what you write is saved as a new draft."),
+        });
+        c.saved = !copy;
         c.minimized = restored;
         if !restored {
             if c.to.text.trim().is_empty() {
@@ -1918,14 +1934,33 @@ mod tests {
         type_into_body(&mut app, "Unfinished");
         let first = app.compose.as_ref().unwrap().draft_id;
         let other = Draft { account: "demo".into(), subject: "Other".into(), body: "Other text".into(), ..Draft::default() };
-        app.show_draft(first + 1, other.clone(), false);
+        app.show_draft(first + 1, other.clone(), false, None);
         assert_eq!(app.toasts.last().map(|t| t.text.as_str()), Some("Saved to Drafts"));
         let c = app.compose.as_ref().unwrap();
         assert_eq!((c.draft_id, c.subject.text.as_str(), c.saved, c.minimized), (first + 1, "Other", true, false));
         // The same draft again (say, Undo send while it's open): the composer keeps its edits.
         type_into_body(&mut app, "More ");
-        app.show_draft(first + 1, other, false);
+        app.show_draft(first + 1, other, false, None);
         assert!(app.compose.as_ref().unwrap().body.text.starts_with("More "));
+    }
+
+    #[test]
+    fn a_server_draft_opens_with_its_files_or_as_an_unsaved_copy() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let files = vec![DraftAttachment { id: 0, filename: "plan.pdf".into(), mime: "application/pdf".into(), size: 10 }];
+        let formatted = Draft { account: "demo".into(), subject: "Plan".into(), attachments: files.clone(), ..Draft::default() };
+        app.show_draft(5, formatted, false, Some(DraftNotice::PlainText));
+        let c = app.compose.as_ref().unwrap();
+        assert_eq!(c.draft().attachments, files, "saved and sent with its files");
+        assert!(c.notice.as_deref().is_some_and(|n| n.contains("formatting")) && c.saved);
+        // One Envoy can't edit in place: a copy, nothing in the store until it's edited.
+        app.compose = None;
+        let signed = Draft { account: "demo".into(), subject: "Signed".into(), ..Draft::default() };
+        app.show_draft(0, signed, false, Some(DraftNotice::Copy("it's signed or encrypted".into())));
+        let c = app.compose.as_ref().unwrap();
+        assert!(c.draft_id != 0 && !c.saved);
+        assert!(c.notice.as_deref().is_some_and(|n| n.contains("stays in Drafts as it is")));
     }
 
     #[test]
@@ -1933,13 +1968,13 @@ mod tests {
         let mut app = App::new(true);
         crate::demo::populate(&mut app);
         let left = Draft { account: "demo".into(), subject: "Left open".into(), ..Draft::default() };
-        app.apply(Event::DraftOpened { id: 5, draft: left.clone(), restored: true }, &mut Tx::default());
+        app.apply(Event::DraftOpened { id: 5, draft: left.clone(), restored: true, notice: None }, &mut Tx::default());
         let c = app.compose.as_ref().unwrap();
         assert_eq!((c.draft_id, c.minimized), (5, true));
         // Already writing something else: that stays; the restored one waits in Drafts.
         app.compose_new();
         let writing = app.compose.as_ref().unwrap().draft_id;
-        app.apply(Event::DraftOpened { id: 6, draft: left, restored: true }, &mut Tx::default());
+        app.apply(Event::DraftOpened { id: 6, draft: left, restored: true, notice: None }, &mut Tx::default());
         assert_eq!(app.compose.as_ref().unwrap().draft_id, writing);
     }
 

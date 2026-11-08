@@ -237,6 +237,14 @@ const SCENES: &[Scene] = &[
             s.open_message(id);
         }
     }),
+    ("draft-notice", |s| {
+        scene_drafts(s);
+        if let Some(d) = s.list.first().and_then(|m| demo::draft_for(m.id)) {
+            // A copy comes without the original's files.
+            let copy = envoy_core::model::Draft { attachments: vec![], ..d };
+            s.show_draft(0, copy, false, Some(envoy_core::model::DraftNotice::Copy("it's signed or encrypted".into())));
+        }
+    }),
 ];
 
 fn scene_drafts(s: &mut App) {

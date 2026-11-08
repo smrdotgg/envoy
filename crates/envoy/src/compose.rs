@@ -4,7 +4,7 @@ use rune::{Cursor, El, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Select, TextInput};
 
 use crate::app::{App, Compose, key_label};
-use crate::icons;
+use crate::{fmt, icons};
 use crate::theme::Theme;
 
 fn field_row(t: &Theme, label: &str, input: El, trailing: Option<El>) -> El {
@@ -144,6 +144,19 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
             .child(field_row(t, "Bcc", plain_input(&cm.bcc, "Bcc", "field-compose-bcc", |s| &mut c(s).bcc, k), None));
     }
     fields = fields.child(field_row(t, "Subject", plain_input(&cm.subject, "Subject", "field-compose-subject", |s| &mut c(s).subject, k), None));
+    if let Some(notice) = &cm.notice {
+        fields = fields.child(
+            row()
+                .key("compose-notice")
+                .w_full()
+                .px(16.0)
+                .py(8.0)
+                .gap(8.0)
+                .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_muted)
+                .child(icon(&icons::ALERT, 14.0).color(k.c.icon_muted))
+                .child(text(notice.clone()).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().grow(1.0).min_w(0.0)),
+        );
+    }
 
     let ink = k.c.text_base;
     let body = col()
@@ -166,6 +179,28 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
                 .on_edit(|s: &mut App| &mut c(s).body)
                 .on_input_change(|s: &mut App, _: &mut Tx| s.compose_edited()),
         );
+
+    // The draft's files: they go with it when it's saved and sent.
+    let files = (!cm.attachments.is_empty()).then(|| {
+        let mut chips = row().key("compose-files").w_full().px(14.0).pt(8.0).gap(8.0).flex_wrap();
+        for a in &cm.attachments {
+            chips = chips.child(
+                row()
+                    .key(format!("compose-file-{}", a.id))
+                    .h(30.0)
+                    .px(10.0)
+                    .gap(6.0)
+                    .center_y()
+                    .radius(8.0)
+                    .fill(k.c.layer_02)
+                    .label(format!("Attached: {}, {}", a.filename, fmt::size(a.size)))
+                    .child(icon(&icons::PAPERCLIP, 13.0).color(k.c.icon_muted))
+                    .child(text(a.filename.clone()).font(k.ty.text_xsmall_medium).color(k.c.text_base).truncate().max_w(220.0))
+                    .child(text(fmt::size(a.size)).font(k.ty.text_xsmall).color(k.c.text_faint)),
+            );
+        }
+        chips
+    });
 
     let send_label = key_label(&s.settings, "keys.send");
     let mut footer = row()
@@ -232,8 +267,12 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
         .clip_rounded(12.0)
         .child(title_bar)
         .child(fields)
-        .child(body)
-        .child(footer);
+        .child(body);
+    let card = match files {
+        Some(f) => card.child(f),
+        None => card,
+    }
+    .child(footer);
     Some(col().key("compose-dock").pin(None, None, Some(24.0), Some(0.0)).child(card))
 }
 
