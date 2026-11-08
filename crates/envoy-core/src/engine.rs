@@ -1377,9 +1377,9 @@ trait OpRunner {
     fn status(&mut self, mailbox: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send;
     /// Puts a draft in `mailbox`, replacing its `previous` copy ([`imap::replace_draft`]).
     fn replace_draft(&mut self, mailbox: &str, raw: &[u8], message_id: &str, previous: Option<(u32, u32)>, maybe_strays: bool) -> impl std::future::Future<Output = Result<imap::Replaced>> + Send;
-    /// Deletes a draft's copies from `mailbox`: `known`, and any with its Message-ID. Returns
-    /// their UIDs.
-    fn purge_draft(&mut self, mailbox: &str, message_id: &str, known: Option<(u32, u32)>) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send;
+    /// Deletes a draft's copies from `mailbox`: `known`, and, with `search`, any with its
+    /// Message-ID. Returns their UIDs.
+    fn purge_draft(&mut self, mailbox: &str, message_id: &str, known: Option<(u32, u32)>, search: bool) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send;
 }
 
 struct ImapRunner<'a> {
@@ -1398,8 +1398,8 @@ impl OpRunner for ImapRunner<'_> {
         imap::replace_draft(self.session, self.caps, mailbox, raw, message_id, previous, maybe_strays).await
     }
 
-    async fn purge_draft(&mut self, mailbox: &str, message_id: &str, known: Option<(u32, u32)>) -> Result<Vec<u32>> {
-        imap::purge_message_id(self.session, self.caps, mailbox, message_id, known).await
+    async fn purge_draft(&mut self, mailbox: &str, message_id: &str, known: Option<(u32, u32)>, search: bool) -> Result<Vec<u32>> {
+        imap::purge_message_id(self.session, self.caps, mailbox, message_id, known, search).await
     }
 
     async fn run(&mut self, op: &Op) -> Result<()> {
@@ -1550,24 +1550,29 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
             let raw = smtp::build_draft(account, &up.draft, &up.message_id, &files).map_err(|e| imap::Refused(format!("{e:#}")))?;
             // The copy on record is replaced by UID; one in another mailbox (the Drafts role
             // moved) is left to the search.
-            let previous = up.previous.filter(|(m, _, _)| *m == mailbox).map(|(_, validity, uid)| (validity, uid));
+            let previous = up.previous.as_ref().filter(|(m, _, _)| *m == mailbox).map(|(_, validity, uid)| (*validity, *uid));
             let done = runner.replace_draft(&mailbox, &raw, &up.message_id, previous, up.maybe_strays).await?;
             shared.with_writer(|st| {
-                st.draft_uploaded(*draft, up.version, &mailbox, done.copy, done.certain)?;
+                // If the draft moved to another account meanwhile, this copy is queued for
+                // deletion here instead of recorded.
+                if !st.draft_uploaded(*draft, &up, &mailbox, done.copy, done.certain)? {
+                    log::info!("{}: a draft moved to another account while it was uploaded here; its copy goes", account.email);
+                }
                 st.delete_uids(id, &mailbox, &done.deleted)
             })?;
         }
-        Op::PurgeDraft { message_id, draft } => {
-            let on_server = match draft {
-                Some(d) => shared.with_writer(|st| st.draft_appended(*d))?,
-                None => true,
+        Op::PurgeDraft { message_id, draft, copy, exact } => {
+            let (on_server, known) = match draft {
+                // The copy on record counts only if it's on this account's server.
+                Some(d) => shared.with_writer(|st| {
+                    let known = st.draft_copy(*d)?.filter(|(acct, ..)| acct == id).map(|(_, m, v, u)| (m, v, u));
+                    Ok((st.draft_appended(*d)?, known.or_else(|| copy.clone())))
+                })?,
+                None => (true, copy.clone()),
             };
             if on_server && let Some(mailbox) = drafts_mailbox(shared, id)? {
-                let known = match draft {
-                    Some(d) => shared.with_writer(|st| st.draft_copy(*d))?.filter(|(m, _, _)| *m == mailbox).map(|(_, validity, uid)| (validity, uid)),
-                    None => None,
-                };
-                let gone = runner.purge_draft(&mailbox, message_id, known).await?;
+                let known = known.filter(|(m, _, _)| *m == mailbox).map(|(_, validity, uid)| (validity, uid));
+                let gone = runner.purge_draft(&mailbox, message_id, known, !*exact).await?;
                 shared.with_writer(|st| st.delete_uids(id, &mailbox, &gone))?;
             }
             if let Some(d) = draft {
@@ -1728,10 +1733,11 @@ mod tests {
             async move { r }
         }
 
-        fn purge_draft(&mut self, _: &str, message_id: &str, _: Option<(u32, u32)>) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send {
+        fn purge_draft(&mut self, _: &str, message_id: &str, known: Option<(u32, u32)>, search: bool) -> impl std::future::Future<Output = Result<Vec<u32>>> + Send {
             let r = self.on_the_wire().map(|()| {
-                let gone: Vec<u32> = self.drafts.iter().filter(|(_, m, _)| m == message_id).map(|(u, _, _)| *u).collect();
-                self.drafts.retain(|(_, m, _)| m != message_id);
+                let goes = |u: u32, m: &str| known.is_some_and(|(_, k)| k == u) || (search && m == message_id);
+                let gone: Vec<u32> = self.drafts.iter().filter(|(u, m, _)| goes(*u, m)).map(|(u, _, _)| *u).collect();
+                self.drafts.retain(|(u, m, _)| !goes(*u, m));
                 gone
             });
             async move { r }
@@ -2046,6 +2052,27 @@ mod tests {
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(server.previous.last(), Some(&(None, true)));
         assert_eq!(server.drafts(), vec![(4, "v4".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn an_upload_finishing_after_the_account_changed_is_not_trusted() {
+        let (shared, _rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "from a");
+        // The user picks another From while a's upload is on the wire.
+        let mut a = FakeServer::new(&shared, |s: &Shared| {
+            let moved = Draft { account: "b".into(), ..draft("from b") };
+            s.with_writer(|st| drafts::save(st, 7, &moved, true, 2, now() - drafts::UPLOAD_DELAY - 1)).unwrap();
+        });
+        replay_with(&shared, &account("a"), &mut a).await.unwrap();
+        // Both servers number their Drafts alike: a's UID must mean nothing on b.
+        let mut b = FakeServer::new(&shared, |_: &Shared| {});
+        replay_with(&shared, &account("b"), &mut b).await.unwrap();
+        assert_eq!(b.previous.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![None], "b's first save replaces nothing of a's");
+        assert_eq!(b.drafts(), vec![(1, "from b".to_owned())]);
+        // The copy a made after the switch is cleaned up on a, by its UID.
+        replay_times(&shared, &mut a, 1).await;
+        assert!(a.drafts.is_empty(), "{:?}", a.drafts());
+        assert_eq!(b.drafts().len(), 1, "and only on a");
     }
 
     #[tokio::test]
