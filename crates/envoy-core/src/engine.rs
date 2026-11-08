@@ -61,6 +61,9 @@ pub enum Command {
     OpenDraft { id: MessageId },
     /// Discards draft `id`, here and on the server. `undo` as in [`Command::Move`].
     DiscardDraft { id: i64, undo: Option<i64> },
+    /// Deletes a row of a Drafts list: its local draft is discarded (all its copies go), and a
+    /// draft only the server has goes to Trash like a message. `undo` as in [`Command::Move`].
+    DiscardDraftRow { row: MessageId, undo: Option<i64> },
     SyncNow,
     /// The mailbox the user is looking at: synced first and kept fresh.
     Watch { view: View },
@@ -108,6 +111,9 @@ pub enum Event {
     /// tell the user about a draft from the server; with [`DraftNotice::Copy`] it's an unsaved
     /// copy and `id` is 0, for the app to pick one.
     DraftOpened { id: i64, draft: Draft, restored: bool, notice: Option<DraftNotice> },
+    /// Draft `id` was discarded from the Drafts list ([`Command::DiscardDraftRow`]), under
+    /// `undo`: a composer holding it closes.
+    DraftDiscarded { id: i64, undo: Option<i64> },
 }
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -507,18 +513,31 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             Opening::Gone => shared.emit(Event::Changed { account: String::new() }),
         },
         Command::DiscardDraft { id, undo } => {
-            let window = shared.setting_u32("behavior.undoSeconds");
-            // Held like a move, with its second of grace (see move_and_hold).
-            let hold = undo.filter(|_| window > 0).map(|key| (now() + window as i64 + 1, key));
-            if let Some(account) = shared.with_writer(|st| st.discard_draft(id, hold))? {
-                if let Some((_, key)) = hold
-                    && let Ok(mut keys) = shared.undo_keys.lock()
-                {
-                    keys.insert(key, 1);
+            discard_draft(shared, workers, id, undo)?;
+        }
+        Command::DiscardDraftRow { row, undo } => {
+            let local = shared.with_writer(|st| {
+                Ok(match drafts::draft_of_list_id(row) {
+                    Some(d) => st.draft(d)?,
+                    None => st.draft_of_message(row)?,
+                })
+            })?;
+            match local {
+                Some(d) if discard_draft(shared, workers, d.id, undo)? => shared.emit(Event::DraftDiscarded { id: d.id, undo }),
+                // A draft only the server has (written elsewhere): to Trash, like a message.
+                None if row > 0 => {
+                    for a in move_and_hold(shared, vec![row], &MoveTarget::Trash, false, undo, now())? {
+                        shared.emit_mailboxes(&a);
+                        shared.emit(Event::Changed { account: a.clone() });
+                        poke(workers, &a, Job::Sync);
+                    }
+                    shared.emit_pending();
                 }
-                shared.emit(Event::Changed { account: account.clone() });
-                shared.emit_pending();
-                wake(workers, &account);
+                // Already on its way out, or gone: nothing to undo, and the list catches up.
+                _ => match undo {
+                    Some(key) => shared.emit(Event::Held { undo: key, ops: 0 }),
+                    None => shared.emit(Event::Changed { account: String::new() }),
+                },
             }
         }
         Command::SyncNow => {
@@ -673,6 +692,24 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
         }
     }
     Ok(())
+}
+
+/// [`Command::DiscardDraft`]: hides the draft and queues its purge, held for the undo window
+/// like a move (with its second of grace, see [`move_and_hold`]). False if there was nothing to
+/// discard.
+fn discard_draft(shared: &Shared, workers: &HashMap<String, Worker>, id: i64, undo: Option<i64>) -> Result<bool> {
+    let window = shared.setting_u32("behavior.undoSeconds");
+    let hold = undo.filter(|_| window > 0).map(|key| (now() + window as i64 + 1, key));
+    let Some(account) = shared.with_writer(|st| st.discard_draft(id, hold))? else { return Ok(false) };
+    if let Some((_, key)) = hold
+        && let Ok(mut keys) = shared.undo_keys.lock()
+    {
+        *keys.entry(key).or_insert(0) += 1;
+    }
+    shared.emit(Event::Changed { account: account.clone() });
+    shared.emit_pending();
+    wake(workers, &account);
+    Ok(true)
 }
 
 /// [`Command::Send`]: builds the message and queues it for `compose.undoSendSeconds`, with the
@@ -2174,6 +2211,52 @@ mod tests {
         let opened = rx.try_iter().find_map(|e| if let Event::DraftOpened { id, draft, .. } = e { Some((id, draft.subject)) } else { None });
         assert_eq!(opened, Some((9, "unsendable".to_owned())), "nothing written is lost");
         assert!(shared.with_writer(|st| st.draft(9)).unwrap().unwrap().visible, "and it's in Drafts");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_local_drafts_row_discards_it() {
+        let (shared, rx) = drafts_engine();
+        // Not uploaded yet: its row is the draft itself (a negative id).
+        shared.with_writer(|st| drafts::save(st, 7, &draft("only here"), true, 1, now())).unwrap();
+        let row = drafts::list_id(7);
+        assert_eq!(drafts_list(&shared, "").iter().map(|r| r.id).collect::<Vec<_>>(), vec![row]);
+        // What Delete used to send: a message move, which can't touch a draft.
+        handle(&shared, &mut HashMap::new(), Command::Move { ids: vec![row], to: MoveTarget::Trash, thread: false, undo: None }).await.unwrap();
+        assert_eq!(drafts_list(&shared, "").len(), 1);
+        handle(&shared, &mut HashMap::new(), Command::DiscardDraftRow { row, undo: Some(3) }).await.unwrap();
+        assert!(drafts_list(&shared, "").is_empty(), "discarded");
+        assert!(rx.try_iter().any(|e| matches!(e, Event::DraftDiscarded { id: 7, undo: Some(3) })), "a composer holding it is told");
+        undo_move(&shared, 3).unwrap();
+        assert_eq!(drafts_list(&shared, "").len(), 1, "Undo brings it back");
+        handle(&shared, &mut HashMap::new(), Command::DiscardDraftRow { row, undo: None }).await.unwrap();
+        assert!(shared.with_writer(|st| st.drafts(None)).unwrap().is_empty(), "never on the server: gone at once");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_drafts_server_copy_discards_the_draft_for_good() {
+        let (shared, _rx) = drafts_engine();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        type_draft(&shared, 7, 1, "uploaded");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        let copy = sync_copy(&shared, &server, 1);
+        handle(&shared, &mut HashMap::new(), Command::DiscardDraftRow { row: copy, undo: None }).await.unwrap();
+        assert!(drafts_list(&shared, "").is_empty());
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert!(server.drafts.is_empty(), "off the server");
+        assert!(shared.with_writer(|st| st.draft(7)).unwrap().is_none(), "the local draft too");
+        assert!(drafts_list(&shared, "").is_empty(), "and it doesn't come back");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_server_only_drafts_row_trashes_it_undoably() {
+        let (shared, _rx) = drafts_engine();
+        let id = server_copy(&shared, 5, &draft_with_pdf(false));
+        handle(&shared, &mut HashMap::new(), Command::DiscardDraftRow { row: id, undo: Some(4) }).await.unwrap();
+        assert!(drafts_list(&shared, "").is_empty());
+        let held: Vec<Op> = shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().into_iter().map(|q| q.op).collect();
+        assert_eq!(held, vec![Op::Move { mailbox: "Drafts".into(), uid: 5, dest: "Trash".into() }]);
+        undo_move(&shared, 4).unwrap();
+        assert_eq!(drafts_list(&shared, "").iter().map(|r| r.id).collect::<Vec<_>>(), vec![id]);
     }
 
     #[tokio::test]

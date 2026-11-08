@@ -352,10 +352,16 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
         .radius(8.0)
         .fill(if selected { t.selected } else { t.card })
         .pin(None, Some(if compact { 3.0 } else { 7.0 }), Some(8.0), None)
-        .group_opacity(0.0, 1.0)
-        .child(act(&icons::ARCHIVE, "Archive", "a", |s, id, tx| s.archive(vec![id], tx)))
-        .child(act(&icons::TRASH, "Delete", "d", |s, id, tx| s.delete(vec![id], tx)))
-        .child(act(if unread { &icons::MAIL_OPEN } else { &icons::MAIL_DOT }, if unread { "Mark as read" } else { "Mark as unread" }, "r", |s, id, _| s.toggle_read(id)));
+        .group_opacity(0.0, 1.0);
+    // A draft is only discarded (with Undo): it isn't archived, and it's never unread.
+    let actions = if role == Some(Role::Drafts) || id < 0 {
+        actions.child(act(&icons::TRASH, "Discard draft", "d", |s, id, tx| s.delete(vec![id], tx)))
+    } else {
+        actions
+            .child(act(&icons::ARCHIVE, "Archive", "a", |s, id, tx| s.archive(vec![id], tx)))
+            .child(act(&icons::TRASH, "Delete", "d", |s, id, tx| s.delete(vec![id], tx)))
+            .child(act(if unread { &icons::MAIL_OPEN } else { &icons::MAIL_DOT }, if unread { "Mark as read" } else { "Mark as unread" }, "r", |s, id, _| s.toggle_read(id)))
+    };
 
     let star_icon = if m.flagged() { &icons::STAR_FILLED } else { &icons::STAR };
     let star = el()
