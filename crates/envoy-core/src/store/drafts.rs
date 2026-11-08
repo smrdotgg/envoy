@@ -113,21 +113,21 @@ impl Store {
             None => {}
         }
         let content = json(draft);
-        type Row = (String, String, String, i64, bool, Option<(String, u32, u32)>, bool, bool);
+        type Row = (String, String, String, i64, bool, Option<(String, u32, u32)>, bool, bool, i64);
         let old: Option<Row> = self
             .conn
             .query_row(
                 "SELECT account, content, message_id, rev, appended != 0, server_mailbox, server_validity, server_uid, server_account = account, unconfirmed != 0,
-                     sending != 0 OR sent != 0
+                     sending != 0 OR sent != 0, upload_gen
                  FROM drafts WHERE id = ?1",
                 params![id],
                 |r| {
                     let copy = (r.get::<_, u32>(7)? != 0 && r.get::<_, bool>(8)?).then(|| Ok::<_, rusqlite::Error>((r.get(5)?, r.get(6)?, r.get(7)?))).transpose()?;
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, copy, r.get(9)?, r.get(10)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, copy, r.get(9)?, r.get(10)?, r.get(11)?))
                 },
             )
             .optional()?;
-        let Some((account, old_content, message_id, old_rev, appended, copy, unconfirmed, outbox)) = old else {
+        let Some((account, old_content, message_id, old_rev, appended, copy, unconfirmed, outbox, generation)) = old else {
             self.conn.execute(
                 "INSERT INTO drafts (id, account, content, message_id, rev, updated, version, open) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
                 params![id, draft.account, content, new_message_id(id), rev.unwrap_or(0), now, open],
@@ -144,7 +144,7 @@ impl Store {
             // Its copies on the old account's server go, there: the one on record by UID, and
             // by Message-ID only if an upload may have left one no one knows the UID of.
             let exact = copy.is_some() && !unconfirmed;
-            self.enqueue(&account, &Op::PurgeDraft { message_id, draft: None, copy, exact })?;
+            self.enqueue(&account, &Op::PurgeDraft { message_id, draft: None, copy, exact, left_by: Some((id, generation)) })?;
         }
         let changed = old_content != content;
         // Moved: a new round of uploads, on the new account; one still running for the old
@@ -345,7 +345,7 @@ impl Store {
             if !recorded && st.draft(id)?.is_some() {
                 let copy = copy.map(|(v, u)| (mailbox.to_owned(), v, u));
                 let exact = copy.is_some();
-                st.enqueue(&up.account, &Op::PurgeDraft { message_id: up.message_id.clone(), draft: None, copy, exact })?;
+                st.enqueue(&up.account, &Op::PurgeDraft { message_id: up.message_id.clone(), draft: None, copy, exact, left_by: Some((id, up.generation)) })?;
             }
             Ok(recorded)
         })
@@ -359,6 +359,24 @@ impl Store {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()?)
+    }
+
+    /// A cleanup of the copies draft `id` left on `account` in upload generation `generation`
+    /// ([`Op::PurgeDraft`] without a draft) deleted copies it found by Message-ID. If the draft
+    /// is back on that account in a newer generation, with an upload started, its new copy may
+    /// have been one of them: the draft is marked as behind the server, and its upload queued
+    /// (looking for strays, in case the copy is still there). Returns whether it was.
+    pub fn draft_cleaned_up(&self, id: i64, account: &str, generation: i64, now: i64) -> Result<bool> {
+        self.transaction(|st| {
+            let lost = st.conn.execute(
+                "UPDATE drafts SET server_version = 0, unconfirmed = 1 WHERE id = ?1 AND account = ?2 AND upload_gen > ?3 AND appended != 0",
+                params![id, account, generation],
+            )? > 0;
+            if lost && st.draft_needs_upload(id)? {
+                st.queue_draft_upload(account, id, now)?;
+            }
+            Ok(lost)
+        })
     }
 
     /// Whether the server may have copies of the draft (an upload was started). False for a
@@ -439,7 +457,7 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
         for (id, account, message_id, appended) in sent {
             if appended {
-                let purge = self.enqueue(&account, &Op::PurgeDraft { message_id, draft: Some(id), copy: None, exact: false })?;
+                let purge = self.enqueue(&account, &Op::PurgeDraft { message_id, draft: Some(id), copy: None, exact: false, left_by: None })?;
                 self.conn.execute("UPDATE drafts SET sending = 0, purge_op = ?2, open = 0, sent = 1 WHERE id = ?1", params![id, purge])?;
             } else {
                 self.conn.execute("DELETE FROM drafts WHERE id = ?1", params![id])?;
@@ -462,7 +480,7 @@ impl Store {
                 })
                 .optional()?;
             let Some((account, message_id, appended)) = found else { return Ok(None) };
-            let op = Op::PurgeDraft { message_id, draft: Some(id), copy: None, exact: false };
+            let op = Op::PurgeDraft { message_id, draft: Some(id), copy: None, exact: false, left_by: None };
             let purge = match hold {
                 Some((not_before, key)) => st.enqueue_held(&account, &op, not_before, key)?,
                 None if !appended => {
@@ -487,7 +505,7 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
         for (id, account, message_id, sent) in back {
             if sent {
-                let purge = self.enqueue(&account, &Op::PurgeDraft { message_id, draft: Some(id), copy: None, exact: false })?;
+                let purge = self.enqueue(&account, &Op::PurgeDraft { message_id, draft: Some(id), copy: None, exact: false, left_by: None })?;
                 self.conn.execute("UPDATE drafts SET purge_op = ?2 WHERE id = ?1", params![id, purge])?;
                 continue;
             }
@@ -821,7 +839,7 @@ mod tests {
         assert_eq!(s.draft_copy(1).unwrap(), None, "the draft has no copy on b");
         assert!(s.draft_needs_upload(1).unwrap(), "and b still needs one");
         let on_a = queued(&s, "a");
-        assert!(on_a.contains(&Op::PurgeDraft { message_id: mid, draft: None, copy: Some(("Drafts".into(), 7, 21)), exact: true }), "a's copy goes, on a, by UID: {on_a:?}");
+        assert!(on_a.contains(&Op::PurgeDraft { message_id: mid, draft: None, copy: Some(("Drafts".into(), 7, 21)), exact: true, left_by: Some((1, 0)) }), "a's copy goes, on a, by UID: {on_a:?}");
         assert!(s.draft_upload("b", 1).unwrap().unwrap().previous.is_none(), "b's upload replaces nothing");
     }
 
@@ -834,7 +852,7 @@ mod tests {
         assert!(s.draft_uploaded(1, &up, "Drafts", Some((1, 1)), true).unwrap());
         let moved = Draft { account: "b".into(), ..draft("hello") };
         assert!(s.save_draft(1, &moved, true, 2, 101).unwrap());
-        assert_eq!(queued(&s, "a"), vec![Op::PurgeDraft { message_id: mid, draft: None, copy: Some(("Drafts".into(), 1, 1)), exact: true }], "the copy on record, by UID");
+        assert_eq!(queued(&s, "a"), vec![Op::PurgeDraft { message_id: mid, draft: None, copy: Some(("Drafts".into(), 1, 1)), exact: true, left_by: Some((1, 0)) }], "the copy on record, by UID");
         assert!(s.draft_upload("a", 1).unwrap().is_none(), "not uploaded to the old account");
         assert!(s.draft_upload("b", 1).unwrap().is_some(), "but to the new one");
     }

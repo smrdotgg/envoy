@@ -347,6 +347,11 @@ pub enum Op {
         copy: Option<(String, u32, u32)>,
         #[serde(default)]
         exact: bool,
+        /// A cleanup's draft, and the upload generation whose copies it deletes: should the
+        /// draft be back on this account in a newer one, the search may take its new copy too,
+        /// and it's uploaded again ([`Store::draft_cleaned_up`]).
+        #[serde(default)]
+        left_by: Option<(i64, i64)>,
     },
 }
 
