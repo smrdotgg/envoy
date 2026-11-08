@@ -287,7 +287,22 @@ fn tidy_markdown(md: &str) -> String {
         }
         out.push('\n');
     }
-    out.trim().to_owned()
+    // A hard break before a blank line (or the end) would draw as a literal backslash.
+    let lines: Vec<&str> = out.lines().collect();
+    let mut fixed = String::with_capacity(out.len());
+    for (i, l) in lines.iter().enumerate() {
+        let next_blank = lines.get(i + 1).is_none_or(|n| n.trim().is_empty());
+        fixed.push_str(if next_blank { l.trim_end_matches('\\') } else { l });
+        fixed.push('\n');
+    }
+    fixed.trim().to_owned()
+}
+
+/// The bytes of the inline part with this Content-ID (`cid:` images in HTML mail).
+pub fn inline_part(raw: &[u8], cid: &str) -> Option<Vec<u8>> {
+    let msg = MessageParser::default().parse(raw)?;
+    let want = cid.trim_start_matches("cid:").trim_matches(|c| c == '<' || c == '>');
+    msg.parts.iter().find(|p| p.content_id().is_some_and(|id| id.trim_matches(|c| c == '<' || c == '>') == want)).map(|p| p.contents().to_vec())
 }
 
 #[cfg(test)]

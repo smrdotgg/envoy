@@ -13,6 +13,12 @@ use envoy_core::settings::Settings;
 
 use crate::fmt;
 
+pub enum ImageState {
+    Loading,
+    Ready(rune::Image),
+    Failed,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
     Mail,
@@ -182,6 +188,8 @@ pub struct App {
     pub demo: bool,
     pub settings_checked_at: f64,
     pub confirm_delete: Option<Vec<MessageId>>,
+    pub images: HashMap<String, ImageState>,
+    pub image_cache: Option<rune::ImageCache>,
 }
 
 pub fn parse_keys(s: &Settings) -> Vec<(Action, Keybind)> {
@@ -242,6 +250,8 @@ impl App {
             demo,
             settings_checked_at: 0.0,
             confirm_delete: None,
+            images: HashMap::new(),
+            image_cache: None,
         }
     }
 
@@ -306,7 +316,16 @@ impl App {
                             }
                         }
                         self.thread = messages;
+                        self.request_images();
                     }
+                }
+                Event::Image { url, width, height, rgba } => {
+                    if let Some(cache) = &self.image_cache {
+                        self.images.insert(url, ImageState::Ready(cache.rgba(width, height, rgba)));
+                    }
+                }
+                Event::ImageFailed { url } => {
+                    self.images.insert(url, ImageState::Failed);
                 }
                 Event::Changed { .. } => reload = true,
                 Event::Sync { account, state } => {
@@ -362,6 +381,39 @@ impl App {
             self.reload();
         }
         changed
+    }
+
+    /// Starts downloading the open conversation's images (once per URL per session).
+    pub fn request_images(&mut self) {
+        if self.settings.str("reading.loadImages") != "always" {
+            return;
+        }
+        let mut wanted = Vec::new();
+        for m in &self.thread {
+            let Some(doc) = m.body.as_ref().and_then(|b| b.doc.as_ref()) else { continue };
+            for url in &doc.images {
+                if !self.images.contains_key(url) {
+                    wanted.push((url.clone(), m.summary.id));
+                }
+            }
+        }
+        // Keep memory bounded: forget decoded images once the session has seen a lot of them.
+        if self.images.len() > 400 {
+            self.images.retain(|_, st| !matches!(st, ImageState::Ready(_)));
+        }
+        for (url, message) in wanted {
+            if self.demo {
+                // No engine in demo mode: fetch right here (demo only; blocks briefly).
+                let st = match (envoy_core::engine::fetch_image(&url, None), &self.image_cache) {
+                    (Ok((w, h, rgba)), Some(cache)) => ImageState::Ready(cache.rgba(w, h, rgba)),
+                    _ => ImageState::Failed,
+                };
+                self.images.insert(url, st);
+                continue;
+            }
+            self.images.insert(url.clone(), ImageState::Loading);
+            self.send(Command::FetchImage { url, message });
+        }
     }
 
     pub fn toast(&mut self, text: impl Into<String>, error: bool) {
@@ -473,6 +525,7 @@ impl App {
             if let Some(last) = self.thread.last() {
                 self.expanded.insert(last.summary.id);
             }
+            self.request_images();
         }
         let unread = self.list.iter().find(|s| s.id == id).is_some_and(|s| s.thread_unread);
         if unread {

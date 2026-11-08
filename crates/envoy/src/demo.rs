@@ -141,7 +141,10 @@ pub fn thread_for(id: MessageId) -> Vec<ThreadMessage> {
         if !last {
             m.flags |= flags::SEEN;
         }
-        let (text, markdown) = if last && i == 0 {
+        let html_path = std::env::var("ENVOY_DEMO_HTML").ok().filter(|_| last && i == 0);
+        let (text, markdown) = if html_path.is_some() {
+            (None, None)
+        } else if last && i == 0 {
             (None, Some(DESIGN_MD.to_owned()))
         } else if last {
             (Some(format!("{}\n\nSee you soon,\n{}\n\nOn Tue, You wrote:\n> Earlier message, quoted.", s.preview, first(s.from.0))), None)
@@ -161,6 +164,7 @@ pub fn thread_for(id: MessageId) -> Vec<ThreadMessage> {
                 cc: if last && s.count > 2 { vec![addr("Jordan Lee", "jordan@northwind.dev")] } else { vec![] },
                 reply_to: vec![],
                 text,
+                doc: html_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map(|h| std::sync::Arc::new(envoy_core::html::parse(&h))),
                 html: None,
                 markdown,
                 attachments,

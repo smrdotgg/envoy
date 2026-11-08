@@ -48,6 +48,8 @@ pub enum Command {
     SaveAttachment { id: MessageId, index: usize },
     OpenOriginal { id: MessageId },
     Settings(Box<Settings>),
+    /// Download (or read from the message, for `cid:`) and decode an image in an HTML mail.
+    FetchImage { url: String, message: MessageId },
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +71,9 @@ pub enum Event {
     /// A file was written (attachment, original message) and can be opened.
     Saved(PathBuf),
     Pending(u32),
+    /// A decoded image: straight-alpha sRGB RGBA.
+    Image { url: String, width: u32, height: u32, rgba: Arc<[u8]> },
+    ImageFailed { url: String },
 }
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -495,6 +500,24 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             };
             shared.emit(Event::Saved(path));
         }
+        Command::FetchImage { url, message } => {
+            let shared = shared.clone();
+            let raw = if url.starts_with("cid:") { shared.with_writer(|st| st.raw(message)).ok().flatten() } else { None };
+            tokio::spawn(async move {
+                let permit = IMAGE_SLOTS.acquire().await;
+                let u = url.clone();
+                let r = tokio::task::spawn_blocking(move || fetch_image(&u, raw.as_deref())).await;
+                drop(permit);
+                match r {
+                    Ok(Ok((width, height, rgba))) => shared.emit(Event::Image { url, width, height, rgba }),
+                    Ok(Err(e)) => {
+                        log::debug!("image {url}: {e:#}");
+                        shared.emit(Event::ImageFailed { url });
+                    }
+                    Err(_) => shared.emit(Event::ImageFailed { url }),
+                }
+            });
+        }
         Command::Settings(s) => {
             if let Ok(mut cur) = shared.settings.write() {
                 *cur = *s;
@@ -525,6 +548,44 @@ fn expand(shared: &Shared, ids: Vec<MessageId>, thread: bool, same_mailbox: bool
         }
         Ok(out)
     })
+}
+
+static IMAGE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(6);
+
+const MAX_IMAGE_BYTES: u64 = 15 * 1024 * 1024;
+
+/// Bytes for an image: a `cid:` part of the message, the disk cache, or the network.
+fn image_bytes(url: &str, raw: Option<&[u8]>) -> Result<Vec<u8>> {
+    if url.starts_with("cid:") {
+        return crate::mime::inline_part(raw.ok_or_else(|| anyhow!("message not downloaded"))?, url).ok_or_else(|| anyhow!("no such inline part"));
+    }
+    use sha2::Digest;
+    let dir = paths::data_dir().join("images");
+    let key: String = sha2::Sha256::digest(url.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(key);
+    if let Ok(b) = std::fs::read(&path) {
+        return Ok(b);
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .user_agent("Mozilla/5.0 (compatible; Envoy mail)")
+        .build()
+        .into();
+    let mut resp = agent.get(url).call()?;
+    let bytes = resp.body_mut().with_config().limit(MAX_IMAGE_BYTES).read_to_vec()?;
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&path, &bytes);
+    Ok(bytes)
+}
+
+pub fn fetch_image(url: &str, raw: Option<&[u8]>) -> Result<(u32, u32, Arc<[u8]>)> {
+    let bytes = image_bytes(url, raw)?;
+    let img = image::load_from_memory(&bytes)?;
+    // Email images are shown at most ~1000 points wide; keep 2× of that.
+    let img = if img.width() > 2000 { img.resize(2000, 2000 * img.height() / img.width().max(1), image::imageops::FilterType::Triangle) } else { img };
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Ok((w, h, Arc::from(rgba.into_raw())))
 }
 
 pub fn open_browser(url: &str) -> std::io::Result<()> {

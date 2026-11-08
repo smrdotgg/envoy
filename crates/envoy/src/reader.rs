@@ -120,6 +120,23 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
     let prefer_plain = s.settings.bool("reading.preferPlainText");
     let show_quoted = s.settings.bool("reading.showQuoted") || s.show_quoted.contains(&id);
     let copy_links = s.settings.bool("behavior.copyLinks");
+    let doc = b.doc.as_ref().filter(|d| !d.nodes.is_empty() && (!prefer_plain || b.text.as_ref().is_none_or(|t| t.trim().is_empty())));
+    if let Some(doc) = doc {
+        let cx = crate::html_view::Ctx {
+            t,
+            images: &s.images,
+            adapt: s.settings.str("reading.htmlColors") != "original",
+            load_images: s.settings.str("reading.loadImages") == "always",
+            copy_links: s.settings.bool("behavior.copyLinks"),
+            max_w,
+        };
+        let ready = doc.images.iter().filter(|u| matches!(s.images.get(*u), Some(crate::app::ImageState::Ready(_)))).count();
+        let version = (t.dark, cx.adapt, cx.load_images, cx.copy_links, max_w as u32, ready, std::sync::Arc::as_ptr(doc) as usize);
+        let rendered = rune::memo(format!("html-{id}"), version, || crate::html_view::render(&cx, doc));
+        let mut out = col().key(format!("body-{id}")).w_full().max_w(max_w + 32.0).gap(8.0).child(rendered);
+        out = attachments(out, t, b, id);
+        return out;
+    }
     let use_md = b.markdown.as_ref().is_some_and(|md| !md.trim().is_empty()) && (!prefer_plain || b.text.as_ref().is_none_or(|t| t.trim().is_empty()));
     let mut out = col().key(format!("body-{id}")).w_full().max_w(max_w).gap(8.0);
     if use_md {
@@ -162,6 +179,11 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
             );
         }
     }
+    attachments(out, t, b, id)
+}
+
+fn attachments(mut out: El, t: &Theme, b: &envoy_core::model::Body, id: i64) -> El {
+    let k = &t.k;
     if !b.attachments.is_empty() {
         let mut chips = row().key(format!("atts-{id}")).gap(8.0).flex_wrap().pt(8.0);
         for a in &b.attachments {

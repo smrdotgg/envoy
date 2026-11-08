@@ -8,6 +8,7 @@ mod app;
 mod compose;
 mod demo;
 mod fmt;
+mod html_view;
 mod icons;
 mod reader;
 mod theme;
@@ -37,6 +38,7 @@ fn init() -> App {
 }
 
 fn setup(s: &mut App, waker: Waker) {
+    s.image_cache = Some(rune::ImageCache::new(waker.clone()));
     if s.demo {
         return;
     }

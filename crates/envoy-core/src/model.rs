@@ -184,8 +184,10 @@ pub struct Body {
     pub reply_to: Vec<Address>,
     pub text: Option<String>,
     pub html: Option<String>,
-    /// The HTML turned into Markdown, for drawing natively.
+    /// The HTML turned into Markdown (for quoting in replies).
     pub markdown: Option<String>,
+    /// The HTML as a layout tree, for drawing natively.
+    pub doc: Option<std::sync::Arc<crate::html::Doc>>,
     pub attachments: Vec<Attachment>,
 }
 

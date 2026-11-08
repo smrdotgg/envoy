@@ -451,7 +451,9 @@ impl Store {
             markdown = Some(md);
         }
         let attachments: Vec<AttachmentRow> = from_json(&attachments);
+        let doc = html.as_deref().map(|h| std::sync::Arc::new(crate::html::parse(h)));
         Ok(Some(Body {
+            doc,
             id,
             message_id,
             references: refs,
