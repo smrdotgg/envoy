@@ -38,8 +38,9 @@ pub struct Recovered {
     /// It was in the composer.
     pub open: bool,
     /// The app's stamp when it was written (or sent): imported like a save made then, so it
-    /// doesn't overwrite anything newer.
-    pub stamp: i64,
+    /// doesn't overwrite anything newer, unsent messages included.
+    #[serde(alias = "stamp")]
+    pub rev: i64,
     /// The draft's lifecycle it was written in: it brings back nothing that ended since.
     #[serde(default)]
     pub lifecycle: i64,
@@ -83,11 +84,11 @@ pub fn import_recovery(path: &Path, st: &Store, now: i64) -> Result<usize> {
     };
     let waiting: Vec<Recovered> = serde_json::from_slice(&bytes)?;
     for r in &waiting {
-        let at = DraftRev { lifecycle: r.lifecycle, rev: r.stamp };
+        let at = DraftRev { lifecycle: r.lifecycle, rev: r.rev };
         let kept = if r.unsent { st.draft_unsent(r.id, &r.draft, Some(at), now)? } else { save(st, r.id, &r.draft, r.open, at, now)?.is_some() };
         if !kept {
             let id = st.fresh_draft_id(now)?;
-            save(st, id, &r.draft, r.open, DraftRev { lifecycle: 0, rev: r.stamp }, now)?;
+            save(st, id, &r.draft, r.open, DraftRev { lifecycle: 0, rev: r.rev }, now)?;
         }
     }
     std::fs::remove_file(path)?;
@@ -214,8 +215,8 @@ mod tests {
         dir
     }
 
-    fn recovered(id: i64, subject: &str, stamp: i64, unsent: bool) -> Recovered {
-        Recovered { id, draft: Draft { account: "a".into(), subject: subject.into(), ..Draft::default() }, open: true, stamp, lifecycle: 0, unsent }
+    fn recovered(id: i64, subject: &str, rev: i64, unsent: bool) -> Recovered {
+        Recovered { id, draft: Draft { account: "a".into(), subject: subject.into(), ..Draft::default() }, open: true, rev, lifecycle: 0, unsent }
     }
 
     #[test]
@@ -254,6 +255,19 @@ mod tests {
         let subjects: Vec<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
         assert_eq!(subjects.len(), 2, "{subjects:?}");
         assert!(subjects.contains(&"typed after the late undo".to_owned()), "its text is kept, as a new draft: {subjects:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recovered_unsent_message_overwrites_nothing_newer() {
+        let dir = temp("unsent");
+        let file = dir.join("drafts-recovery.json");
+        let st = Store::memory();
+        save_recovery(&file, &[recovered(1, "sent, never queued", 40, true)]).unwrap();
+        // Edited since, in a later run (the file stayed: the database refused it then).
+        st.save_draft(1, &Draft { account: "a".into(), subject: "edited since".into(), ..Draft::default() }, true, DraftRev { lifecycle: 0, rev: 50 }, 100).unwrap();
+        import_recovery(&file, &st, 101).unwrap();
+        assert_eq!(st.draft(1).unwrap().unwrap().draft.subject, "edited since");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

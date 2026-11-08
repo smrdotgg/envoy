@@ -172,9 +172,9 @@ impl Unsaved {
     fn recovered(&self) -> envoy_core::drafts::Recovered {
         match self {
             Unsaved::Save { id, draft, open, rev, lifecycle } => {
-                envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: *open, stamp: *rev, lifecycle: *lifecycle, unsent: false }
+                envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: *open, rev: *rev, lifecycle: *lifecycle, unsent: false }
             }
-            Unsaved::Unsent { id, draft, rev, lifecycle } => envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: true, stamp: *rev, lifecycle: *lifecycle, unsent: true },
+            Unsaved::Unsent { id, draft, rev, lifecycle } => envoy_core::drafts::Recovered { id: *id, draft: draft.clone(), open: true, rev: *rev, lifecycle: *lifecycle, unsent: true },
         }
     }
 
@@ -2393,6 +2393,10 @@ mod tests {
         assert!(unsaved.iter().any(|u| has(u, b)), "B, parked with its edits: {unsaved:?}");
         assert!(unsaved.iter().any(|u| matches!(u, Unsaved::Unsent { id, draft, .. } if *id == c && draft.to == "ana@x.com")), "C, as sent: {unsaved:?}");
         assert!(matches!(unsaved.last(), Some(Unsaved::Unsent { .. })), "after C's own earlier save, so the sent version wins");
+        // In the recovery file too, it keeps its stamp: it overwrites nothing newer there either.
+        let Some(Unsaved::Unsent { rev, .. }) = unsaved.last() else { panic!("{unsaved:?}") };
+        let kept = unsaved.last().unwrap().recovered();
+        assert!(kept.unsent && kept.rev == *rev, "{kept:?}");
         assert!(app.unsaved().is_empty(), "taken");
         // Confirmed, none of it is written again.
         let (d, d_rev) = typed_and_saved(&mut app, "Draft D");

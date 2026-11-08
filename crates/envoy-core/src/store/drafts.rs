@@ -450,10 +450,11 @@ impl Store {
 
     /// Keeps a message that wasn't sent as a draft, in the composer, with what was being sent:
     /// its send couldn't be queued, or the window closed before the engine confirmed it. `at`:
-    /// the composer's when it sent; None for the engine's own copy, written as the send failed,
-    /// which nothing came after. True when that's dealt with: kept, or its send is queued or
-    /// went out (nothing to keep). False when refused like a save ([`Store::save_draft`]): the
-    /// draft ended without being sent, or moved on, and the caller must keep the text.
+    /// the composer's when it sent, ordering it like a save (it overwrites nothing newer); None
+    /// for the engine's own copy, written as the send failed, which nothing came after. True
+    /// when that's dealt with: kept, or overtaken, or its send is queued or went out (nothing
+    /// to keep). False when refused like a save ([`Store::save_draft`]): the draft ended
+    /// without being sent, or moved on, and the caller must keep the text.
     pub fn draft_unsent(&self, id: i64, draft: &Draft, at: Option<DraftRev>, now: i64) -> Result<bool> {
         self.transaction(|st| {
             let on_its_way: bool = st.conn.query_row(
@@ -464,7 +465,7 @@ impl Store {
             if on_its_way {
                 return Ok(true);
             }
-            Ok(st.put_draft(id, draft, true, at.map(|a| a.lifecycle), None, now)?.is_some())
+            Ok(st.put_draft(id, draft, true, at.map(|a| a.lifecycle), at.map(|a| a.rev), now)?.is_some())
         })
     }
 
@@ -701,6 +702,19 @@ mod tests {
         assert!(s.draft_unsent(1, &draft("hello"), Some(at(2)), 102).unwrap(), "nothing to keep");
         assert!(!s.draft(1).unwrap().unwrap().visible, "still in the outbox");
         assert_eq!(s.draft_to_restore().unwrap(), None);
+    }
+
+    #[test]
+    fn an_unsent_copy_overwrites_nothing_newer() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("newer"), true, at(20), 100).unwrap();
+        // The copy of an earlier send that never got queued, written late (from the recovery
+        // file, say): newer text is already there.
+        assert!(s.draft_unsent(1, &draft("older"), Some(at(10)), 101).unwrap(), "dealt with");
+        assert_eq!(s.draft(1).unwrap().unwrap().draft.subject, "newer");
+        // One made after it is kept.
+        assert!(s.draft_unsent(1, &draft("sent"), Some(at(30)), 102).unwrap());
+        assert_eq!(s.draft(1).unwrap().unwrap().draft.subject, "sent");
     }
 
     #[test]
