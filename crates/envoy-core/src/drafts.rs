@@ -29,6 +29,16 @@ pub fn save(st: &Store, id: i64, draft: &Draft, open: bool, at: DraftRev, now: i
     Ok(Some(false))
 }
 
+/// Saves `draft` as a new draft ([`Store::insert_new_draft`]) and queues its upload, in one
+/// transaction. Returns its id.
+pub fn save_new(st: &Store, draft: &Draft, open: bool, rev: i64, now: i64) -> Result<i64> {
+    st.transaction(|st| {
+        let id = st.insert_new_draft(draft, open, rev, now)?;
+        st.queue_draft_upload(&draft.account, id, if open { now + UPLOAD_DELAY } else { now })?;
+        Ok(id)
+    })
+}
+
 /// A draft the app couldn't write to the store as the window closed: kept in a file of its own
 /// in the recovery folder ([`recovery_dir`]) and imported on the next start, so it's never lost.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -84,9 +94,9 @@ fn write_recovered(dir: &Path, r: &Recovered) -> Result<()> {
 }
 
 /// Imports the drafts waiting in the recovery folder `dir` (none if there's no folder), oldest
-/// first, one file at a time: each like a save made when it was written (one the store
-/// refuses, its draft having ended or moved on since, becomes a draft of its own), and its
-/// file is removed only once that's in the store. Files written meanwhile, by this Envoy or
+/// first, one file at a time: each like a save made when it was written, and its file is
+/// removed only once the store holds its text. One the store refuses (its draft ended or moved
+/// on since), or that newer text overtook, becomes a draft of its own. Files written meanwhile, by this Envoy or
 /// another, wait for the next import; one another importer took first is skipped. A file that
 /// isn't a draft is set aside (renamed), never removed. Stops at the first store error, leaving
 /// the rest for the next start. Returns how many were imported.
@@ -129,14 +139,19 @@ pub fn import_recovery(dir: &Path, st: &Store, now: i64) -> Result<usize> {
     Ok(imported)
 }
 
-/// One recovered draft into the store, like a save made when it was written; as a new draft if
-/// the store refuses it.
+/// One recovered draft into the store, like a save made when it was written. Only its text in
+/// the store (or, for an unsent message, its send on its way) lets its file go: refused, or
+/// overtaken by other text, it's kept as a new draft.
 fn import_one(st: &Store, r: &Recovered, now: i64) -> Result<()> {
     let at = DraftRev { lifecycle: r.lifecycle, rev: r.rev };
-    let kept = if r.unsent { st.draft_unsent(r.id, &r.draft, Some(at), now)? } else { save(st, r.id, &r.draft, r.open, at, now)?.is_some() };
-    if !kept {
-        let id = st.fresh_draft_id(now)?;
-        save(st, id, &r.draft, r.open, DraftRev { lifecycle: 0, rev: r.rev }, now)?;
+    if r.unsent {
+        st.draft_unsent(r.id, &r.draft, Some(at), now)?;
+    } else {
+        save(st, r.id, &r.draft, r.open, at, now)?;
+    }
+    let held = st.draft(r.id)?.is_some_and(|d| d.draft == r.draft) || (r.unsent && st.draft_on_its_way(r.id)?);
+    if !held {
+        save_new(st, &r.draft, r.open, r.rev, now)?;
     }
     Ok(())
 }
@@ -321,9 +336,10 @@ mod tests {
         import_recovery(&file, &st, 101).unwrap();
         assert_eq!(st.draft(1).unwrap().unwrap().draft.subject, "newer");
         assert_eq!((st.draft(2).unwrap(), st.draft(3).unwrap()), (None, None), "neither comes back");
-        let subjects: Vec<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
-        assert_eq!(subjects.len(), 2, "{subjects:?}");
-        assert!(subjects.contains(&"typed after the late undo".to_owned()), "its text is kept, as a new draft: {subjects:?}");
+        let mut subjects: Vec<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
+        subjects.sort();
+        // The texts that couldn't go where they were written are kept as new drafts.
+        assert_eq!(subjects, vec!["newer", "older", "typed after the late undo"], "{subjects:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -361,6 +377,66 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_draft_overtaken_by_other_text_is_kept_as_its_own() {
+        let dir = temp("overtaken");
+        let folder = dir.join("drafts-recovery");
+        let st = Store::memory();
+        save_recovery(&folder, &[recovered(1, "written at close", 40, false)]).unwrap();
+        // Saved since with other text, stamped later.
+        st.save_draft(1, &Draft { account: "a".into(), subject: "saved since".into(), ..Draft::default() }, true, DraftRev { lifecycle: 0, rev: 50 }, 100).unwrap();
+        import_recovery(&folder, &st, 101).unwrap();
+        assert_eq!(st.draft(1).unwrap().unwrap().draft.subject, "saved since", "nothing newer overwritten");
+        let subjects: Vec<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
+        assert!(subjects.contains(&"written at close".to_owned()), "and the file's text is in the store before the file goes: {subjects:?}");
+        assert!(files(&folder).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn importers_running_at_once_keep_every_refused_draft() {
+        let dir = temp("importers");
+        let db = dir.join("mail.sqlite");
+        let (importers, each) = (4i64, 30i64);
+        // Every snapshot's draft ended since it was written: each is kept as a new draft.
+        {
+            let st = Store::open(&db).unwrap();
+            for id in 1..=importers * each {
+                st.save_draft(id, &Draft { account: "a".into(), ..Draft::default() }, true, DraftRev { lifecycle: 0, rev: 1 }, 100).unwrap();
+                st.discard_draft(id, None).unwrap();
+            }
+        }
+        let folders: Vec<PathBuf> = (0..importers)
+            .map(|i| {
+                let folder = dir.join(format!("recovery-{i}"));
+                let snapshots: Vec<Recovered> = (0..each).map(|j| recovered(1 + i * each + j, &format!("text {i}-{j}"), 10 + j, false)).collect();
+                save_recovery(&folder, &snapshots).unwrap();
+                folder
+            })
+            .collect();
+        // Envoys starting at once, each importing its own snapshots into the same database.
+        std::thread::scope(|s| {
+            for folder in &folders {
+                let db = &db;
+                s.spawn(move || {
+                    let st = Store::open(db).unwrap();
+                    for _ in 0..200 {
+                        let _ = import_recovery(folder, &st, 100); // busy: the rest waits for the next go
+                        if files(folder).is_empty() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let st = Store::open(&db).unwrap();
+        let subjects: HashSet<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
+        let lost: Vec<String> = (0..importers).flat_map(|i| (0..each).map(move |j| format!("text {i}-{j}"))).filter(|t| !subjects.contains(t)).collect();
+        assert!(lost.is_empty(), "lost {} of {}: {lost:?}", lost.len(), importers * each);
+        assert!(folders.iter().all(|f| files(f).is_empty()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_recovered_unsent_message_overwrites_nothing_newer() {
         let dir = temp("unsent");
         let file = dir.join("drafts-recovery");
@@ -370,6 +446,8 @@ mod tests {
         st.save_draft(1, &Draft { account: "a".into(), subject: "edited since".into(), ..Draft::default() }, true, DraftRev { lifecycle: 0, rev: 50 }, 100).unwrap();
         import_recovery(&file, &st, 101).unwrap();
         assert_eq!(st.draft(1).unwrap().unwrap().draft.subject, "edited since");
+        let subjects: Vec<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
+        assert!(subjects.contains(&"sent, never queued".to_owned()), "kept as a new draft: {subjects:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
