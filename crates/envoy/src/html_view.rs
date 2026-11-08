@@ -111,14 +111,24 @@ impl Ctx<'_> {
     }
 }
 
+/// What pressing a link in mail does: open it, or copy it with `behavior.copyLinks`.
+fn follow(url: &str, copy: bool, tx: &mut Tx) {
+    if copy {
+        tx.copy(url.to_owned());
+    } else {
+        let _ = tx.open_url(url);
+    }
+}
+
 fn link_handler(e: El, copy: bool) -> El {
-    e.on_link(move |_: &mut App, url: &str, tx: &mut Tx| {
-        if copy {
-            tx.copy(url.to_owned());
-        } else {
-            let _ = tx.open_url(url);
-        }
-    })
+    e.on_link(move |_: &mut App, url: &str, tx: &mut Tx| follow(url, copy, tx))
+}
+
+/// A box or picture that's a link: announced as one, and pressed as text links are
+/// ([`follow`]). The only place mail sets `href` on an element: `El::href` alone always opens.
+fn linked(e: El, url: &str, copy: bool) -> El {
+    let u = url.to_owned();
+    e.href(url.to_owned()).cursor(rune::Cursor::Pointer).on_press_tx(move |_: &mut App, tx: &mut Tx| follow(&u, copy, tx))
 }
 
 fn weight(w: u16) -> f32 {
@@ -233,7 +243,7 @@ fn image(cx: &Ctx, img: &Img, l: Local) -> El {
         }
     };
     if let Some(h) = &img.href {
-        e = e.href(h.clone()).cursor(rune::Cursor::Pointer);
+        e = linked(e, h, cx.copy_links);
     }
     e
 }
@@ -299,7 +309,7 @@ fn styled_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
         }
     }
     if let Some(h) = &s.href {
-        e = e.href(h.clone()).cursor(rune::Cursor::Pointer).hover(Color::WHITE.alpha(0.08)).press(Color::BLACK.alpha(0.08));
+        e = linked(e, h, cx.copy_links).hover(Color::WHITE.alpha(0.08)).press(Color::BLACK.alpha(0.08));
     }
     e
 }
@@ -446,5 +456,23 @@ pub fn render(cx: &Ctx, doc: &Doc) -> El {
         col().w_full().max_w(cx.max_w + 32.0).padding(16.0).radius(12.0).fill(page).child(c)
     } else {
         c
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_linked_element_honours_copy_links() {
+        // `El::href` installs a press handler that always opens the URL, ignoring
+        // `behavior.copyLinks`; boxes and pictures used it directly. Now only `linked` may
+        // call it, and it replaces that handler with the one text links use.
+        let src = include_str!("html_view.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        let call = [".hr", "ef("].concat();
+        assert_eq!(code.matches(&call).count(), 1, "every link goes through `linked`");
+        let at = code.find(&call).unwrap();
+        let def = code[..at].rfind("fn ").unwrap();
+        assert!(code[def..].starts_with("fn linked("), "the one call is in `linked`");
+        assert!(code[at..].lines().next().unwrap().contains("follow(&u, copy, tx)"));
     }
 }
