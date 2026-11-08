@@ -122,7 +122,8 @@ CREATE TRIGGER IF NOT EXISTS drafts_files_delete AFTER DELETE ON drafts BEGIN
     DELETE FROM draft_files WHERE draft = old.id;
 END;
 CREATE TABLE IF NOT EXISTS draft_ends (
-    id INTEGER PRIMARY KEY,
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER NOT NULL UNIQUE,
     lifecycle INTEGER NOT NULL,
     sent INTEGER NOT NULL
 );
@@ -163,17 +164,19 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
 /// Building it takes 0.2 s for a 100k-message cache on an M4 Pro, once, on the engine's thread.
 ///
 /// A draft deleted (sent, purged, discarded, its account removed) is remembered in draft_ends,
-/// so no write from its life brings it back. Ids are never reused, so the newest 10,000 are
-/// plenty. They replace the clock-stamped tombstones of an earlier build.
+/// so no write from its life brings it back: the last 10,000 ends, in the order they happened
+/// (`seq`; a draft's id says when it was started, not when it ended). They replace the
+/// clock-stamped tombstones, and the id-ordered trigger, of earlier builds.
 const POST_MIGRATION: &str = "
 DROP INDEX IF EXISTS messages_box_date;
 DROP INDEX IF EXISTS messages_list;
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages (account, mailbox, date DESC, id DESC, flags, held_op, has_attachments, thread, message_id, from_email, from_name);
 DROP TRIGGER IF EXISTS drafts_tombstone;
 DROP TABLE IF EXISTS draft_tombstones;
-CREATE TRIGGER IF NOT EXISTS drafts_end AFTER DELETE ON drafts BEGIN
+DROP TRIGGER IF EXISTS drafts_end;
+CREATE TRIGGER IF NOT EXISTS drafts_ended AFTER DELETE ON drafts BEGIN
     INSERT OR REPLACE INTO draft_ends (id, lifecycle, sent) VALUES (old.id, old.lifecycle, old.sending != 0 OR old.sent != 0);
-    DELETE FROM draft_ends WHERE id < (SELECT id FROM draft_ends ORDER BY id DESC LIMIT 1 OFFSET 9999);
+    DELETE FROM draft_ends WHERE seq <= (SELECT MAX(seq) FROM draft_ends) - 10000;
 END;
 CREATE INDEX IF NOT EXISTS messages_held ON messages (held_op) WHERE held_op != 0;
 CREATE INDEX IF NOT EXISTS messages_held_box ON messages (account, mailbox, flags, held_op) WHERE held_op != 0;
@@ -228,6 +231,24 @@ CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM fts WHERE rowid = old.id;
 END;
 DROP TABLE fts_upgrade;
+";
+
+/// draft_ends from an earlier build, keyed by draft id, gets its order of ends (oldest first,
+/// as best known: by id). Its trigger goes first (a rename fails while a trigger names a
+/// missing table); POST_MIGRATION puts the new one in.
+const DRAFT_ENDS_AUTOINCREMENT: &str = "
+BEGIN;
+DROP TRIGGER IF EXISTS drafts_end;
+CREATE TABLE draft_ends_new (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER NOT NULL UNIQUE,
+    lifecycle INTEGER NOT NULL,
+    sent INTEGER NOT NULL
+);
+INSERT INTO draft_ends_new (id, lifecycle, sent) SELECT id, lifecycle, sent FROM draft_ends ORDER BY id;
+DROP TABLE draft_ends;
+ALTER TABLE draft_ends_new RENAME TO draft_ends;
+COMMIT;
 ";
 
 // Undo bookkeeping. Every successful op runs DELETE_HELD, so these must hit the partial
@@ -320,6 +341,13 @@ fn migrate(conn: &Connection) -> Result<()> {
             let _ = conn.execute_batch("ROLLBACK");
         }
         conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        rebuilt?;
+    }
+    if !has_autoincrement(conn, "draft_ends")? {
+        let rebuilt = conn.execute_batch(DRAFT_ENDS_AUTOINCREMENT);
+        if rebuilt.is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
         rebuilt?;
     }
     conn.execute_batch(POST_MIGRATION)?;
