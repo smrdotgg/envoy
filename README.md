@@ -4,6 +4,9 @@ A fast, native, configurable email client in Rust, built on [Rune](https://githu
 (GPU-rendered native UI). Gmail-like layout, offline-first, everything configurable from a
 VS Code–style settings screen backed by a plain `settings.json`.
 
+**Email at the speed of thought.** See [`docs/NORTH_STAR.md`](docs/NORTH_STAR.md) for the laws
+every decision is judged against. MIT licensed.
+
 ## Try it
 
 ```sh
