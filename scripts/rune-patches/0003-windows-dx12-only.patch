@@ -22,3 +22,84 @@ index 094a381..a7a1a08 100644
  
  [lints]
  workspace = true
+diff --git a/vendor/rune/crates/rune/src/gpu/pick.rs b/vendor/rune/crates/rune/src/gpu/pick.rs
+index caa9de5..040fc0e 100644
+--- a/vendor/rune/crates/rune/src/gpu/pick.rs
++++ b/vendor/rune/crates/rune/src/gpu/pick.rs
+@@ -123,7 +123,18 @@ fn request(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, power
+         compatible_surface: surface,
+         apply_limit_buckets: false,
+     }))
+-    .map_err(|error| format!("no GPU adapter: {error}"))
++    .map_err(|error| no_adapter(&error))
++}
++
++#[cfg(not(target_os = "windows"))]
++fn no_adapter(error: &dyn std::fmt::Display) -> String { format!("no GPU adapter: {error}") }
++
++/// Windows draws with DX12 alone (`Gpu::wgpu_instance`), whose adapter list always holds WARP
++/// when Direct3D 12 works at all: none means it didn't start.
++#[cfg(target_os = "windows")]
++fn no_adapter(error: &dyn std::fmt::Display) -> String {
++    format!("Direct3D 12 didn't start: no DX12 adapter, not even WARP, Windows' software renderer ({error}). \
++        Update or reinstall the graphics driver; if that doesn't help, repair Windows' graphics components (d3d12.dll, dxgi.dll)")
+ }
+ 
+ /// The first usable adapter whose name contains `name`, ignoring case.
+diff --git a/vendor/rune/crates/rune/src/render.rs b/vendor/rune/crates/rune/src/render.rs
+index 1d59183..19f85a4 100644
+--- a/vendor/rune/crates/rune/src/render.rs
++++ b/vendor/rune/crates/rune/src/render.rs
+@@ -534,23 +534,16 @@ impl Gpu {
+         if crate::gpu::backend::wgpu_for(wanted) { Self::wgpu_instance() } else { Self::instance() }
+     }
+ 
+-    /// wgpu's own backends, whatever `RUNE_GPU_BACKEND` says: DX12 alone on Windows: it's the backend that composites transparent surfaces, and a
+-    /// Vulkan instance loads every GPU's Vulkan driver, where a broken one (Intel's, on a hybrid
+-    /// laptop) crashed the process before its first window (Hex #662). Vulkan only when no DX12
+-    /// adapter exists.
+-    /// The choice is made on the first GPU use in the process, not at launch, so a windowless
+-    /// app (a tray app before it draws anything) touches no GPU: asking whether a DX12 adapter
+-    /// exists makes a device on every adapter, over 100 ms.
++    /// wgpu's own backends, whatever `RUNE_GPU_BACKEND` says: DX12 alone on Windows. It's the
++    /// backend that composites transparent surfaces, and it always has an adapter: DXGI lists
++    /// WARP, the software rasterizer, on every Windows 10 and later, with or without a GPU. Windows
++    /// builds have no Vulkan (a Vulkan instance loads every GPU's Vulkan driver, where a broken one,
++    /// Intel's on a hybrid laptop, crashed the process before its first window: Hex #662). A DX12
++    /// that lists no adapter at all fails the pick with a message saying so (`gpu::pick`).
+     #[cfg(target_os = "windows")]
+     fn wgpu_instance() -> wgpu::Instance {
+-        static DX12: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+         let _serial = GPU_INIT.lock().unwrap_or_else(|e| e.into_inner());
+-        let dx12 = *DX12.get_or_init(|| {
+-            let found = !pollster::block_on(Self::wgpu_instance_on(wgpu::Backends::DX12).enumerate_adapters(wgpu::Backends::DX12)).is_empty();
+-            if !found { eprintln!("rune: no DX12 adapter; drawing with Vulkan"); }
+-            found
+-        });
+-        Self::wgpu_instance_on(if dx12 { wgpu::Backends::DX12 } else { wgpu::Backends::VULKAN })
++        Self::wgpu_instance_on(wgpu::Backends::DX12)
+     }
+ 
+     /// wgpu's own backends, whatever `RUNE_GPU_BACKEND` says.
+diff --git a/vendor/rune/crates/rune/src/render/warmup.rs b/vendor/rune/crates/rune/src/render/warmup.rs
+index 0911690..ac3c840 100644
+--- a/vendor/rune/crates/rune/src/render/warmup.rs
++++ b/vendor/rune/crates/rune/src/render/warmup.rs
+@@ -24,8 +24,7 @@ pub(crate) fn park_gpu(gpu: super::Gpu, renderer: super::Renderer) {
+ /// it's still working; unclaimed, they go half a minute after the last call. Does nothing while a
+ /// surface's device lives. `features` are the ones that surface's compositor asks for
+ /// (`Compositor::features`); a device without them isn't taken. Windows and Linux; on macOS
+-/// use `prewarm_gpu`. On Windows, the first call in a process also makes the DX12-or-Vulkan
+-/// choice on its thread. Cheap to call often, from any thread.
++/// use `prewarm_gpu`. Cheap to call often, from any thread.
+ pub fn warm_gpu(features: wgpu::Features) {
+     #[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
+     super::prewarm::warm(features, None);
+@@ -35,7 +34,6 @@ pub fn warm_gpu(features: wgpu::Features) {
+ 
+ /// `warm_gpu`, then `prepare` on that thread with the device, new or the one a surface draws
+ /// with: an app makes its own pipelines there, off the UI thread, for its compositor to find.
+-/// On Windows, its first call in a process also makes the DX12-or-Vulkan choice on that thread.
+ pub fn warm_gpu_with(features: wgpu::Features, prepare: impl FnOnce(&wgpu::Device) + Send + 'static) {
+     #[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
+     super::prewarm::warm(features, Some(Box::new(prepare)));
