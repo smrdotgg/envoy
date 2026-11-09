@@ -73,9 +73,12 @@ pub enum Command {
     RemoveAccount { id: String },
     GoogleSignIn { client_id: String, client_secret: String, hint: String },
     SaveAttachment { id: MessageId, index: usize },
+    /// Open the message as received: its raw MIME as an `.eml` file in a private folder
+    /// ([`crate::paths::write_export`]), for the system's mail viewer.
     OpenOriginal { id: MessageId },
     /// Open a message's HTML in the system browser, sanitized ([`crate::mime::browser_html`]):
-    /// nothing in it runs, and remote pictures load only with `remote_images`.
+    /// nothing in it runs, and remote pictures load only with `remote_images`. Written to the
+    /// same private folder.
     OpenInBrowser { id: MessageId, remote_images: bool },
     Settings(Box<Settings>),
     /// Download (or read from the message, for `cid:`) and decode an image in an HTML mail.
@@ -686,32 +689,17 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             shared.emit(Event::Saved(path));
         }
         Command::OpenOriginal { id } => {
-            let body = shared.with_writer(|st| st.body(id))?.ok_or_else(|| anyhow!("The message isn't downloaded yet"))?;
-            let dir = std::env::temp_dir().join("envoy");
-            std::fs::create_dir_all(&dir)?;
-            let path = match (&body.html, &body.text) {
-                (Some(h), _) => {
-                    let p = dir.join(format!("message-{id}.html"));
-                    std::fs::write(&p, h)?;
-                    p
-                }
-                (None, Some(t)) => {
-                    let p = dir.join(format!("message-{id}.txt"));
-                    std::fs::write(&p, t)?;
-                    p
-                }
-                _ => return Err(anyhow!("This message has no body")),
-            };
+            // The message as received, for the system's mail viewer: nothing in it is rendered
+            // by a browser that ignores Envoy's image setting.
+            let raw = shared.with_writer(|st| st.raw(id))?.ok_or_else(|| anyhow!("The message isn't downloaded yet"))?;
+            let path = crate::paths::write_export(&format!("message-{id}"), "eml", &raw)?;
             shared.emit(Event::Saved(path));
         }
         Command::OpenInBrowser { id, remote_images } => {
             let (body, raw) = shared.with_writer(|st| Ok((st.body(id)?, st.raw(id)?)))?;
             let html = body.and_then(|b| b.html).ok_or_else(|| anyhow!("This message has no HTML to open"))?;
             let safe = crate::mime::browser_html(&html, raw.as_deref(), remote_images);
-            let dir = std::env::temp_dir().join("envoy");
-            std::fs::create_dir_all(&dir)?;
-            let path = dir.join(format!("message-{id}-safe.html"));
-            std::fs::write(&path, safe)?;
+            let path = crate::paths::write_export(&format!("message-{id}-safe"), "html", safe.as_bytes())?;
             shared.emit(Event::Saved(path));
         }
         Command::FetchImage { url, message } => {

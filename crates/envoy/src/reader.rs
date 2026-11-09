@@ -83,7 +83,7 @@ fn header(s: &App, t: &Theme) -> El {
                 .build(k)
                 .key("t-star"),
         )
-        .child(tool(t, &icons::EXTERNAL, "Open original in browser", "t-original", move |s, _| s.send(Command::OpenOriginal { id: last_id })));
+        .child(tool(t, &icons::EXTERNAL, "Open original (.eml) in your mail viewer", "t-original", move |s, _| s.send(Command::OpenOriginal { id: last_id })));
 
     let mut title_row = row().gap(10.0).items_start().w_full().child(
         text(subject).font(rune::TextStyle::new(21.0, 600.0).lh(28.0)).color(k.c.text_base).wrap().selectable(true).grow(1.0).min_w(0.0),
