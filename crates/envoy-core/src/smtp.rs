@@ -2,8 +2,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use lettre::message::{Mailbox as LMailbox, Mailboxes, header};
+use lettre::Message;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::transport::smtp::client::{AsyncSmtpConnection, TlsParameters};
 
 use crate::accounts::Account;
 use crate::imap::Credential;
@@ -71,9 +72,10 @@ fn with_body(b: lettre::message::MessageBuilder, text: &str, files: Files) -> Re
     }
     let mut parts = MultiPart::mixed().singlepart(SinglePart::builder().header(header::ContentType::TEXT_PLAIN).body(text));
     for (a, data) in files {
-        // Text that is UTF-8 says so (a server draft's text files were read as UTF-8); any
-        // other is left for the reader to work out, rather than mislabelled.
-        let mime = if a.mime.starts_with("text/") && std::str::from_utf8(&data).is_ok() { format!("{}; charset=utf-8", a.mime) } else { a.mime.clone() };
+        // Text keeps the charset it came with (a forwarded file); other text that is UTF-8
+        // says so; any other is left for the reader to work out, rather than mislabelled.
+        let labelled = a.mime.to_ascii_lowercase().contains("charset=");
+        let mime = if a.mime.starts_with("text/") && !labelled && std::str::from_utf8(&data).is_ok() { format!("{}; charset=utf-8", a.mime) } else { a.mime.clone() };
         let kind = header::ContentType::parse(&mime).or_else(|_| header::ContentType::parse("application/octet-stream"))?;
         parts = parts.singlepart(Attachment::new(a.filename).body(data, kind));
     }
@@ -158,36 +160,66 @@ pub fn build(account: &Account, draft: &Draft, files: Files) -> Result<Built> {
     Ok(Built { raw: msg.formatted(), from: account.email.clone(), to: to_addrs })
 }
 
-pub async fn send(account: &Account, cred: &Credential, from: &str, to: &[String], raw: &[u8]) -> Result<()> {
-    use lettre::transport::smtp::client::{Tls, TlsParameters};
+/// The largest message a server takes, from its EHLO answer's `SIZE` line (RFC 1870): None when
+/// it gives none, or 0 ("no fixed limit").
+pub fn ehlo_size<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<u64> {
+    lines
+        .into_iter()
+        .find_map(|line| {
+            let mut words = line.split_whitespace();
+            words.next().filter(|w| w.eq_ignore_ascii_case("SIZE"))?;
+            words.next().and_then(|n| n.parse().ok())
+        })
+        .filter(|size| *size > 0)
+}
+
+/// A connection to the account's SMTP server, encrypted (TLS from the first byte on 465,
+/// STARTTLS, required, otherwise), and the largest message it says it takes.
+async fn connect(account: &Account) -> Result<(AsyncSmtpConnection, Option<u64>)> {
+    use lettre::transport::smtp::commands::Ehlo;
+    use lettre::transport::smtp::extension::ClientId;
     let host = account.smtp_host.as_str();
     let insecure = crate::imap::insecure_tls();
-    let params = TlsParameters::builder(host.to_owned())
-        .dangerous_accept_invalid_certs(insecure)
-        .dangerous_accept_invalid_hostnames(insecure)
-        .build_rustls()?;
-    // 465: TLS from the first byte. Anything else: plain, upgraded with STARTTLS (required).
-    let tls = if account.smtp_port == 465 || account.smtp_port == 3465 { Tls::Wrapper(params) } else { Tls::Required(params) };
+    let params = TlsParameters::builder(host.to_owned()).dangerous_accept_invalid_certs(insecure).dangerous_accept_invalid_hostnames(insecure).build_rustls()?;
+    let wrapper = account.smtp_port == 465 || account.smtp_port == 3465;
+    let hello = ClientId::default();
+    let mut conn = AsyncSmtpConnection::connect_tokio1((host, account.smtp_port), Some(std::time::Duration::from_secs(60)), &hello, wrapper.then(|| params.clone()), None).await?;
+    if !wrapper {
+        conn.starttls(params, &hello).await?;
+    }
+    // lettre keeps only the parts of EHLO's answer it uses: asked again for SIZE.
+    let ehlo = conn.command(Ehlo::new(hello)).await?;
+    Ok((conn, ehlo_size(ehlo.message())))
+}
+
+/// What the account's SMTP server says it takes (connecting, and leaving before logging in).
+pub async fn server_size(account: &Account) -> Result<Option<u64>> {
+    let work = async {
+        let (mut conn, size) = connect(account).await?;
+        let _ = conn.quit().await;
+        Ok::<_, anyhow::Error>(size)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), work).await.map_err(|_| anyhow!("SMTP timed out"))?
+}
+
+/// Sends `raw`. Returns the largest message the server said it takes, for the next one.
+pub async fn send(account: &Account, cred: &Credential, from: &str, to: &[String], raw: &[u8]) -> Result<Option<u64>> {
     let (creds, mech) = match cred {
         Credential::Password(p) => (Credentials::new(account.login().to_owned(), p.clone()), vec![Mechanism::Plain, Mechanism::Login]),
         Credential::OAuth(t) => (Credentials::new(account.login().to_owned(), t.clone()), vec![Mechanism::Xoauth2]),
     };
-    let transport: AsyncSmtpTransport<Tokio1Executor> = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
-        .port(account.smtp_port)
-        .tls(tls)
-        .credentials(creds)
-        .authentication(mech)
-        .timeout(Some(std::time::Duration::from_secs(60)))
-        .build();
     let envelope = lettre::address::Envelope::new(
         Some(from.parse().map_err(|_| anyhow!("bad from address"))?),
         to.iter().filter_map(|a| a.parse().ok()).collect(),
     )?;
-    tokio::time::timeout(std::time::Duration::from_secs(120), transport.send_raw(&envelope, raw))
-        .await
-        .map_err(|_| anyhow!("SMTP send timed out"))?
-        .context("SMTP send failed")?;
-    Ok(())
+    let work = async {
+        let (mut conn, size) = connect(account).await?;
+        conn.auth(&mech, &creds).await?;
+        conn.send(&envelope, raw).await?;
+        let _ = conn.quit().await;
+        Ok::<_, anyhow::Error>(size)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(120), work).await.map_err(|_| anyhow!("SMTP send timed out"))?.context("SMTP send failed")
 }
 
 #[cfg(test)]
@@ -247,21 +279,21 @@ mod tests {
     fn attachments_go_with_the_draft_and_the_message() {
         let pdf: Vec<u8> = (0..=255u8).cycle().take(3000).collect();
         let files = vec![
-            (DraftAttachment { id: 0, filename: "plan.pdf".into(), mime: "application/pdf".into(), size: pdf.len() }, pdf.clone()),
-            (DraftAttachment { id: 1, filename: "notes.txt".into(), mime: "text/plain".into(), size: 6 }, "café\n".as_bytes().to_vec()),
+            (DraftAttachment { id: 0, filename: "plan.pdf".into(), mime: "application/pdf".into(), size: pdf.len(), ..Default::default() }, pdf.clone()),
+            (DraftAttachment { id: 1, filename: "notes.txt".into(), mime: "text/plain".into(), size: 6, ..Default::default() }, "café\n".as_bytes().to_vec()),
         ];
         let draft = Draft { to: "ana@x.com".into(), subject: "Plans".into(), body: "See attached.".into(), attachments: files.iter().map(|(a, _)| a.clone()).collect(), ..Draft::default() };
         for raw in [build_draft(&account(), &draft, "<3.a.draft@envoy>", files.clone()).unwrap(), build(&account(), &draft, files.clone()).unwrap().raw] {
             let back = crate::mime::server_draft(&raw).unwrap();
             assert_eq!(back.draft.body.trim_end(), "See attached.");
-            assert_eq!(back.draft.attachments.iter().map(|a| (a.filename.as_str(), a.mime.as_str())).collect::<Vec<_>>(), vec![("plan.pdf", "application/pdf"), ("notes.txt", "text/plain")]);
+            assert_eq!(back.draft.attachments.iter().map(|a| (a.filename.as_str(), a.mime.as_str())).collect::<Vec<_>>(), vec![("plan.pdf", "application/pdf"), ("notes.txt", "text/plain; charset=utf-8")], "the charset said, once");
             assert_eq!(back.files, vec![pdf.clone(), "café\n".as_bytes().to_vec()], "the bytes, exactly");
         }
     }
 
     /// A file as the composer attaches it: its type from its name.
-    fn attached(id: u32, name: &str, data: &[u8]) -> (DraftAttachment, Vec<u8>) {
-        (DraftAttachment { id, filename: name.into(), mime: crate::attach::type_for(name).into(), size: data.len() }, data.to_vec())
+    fn attached(id: i64, name: &str, data: &[u8]) -> (DraftAttachment, Vec<u8>) {
+        (DraftAttachment { id, filename: name.into(), mime: crate::attach::type_for(name).into(), size: data.len(), ..Default::default() }, data.to_vec())
     }
 
     fn message_with(files: Files) -> Vec<u8> {
@@ -273,7 +305,7 @@ mod tests {
     fn non_ascii_file_names_are_encoded_and_come_back_whole() {
         let long = format!("Протокол встречи {} — итоги.pdf", "очень длинное название ".repeat(4));
         let names = ["Résumé 2026.pdf", "会议纪要.docx", "naïve \"quoted\"; name.txt", long.as_str()];
-        let files: Files = names.iter().enumerate().map(|(i, n)| attached(i as u32, n, b"data")).collect();
+        let files: Files = names.iter().enumerate().map(|(i, n)| attached(i as i64, n, b"data")).collect();
         let raw = message_with(files);
         let text = String::from_utf8(raw.clone()).expect("the message is ASCII");
         assert!(text.is_ascii(), "headers are encoded, never raw UTF-8");
@@ -312,6 +344,16 @@ mod tests {
         assert!(raw.split(|b| *b == b'\n').all(|l| l.len() <= 1000), "no line over SMTP's 1000");
         let back = crate::mime::forwarded_files(&raw, &[(0, 0)]);
         assert!(back[0].as_ref().unwrap().1 == big, "the bytes, exactly");
+    }
+
+    #[test]
+    fn the_servers_size_is_read_from_its_ehlo() {
+        let gmail = ["smtp.gmail.com at your service, [203.0.113.7]", "SIZE 35882577", "8BITMIME", "AUTH LOGIN PLAIN XOAUTH2", "ENHANCEDSTATUSCODES", "PIPELINING", "CHUNKING", "SMTPUTF8"];
+        assert_eq!(ehlo_size(gmail), Some(35_882_577));
+        assert_eq!(ehlo_size(["mx.example.com", "size 1000000"]), Some(1_000_000), "any case");
+        assert_eq!(ehlo_size(["mx.example.com", "SIZE 0"]), None, "no fixed limit");
+        assert_eq!(ehlo_size(["mx.example.com", "SIZE"]), None, "none given");
+        assert_eq!(ehlo_size(["mx.example.com", "SIZEABLE 7", "8BITMIME"]), None);
     }
 
     #[test]

@@ -189,6 +189,9 @@ pub struct Body {
     /// The HTML as a layout tree, for drawing natively.
     pub doc: Option<std::sync::Arc<crate::html::Doc>>,
     pub attachments: Vec<Attachment>,
+    /// Pictures shown inside the message (`cid:`), which aren't listed as files: a forward,
+    /// written as plain text, takes them along as files.
+    pub inline: Vec<Attachment>,
 }
 
 /// One message of an opened conversation.
@@ -213,21 +216,47 @@ pub struct Draft {
     pub references: String,
     /// The message this replies to, to mark it answered after sending.
     pub reply_of: Option<MessageId>,
-    /// Files that go with it. Their bytes live in the store with the draft (`draft_files`),
-    /// written once, so saving the text as it's typed never rewrites them.
+    /// Its files, as the store has them: the store owns this list (a file is added and taken
+    /// off by commands of its own, and a save's list is ignored), and each file's bytes are in
+    /// it with the draft, written once, so saving the text as it's typed never rewrites them.
     pub attachments: Vec<DraftAttachment>,
 }
 
-/// A file attached to a draft: what the composer shows. The bytes are in the store, under the
-/// draft's id and this `id`.
+/// A file of a draft: what the composer shows. Its id is unique and never given twice (the
+/// app's stamps); the bytes are in the store under the draft's id and this one.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DraftAttachment {
-    pub id: u32,
+    pub id: i64,
     pub filename: String,
-    /// `type/subtype`.
+    /// `type/subtype`, with the `charset` of text that names one.
     pub mime: String,
     pub size: usize,
+    pub status: FileStatus,
+}
+
+/// Where a file of a draft stands.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FileStatus {
+    /// Its bytes are in the store: it's saved, uploaded and sent with the draft.
+    #[default]
+    Attached,
+    /// Being read (from disk, or from a forwarded message): kept with the draft meanwhile,
+    /// and taken up again after a restart.
+    Attaching,
+    /// It couldn't be: why, to show.
+    Failed(String),
+}
+
+/// Where a file being attached comes from, kept with it so attaching it can go on after a
+/// restart.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FileSource {
+    /// A file on this computer.
+    Path(std::path::PathBuf),
+    /// Attachment `index` of message `id` (a forward's), as [`Attachment::index`] numbers them.
+    Message { id: MessageId, index: usize },
 }
 
 /// What the composer should say about a draft opened from the server.

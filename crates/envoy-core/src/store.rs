@@ -121,6 +121,25 @@ CREATE TABLE IF NOT EXISTS draft_files (
 CREATE TRIGGER IF NOT EXISTS drafts_files_delete AFTER DELETE ON drafts BEGIN
     DELETE FROM draft_files WHERE draft = old.id;
 END;
+CREATE TABLE IF NOT EXISTS draft_attachments (
+    draft INTEGER NOT NULL,
+    id INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    status INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (draft, id)
+);
+CREATE INDEX IF NOT EXISTS draft_attachments_attaching ON draft_attachments (id) WHERE status = 1;
+CREATE TRIGGER IF NOT EXISTS drafts_attachments_delete AFTER DELETE ON drafts BEGIN
+    DELETE FROM draft_attachments WHERE draft = old.id;
+END;
+CREATE TABLE IF NOT EXISTS send_limits (
+    account TEXT PRIMARY KEY,
+    size INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS draft_ends (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     id INTEGER NOT NULL UNIQUE,
@@ -163,6 +182,10 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
 /// carry recipients and previews). It replaces `messages_box_date`, its first three columns.
 /// Building it takes 0.2 s for a 100k-message cache on an M4 Pro, once, on the engine's thread.
 ///
+/// A draft's files are listed in draft_attachments (name, type, size, where each stands), their
+/// bytes in draft_files, apart, so listing them never reads the bytes. Files of drafts saved
+/// by an earlier build, listed in the draft's content, get their row here.
+///
 /// A draft deleted (sent, purged, discarded, its account removed) is remembered in draft_ends,
 /// so no write from its life brings it back: the last 10,000 ends, in the order they happened
 /// (`seq`; a draft's id says when it was started, not when it ended). They replace the
@@ -182,6 +205,10 @@ CREATE INDEX IF NOT EXISTS messages_held ON messages (held_op) WHERE held_op != 
 CREATE INDEX IF NOT EXISTS messages_held_box ON messages (account, mailbox, flags, held_op) WHERE held_op != 0;
 CREATE INDEX IF NOT EXISTS messages_deleted_box ON messages (account, mailbox, flags, held_op) WHERE flags & 16 != 0;
 CREATE INDEX IF NOT EXISTS ops_batch ON ops (batch) WHERE batch != 0;
+INSERT OR IGNORE INTO draft_attachments (draft, id, filename, mime, size)
+    SELECT f.draft, f.id, json_extract(a.value, '$.filename'), json_extract(a.value, '$.mime'), json_extract(a.value, '$.size')
+    FROM draft_files f JOIN drafts d ON d.id = f.draft AND json_valid(d.content) JOIN json_each(d.content, '$.attachments') a ON json_extract(a.value, '$.id') = f.id
+    WHERE NOT EXISTS (SELECT 1 FROM draft_attachments x WHERE x.draft = f.draft AND x.id = f.id);
 ";
 
 /// Op ids must never be reused: a toast's Undo or a replay in flight holds one, and a reused
@@ -421,6 +448,10 @@ fn json<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "[]".into())
 }
 
+fn attachment(a: &AttachmentRow) -> Attachment {
+    Attachment { index: a.index, filename: a.filename.clone(), mime: a.mime.clone(), size: a.size }
+}
+
 fn from_json<T: for<'de> Deserialize<'de> + Default>(s: &str) -> T {
     serde_json::from_str(s).unwrap_or_default()
 }
@@ -431,6 +462,9 @@ struct AttachmentRow {
     filename: String,
     mime: String,
     size: usize,
+    /// A picture shown inside the message ([`Body::inline`]).
+    #[serde(default)]
+    inline: bool,
 }
 
 /// A parsed search: free text for FTS plus `from:`, `to:`, `subject:`, `is:`, `has:` filters.
@@ -706,15 +740,16 @@ impl Store {
 
     pub fn set_body(&self, id: MessageId, raw: &[u8], p: &Parsed) -> Result<()> {
         let preview = mime::preview(p.text.as_deref(), p.html.as_deref());
-        let attachments: Vec<AttachmentRow> =
-            p.attachments.iter().map(|a| AttachmentRow { index: a.index, filename: a.filename.clone(), mime: a.mime.clone(), size: a.size }).collect();
+        let row = |a: &Attachment, inline| AttachmentRow { index: a.index, filename: a.filename.clone(), mime: a.mime.clone(), size: a.size, inline };
+        let has_files = !p.attachments.is_empty();
+        let attachments: Vec<AttachmentRow> = p.attachments.iter().map(|a| row(a, false)).chain(p.inline.iter().map(|a| row(a, true))).collect();
         self.conn.execute(
             "INSERT OR REPLACE INTO bodies (id, raw, text, html, markdown, cc, reply_to, refs, attachments) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)",
             params![id, raw, p.text, p.html, json(&p.cc), json(&p.reply_to), p.references, json(&attachments)],
         )?;
         self.conn.execute(
             "UPDATE messages SET has_body = 1, preview = ?2, has_attachments = ?3 WHERE id = ?1",
-            params![id, preview, !attachments.is_empty()],
+            params![id, preview, has_files],
         )?;
         let body_text = match (&p.text, &p.html) {
             (Some(t), _) => mime::truncate_chars(t, 20_000),
@@ -862,7 +897,8 @@ impl Store {
             text,
             html,
             markdown,
-            attachments: attachments.into_iter().map(|a| Attachment { index: a.index, filename: a.filename, mime: a.mime, size: a.size }).collect(),
+            attachments: attachments.iter().filter(|a| !a.inline).map(attachment).collect(),
+            inline: attachments.iter().filter(|a| a.inline).map(attachment).collect(),
         }))
     }
 
@@ -1269,7 +1305,29 @@ impl Store {
         self.conn.execute("DELETE FROM mailboxes WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM ops WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM drafts WHERE account = ?1", params![account])?;
+        self.conn.execute("DELETE FROM send_limits WHERE account = ?1", params![account])?;
         Ok(())
+    }
+
+    /// The largest message the account's SMTP server takes, as it last said (its EHLO `SIZE`).
+    pub fn send_limit(&self, account: &str) -> Result<Option<u64>> {
+        Ok(self.conn.query_row("SELECT size FROM send_limits WHERE account = ?1", params![account], |r| r.get(0)).optional()?)
+    }
+
+    /// Every account's [`Store::send_limit`] known.
+    pub fn send_limits(&self) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT account, size FROM send_limits")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records what the account's server said it takes. True when that's news.
+    pub fn set_send_limit(&self, account: &str, size: u64) -> Result<bool> {
+        if self.send_limit(account)? == Some(size) {
+            return Ok(false);
+        }
+        self.conn.execute("INSERT OR REPLACE INTO send_limits (account, size) VALUES (?1, ?2)", params![account, size])?;
+        Ok(true)
     }
 
     /// Recomputes a mailbox's unread count from the local copy after a local change, so the

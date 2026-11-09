@@ -1,6 +1,6 @@
-//! Files attached in the composer: how big a message's files may be, what type a file is, and
-//! reading one from disk (on the engine's threads, never the UI's). Their bytes go into the
-//! store with the draft (`draft_files`, see `store/drafts.rs`), once.
+//! Files attached in the composer: how big a message may be, what type a file is, and reading
+//! one from disk (on the engine's threads, never the UI's). Their bytes go into the store with
+//! the draft (`draft_files`, see `store/drafts.rs`), once.
 
 use std::io::Read;
 use std::path::Path;
@@ -8,30 +8,91 @@ use std::path::Path;
 use crate::accounts::Account;
 use crate::model::DraftAttachment;
 
-/// The most a message's attachments may add up to: Gmail's 25 MB (in the binary megabytes
-/// Gmail and Envoy both show; Gmail's server takes a message just over that once encoded). It's
-/// what most providers take, so it's every account's limit: a message over it is refused before
-/// it's sent, rather than bounced by the server after.
+/// What a message's attachments may add up to while its server hasn't said what it takes:
+/// Gmail's 25 MB (binary megabytes, as Gmail and Envoy show sizes), which is about what most
+/// providers take.
 pub const LIMIT: usize = 25 * 1024 * 1024;
 
-/// Whose limit [`LIMIT`] is, for an account, as a message names it: "Gmail's 25 MB limit".
-fn whose(account: Option<&Account>) -> &'static str {
-    if account.is_some_and(Account::is_gmail) { "Gmail's" } else { "the" }
+/// How big a message may be, for an account: what its SMTP server says it takes (its EHLO
+/// `SIZE`: the whole message, encoded for sending), once it has; until then, [`LIMIT`] of
+/// attachments. The composer and the engine judge a message by this one rule: the composer by
+/// what the message can't be less than, the engine, before it queues the message, by the
+/// message itself. So the composer never refuses what the engine would send, and a message
+/// over is refused before it goes, not bounced by the server after.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limit {
+    /// The server's `SIZE`, if it gave one (0, "no fixed limit", counts as none).
+    pub server: Option<u64>,
+    gmail: bool,
 }
 
-/// What the composer says when the files add up to more than [`LIMIT`] (None when they don't).
-pub fn over_limit(account: Option<&Account>, total: usize) -> Option<String> {
-    (total > LIMIT).then(|| format!("Attachments total {}, over {} {} limit. Remove some to send.", size_label(total), whose(account), limit_label(LIMIT)))
+impl Limit {
+    pub fn new(account: Option<&Account>, server: Option<u64>) -> Limit {
+        Limit { server: server.filter(|s| *s > 0), gmail: account.is_some_and(Account::is_gmail) }
+    }
+
+    /// Who takes the message, as the composer names it.
+    fn who(&self) -> &'static str {
+        if self.gmail { "Gmail" } else { "your mail server" }
+    }
+
+    /// The most attachments can weigh in a message, its text taking `text` bytes: [`LIMIT`], or
+    /// what fits the server's `SIZE` once encoded (as [`encoded_len`] counts).
+    pub fn allowance(&self, text: usize) -> usize {
+        match self.server {
+            None => LIMIT,
+            // 57 bytes of a file take a 78-byte line of base64.
+            Some(size) => ((size as usize).saturating_sub(text) / 78) * 57,
+        }
+    }
+
+    /// The biggest file that can be attached at all (to a message with no text).
+    pub fn max_file(&self) -> usize {
+        self.allowance(0)
+    }
+
+    /// Why a message with files of these `sizes` and text of `text` bytes can't be sent (None
+    /// when it can, as far as can be told before it's built).
+    pub fn over(&self, sizes: &[usize], text: usize) -> Option<String> {
+        let total: usize = sizes.iter().sum();
+        match self.server {
+            None if total > LIMIT => {
+                Some(format!("Attachments total {}, over {} {} limit. Remove some to send.", size_label(total), if self.gmail { "Gmail's" } else { "the" }, limit_label(LIMIT)))
+            }
+            Some(size) if sizes.iter().map(|s| encoded_len(*s)).sum::<usize>() + text > size as usize => Some(format!(
+                "Attachments total {}: more than {} takes in one message (about {}). Remove some to send.",
+                size_label(total),
+                self.who(),
+                size_label(self.allowance(text))
+            )),
+            _ => None,
+        }
+    }
+
+    /// Why the message built for sending, `raw` bytes, can't go (None when it can): the
+    /// engine's last word, before it queues it.
+    pub fn refuses(&self, raw: usize) -> Option<String> {
+        let size = self.server? as usize;
+        (raw > size).then(|| {
+            format!("This message is {} once encoded for sending; {} takes at most {}. Remove some attachments and send again.", size_label(raw), self.who(), size_label(size))
+        })
+    }
+}
+
+/// How big a file's bytes get once base64-encoded for sending, in lines of 76 characters and a
+/// line break, as the message is written (lettre's `email-encoding`).
+pub fn encoded_len(n: usize) -> usize {
+    let b64 = n.div_ceil(3) * 4;
+    let mut breaks = b64 / 76 * 2;
+    if breaks >= 2 && b64.is_multiple_of(76) {
+        breaks -= 2;
+    }
+    b64 + breaks
 }
 
 /// A limit as it's spoken of: `25 MB`, not `25.0 MB`.
 fn limit_label(limit: usize) -> String {
     if limit >= 1024 * 1024 && limit.is_multiple_of(1024 * 1024) { format!("{} MB", limit / (1024 * 1024)) } else { size_label(limit) }
-}
-
-/// The files' total size.
-pub fn total(files: &[DraftAttachment]) -> usize {
-    files.iter().map(|f| f.size).sum()
 }
 
 /// A size as the composer and the reader show it: `512 B`, `48 KB`, `3.2 MB`.
@@ -47,7 +108,7 @@ pub fn size_label(bytes: usize) -> String {
 
 /// Reads a file to attach, as attachment `id`. Refuses a folder, and a file bigger than `limit`
 /// without reading it (it could never be sent). The error is the sentence to show.
-pub fn read_file(path: &Path, id: u32, limit: usize) -> Result<(DraftAttachment, Vec<u8>), String> {
+pub fn read_file(path: &Path, id: i64, limit: usize) -> Result<(DraftAttachment, Vec<u8>), String> {
     let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
     let gone = |e: std::io::Error| format!("Couldn't read {filename}: {e}");
     // Asked of the path, before opening: Windows won't open a folder as a file.
@@ -68,7 +129,7 @@ pub fn read_file(path: &Path, id: u32, limit: usize) -> Result<(DraftAttachment,
         return Err(too_big(data.len()));
     }
     let mime = type_for(&filename).to_owned();
-    Ok((DraftAttachment { id, size: data.len(), filename, mime }, data))
+    Ok((DraftAttachment { id, size: data.len(), filename, mime, ..Default::default() }, data))
 }
 
 /// Why a file of `size` bytes can't be attached, under `limit`.
@@ -174,7 +235,7 @@ mod tests {
         let path = dir.join("Résumé 2026.pdf");
         std::fs::write(&path, b"%PDF-1.7 \x00\xff").unwrap();
         let (file, data) = read_file(&path, 3, LIMIT).unwrap();
-        assert_eq!(file, DraftAttachment { id: 3, filename: "Résumé 2026.pdf".into(), mime: "application/pdf".into(), size: 11 });
+        assert_eq!(file, DraftAttachment { id: 3, filename: "Résumé 2026.pdf".into(), mime: "application/pdf".into(), size: 11, ..Default::default() });
         assert_eq!(data, b"%PDF-1.7 \x00\xff");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -194,28 +255,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn the_limit_is_named_for_gmail_and_said_plainly_otherwise() {
-        let mut gmail = crate::accounts::Account {
+    fn account(imap_host: &str) -> crate::accounts::Account {
+        crate::accounts::Account {
             id: "a".into(),
-            email: "me@gmail.com".into(),
+            email: "me@x.com".into(),
             display_name: String::new(),
             auth: crate::accounts::AuthKind::Password,
             username: String::new(),
-            imap_host: "imap.gmail.com".into(),
+            imap_host: imap_host.into(),
             imap_port: 993,
-            smtp_host: "smtp.gmail.com".into(),
+            smtp_host: String::new(),
             smtp_port: 465,
             hue: 0.0,
             signature: String::new(),
             oauth_client_id: String::new(),
             oauth_client_secret: String::new(),
-        };
-        assert_eq!(over_limit(Some(&gmail), LIMIT), None, "the limit itself is fine");
-        assert_eq!(over_limit(Some(&gmail), 31 * 1024 * 1024).as_deref(), Some("Attachments total 31.0 MB, over Gmail's 25 MB limit. Remove some to send."));
-        gmail.imap_host = "imap.fastmail.com".into();
-        assert_eq!(over_limit(Some(&gmail), 26 * 1024 * 1024).as_deref(), Some("Attachments total 26.0 MB, over the 25 MB limit. Remove some to send."));
-        assert!(over_limit(None, LIMIT + 1).is_some(), "a byte over is over");
+        }
+    }
+
+    #[test]
+    fn until_the_server_says_the_limit_is_25_mb_of_attachments() {
+        let gmail = account("imap.gmail.com");
+        let limit = Limit::new(Some(&gmail), None);
+        assert_eq!(limit.over(&[LIMIT], 10_000), None, "the limit itself is fine");
+        assert_eq!(limit.over(&[20 << 20, 11 << 20], 0).as_deref(), Some("Attachments total 31.0 MB, over Gmail's 25 MB limit. Remove some to send."));
+        let other = Limit::new(Some(&account("imap.fastmail.com")), Some(0));
+        assert_eq!(other.over(&[26 << 20], 0).as_deref(), Some("Attachments total 26.0 MB, over the 25 MB limit. Remove some to send."), "SIZE 0 says nothing");
+        assert_eq!((limit.max_file(), limit.refuses(usize::MAX)), (LIMIT, None), "and the built message isn't judged");
+    }
+
+    #[test]
+    fn a_server_that_says_its_size_is_judged_by_it_encoded() {
+        // Gmail's EHLO says SIZE 35882577: about 25 MB of attachments once encoded.
+        let limit = Limit::new(Some(&account("imap.gmail.com")), Some(35_882_577));
+        let allowance = limit.allowance(0);
+        assert_eq!(size_label(allowance), "25.0 MB");
+        assert!(encoded_len(allowance) <= 35_882_577 && encoded_len(allowance + 600) > 35_882_577, "{allowance} is about all that fits");
+        assert_eq!(limit.over(&[allowance], 0), None);
+        let over = limit.over(&[allowance / 2, allowance / 2 + 1000], 0).unwrap();
+        assert!(over.starts_with("Attachments total 25.0 MB: more than Gmail takes in one message (about 25.0 MB)"), "{over}");
+        assert!(limit.over(&[allowance], 5000).is_some(), "the text counts too");
+        // The message built is what's judged last: its headers and parts take room too.
+        assert_eq!(limit.refuses(35_882_577), None);
+        let refused = limit.refuses(35_882_578).unwrap();
+        assert_eq!(refused, "This message is 34.2 MB once encoded for sending; Gmail takes at most 34.2 MB. Remove some attachments and send again.");
+        // A smaller server: a file it can never take is refused when it's attached.
+        let small = Limit::new(Some(&account("imap.example.com")), Some(10 << 20));
+        assert!(small.max_file() < 8 << 20 && small.max_file() > 7 << 20, "{}", small.max_file());
+        assert!(small.over(&[9 << 20], 0).unwrap().contains("more than your mail server takes"));
+    }
+
+    #[test]
+    fn encoded_sizes_are_counted_as_the_message_is_written() {
+        // email-encoding's own examples.
+        assert_eq!((encoded_len(0), encoded_len(16), encoded_len(300)), (0, 24, 410));
+        assert_eq!(encoded_len(57), 76, "one full line, no break after it");
+        assert_eq!(encoded_len(58), 76 + 2 + 4);
         assert_eq!(size_label(1023), "1023 B");
         assert_eq!(size_label(48 * 1024), "48 KB");
     }

@@ -3,7 +3,8 @@
 use rune::{Cursor, El, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Select, Spinner, TextInput};
 
-use crate::app::{App, Compose, ComposeFile, FileState, key_label};
+use crate::app::{App, Compose, key_label};
+use envoy_core::model::{DraftAttachment, FileStatus};
 use crate::{fmt, icons};
 use crate::theme::Theme;
 
@@ -181,8 +182,10 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
         );
 
     // The draft's files: they go with it when it's saved and sent.
-    let account = s.accounts.iter().find(|a| a.id == cm.account);
-    let files = (!cm.files.is_empty()).then(|| files_section(t, cm, envoy_core::attach::over_limit(account, cm.files_size())));
+    let files = (!cm.files.is_empty()).then(|| {
+        let (sizes, text) = cm.sizes();
+        files_section(t, cm, s.compose_limit().over(&sizes, text))
+    });
 
     let send_label = key_label(&s.settings, "keys.send");
     let mut footer = row()
@@ -296,13 +299,13 @@ fn drop_target(card: El) -> El {
 fn files_section(t: &Theme, cm: &Compose, over_limit: Option<String>) -> El {
     let k = &t.k;
     let mut chips = row().key("compose-files").w_full().gap(8.0).flex_wrap();
-    for f in &cm.files {
-        chips = chips.child(file_chip(t, f));
+    for (i, f) in cm.files.iter().enumerate() {
+        chips = chips.child(file_chip(t, f, i));
     }
     let files = |n: usize| if n == 1 { "1 file".to_owned() } else { format!("{n} files") };
-    let attached: Vec<&ComposeFile> = cm.files.iter().filter(|f| f.state == FileState::Attached).collect();
-    let attaching = cm.files.iter().filter(|f| f.state == FileState::Attaching).count();
-    let size = fmt::size(attached.iter().map(|f| f.file.size).sum());
+    let attached: Vec<&DraftAttachment> = cm.files.iter().filter(|f| f.status == FileStatus::Attached).collect();
+    let attaching = cm.files.iter().filter(|f| f.status == FileStatus::Attaching).count();
+    let size = fmt::size(attached.iter().map(|f| f.size).sum());
     let summary = match (attached.len(), attaching) {
         (0, 0) => None,
         (0, n) => Some(format!("Attaching {}…", files(n))),
@@ -312,8 +315,8 @@ fn files_section(t: &Theme, cm: &Compose, over_limit: Option<String>) -> El {
     let mut section = col().key("compose-files-section").w_full().px(14.0).pt(8.0).gap(6.0).child(chips);
     // Why a file isn't attached, in words, not only on hover.
     for f in &cm.files {
-        if let FileState::Failed(why) = &f.state {
-            section = section.child(text(why.clone()).font(k.ty.text_xsmall).color(k.c.danger.fg).wrap().w_full().key(format!("compose-file-why-{}", f.file.id)));
+        if let FileStatus::Failed(why) = &f.status {
+            section = section.child(text(why.clone()).font(k.ty.text_xsmall).color(k.c.danger.fg).wrap().w_full().key(format!("compose-file-why-{}", f.id)));
         }
     }
     if let Some(summary) = summary {
@@ -339,16 +342,17 @@ fn files_section(t: &Theme, cm: &Compose, over_limit: Option<String>) -> El {
     section
 }
 
-/// One file: its name and size (or that it's on its way, or why it isn't attached), and a
-/// button to take it off.
-fn file_chip(t: &Theme, f: &ComposeFile) -> El {
+/// One file, the `i`th: its name and size (or that it's on its way, or why it isn't attached),
+/// and a button to take it off. The button is keyed by place, so once a file is taken off the
+/// keyboard's focus stays put, on the next file's (its label says which).
+fn file_chip(t: &Theme, f: &DraftAttachment, i: usize) -> El {
     let k = &t.k;
-    let id = f.file.id;
-    let name = f.file.filename.clone();
-    let (lead, detail, detail_color, label) = match &f.state {
-        FileState::Attached => (icon(&icons::PAPERCLIP, 13.0).color(k.c.icon_muted), fmt::size(f.file.size), k.c.text_faint, format!("Attached: {name}, {}", fmt::size(f.file.size))),
-        FileState::Attaching => (Spinner::new().size(12.0).build(k), "Attaching…".to_owned(), k.c.text_faint, format!("Attaching {name}")),
-        FileState::Failed(why) => (icon(&icons::ALERT, 13.0).color(k.c.danger.icon), "Not attached".to_owned(), k.c.danger.fg, format!("Not attached: {why}")),
+    let id = f.id;
+    let name = f.filename.clone();
+    let (lead, detail, detail_color, label) = match &f.status {
+        FileStatus::Attached => (icon(&icons::PAPERCLIP, 13.0).color(k.c.icon_muted), fmt::size(f.size), k.c.text_faint, format!("Attached: {name}, {}", fmt::size(f.size))),
+        FileStatus::Attaching => (Spinner::new().size(12.0).build(k), "Attaching…".to_owned(), k.c.text_faint, format!("Attaching {name}")),
+        FileStatus::Failed(why) => (icon(&icons::ALERT, 13.0).color(k.c.danger.icon), "Not attached".to_owned(), k.c.danger.fg, format!("Not attached: {why}")),
     };
     let mut chip = row()
         .key(format!("compose-file-{id}"))
@@ -371,9 +375,9 @@ fn file_chip(t: &Theme, f: &ComposeFile) -> El {
                 .help("Remove")
                 .on_press(move |s: &mut App| s.remove_file(id))
                 .build(k)
-                .key(format!("compose-file-remove-{id}")),
+                .key(format!("compose-file-remove-{i}")),
         );
-    if let FileState::Failed(why) = &f.state {
+    if let FileStatus::Failed(why) = &f.status {
         chip = chip.border(1.0, k.c.danger.border).help(why.clone());
     }
     chip

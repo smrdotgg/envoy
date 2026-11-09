@@ -15,7 +15,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::accounts::{self, Account, AuthKind};
 use crate::imap::{self, Credential, Session};
-use crate::model::{Draft, DraftNotice, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
+use crate::model::{Draft, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use crate::settings::Settings;
 use crate::store::{DraftRev, LocalDraft, Op, Query, Store};
 use crate::{drafts, oauth, paths, secrets, smtp};
@@ -62,15 +62,20 @@ pub enum Command {
     /// [`Command::SaveDraft`] for a draft that carries on draft `files_from`'s text (a save
     /// refused under that id): the files it lists are that draft's ([`Store::save_draft_from`]).
     SaveDraftFrom { id: i64, draft: Draft, open: bool, rev: i64, lifecycle: i64, files_from: i64 },
-    /// Reads files from disk into draft `draft`'s store, as attachments with the ids given (the
-    /// composer picks them), off the UI thread. The draft must be in the store (the composer
-    /// saves it first). Each is answered, in order, with [`Event::FileAttached`] or
-    /// [`Event::AttachFailed`]; the composer lists a file in the draft only once it's attached.
-    AttachFiles { draft: i64, files: Vec<(u32, PathBuf)> },
+    /// Attaches files from disk to draft `draft`, with the ids given (the app's stamps: never
+    /// given twice). The draft must be in the store (the composer saves it first). Each is
+    /// listed with the draft at once, as being attached ([`Store::attaching`]), then read off
+    /// the UI thread and the engine's loop; whether the composer is still there or not, the
+    /// store gets the file, and a restart takes up one cut off. Each is answered with
+    /// [`Event::FileAttached`] or [`Event::AttachFailed`].
+    AttachFiles { draft: i64, files: Vec<(i64, PathBuf)> },
     /// Attaches files of message `message` to draft `draft`, as a forward takes them along:
-    /// `(id, index)`, the id in the draft and the index among the message's attachments. A
-    /// message not downloaded yet is fetched first. Answered as [`Command::AttachFiles`].
-    AttachForwarded { draft: i64, message: MessageId, files: Vec<(u32, usize)> },
+    /// each as listed (id, name, type, size), with its index among the message's attachments
+    /// ([`crate::model::Attachment::index`]). A message not downloaded yet is fetched first.
+    /// Answered as [`Command::AttachFiles`].
+    AttachForwarded { draft: i64, message: MessageId, files: Vec<(crate::model::DraftAttachment, usize)> },
+    /// Takes file `file` off draft `draft` ([`Store::remove_file`]).
+    DetachFile { draft: i64, file: i64 },
     /// Opens a row of a Drafts list in the composer: answered with [`Event::DraftOpened`].
     OpenDraft { id: MessageId },
     /// Discards draft `id`, here and on the server. `undo` as in [`Command::Move`].
@@ -124,14 +129,13 @@ pub enum Event {
     /// Save `rev` of draft `id` was refused: the draft moved on without it (gone for good, or
     /// sent, since it was made). It isn't saved, and a retry won't be: keep it as a new draft.
     DraftSaveRefused { id: i64, rev: i64 },
-    /// A save of draft `id` listed files the store doesn't have the bytes of (their ids), and
-    /// was saved without them: the composer takes them off (or attaches them again). Sent just
-    /// before the save's [`Event::DraftSaved`].
-    DraftFilesMissing { id: i64, files: Vec<u32> },
-    /// A file is in draft `draft`'s store ([`Command::AttachFiles`]): the composer lists it.
+    /// A file of draft `draft` is in: attached, saved and sent with it.
     FileAttached { draft: i64, file: crate::model::DraftAttachment },
     /// File `file` couldn't be attached to draft `draft`: `error` says why, to show.
-    AttachFailed { draft: i64, file: u32, error: String },
+    AttachFailed { draft: i64, file: i64, error: String },
+    /// The largest message the account's SMTP server takes, as it said (its EHLO `SIZE`), for
+    /// the composer to judge a message by ([`crate::attach::Limit`]).
+    SendLimit { account: String, size: u64 },
     /// How many ops an undoable [`Command::Move`] actually held. 0 means it had nothing to do
     /// (the messages were already moving, or already there), so there's nothing to undo.
     Held { undo: i64, ops: usize },
@@ -214,6 +218,7 @@ impl Engine {
                 accounts: RwLock::new(accounts::load()),
                 watched: Mutex::new(HashSet::new()),
                 undo_keys: Mutex::new(HashMap::new()),
+                wakers: Mutex::new(HashMap::new()),
             });
             let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("envoy-io").build() {
                 Ok(rt) => rt,
@@ -266,6 +271,8 @@ struct Shared {
     /// Undo keys of moves this run held ops for, with how many: to tell "too late" from
     /// "nothing to undo", and a partial undo from a full one.
     undo_keys: Mutex<HashMap<i64, usize>>,
+    /// Each account's worker's [`Worker::notify`], to wake it from off the engine's loop.
+    wakers: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl Shared {
@@ -306,6 +313,27 @@ impl Shared {
     fn emit_mailboxes(&self, account: &str) {
         if let Ok(mailboxes) = self.with_writer(|st| st.mailboxes(account)) {
             self.emit(Event::Mailboxes { account: account.to_owned(), mailboxes });
+        }
+    }
+
+    /// Wakes an account's worker to plan its wait again (from anywhere: see [`wake`]).
+    fn wake_account(&self, account: &str) {
+        if let Some(n) = self.wakers.lock().ok().and_then(|w| w.get(account).cloned()) {
+            n.notify_one();
+        }
+    }
+
+    /// How big a message from this account may be.
+    fn limit(&self, account: &str) -> crate::attach::Limit {
+        let server = self.with_writer(|st| st.send_limit(account)).ok().flatten();
+        crate::attach::Limit::new(self.account(account).as_ref(), server)
+    }
+
+    /// The account's SMTP server said what it takes: kept, and the app told.
+    fn learned_size(&self, account: &str, size: Option<u64>) {
+        let Some(size) = size else { return };
+        if self.with_writer(|st| st.set_send_limit(account, size)).unwrap_or(false) {
+            self.emit(Event::SendLimit { account: account.to_owned(), size });
         }
     }
 
@@ -371,8 +399,8 @@ enum Reply {
     Thread(u64, MessageId, bool),
     /// A Drafts row, now readable, in the composer ([`Command::OpenDraft`]).
     Draft(MessageId),
-    /// A forwarded message's files, now readable, for the composer ([`Command::AttachForwarded`]).
-    Attach { draft: i64, message: MessageId, files: Vec<(u32, usize)> },
+    /// A forwarded message's files, now readable: `(file id, index)` ([`Command::AttachForwarded`]).
+    Attach { message: MessageId, files: Vec<(i64, usize)> },
 }
 
 /// Answers a [`Job::Bodies`] once its messages are downloaded.
@@ -387,9 +415,9 @@ fn reply(shared: &Arc<Shared>, reply: &Reply) -> Result<()> {
             Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, at: DraftRev::default(), restored: false, notice: Some(DraftNotice::Copy(why)) }),
             _ => {}
         },
-        Reply::Attach { draft, message, ref files } => {
+        Reply::Attach { message, ref files } => {
             let (shared, files) = (shared.clone(), files.clone());
-            tokio::task::spawn_blocking(move || attach_forwarded(&shared, draft, message, &files));
+            tokio::task::spawn_blocking(move || attach_forwarded(&shared, message, &files));
         }
     }
     Ok(())
@@ -415,6 +443,12 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
         Ok(None) => {}
         Err(e) => log::warn!("couldn't read drafts: {e:#}"),
     }
+    // What the accounts' servers said they take, for the composer.
+    for (account, size) in shared.with_writer(|st| st.send_limits()).unwrap_or_default() {
+        shared.emit(Event::SendLimit { account, size });
+    }
+    // Files that were being attached when the app last closed.
+    resume_attaching(&shared, &workers);
     shared.emit_pending();
     tokio::spawn(upgrade_search(shared.clone()));
     while let Some(cmd) = rx.recv().await {
@@ -565,33 +599,39 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
         Command::SaveDraft { id, draft, open, rev, lifecycle } => save_draft(shared, workers, id, &draft, open, DraftRev { lifecycle, rev }, None),
         Command::SaveDraftFrom { id, draft, open, rev, lifecycle, files_from } => save_draft(shared, workers, id, &draft, open, DraftRev { lifecycle, rev }, Some(files_from)),
         Command::AttachFiles { draft, files } => {
+            let listed: Vec<_> = files
+                .iter()
+                .map(|(id, path)| {
+                    let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                    let mime = crate::attach::type_for(&filename).to_owned();
+                    let file = crate::model::DraftAttachment { id: *id, filename, mime, size: 0, status: FileStatus::Attaching };
+                    (file, FileSource::Path(path.clone()))
+                })
+                .collect();
+            let Some(files) = start_attaching(shared, draft, listed) else { return Ok(()) };
+            let max = shared.with_writer(|st| st.draft(draft)).ok().flatten().map(|d| shared.limit(&d.account).max_file()).unwrap_or(crate::attach::LIMIT);
             let shared = shared.clone();
             // Off the engine's loop too: a big file takes a moment to read.
             tokio::task::spawn_blocking(move || {
-                for (id, path) in files {
-                    shared.emit(match crate::attach::read_file(&path, id, crate::attach::LIMIT) {
-                        Ok((file, data)) => store_file(&shared, draft, file, &data),
-                        Err(error) => Event::AttachFailed { draft, file: id, error },
-                    });
+                for (file, source) in files {
+                    if let FileSource::Path(path) = source {
+                        read_file_in(&shared, file.id, &path, max);
+                    }
                 }
             });
         }
         Command::AttachForwarded { draft, message, files } => {
-            let (summary, here) = shared.with_writer(|st| Ok((st.summary(message)?, st.has_raw(message)?)))?;
-            match summary {
-                _ if here => {
-                    let shared = shared.clone();
-                    tokio::task::spawn_blocking(move || attach_forwarded(&shared, draft, message, &files));
+            let listed = files.iter().map(|(f, index)| (crate::model::DraftAttachment { status: FileStatus::Attaching, ..f.clone() }, FileSource::Message { id: message, index: *index })).collect();
+            let Some(files) = start_attaching(shared, draft, listed) else { return Ok(()) };
+            let parts = files.iter().filter_map(|(f, source)| if let FileSource::Message { index, .. } = source { Some((f.id, *index)) } else { None }).collect();
+            forward_files(shared, workers, message, parts)?;
+        }
+        Command::DetachFile { draft, file } => {
+            if shared.with_writer(|st| st.remove_file(draft, file, now()))? {
+                if let Some(d) = shared.with_writer(|st| st.draft(draft))? {
+                    wake(workers, &d.account);
                 }
-                // Downloaded first, on the connection that serves what the user is waiting on.
-                Some(s) if workers.contains_key(&s.account) => {
-                    poke(workers, &s.account, Job::Bodies { mailbox: s.mailbox, uids: vec![s.uid], reply: Some(Reply::Attach { draft, message, files }) });
-                }
-                _ => {
-                    for (id, _) in files {
-                        shared.emit(Event::AttachFailed { draft, file: id, error: "The original message is no longer on this computer".into() });
-                    }
-                }
+                shared.emit_pending();
             }
         }
         Command::OpenDraft { id } => match open_draft(shared, id, now())? {
@@ -700,6 +740,9 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 w.task.abort();
                 w.fg_task.abort();
             }
+            if let Ok(mut w) = shared.wakers.lock() {
+                w.remove(&id);
+            }
             secrets::remove(&id);
             let list = {
                 let mut accts = shared.accounts.write().map_err(|_| anyhow!("poisoned"))?;
@@ -789,13 +832,10 @@ fn export_in_background(shared: &Arc<Shared>, stem: String, ext: &'static str, b
 /// [`Command::SaveDraft`] and [`Command::SaveDraftFrom`]: saves, then says how it went.
 fn save_draft(shared: &Shared, workers: &HashMap<String, Worker>, id: i64, draft: &Draft, open: bool, at: DraftRev, files_from: Option<i64>) {
     match shared.with_writer(|st| drafts::save_from(st, id, draft, open, at, now(), files_from)) {
-        Ok(Some(saved)) => {
-            if !saved.missing.is_empty() {
-                shared.emit(Event::DraftFilesMissing { id, files: saved.missing });
-            }
+        Ok(Some(queued)) => {
             // Only now is it saved: the app shows "Draft saved", and drops its own copy.
             shared.emit(Event::DraftSaved { id, rev: at.rev });
-            if saved.queued {
+            if queued {
                 shared.emit_pending();
                 wake(workers, &draft.account);
             }
@@ -805,27 +845,141 @@ fn save_draft(shared: &Shared, workers: &HashMap<String, Worker>, id: i64, draft
     }
 }
 
-/// Puts an attachment's bytes with draft `draft` ([`Store::add_draft_file`]): the event to send.
-fn store_file(shared: &Shared, draft: i64, file: crate::model::DraftAttachment, data: &[u8]) -> Event {
-    match shared.with_writer(|st| st.add_draft_file(draft, file.id, data)) {
-        Ok(true) => Event::FileAttached { draft, file },
-        Ok(false) => Event::AttachFailed { draft, file: file.id, error: format!("Couldn't attach {}: the draft isn't saved", file.filename) },
-        Err(e) => Event::AttachFailed { draft, file: file.id, error: format!("Couldn't attach {} ({e:#})", file.filename) },
+/// Lists `files` with draft `draft`, as being attached ([`Store::attaching`]). Those it couldn't
+/// (no such draft, or an id it already has) are answered [`Event::AttachFailed`] here; the rest
+/// are returned, to be read in.
+fn start_attaching(shared: &Shared, draft: i64, files: Vec<(crate::model::DraftAttachment, FileSource)>) -> Option<Vec<(crate::model::DraftAttachment, FileSource)>> {
+    let taken = match shared.with_writer(|st| st.attaching(draft, &files)) {
+        Ok(Some(taken)) => taken,
+        Ok(None) => {
+            for (f, _) in &files {
+                shared.emit(Event::AttachFailed { draft, file: f.id, error: format!("Couldn't attach {}: the draft isn't saved", f.filename) });
+            }
+            return None;
+        }
+        Err(e) => {
+            for (f, _) in &files {
+                shared.emit(Event::AttachFailed { draft, file: f.id, error: format!("Couldn't attach {} ({e:#})", f.filename) });
+            }
+            return None;
+        }
+    };
+    let mut go = Vec::new();
+    for ((f, source), taken) in files.into_iter().zip(taken) {
+        if taken {
+            go.push((f, source));
+        } else {
+            // Never another file's id: what's there stays as it is.
+            shared.emit(Event::AttachFailed { draft, file: f.id, error: format!("Couldn't attach {}: attach it again", f.filename) });
+        }
+    }
+    Some(go)
+}
+
+/// Reads file `file` from `path` into the drafts attaching it (at most `max` bytes).
+fn read_file_in(shared: &Shared, file: i64, path: &std::path::Path, max: usize) {
+    match crate::attach::read_file(path, file, max) {
+        Ok((f, data)) => file_in(shared, file, &data, &f.mime),
+        Err(error) => file_failed(shared, file, &error),
     }
 }
 
-/// [`Command::AttachForwarded`] once the message is on this computer: its files into the draft.
-fn attach_forwarded(shared: &Shared, draft: i64, message: MessageId, files: &[(u32, usize)]) {
+/// File `file`'s bytes are read ([`Store::file_in`]): the drafts attaching it hear, and their
+/// uploads are planned.
+fn file_in(shared: &Shared, file: i64, data: &[u8], mime: &str) {
+    match shared.with_writer(|st| st.file_in(file, data, mime, now())) {
+        Ok(done) => {
+            for (draft, f) in done {
+                if let Ok(Some(d)) = shared.with_writer(|st| st.draft(draft)) {
+                    shared.wake_account(&d.account);
+                }
+                shared.emit(Event::FileAttached { draft, file: f });
+            }
+            shared.emit_pending();
+        }
+        Err(e) => file_failed(shared, file, &format!("Couldn't attach it ({e:#})")),
+    }
+}
+
+fn file_failed(shared: &Shared, file: i64, error: &str) {
+    for draft in shared.with_writer(|st| st.file_failed(file, error)).unwrap_or_default() {
+        shared.emit(Event::AttachFailed { draft, file, error: error.to_owned() });
+    }
+}
+
+/// Reads `(file id, index)` attachments of message `message` into the drafts attaching them:
+/// from the cache, or once the message is downloaded, on the connection that serves what the
+/// user is waiting on.
+fn forward_files(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, message: MessageId, files: Vec<(i64, usize)>) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let (summary, here) = shared.with_writer(|st| Ok((st.summary(message)?, st.has_raw(message)?)))?;
+    match summary {
+        _ if here => {
+            let shared = shared.clone();
+            tokio::task::spawn_blocking(move || attach_forwarded(&shared, message, &files));
+        }
+        Some(s) if workers.contains_key(&s.account) => {
+            poke(workers, &s.account, Job::Bodies { mailbox: s.mailbox, uids: vec![s.uid], reply: Some(Reply::Attach { message, files }) });
+        }
+        _ => {
+            for (file, _) in files {
+                file_failed(shared, file, "The original message is no longer on this computer");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`forward_files`] once the message is on this computer: its files into the drafts.
+fn attach_forwarded(shared: &Shared, message: MessageId, files: &[(i64, usize)]) {
     let found = match shared.with_writer(|st| st.raw(message)) {
         Ok(Some(raw)) => crate::mime::forwarded_files(&raw, files),
         Ok(None) => files.iter().map(|_| Err("The original message is no longer on this computer".to_owned())).collect(),
         Err(e) => files.iter().map(|_| Err(format!("Couldn't read the original message ({e:#})"))).collect(),
     };
-    for (&(id, _), file) in files.iter().zip(found) {
-        shared.emit(match file {
-            Ok((file, data)) => store_file(shared, draft, file, &data),
-            Err(error) => Event::AttachFailed { draft, file: id, error },
+    for (&(file, _), found) in files.iter().zip(found) {
+        match found {
+            Ok((f, data)) => file_in(shared, file, &data, &f.mime),
+            Err(error) => file_failed(shared, file, &error),
+        }
+    }
+}
+
+/// Files a restart finds still being attached (cut off by a quit or a crash) are taken up
+/// again: read from where they came from, or, if that's gone, said so on their chip.
+fn resume_attaching(shared: &Arc<Shared>, workers: &HashMap<String, Worker>) {
+    let pending = match shared.with_writer(|st| st.attaching_files()) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("couldn't read the files being attached: {e:#}");
+            return;
+        }
+    };
+    let mut forwards: HashMap<MessageId, Vec<(i64, usize)>> = HashMap::new();
+    let mut paths = Vec::new();
+    for (draft, file, source) in pending {
+        match source {
+            FileSource::Path(path) => {
+                let max = shared.with_writer(|st| st.draft(draft)).ok().flatten().map(|d| shared.limit(&d.account).max_file()).unwrap_or(crate::attach::LIMIT);
+                paths.push((file, path, max));
+            }
+            FileSource::Message { id, index } => forwards.entry(id).or_default().push((file, index)),
+        }
+    }
+    if !paths.is_empty() {
+        let shared = shared.clone();
+        tokio::task::spawn_blocking(move || {
+            for (file, path, max) in paths {
+                read_file_in(&shared, file, &path, max);
+            }
         });
+    }
+    for (message, files) in forwards {
+        if let Err(e) = forward_files(shared, workers, message, files) {
+            log::warn!("couldn't take up a forward's files: {e:#}");
+        }
     }
 }
 
@@ -851,17 +1005,33 @@ fn discard_draft(shared: &Shared, workers: &HashMap<String, Worker>, id: i64, un
 /// composer's draft waiting alongside it (hidden from Drafts) until it's out.
 fn queue_send(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, draft: &Draft, draft_id: Option<i64>) -> Result<()> {
     let account = shared.account(&draft.account).ok_or_else(|| anyhow!("Choose an account to send from"))?;
-    // Refused here, not bounced by the server later.
-    if let Some(why) = crate::attach::over_limit(Some(&account), crate::attach::total(&draft.attachments)) {
-        return Err(anyhow!(why));
-    }
-    // Never sent without a file the draft lists.
-    let files = match draft_id {
-        _ if draft.attachments.is_empty() => Vec::new(),
-        Some(d) => shared.with_writer(|st| st.draft_files(d, &draft.attachments))?,
+    // The draft's files, as the store has them: never sent without one it shows, nor before
+    // one is in.
+    let listed = match draft_id {
+        Some(d) => shared.with_writer(|st| st.files_of(d))?,
+        None if draft.attachments.is_empty() => Vec::new(),
         None => return Err(anyhow!("The attached files aren't saved with this message")),
     };
+    if let Some(f) = listed.iter().find(|f| f.status == FileStatus::Attaching) {
+        return Err(anyhow!("Still attaching {}…", f.filename));
+    }
+    if let Some(f) = listed.iter().find(|f| matches!(f.status, FileStatus::Failed(_))) {
+        return Err(anyhow!("{} isn't attached: remove it, or attach it again", f.filename));
+    }
+    // Refused here, not bounced by the server later: first as the composer judges it, then
+    // the message itself, as built.
+    let limit = shared.limit(&account.id);
+    if let Some(why) = limit.over(&listed.iter().map(|f| f.size).collect::<Vec<_>>(), draft.body.len() + draft.subject.len()) {
+        return Err(anyhow!(why));
+    }
+    let files = match draft_id {
+        Some(d) if !listed.is_empty() => shared.with_writer(|st| st.attached_files(d))?,
+        _ => Vec::new(),
+    };
     let built = smtp::build(&account, draft, files)?;
+    if let Some(why) = limit.refuses(built.raw.len()) {
+        return Err(anyhow!(why));
+    }
     let undo = shared.setting_u32("compose.undoSendSeconds");
     let (sent_mailbox, reply_of) = shared.with_writer(|st| {
         let sent = if account.is_gmail() { None } else { st.mailbox_for_role(&account.id, Role::Sent)? };
@@ -1161,10 +1331,27 @@ pub fn open_browser(url: &str) -> std::io::Result<()> {
     r.map(|_| ())
 }
 
+/// Asks the account's SMTP server what it takes (its EHLO `SIZE`), once: what it said is kept,
+/// and each send hears it again. Without an answer, the composer's 25 MB rule stands.
+async fn learn_server_size(shared: Arc<Shared>, id: String) {
+    if shared.with_writer(|st| st.send_limit(&id)).ok().flatten().is_some() {
+        return;
+    }
+    let Some(account) = shared.account(&id) else { return };
+    match smtp::server_size(&account).await {
+        Ok(size) => shared.learned_size(&id, size),
+        Err(e) => log::debug!("{}: couldn't ask the SMTP server what it takes: {e:#}", account.email),
+    }
+}
+
 fn spawn_worker(shared: Arc<Shared>, account: String) -> Worker {
     let (jobs, rx) = mpsc::unbounded_channel();
     let (now, now_rx) = mpsc::unbounded_channel();
     let notify = Arc::new(Notify::new());
+    if let Ok(mut w) = shared.wakers.lock() {
+        w.insert(account.clone(), notify.clone());
+    }
+    tokio::spawn(learn_server_size(shared.clone(), account.clone()));
     let task = tokio::spawn(worker(shared.clone(), account.clone(), rx, notify.clone()));
     let fg_task = tokio::spawn(foreground(shared, account, now_rx, jobs.clone(), notify.clone()));
     Worker { jobs, now, notify, task, fg_task }
@@ -1543,7 +1730,8 @@ impl OpRunner for ImapRunner<'_> {
                 let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
                 let cred = shared.credential(account).await?;
                 log::info!("{}: sending to {} recipient(s)", account.email, to.len());
-                smtp::send(account, &cred, from, to, &raw).await?;
+                let size = smtp::send(account, &cred, from, to, &raw).await?;
+                shared.learned_size(&account.id, size);
                 log::info!("{}: sent", account.email);
                 shared.emit(Event::Toast("Message sent".into()));
                 // From here on the message is out; failures below must not resend it.
@@ -1676,7 +1864,7 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
             let Some(mailbox) = drafts_mailbox(shared, id)? else { return Ok(()) };
             let Some(up) = shared.with_writer(|st| st.draft_upload(id, *draft))? else { return Ok(()) };
             // A draft that can't be built (or lost a file) won't do better on a retry.
-            let files = shared.with_writer(|st| st.draft_files(*draft, &up.draft.attachments)).map_err(|e| imap::Refused(format!("{e:#}")))?;
+            let files = shared.with_writer(|st| st.attached_files(*draft)).map_err(|e| imap::Refused(format!("{e:#}")))?;
             let raw = smtp::build_draft(account, &up.draft, &up.message_id, files).map_err(|e| imap::Refused(format!("{e:#}")))?;
             // The copy on record is replaced by UID; one in another mailbox (the Drafts role
             // moved) is left to the search.
@@ -1764,6 +1952,7 @@ mod tests {
             accounts: RwLock::new(vec![]),
             watched: Mutex::new(HashSet::new()),
             undo_keys: Default::default(),
+            wakers: Default::default(),
         });
         (shared, rx)
     }
@@ -2747,7 +2936,7 @@ mod tests {
         let Opening::Ready(d, notice) = open_draft(&shared, id, now()).unwrap() else { panic!("should open") };
         assert_eq!(notice, Some(DraftNotice::PlainText));
         assert_eq!(d.draft.body.trim_end(), "Plan attached.");
-        assert_eq!(shared.with_writer(|st| st.draft_files(d.id, &d.draft.attachments)).unwrap()[0].1, PDF.to_vec());
+        assert_eq!(shared.with_writer(|st| st.attached_files(d.id)).unwrap()[0].1, PDF.to_vec());
     }
 
     #[tokio::test]
@@ -2804,13 +2993,14 @@ mod tests {
         let files = attached(&events);
         assert_eq!(files.iter().map(|f| (f.id, f.filename.as_str(), f.mime.as_str(), f.size)).collect::<Vec<_>>(), [(0, "Plan for Café.pdf", "application/pdf", PDF.len()), (1, "photo.png", "image/png", 8)]);
         assert!(events.iter().any(|e| matches!(e, Event::AttachFailed { draft: 7, file: 2, error } if error.starts_with("Couldn't read gone.txt"))), "{events:?}");
-        // Listed in the draft once attached: its upload and its send carry them.
-        let with_files = Draft { attachments: files.clone(), ..draft("plan") };
-        shared.with_writer(|st| drafts::save(st, 7, &with_files, true, at(2), now() - 600)).unwrap();
+        // In the draft, with the store, once attached: its upload carries them.
+        assert_eq!(uploaded_files(&shared).await.into_iter().map(|(_, d)| d).collect::<Vec<_>>(), vec![PDF.to_vec(), b"\x89PNG\r\n\x1a\n".to_vec()], "the Drafts copy");
+        // Not sent while a file it shows isn't attached; taken off, it goes, with every file.
+        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("plan"), draft_id: Some(7) }).await.unwrap_err();
+        assert_eq!(format!("{err}"), "gone.txt isn't attached: remove it, or attach it again");
+        handle(&shared, &mut HashMap::new(), Command::DetachFile { draft: 7, file: 2 }).await.unwrap();
         let mut server = FakeServer::new(&shared, |_: &Shared| {});
-        replay_with(&shared, &account("a"), &mut server).await.unwrap();
-        assert_eq!(files_of(&server.drafts[0].2), vec![PDF.to_vec(), b"\x89PNG\r\n\x1a\n".to_vec()], "the Drafts copy");
-        handle(&shared, &mut HashMap::new(), Command::Send { draft: with_files, draft_id: Some(7) }).await.unwrap();
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("plan"), draft_id: Some(7) }).await.unwrap();
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(files_of(&sent_raw(&server)), vec![PDF.to_vec(), b"\x89PNG\r\n\x1a\n".to_vec()], "and the message: every file");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2824,8 +3014,58 @@ mod tests {
         handle(&shared, &mut HashMap::new(), Command::AttachFiles { draft: 99, files: vec![(0, path.clone())] }).await.unwrap();
         let events = wait_for(&rx, 1, |e| matches!(e, Event::AttachFailed { .. } | Event::FileAttached { .. }));
         assert!(matches!(events.last(), Some(Event::AttachFailed { draft: 99, file: 0, error }) if error.contains("isn't saved")), "{events:?}");
-        assert!(shared.with_writer(|st| st.missing_files(99, &[crate::model::DraftAttachment { id: 0, ..Default::default() }])).unwrap() == vec![0]);
+        assert!(shared.with_writer(|st| st.files_of(99)).unwrap().is_empty(), "nothing kept for it");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A file named `name` holding `data`, in a folder of the test's own.
+    fn file_at(test: &str, name: &str, data: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("envoy-engine-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    /// The files of the draft's copy in Drafts, uploaded now: name and bytes.
+    async fn uploaded_files(shared: &Arc<Shared>) -> Vec<(String, Vec<u8>)> {
+        let mut server = FakeServer::new(shared, |_: &Shared| {});
+        shared.with_writer(|st| st.queue_draft_upload("a", 7, 0)).unwrap();
+        replay_with(shared, &account("a"), &mut server).await.unwrap();
+        let found = crate::mime::server_draft(&server.drafts.last().expect("uploaded").2).unwrap();
+        found.draft.attachments.into_iter().map(|a| a.filename).zip(found.files).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_still_attaching_when_its_composer_goes_lands_in_the_draft() {
+        let (shared, rx) = drafts_engine();
+        let path = file_at("pending", "slow.pdf", PDF);
+        type_draft(&shared, 7, 1, "plan");
+        handle(&shared, &mut HashMap::new(), Command::AttachFiles { draft: 7, files: vec![(1, path)] }).await.unwrap();
+        // The composer goes away before the file is in (another message started, or the app
+        // closed): its last save lists no file, and nobody is there to hear the answer.
+        type_draft(&shared, 7, 2, "plan, put away");
+        wait_for(&rx, 1, |e| matches!(e, Event::FileAttached { .. } | Event::AttachFailed { .. }));
+        let listed: Vec<String> = shared.with_writer(|st| st.draft(7)).unwrap().unwrap().draft.attachments.into_iter().map(|a| a.filename).collect();
+        assert_eq!(listed, ["slow.pdf"], "kept with the draft, for whoever opens it next");
+        assert_eq!(uploaded_files(&shared).await, [("slow.pdf".to_owned(), PDF.to_vec())]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_attachment_id_is_never_taken_twice_nor_its_bytes_replaced() {
+        let (shared, rx) = drafts_engine();
+        let (a, b) = (file_at("ids", "a.pdf", b"AAAA"), file_at("ids", "b.png", b"BBBBBBBB"));
+        type_draft(&shared, 7, 1, "x");
+        handle(&shared, &mut HashMap::new(), Command::AttachFiles { draft: 7, files: vec![(5, a)] }).await.unwrap();
+        let first = attached(&wait_for(&rx, 1, |e| matches!(e, Event::FileAttached { .. } | Event::AttachFailed { .. })));
+        // A composer that lost count (reopened, say) gives another file the same id.
+        handle(&shared, &mut HashMap::new(), Command::AttachFiles { draft: 7, files: vec![(5, b)] }).await.unwrap();
+        let events = wait_for(&rx, 1, |e| matches!(e, Event::FileAttached { .. } | Event::AttachFailed { .. }));
+        assert!(matches!(events.last(), Some(Event::AttachFailed { draft: 7, file: 5, .. })), "refused: {events:?}");
+        // a.pdf keeps its bytes: what goes under its name is a.pdf.
+        let listed = Draft { attachments: first, ..draft("x") };
+        shared.with_writer(|st| drafts::save(st, 7, &listed, true, at(2), now() - 600)).unwrap();
+        assert_eq!(uploaded_files(&shared).await, [("a.pdf".to_owned(), b"AAAA".to_vec())]);
     }
 
     /// A message with a PDF and a picture in the inbox, as `uid`: downloaded unless `headers_only`.
@@ -2851,6 +3091,11 @@ mod tests {
         (id, raw)
     }
 
+    /// A file of a forward, as the composer lists it from the original.
+    fn forwarded(id: i64, name: &str) -> crate::model::DraftAttachment {
+        crate::model::DraftAttachment { id, filename: name.into(), mime: crate::attach::type_for(name).into(), ..Default::default() }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn forwarding_takes_the_originals_files_along() {
         let (shared, rx) = drafts_engine();
@@ -2860,16 +3105,40 @@ mod tests {
         assert_eq!(listed.iter().map(|a| (a.index, a.filename.as_str())).collect::<Vec<_>>(), [(0, "Plán.pdf"), (1, "map.png")]);
         type_draft(&shared, 7, 1, "Fwd: The plan");
         // The forward keeps the picture only (the PDF was taken off), as file 4.
-        handle(&shared, &mut HashMap::new(), Command::AttachForwarded { draft: 7, message: original, files: vec![(4, 1)] }).await.unwrap();
+        handle(&shared, &mut HashMap::new(), Command::AttachForwarded { draft: 7, message: original, files: vec![(forwarded(4, "map.png"), 1)] }).await.unwrap();
         let files = attached(&wait_for(&rx, 1, |e| matches!(e, Event::FileAttached { .. } | Event::AttachFailed { .. })));
-        assert_eq!(files, vec![crate::model::DraftAttachment { id: 4, filename: "map.png".into(), mime: "image/png".into(), size: 8 }]);
-        let fwd = Draft { attachments: files, ..draft("Fwd: The plan") };
-        shared.with_writer(|st| drafts::save(st, 7, &fwd, true, at(2), now())).unwrap();
-        handle(&shared, &mut HashMap::new(), Command::Send { draft: fwd, draft_id: Some(7) }).await.unwrap();
+        assert_eq!(files, vec![crate::model::DraftAttachment { id: 4, filename: "map.png".into(), mime: "image/png".into(), size: 8, ..Default::default() }]);
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("Fwd: The plan"), draft_id: Some(7) }).await.unwrap();
         let mut server = FakeServer::new(&shared, |_: &Shared| {});
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(files_of(&sent_raw(&server)), vec![b"\x89PNG map".to_vec()]);
         assert_eq!(files_of(&raw)[1], b"\x89PNG map".to_vec(), "the original's bytes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forward_takes_the_pictures_shown_inside_the_original_along() {
+        use base64::Engine as _;
+        let (shared, rx) = drafts_engine();
+        let logo = b"\x89PNG logo".to_vec();
+        let raw = format!(
+            "From: Ana <ana@x.com>\r\nTo: a@x.com\r\nSubject: Our logo\r\nMessage-ID: <logo@x>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"rel\"\r\n\r\n--rel\r\nContent-Type: text/html\r\n\r\n<p>Here: <img src=\"cid:logo@x\"></p>\r\n--rel\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\nContent-ID: <logo@x>\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--rel--\r\n",
+            base64::engine::general_purpose::STANDARD.encode(&logo)
+        );
+        let p = crate::mime::parse(raw.as_bytes(), false).unwrap();
+        let original = shared.with_writer(|st| {
+            let id = st.upsert_header("a", "INBOX", 9, flags::SEEN, raw.len() as u32, 0, &p)?;
+            st.set_body(id, raw.as_bytes(), &p)?;
+            Ok(id)
+        })
+        .unwrap();
+        let body = shared.with_writer(|st| st.body(original)).unwrap().unwrap();
+        assert!(body.attachments.is_empty(), "the reader shows the picture in the message, not as a file");
+        assert_eq!(body.inline.iter().map(|a| (a.index, a.filename.as_str())).collect::<Vec<_>>(), [(0, "image-1.png")]);
+        type_draft(&shared, 7, 1, "Fwd: Our logo");
+        let inline = &body.inline[0];
+        handle(&shared, &mut HashMap::new(), Command::AttachForwarded { draft: 7, message: original, files: vec![(forwarded(5, &inline.filename), inline.index)] }).await.unwrap();
+        wait_for(&rx, 1, |e| matches!(e, Event::FileAttached { .. } | Event::AttachFailed { .. }));
+        assert_eq!(shared.with_writer(|st| st.attached_files(7)).unwrap()[0].1, logo, "a forward, written as plain text, carries it as a file");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2878,39 +3147,92 @@ mod tests {
         let (original, raw) = mail_with_files(&shared, 3, true);
         type_draft(&shared, 7, 1, "Fwd: The plan");
         // No connection here to fetch it on: said so, not left waiting.
-        handle(&shared, &mut HashMap::new(), Command::AttachForwarded { draft: 7, message: original, files: vec![(0, 0)] }).await.unwrap();
-        assert!(matches!(wait_for(&rx, 1, |e| matches!(e, Event::AttachFailed { .. })).last(), Some(Event::AttachFailed { file: 0, .. })));
+        handle(&shared, &mut HashMap::new(), Command::AttachForwarded { draft: 7, message: original, files: vec![(forwarded(10, "Plán.pdf"), 0)] }).await.unwrap();
+        assert!(matches!(wait_for(&rx, 1, |e| matches!(e, Event::AttachFailed { .. })).last(), Some(Event::AttachFailed { file: 10, .. })));
         // With one, the download's answer attaches them.
+        handle(&shared, &mut HashMap::new(), Command::AttachForwarded { draft: 7, message: original, files: vec![(forwarded(11, "Plán.pdf"), 0), (forwarded(12, "map.png"), 1)] }).await.unwrap();
+        wait_for(&rx, 2, |e| matches!(e, Event::AttachFailed { .. }));
+        let pending = shared.with_writer(|st| st.attaching_files()).unwrap();
+        assert!(pending.is_empty(), "nothing left waiting: {pending:?}");
         let p = crate::mime::parse(&raw, false).unwrap();
         shared.with_writer(|st| st.set_body(original, &raw, &p)).unwrap();
-        reply(&shared, &Reply::Attach { draft: 7, message: original, files: vec![(0, 0), (1, 1)] }).unwrap();
+        let listed = vec![(forwarded(13, "Plán.pdf"), FileSource::Message { id: original, index: 0 }), (forwarded(14, "map.png"), FileSource::Message { id: original, index: 1 })];
+        shared.with_writer(|st| st.attaching(7, &listed)).unwrap();
+        reply(&shared, &Reply::Attach { message: original, files: vec![(13, 0), (14, 1)] }).unwrap();
         let files = attached(&wait_for(&rx, 2, |e| matches!(e, Event::FileAttached { .. })));
         assert_eq!(files.iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(), ["Plán.pdf", "map.png"]);
-        assert_eq!(shared.with_writer(|st| st.draft_files(7, &files)).unwrap()[0].1, PDF.to_vec());
+        assert_eq!(shared.with_writer(|st| st.attached_files(7)).unwrap().last().unwrap().1, b"\x89PNG map".to_vec());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn files_a_restart_finds_half_attached_are_taken_up_or_said_lost() {
+        let (shared, rx) = drafts_engine();
+        let here = file_at("restart", "here.pdf", PDF);
+        let gone = here.with_file_name("gone.pdf");
+        let (original, _) = mail_with_files(&shared, 3, false);
+        type_draft(&shared, 7, 1, "plan");
+        // As the last run left them: listed, being attached, when the app quit.
+        let listed = vec![
+            (forwarded(20, "here.pdf"), FileSource::Path(here)),
+            (forwarded(21, "gone.pdf"), FileSource::Path(gone)),
+            (forwarded(22, "map.png"), FileSource::Message { id: original, index: 1 }),
+        ];
+        shared.with_writer(|st| st.attaching(7, &listed)).unwrap();
+        resume_attaching(&shared, &HashMap::new());
+        let events = wait_for(&rx, 3, |e| matches!(e, Event::FileAttached { .. } | Event::AttachFailed { .. }));
+        assert_eq!(attached(&events).iter().map(|f| f.id).collect::<HashSet<_>>(), HashSet::from([20, 22]), "{events:?}");
+        let files = shared.with_writer(|st| st.files_of(7)).unwrap();
+        assert!(matches!(&files[1].status, FileStatus::Failed(why) if why.starts_with("Couldn't read gone.pdf")), "never dropped without a word: {files:?}");
+        assert_eq!(uploaded_files(&shared).await.len(), 2);
     }
 
     #[tokio::test]
     async fn a_message_over_the_limit_is_refused_before_it_goes() {
         let (shared, rx) = drafts_engine();
         type_draft(&shared, 7, 1, "big");
-        let big = crate::model::DraftAttachment { id: 0, filename: "video.mov".into(), mime: "video/quicktime".into(), size: crate::attach::LIMIT + 1 };
-        let over = Draft { attachments: vec![big], ..draft("big") };
-        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: over, draft_id: Some(7) }).await.unwrap_err();
+        // The server hasn't said what it takes: 25 MB of attachments.
+        let big = vec![7u8; crate::attach::LIMIT + 1];
+        shared.with_writer(|st| st.attaching(7, &[(forwarded(1, "video.mov"), FileSource::Path("video.mov".into()))])).unwrap();
+        shared.with_writer(|st| st.file_in(1, &big, "", now())).unwrap();
+        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("big"), draft_id: Some(7) }).await.unwrap_err();
         assert!(format!("{err}").starts_with("Attachments total 25.0 MB, over the 25 MB limit"), "{err}");
         assert!(rx.try_iter().any(|e| matches!(e, Event::SendFailed { draft_id: Some(7) })), "the composer gets it back");
         assert_eq!(shared.with_writer(|st| st.pending_count()).unwrap(), 1, "nothing queued but the draft's upload");
     }
 
     #[tokio::test]
-    async fn a_save_listing_a_file_the_store_lacks_says_which() {
-        let (shared, rx) = drafts_engine();
-        let lost = crate::model::DraftAttachment { id: 3, filename: "lost.pdf".into(), mime: "application/pdf".into(), size: 10 };
-        handle(&shared, &mut HashMap::new(), Command::SaveDraft { id: 7, draft: Draft { attachments: vec![lost], ..draft("x") }, open: true, rev: 1, lifecycle: 0 }).await.unwrap();
-        let events: Vec<Event> = rx.try_iter().collect();
-        let missing = events.iter().position(|e| matches!(e, Event::DraftFilesMissing { id: 7, files } if files == &[3]));
-        let saved = events.iter().position(|e| matches!(e, Event::DraftSaved { id: 7, rev: 1 }));
-        assert!(missing.is_some() && missing < saved, "said before the save is confirmed: {events:?}");
-        assert!(shared.with_writer(|st| st.draft(7)).unwrap().unwrap().draft.attachments.is_empty());
+    async fn a_message_too_big_for_its_server_is_refused_before_it_goes() {
+        let (shared, _rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "big");
+        let file = vec![7u8; 300_000];
+        shared.with_writer(|st| st.attaching(7, &[(forwarded(1, "scan.pdf"), FileSource::Path("scan.pdf".into()))])).unwrap();
+        shared.with_writer(|st| st.file_in(1, &file, "", now())).unwrap();
+        // What the file alone takes, encoded: the composer can't tell it's over, the message
+        // itself, built, is.
+        let body = draft("big").body.len() + draft("big").subject.len();
+        let fits = (crate::attach::encoded_len(file.len()) + body) as u64;
+        shared.with_writer(|st| st.set_send_limit("a", fits)).unwrap();
+        assert_eq!(shared.limit("a").over(&[file.len()], body), None);
+        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("big"), draft_id: Some(7) }).await.unwrap_err();
+        assert!(format!("{err}").contains("once encoded for sending; your mail server takes at most"), "{err}");
+        // Smaller still: the composer's rule catches it too, with the same words the engine
+        // refuses it with.
+        shared.with_writer(|st| st.set_send_limit("a", 100_000)).unwrap();
+        let said = shared.limit("a").over(&[file.len()], body).unwrap();
+        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("big"), draft_id: Some(7) }).await.unwrap_err();
+        assert_eq!(format!("{err}"), said);
+        // Room enough: it goes.
+        shared.with_writer(|st| st.set_send_limit("a", 35_882_577)).unwrap();
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("big"), draft_id: Some(7) }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sending_waits_for_a_file_still_being_attached() {
+        let (shared, _rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "x");
+        shared.with_writer(|st| st.attaching(7, &[(forwarded(1, "slow.mov"), FileSource::Path("slow.mov".into()))])).unwrap();
+        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("x"), draft_id: Some(7) }).await.unwrap_err();
+        assert_eq!(format!("{err}"), "Still attaching slow.mov…");
     }
 
     #[test]

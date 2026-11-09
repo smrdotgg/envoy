@@ -133,7 +133,7 @@ pub fn draft_for(id: MessageId) -> Option<Draft> {
         to: format!("{} <{}>", DRAFT_TO.0, DRAFT_TO.1),
         subject: s.subject.into(),
         body: format!("Hi Jordan,\n\n{}\n\nThanks!", s.preview),
-        attachments: vec![DraftAttachment { id: 0, filename: "train-times.pdf".into(), mime: "application/pdf".into(), size: 182_400 }],
+        attachments: vec![DraftAttachment { id: 0, filename: "train-times.pdf".into(), mime: "application/pdf".into(), size: 182_400, ..Default::default() }],
         ..Draft::default()
     })
 }
@@ -190,6 +190,7 @@ pub fn thread_for(id: MessageId) -> Vec<ThreadMessage> {
                 html: None,
                 markdown,
                 attachments,
+                inline: vec![],
             }),
             summary: m,
         });
