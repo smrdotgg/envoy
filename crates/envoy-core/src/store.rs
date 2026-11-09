@@ -1058,30 +1058,40 @@ impl Store {
         Ok(true)
     }
 
-    /// Hides the cached messages that queued moves and expunges are taking away but that show:
-    /// found by the Message-ID each op recorded, in the mailbox it acts in, when exactly one
-    /// such message shows. After a reset the new generation's copies are new rows, and this
-    /// hides them again under the same ops (so undo and replay still reach them); called as
-    /// each chunk of a download lands, in its transaction, it never matters where a download
-    /// was cut off, or that the identities lived in no sync's memory. Ops that already hide a
+    /// Hides the cached messages that queued moves and expunges are taking away but that show.
+    /// In the op's own generation of its mailbox, that's the message at its UID, and no other
+    /// (another UID is another message, Message-ID or not). In another generation (after a
+    /// reset the messages come back as new rows) it's the one message its recorded Message-ID
+    /// finds, if exactly one shows; replay finds it on the server the same way. An op of an
+    /// unknown generation hides nothing. Called as each chunk of a download lands, in its
+    /// transaction, so it never matters where a download was cut off. Ops that already hide a
     /// message are left alone. Returns how many it hid.
     pub fn rehide_queued(&self, account: &str, mailbox: &str) -> Result<usize> {
-        let waiting: Vec<(i64, String)> = self
+        let cached = self.uidvalidity(account, mailbox)?;
+        let waiting: Vec<(i64, u32, String, u32)> = self
             .conn
             .prepare_cached(
-                "SELECT id, message_id FROM ops WHERE account = ?1 AND message_id != ''
+                "SELECT id, uidvalidity, message_id, json_extract(op, '$.uid') FROM ops WHERE account = ?1
                    AND json_extract(op, '$.kind') IN ('move', 'expunge') AND json_extract(op, '$.mailbox') = ?2
                    AND NOT EXISTS (SELECT 1 FROM messages WHERE held_op = ops.id AND held_op != 0)",
             )?
-            .query_map(params![account, mailbox], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![account, mailbox], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut hidden = 0;
-        for (op, message_id) in waiting {
-            let ids: Vec<MessageId> = self
-                .conn
-                .prepare_cached("SELECT id FROM messages WHERE account = ?1 AND mailbox = ?2 AND message_id = ?3 AND held_op = 0 LIMIT 2")?
-                .query_map(params![account, mailbox, message_id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
+        for (op, validity, message_id, uid) in waiting {
+            let ids: Vec<MessageId> = if validity != 0 && validity == cached {
+                self.conn
+                    .prepare_cached("SELECT id FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3 AND held_op = 0")?
+                    .query_map(params![account, mailbox, uid], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            } else if validity != 0 && !message_id.is_empty() {
+                self.conn
+                    .prepare_cached("SELECT id FROM messages WHERE account = ?1 AND mailbox = ?2 AND message_id = ?3 AND held_op = 0 LIMIT 2")?
+                    .query_map(params![account, mailbox, message_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            } else {
+                continue;
+            };
             if let [id] = ids.as_slice()
                 && self.hide_local(*id, op)?
             {
@@ -1420,11 +1430,32 @@ impl Store {
         self.enqueue_with(account, op, not_before, batch)
     }
 
-    /// The op reached the server. A message it was moving away now leaves the local copy too,
-    /// and a draft it was sending is done with ([`Store::draft_sent`]).
+    /// The op reached the server. The message it was moving away now leaves the local copy
+    /// too: exactly the one it acted on, never another. With the cache in the generation replay
+    /// resolved the op in, that's the row at its UID; with the cache still in an older one (a
+    /// reset it hasn't caught up with), UIDs don't compare, and it's the row with the op's
+    /// recorded Message-ID. Anything else it hid shows again. A draft it was sending is done
+    /// with ([`Store::draft_sent`]).
     pub fn op_done(&self, id: i64) -> Result<()> {
         self.transaction(|st| {
-            st.conn.execute(DELETE_HELD, params![id])?;
+            let row: Option<(String, String, u32, String)> = st
+                .conn
+                .query_row("SELECT account, op, uidvalidity, message_id FROM ops WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .optional()?;
+            let row = row.and_then(|(account, op, validity, message_id)| Some((account, serde_json::from_str::<Op>(&op).ok()?, validity, message_id)));
+            match &row {
+                Some((account, op, validity, message_id)) if let Some((mailbox, uid)) = op.located() => {
+                    if st.uidvalidity(account, mailbox)? == *validity {
+                        st.conn.execute("DELETE FROM messages WHERE held_op = ?1 AND held_op != 0 AND mailbox = ?2 AND uid = ?3", params![id, mailbox, uid])?;
+                    } else if !message_id.is_empty() {
+                        st.conn.execute("DELETE FROM messages WHERE held_op = ?1 AND held_op != 0 AND mailbox = ?2 AND message_id = ?3", params![id, mailbox, message_id])?;
+                    }
+                    st.unhide(id)?;
+                }
+                _ => {
+                    st.conn.execute(DELETE_HELD, params![id])?;
+                }
+            }
             st.conn.execute("DELETE FROM ops WHERE id = ?1", params![id])?;
             st.draft_sent(id)
         })
@@ -1471,16 +1502,7 @@ impl Store {
         let mut accounts: Vec<String> = Vec::new();
         for op in ops {
             let account: Option<String> = self.conn.query_row("SELECT account FROM ops WHERE id = ?1", params![op], |r| r.get(0)).optional()?;
-            // Back in their mailbox: undo what hide_local did to its counts.
-            let held: Vec<(String, String, u32)> = self
-                .conn
-                .prepare_cached(HELD_ROWS)?
-                .query_map(params![op], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            for (a, m, fl) in held {
-                self.bump_counts(&a, &m, if fl & flags::SEEN == 0 { 1 } else { 0 }, 1)?;
-            }
-            self.conn.execute(UNHIDE, params![op])?;
+            self.unhide(*op)?;
             self.conn.execute("DELETE FROM ops WHERE id = ?1", params![op])?;
             self.undiscard_drafts(*op)?;
             if let Some(a) = account
@@ -1490,6 +1512,21 @@ impl Store {
             }
         }
         Ok(accounts)
+    }
+
+    /// Shows again what `op` hides, in its mailbox's counts too (undoes [`Store::hide_local`]).
+    /// Call inside a transaction.
+    fn unhide(&self, op: i64) -> Result<()> {
+        let held: Vec<(String, String, u32)> = self
+            .conn
+            .prepare_cached(HELD_ROWS)?
+            .query_map(params![op], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (a, m, fl) in held {
+            self.bump_counts(&a, &m, if fl & flags::SEEN == 0 { 1 } else { 0 }, 1)?;
+        }
+        self.conn.execute(UNHIDE, params![op])?;
+        Ok(())
     }
 
     /// The op failed: back in the queue, for a retry in `retry_in` seconds. A draft upload
@@ -2520,6 +2557,52 @@ mod tests {
         let s = Store::open(&db).unwrap();
         assert!(!s.upgrade_search(3).unwrap(), "nothing left to do after a restart");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_queued_change_hides_and_takes_only_its_own_message() {
+        let s = Store::memory();
+        let row = |mailbox: &str, uid: u32, mid: &str| {
+            let p = mime::parse(format!("From: a@x.com\r\nSubject: m{uid}\r\nMessage-ID: {mid}\r\n\r\n").as_bytes(), true).unwrap();
+            s.upsert_header("a", mailbox, uid, 0, 100, 0, &p).unwrap()
+        };
+        let held = |id: MessageId| -> i64 { s.conn.query_row("SELECT held_op FROM messages WHERE id = ?1", params![id], |r| r.get(0)).unwrap() };
+        let exists = |id: MessageId| s.summary(id).unwrap().is_some();
+        s.upsert_mailbox("a", "Trash", "Trash", Role::Trash, "/", true).unwrap();
+        s.set_uidvalidity("a", "Trash", 7).unwrap();
+        // Two copies of one message in Trash, UIDs 5 and 9. 5 is deleted for good here, its
+        // expunge queued.
+        let five = row("Trash", 5, "<dup@x>");
+        let expunge = s.enqueue("a", &Op::Expunge { mailbox: "Trash".into(), uid: 5 }).unwrap();
+        s.remove_local(five).unwrap();
+        // A sync brings 9: in the expunge's own generation, another UID is another message.
+        let nine = row("Trash", 9, "<dup@x>");
+        s.rehide_queued("a", "Trash").unwrap();
+        assert_eq!(held(nine), 0, "UID 9 isn't taken for UID 5");
+        // 5 itself, downloaded again before the expunge replays, is.
+        let five = row("Trash", 5, "<dup@x>");
+        s.rehide_queued("a", "Trash").unwrap();
+        assert_eq!(held(five), expunge);
+        s.op_done(expunge).unwrap();
+        assert!(!exists(five) && exists(nine), "the expunge takes 5 here, and only 5");
+
+        // Across a reset a move's message is found again by Message-ID. Should replay find it on
+        // the server at another UID than the cache has it, the move takes that one: the row it
+        // hid isn't deleted, and shows again (a sync sorts out the rest).
+        s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        s.set_uidvalidity("a", "INBOX", 6).unwrap();
+        let old = row("INBOX", 3, "<m@x>");
+        let mv = s.enqueue("a", &Op::Move { mailbox: "INBOX".into(), uid: 3, dest: "Archive".into() }).unwrap();
+        assert!(s.hide_local(old, mv).unwrap());
+        s.clear_mailbox("a", "INBOX").unwrap();
+        s.set_uidvalidity("a", "INBOX", 7).unwrap();
+        let new = row("INBOX", 20, "<m@x>");
+        s.rehide_queued("a", "INBOX").unwrap();
+        assert_eq!(held(new), mv, "found again by Message-ID in the new generation");
+        s.relocate_op(mv, &Op::Move { mailbox: "INBOX".into(), uid: 21, dest: "Archive".into() }, 7).unwrap();
+        s.op_done(mv).unwrap();
+        assert!(exists(new), "UID 20 isn't what the move took");
+        assert_eq!(held(new), 0, "and shows again");
     }
 
     #[test]
