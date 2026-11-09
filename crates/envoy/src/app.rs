@@ -1026,9 +1026,11 @@ impl App {
         }
     }
 
-    /// The open message's content arrived: apply the mark-as-read setting, once per open.
+    /// The open message's content arrived: apply the mark-as-read setting, once per open. Not
+    /// while rows are selected: the reader shows them instead, and the setting waits for the
+    /// message to show ([`App::sync_reading`]).
     fn shown(&mut self, id: MessageId) {
-        if self.open != Some(id) || self.mark_read_when_shown != Some(id) {
+        if self.open != Some(id) || self.mark_read_when_shown != Some(id) || !self.selection.is_empty() {
             return;
         }
         self.mark_read_when_shown = None;
@@ -1037,6 +1039,31 @@ impl App {
             "delay" => self.mark_read_at = Some((id, self.clock + self.settings.f64("reading.markAsReadDelay"))),
             _ => {}
         }
+    }
+
+    /// Keeps marking the open message read in step with whether it shows: a selection hides it
+    /// (the reader shows the selection), so a delay running for it stops, to start over once it
+    /// shows again; and once it does, what waited for it (the delay, or "immediately") happens.
+    pub fn sync_reading(&mut self) {
+        if !self.selection.is_empty() {
+            if let Some((id, _)) = self.mark_read_at.take() {
+                self.mark_read_when_shown = Some(id);
+            }
+            return;
+        }
+        if let Some(id) = self.mark_read_when_shown
+            && self.open == Some(id)
+            && self.thread_for == Some(id)
+            && !self.thread.is_empty()
+        {
+            self.shown(id);
+        }
+    }
+
+    /// Unselects every row: the reader shows the open message again.
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.sync_reading();
     }
 
     fn mark_read(&mut self, id: MessageId) {
@@ -1158,6 +1185,7 @@ impl App {
         let mut changed = self.finish_demo_reads(clock, tx);
         changed |= self.autosave(clock, tx);
         self.retry_saves(clock, tx);
+        self.sync_reading();
         if let Some((id, at)) = self.mark_read_at {
             if clock >= at {
                 if self.open == Some(id) {
@@ -1247,6 +1275,8 @@ impl App {
         self.list.retain(|s| !removed.contains(&s.id));
         self.selection.retain(&self.list);
         if !was_open {
+            // The selection may have gone with the rows: the open message shows again.
+            self.sync_reading();
             return;
         }
         let policy = self.settings.str("behavior.afterRemove");
@@ -1537,6 +1567,7 @@ impl App {
     /// Selects or unselects a row (x on the keyboard's row, a row's checkbox, mod-click).
     pub fn toggle_selected(&mut self, id: MessageId) {
         self.selection.toggle(id);
+        self.sync_reading();
     }
 
     /// A press on a row: shift selects the range to it, mod adds or takes it from the
@@ -1558,13 +1589,14 @@ impl App {
             self.open_message(id);
             return;
         }
+        self.sync_reading();
         tx.instant();
     }
 
     /// x: selects or unselects the keyboard's row (the open one, until a selection starts).
     fn select_key(&mut self, tx: &mut Tx) {
         let Some(id) = self.selection.cursor().or(self.open).or(self.list.first().map(|s| s.id)) else { return };
-        self.selection.toggle(id);
+        self.toggle_selected(id);
         tx.scroll_into_view(row_key(id));
         tx.instant();
     }
@@ -2676,7 +2708,7 @@ impl App {
                 } else if self.screen != Screen::Mail && !self.accounts.is_empty() {
                     self.screen = Screen::Mail;
                 } else if !self.selection.is_empty() {
-                    self.selection.clear();
+                    self.clear_selection();
                 } else if !self.applied_query.is_empty() && self.open.is_none() {
                     self.search = TextEdit::new("");
                     self.applied_query.clear();
@@ -3730,6 +3762,47 @@ mod tests {
         assert_eq!(ids(&app.list), all);
         assert_eq!(app.open, Some(all[0]));
         assert_eq!(sent_since(&app, from, "UndoMove").len(), 1);
+    }
+
+    #[test]
+    fn selecting_holds_off_marking_the_hidden_message_read() {
+        let unread = |app: &App, id| app.list.iter().find(|s| s.id == id).unwrap().thread_unread;
+        // "After a delay": the timer is running when a selection hides the reader.
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false; // the conversation comes from the engine
+        let _ = app.settings.set("reading.markAsRead", serde_json::json!("delay"));
+        let mut tx = Tx::default();
+        let id = app.list.iter().find(|s| s.thread_unread).unwrap().id;
+        app.open_message(id);
+        let req = app.thread_req;
+        app.apply(Event::Thread { req, id, messages: crate::demo::thread_for(id) }, &mut tx);
+        assert!(app.mark_read_at.is_some());
+        let other = app.list.iter().find(|s| s.id != id).unwrap().id;
+        app.toggle_selected(other);
+        app.tick(app.clock + 30.0, &mut tx);
+        assert!(unread(&app, id), "not read while the selection hides it");
+        // The reader shows it again: the delay starts over, then it's read.
+        assert!(press(&mut app, rune::Key::Escape, Mods::default()));
+        let t = app.clock;
+        app.tick(t + 0.1, &mut tx);
+        assert!(unread(&app, id), "a fresh delay, not the old one");
+        app.tick(t + 0.2 + app.settings.f64("reading.markAsReadDelay"), &mut tx);
+        assert!(!unread(&app, id), "read once shown for the delay");
+
+        // "Immediately": the conversation arrives while rows are selected.
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let id = app.list.iter().find(|s| s.thread_unread).unwrap().id;
+        app.open_message(id);
+        assert!(key(&mut app, "x"), "selects the open row");
+        let req = app.thread_req;
+        app.apply(Event::Thread { req, id, messages: crate::demo::thread_for(id) }, &mut tx);
+        app.tick(app.clock + 30.0, &mut tx);
+        assert!(unread(&app, id), "not read: the reader shows the selection");
+        assert!(key(&mut app, "x"), "unselected: the reader shows it again");
+        assert!(!unread(&app, id), "and it's read now");
     }
 
     #[test]
