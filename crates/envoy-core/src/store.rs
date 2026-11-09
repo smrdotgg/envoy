@@ -12,7 +12,7 @@
 //!
 //! Drafts (what the composer holds, saved as it's typed) live here too: see `store/drafts.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
@@ -790,16 +790,18 @@ impl Store {
     }
 
     /// Applies what the server reported about the messages we already had (`local`, read
-    /// before fetching; `server`: uid → flags): new flags, deletions, then trims the mailbox to
-    /// its newest `window` messages. True when anything changed.
-    pub fn reconcile(&self, account: &str, mailbox: &str, local: &[(u32, u32)], server: &HashMap<u32, u32>, window: u32) -> Result<bool> {
+    /// before fetching; `server`: their UIDs and flags, from a FETCH the server finished, the
+    /// only kind [`crate::imap::ServerFlags`] can come from): new flags, deletions of the ones
+    /// it left out, then trims the mailbox to its newest `window` messages. True when anything
+    /// changed.
+    pub fn reconcile(&self, account: &str, mailbox: &str, local: &[(u32, u32)], server: &crate::imap::ServerFlags, window: u32) -> Result<bool> {
         let mut changed = false;
         let mut gone = Vec::new();
         self.transaction(|st| {
             for (uid, local_flags) in local {
-                match server.get(uid) {
+                match server.get(*uid) {
                     None => gone.push(*uid),
-                    Some(&f) if f != *local_flags => {
+                    Some(f) if f != *local_flags => {
                         st.set_flags_by_uid(account, mailbox, *uid, f)?;
                         changed = true;
                     }
@@ -1064,7 +1066,7 @@ impl Store {
 
         let mut out: Vec<Summary> = Vec::new();
         let mut seen_ids: HashSet<String> = HashSet::new();
-        let mut thread_index: HashMap<(String, String), usize> = HashMap::new();
+        let mut thread_index: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
         let mut names: Vec<Vec<String>> = Vec::new();
         for row in rows {
             let (s, message_id) = row?;
@@ -1920,7 +1922,7 @@ mod tests {
         assert!(s.hide_local(ids[0], op).unwrap());
         // New mail arrives before the window ends, and the sync trims to the window.
         s.upsert_header("a", "INBOX", 4, 0, 10, 0, &parsed("New", "<4@x>", "", "Bo <bo@x.com>", 4)).unwrap();
-        let server: HashMap<u32, u32> = (1..=4).map(|uid| (uid, 0)).collect();
+        let server = crate::imap::ServerFlags::finished((1..=4).map(|uid| (uid, 0)));
         assert!(!s.reconcile("a", "INBOX", &local, &server, 3).unwrap(), "three visible messages: nothing to trim");
         s.undo_batch(7).unwrap();
         assert!(inbox(&s).iter().any(|m| m.id == ids[0]), "undo still finds it");
@@ -2102,7 +2104,7 @@ mod tests {
         let s = Store::memory();
         with_deleted(&s);
         let local = s.local_uids("a", "INBOX").unwrap();
-        let server: HashMap<u32, u32> = local.iter().copied().collect();
+        let server = crate::imap::ServerFlags::finished(local.iter().copied());
         s.reconcile("a", "INBOX", &local, &server, 5).unwrap();
         let shown: Vec<u32> = inbox(&s).iter().map(|m| m.uid).collect();
         assert_eq!(shown, vec![6, 5, 4, 3, 2], "five to show, not two");

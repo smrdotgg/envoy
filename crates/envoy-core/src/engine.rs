@@ -1697,13 +1697,7 @@ async fn session_loop(
         if last_list.is_none_or(|t| t.elapsed() >= Duration::from_secs(600)) {
             shared.emit(Event::Sync { account: id.clone(), state: SyncState::Syncing("Folders".into()) });
             let listed = imap::list_mailboxes(&mut session).await?;
-            shared.with_writer(|st| {
-                for m in &listed {
-                    st.upsert_mailbox(&id, &m.name, &m.display, m.role, &m.delimiter, m.selectable)?;
-                }
-                st.retain_mailboxes(&id, &listed.iter().map(|m| m.name.clone()).collect::<Vec<_>>())?;
-                Ok(())
-            })?;
+            shared.with_writer(|st| store_listing(st, &id, &listed))?;
             last_list = Some(Instant::now());
             shared.emit_mailboxes(&id);
         }
@@ -1832,6 +1826,20 @@ async fn session_loop(
             }
         }
     }
+}
+
+/// Records the account's mailboxes as a LIST named them, forgetting (with their cached mail)
+/// the ones it no longer names: only when it names INBOX, which every server has. A listing
+/// without it isn't the whole list (whatever cut it short), and nothing is forgotten on it.
+fn store_listing(st: &Store, account: &str, listed: &[imap::ListedMailbox]) -> Result<()> {
+    for m in listed {
+        st.upsert_mailbox(account, &m.name, &m.display, m.role, &m.delimiter, m.selectable)?;
+    }
+    if !listed.iter().any(|m| m.role == Role::Inbox) {
+        log::warn!("{account}: the server's mailbox list didn't name INBOX; no mailbox is forgotten on it");
+        return Ok(());
+    }
+    st.retain_mailboxes(account, &listed.iter().map(|m| m.name.clone()).collect::<Vec<_>>())
 }
 
 fn display_of(mailboxes: &[Mailbox], name: &str) -> String {
@@ -2517,6 +2525,27 @@ mod tests {
         assert!(visible(&st, "INBOX").is_empty());
         st.op_done(due[0].id).unwrap();
         assert!(st.summary(a).unwrap().is_none(), "the local copy goes once the server has it");
+    }
+
+    fn listed(name: &str, role: Role) -> imap::ListedMailbox {
+        imap::ListedMailbox { name: name.into(), display: name.into(), role, delimiter: "/".into(), selectable: true }
+    }
+
+    #[test]
+    fn only_a_listing_with_the_inbox_forgets_mailboxes() {
+        let st = setup();
+        let kept = message(&st, "Archive", 1, "<1@x>", "", 0);
+        // Every server lists INBOX: a listing without it isn't the whole list, and mustn't
+        // forget the mailboxes it leaves out, or their cached mail.
+        store_listing(&st, "a", &[listed("Work", Role::Other)]).unwrap();
+        let names: Vec<String> = st.mailboxes("a").unwrap().into_iter().map(|m| m.name).collect();
+        assert!(names.contains(&"Archive".to_owned()) && names.contains(&"Work".to_owned()), "{names:?}");
+        assert!(st.summary(kept).unwrap().is_some(), "its mail kept");
+        // A whole listing still forgets what's gone.
+        store_listing(&st, "a", &[listed("INBOX", Role::Inbox), listed("Work", Role::Other)]).unwrap();
+        let names: Vec<String> = st.mailboxes("a").unwrap().into_iter().map(|m| m.name).collect();
+        assert_eq!(names, ["INBOX", "Work"]);
+        assert!(st.summary(kept).unwrap().is_none());
     }
 
     #[tokio::test]
