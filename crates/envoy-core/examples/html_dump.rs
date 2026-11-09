@@ -77,7 +77,7 @@ fn outline(nodes: &[Node], depth: usize) {
                 println!("{pad}Box [{}]", boxed(style));
                 outline(children, depth + 1);
             }
-            Node::Row { cells, gap } => {
+            Node::Row { cells, gap, .. } => {
                 println!("{pad}Row gap {gap}");
                 for (s, kids) in cells {
                     println!("{pad}  Cell [{}]", boxed(s));

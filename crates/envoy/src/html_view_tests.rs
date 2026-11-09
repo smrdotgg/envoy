@@ -3,7 +3,7 @@
 //! adapted and original. No element's box may reach past the width or out of the box it's in
 //! (zero-wide ones included), and no line of text past either edge of its own text box (a word
 //! too long for its line). Fluid columns stack below the breakpoint and stand side by side
-//! above it.
+//! above it, and a table's columns line up down it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -259,6 +259,31 @@ fn columns_stack_on_the_breakpoints_sides() {
     let row = |width: f32| column_spots(&lay_out(&fifths, width, HashMap::new(), true), &fifths)[0].clone();
     assert!(side_by_side(&row(600.0)), "{:?}", row(600.0));
     assert!(stacked(&row(592.0)), "{:?}", row(592.0));
+}
+
+#[test]
+fn table_columns_line_up_down_the_table() {
+    // An 80/20 receipt with a small header row, data rows in a larger size, and a three-column
+    // table with a colspan total: every row's cells end on the same column edges.
+    let doc = Arc::new(html::parse(
+        r#"<table width="100%"><tr><th width="80%" align="left" style="font-size:12px">Description</th><th width="20%" align="left" style="font-size:12px">Amount</th></tr>
+           <tr><td style="font-size:16px">Pro plan (monthly)</td><td style="font-size:16px">$1,234.56</td></tr>
+           <tr><td style="font-size:16px">Extra seat</td><td style="font-size:16px">$12.00</td></tr></table>
+           <table width="100%"><tr><td>Item</td><td>Qty</td><td style="font-size:16px">$1,234.50</td></tr><tr><td colspan="2">Subtotal, before tax and shipping</td><td>$9.00</td></tr></table>"#,
+    ));
+    for width in [320.0, 520.0, 900.0] {
+        let rt = lay_out(&doc, width, HashMap::new(), true);
+        let els = rt.elements();
+        // The left edge of the cell holding `t`.
+        let cell = |t: &str| {
+            let e = els.iter().find(|e| e.text.as_deref() == Some(t)).unwrap_or_else(|| panic!("{t}"));
+            els[e.parent.unwrap()].rect[0]
+        };
+        let amounts = [cell("Amount"), cell("$1,234.56"), cell("$12.00")];
+        assert!(amounts.iter().all(|x| (x - amounts[0]).abs() < 0.5), "the amount column at {width} pt: {amounts:?}");
+        let last = [cell("$1,234.50"), cell("$9.00")];
+        assert!((last[0] - last[1]).abs() < 0.5, "below a colspan at {width} pt: {last:?}");
+    }
 }
 
 /// Every paragraph's text in tree order, and per row of columns (fluid columns, and table

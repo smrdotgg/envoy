@@ -20,6 +20,7 @@ mod table;
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
@@ -182,7 +183,9 @@ pub enum Node {
     Box { style: BoxStyle, children: Vec<Node> },
     /// A table row. Each cell's width is its share of the table (`Len::Pct`), from the column
     /// model every row of the table shares, or a fixed width; `gap` is the cell spacing.
-    Row { cells: Vec<(BoxStyle, Vec<Node>)>, gap: f32 },
+    /// `grid` places the cells on that model, so every row of a table gets the same column
+    /// widths at any width ([`Grid::widths`]).
+    Row { cells: Vec<(BoxStyle, Vec<Node>)>, gap: f32, grid: Option<RowGrid> },
     /// Inline-block columns: side by side while they fit, wrapping onto new lines when the pane
     /// is narrow (`width`, `min_width`, `max_width` per column). Cells are in source order;
     /// `rtl` (`dir="rtl"` on their parent) puts them right to left while they stand side by
@@ -197,6 +200,52 @@ pub enum Node {
     List { ordered: bool, marker: bool, items: Vec<Vec<Node>> },
     Quote(Vec<Node>),
     Pre(String),
+}
+
+/// A table's columns, shared by all its rows: each column's share of the table's width, and
+/// the narrowest it may be (its cells' longest word, a small fixed column's width).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grid {
+    pub shares: Vec<f32>,
+    pub mins: Vec<f32>,
+}
+
+/// Where a table row's cells sit on its table's [`Grid`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowGrid {
+    pub grid: Arc<Grid>,
+    /// Per cell: its first column and how many it spans.
+    pub spans: Vec<(u16, u16)>,
+}
+
+impl Grid {
+    /// The columns' widths in a row `room` points wide with `gap` between cells. Each column
+    /// gets its share of what the gaps leave; one whose share is under its minimum gets its
+    /// minimum, and the others give way in proportion to their shares. When the minimums don't
+    /// all fit, they shrink together. The same for every row, so cells line up down the table.
+    pub fn widths(&self, room: f32, gap: f32) -> Vec<f32> {
+        let n = self.shares.len().min(self.mins.len());
+        let free = (room - gap * n.saturating_sub(1) as f32).max(0.0);
+        let mins = &self.mins[..n];
+        let total: f32 = mins.iter().sum();
+        if total >= free {
+            return mins.iter().map(|m| if total > 0.0 { m * free / total } else { free / n as f32 }).collect();
+        }
+        let mut held = vec![false; n];
+        loop {
+            let left = free - (0..n).filter(|&i| held[i]).map(|i| mins[i]).sum::<f32>();
+            let shares: f32 = (0..n).filter(|&i| !held[i]).map(|i| self.shares[i].max(0.0)).sum();
+            let open = (0..n).filter(|&i| !held[i]).count() as f32;
+            let share = |i: usize| if shares > 0.0 { left * self.shares[i].max(0.0) / shares } else { left / open };
+            let under: Vec<usize> = (0..n).filter(|&i| !held[i] && share(i) < mins[i]).collect();
+            if under.is_empty() {
+                return (0..n).map(|i| if held[i] { mins[i] } else { share(i) }).collect();
+            }
+            for i in under {
+                held[i] = true;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -1824,7 +1873,7 @@ impl Builder {
         for c in grid.iter_mut().flat_map(|r| r.cells.iter_mut()) {
             let (lo, hi) = table::estimate(&c.nodes);
             let edge = c.style.pad[1] + c.style.pad[3] + c.style.border.as_ref().map_or(0.0, |b| b.widths[1] + b.widths[3]);
-            c.least = lo.min(WORD_MIN) * WORD_SLACK + edge;
+            c.least = (lo.min(WORD_MIN) * WORD_SLACK + edge).max(c.style.min_width);
             claims.push(table::Claim { col: c.col, span: c.span, width: c.decl, min: lo + edge, max: hi * 1.1 + edge });
         }
         let model = table::resolve(ncols, &claims, twidth, declared);
@@ -1832,11 +1881,37 @@ impl Builder {
             tstyle.width = Some(Len::Px(model.width + tstyle.pad[1] + tstyle.pad[3] + spacing * (ncols - 1) as f32));
         }
         let frac = |col: usize, span: usize| -> f32 { model.fracs[col.min(ncols)..(col + span).min(ncols)].iter().sum() };
-        // Small fixed columns (images, gaps) keep their width when the pane narrows.
-        let min_of = |col: usize, span: usize| -> f32 { (col..(col + span).min(ncols)).filter(|&i| model.fixed[i] && model.widths[i] <= 120.0).map(|i| model.widths[i]).sum() };
+        // The narrowest each column may be, the same in every row: the longest word of its
+        // cells, or its width if it's a small fixed column (an image, a gap). A spanning cell
+        // spreads what it needs beyond its columns' over them, by their shares.
+        let mut mins = vec![0.0f32; ncols];
+        for c in grid.iter().flat_map(|r| &r.cells).filter(|c| c.span == 1 && c.col < ncols) {
+            mins[c.col] = mins[c.col].max(c.least);
+        }
+        for (i, m) in mins.iter_mut().enumerate() {
+            if model.fixed[i] && model.widths[i] <= 120.0 {
+                *m = m.max(model.widths[i]);
+            }
+        }
+        for c in grid.iter().flat_map(|r| &r.cells).filter(|c| c.span > 1) {
+            let cols = c.col.min(ncols)..(c.col + c.span).min(ncols);
+            let have = mins[cols.clone()].iter().sum::<f32>() + spacing * cols.len().saturating_sub(1) as f32;
+            let shares: f32 = model.fracs[cols.clone()].iter().sum();
+            let n = cols.len() as f32;
+            if c.least > have {
+                for i in cols {
+                    mins[i] += (c.least - have) * if shares > 0.0 { model.fracs[i] / shares } else { 1.0 / n };
+                }
+            }
+        }
+        let min_of = |col: usize, span: usize| -> f32 {
+            let cols = col.min(ncols)..(col + span).min(ncols);
+            mins[cols.clone()].iter().sum::<f32>() + spacing * cols.len().saturating_sub(1) as f32
+        };
+        let shared = Arc::new(Grid { shares: model.fracs.clone(), mins: mins.clone() });
         let cell = |c: GCell, scale: f32| -> (BoxStyle, Vec<Node>) {
             let f = frac(c.col, c.span) / scale;
-            (BoxStyle { width: Some(Len::Pct(f * 100.0)), min_width: c.style.min_width.max(min_of(c.col, c.span)).max(c.least), ..c.style }, c.nodes)
+            (BoxStyle { width: Some(Len::Pct(f * 100.0)), min_width: min_of(c.col, c.span), ..c.style }, c.nodes)
         };
         let nrows = grid.len();
         let mut grid: Vec<Option<GRow>> = grid.into_iter().map(Some).collect();
@@ -1858,18 +1933,28 @@ impl Builder {
                 let first = span_cell.col == 0;
                 let span_frac = frac(span_cell.col, span_cell.span);
                 let rest = (1.0 - span_frac).max(0.01);
+                // The band's rows share the columns beside the spanning cell.
+                let others = if first { span_cell.span.min(ncols)..ncols } else { 0..span_cell.col.min(ncols) };
+                let sub_grid = Arc::new(Grid { shares: model.fracs[others.clone()].iter().map(|f| f / rest).collect(), mins: mins[others.clone()].to_vec() });
                 let mut sub = Vec::new();
                 let mut band_rows = vec![row];
                 band_rows.extend((ri + 1..ri + n).filter_map(|j| grid[j].take()));
                 for r in band_rows {
+                    let spans = r.cells.iter().map(|c| ((c.col.saturating_sub(others.start)) as u16, c.span as u16)).collect();
                     let cells: Vec<(BoxStyle, Vec<Node>)> = r.cells.into_iter().map(|c| cell(c, rest)).collect();
-                    push_box(&mut sub, r.style, vec![Node::Row { cells, gap: spacing }]);
+                    push_box(&mut sub, r.style, vec![Node::Row { cells, gap: spacing, grid: Some(RowGrid { grid: sub_grid.clone(), spans }) }]);
                     space(&mut sub, spacing);
                 }
-                let span_box = (BoxStyle { width: Some(Len::Pct(span_frac * 100.0)), ..span_cell.style }, span_cell.nodes);
-                let rest_box = (BoxStyle { width: Some(Len::Pct(rest * 100.0)), valign: VAlign::Top, ..BoxStyle::default() }, tidy(sub));
-                let cells = if first { vec![span_box, rest_box] } else { vec![rest_box, span_box] };
-                inner.push(Node::Row { cells, gap: spacing });
+                let span_min = min_of(span_cell.col, span_cell.span);
+                let rest_min = min_of(others.start, others.len());
+                let span_box = (BoxStyle { width: Some(Len::Pct(span_frac * 100.0)), min_width: span_min, ..span_cell.style }, span_cell.nodes);
+                let rest_box = (BoxStyle { width: Some(Len::Pct(rest * 100.0)), min_width: rest_min, valign: VAlign::Top, ..BoxStyle::default() }, tidy(sub));
+                let (cells, band) = if first {
+                    (vec![span_box, rest_box], Grid { shares: vec![span_frac, rest], mins: vec![span_min, rest_min] })
+                } else {
+                    (vec![rest_box, span_box], Grid { shares: vec![rest, span_frac], mins: vec![rest_min, span_min] })
+                };
+                inner.push(Node::Row { cells, gap: spacing, grid: Some(RowGrid { grid: Arc::new(band), spans: vec![(0, 1), (1, 1)] }) });
                 space(&mut inner, spacing);
                 ri += n;
                 continue;
@@ -1901,13 +1986,14 @@ impl Builder {
                 ri += 1;
                 continue;
             }
-            let mut slots: Vec<(usize, (BoxStyle, Vec<Node>))> = row.cells.into_iter().map(|c| (c.col, cell(c, 1.0))).collect();
+            let mut slots: Vec<(usize, usize, (BoxStyle, Vec<Node>))> = row.cells.into_iter().map(|c| (c.col, c.span, cell(c, 1.0))).collect();
             for (col, span) in row.covered {
-                slots.push((col, (BoxStyle { width: Some(Len::Pct(frac(col, span) * 100.0)), min_width: min_of(col, span), ..BoxStyle::default() }, Vec::new())));
+                slots.push((col, span, (BoxStyle { width: Some(Len::Pct(frac(col, span) * 100.0)), min_width: min_of(col, span), ..BoxStyle::default() }, Vec::new())));
             }
             slots.sort_by_key(|s| s.0);
-            let cells = slots.into_iter().map(|s| s.1).collect();
-            push_box(&mut inner, row.style, vec![Node::Row { cells, gap: spacing }]);
+            let spans = slots.iter().map(|s| (s.0 as u16, s.1 as u16)).collect();
+            let cells = slots.into_iter().map(|s| s.2).collect();
+            push_box(&mut inner, row.style, vec![Node::Row { cells, gap: spacing, grid: Some(RowGrid { grid: shared.clone(), spans }) }]);
             space(&mut inner, spacing);
             ri += 1;
         }
@@ -1924,7 +2010,8 @@ struct GCell {
     decl: Option<Len>,
     nodes: Vec<Node>,
     height: f32,
-    /// The narrowest it can be: its longest word (up to [`WORD_MIN`]) and its edges.
+    /// The narrowest it can be: its longest word (up to [`WORD_MIN`]) and its edges, or its
+    /// own `min-width`.
     least: f32,
 }
 
@@ -2397,6 +2484,82 @@ mod tests {
         let Some(Node::Columns { cells, .. }) = find(&doc.nodes, &|n| matches!(n, Node::Columns { .. })) else { panic!("{:#?}", doc.nodes) };
         let shares: Vec<(Option<Len>, Option<f32>)> = cells.iter().map(|(s, _)| (s.width, s.max_width)).collect();
         assert_eq!(shares, [(Some(Len::Pct(50.0)), None), (Some(Len::Pct(33.0)), None), (Some(Len::Pct(100.0)), Some(300.0))]);
+    }
+
+    /// An 80/20 receipt: a small bold header row, data rows in a larger size, a colspan total.
+    const RECEIPT: &str = r#"<table width="100%"><tr><th width="80%" style="font-size:12px">Description</th><th width="20%" style="font-size:12px">Amount</th></tr>
+        <tr><td style="font-size:16px">Pro plan (monthly)</td><td style="font-size:16px">$1,234.56</td></tr>
+        <tr><td style="font-size:16px">Extra seat</td><td style="font-size:16px">$12.00</td></tr></table>
+        <table width="100%"><tr><td>Item</td><td>Qty</td><td style="font-size:16px">$1,234.56</td></tr><tr><td colspan="2">Subtotal, before tax and shipping</td><td>$9.00</td></tr></table>"#;
+
+    fn rows(nodes: &[Node], out: &mut Vec<Vec<BoxStyle>>) {
+        for n in nodes {
+            match n {
+                Node::Row { cells, .. } => out.push(cells.iter().map(|(s, _)| s.clone()).collect()),
+                Node::Box { children, .. } => rows(children, out),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_tables_columns_hold_the_same_minimum_in_every_row() {
+        // Each cell held its column open for its own longest word, so the header's Amount
+        // column was narrower than the data rows': in a narrow pane their edges didn't line up.
+        let mut r = Vec::new();
+        rows(&parse(RECEIPT).nodes, &mut r);
+        assert_eq!(r.len(), 5, "{r:#?}");
+        let mins = |row: &[BoxStyle]| row.iter().map(|s| s.min_width).collect::<Vec<_>>();
+        assert_eq!(mins(&r[0]), mins(&r[1]), "header and data rows");
+        assert_eq!(mins(&r[1]), mins(&r[2]));
+        assert!(r[1][1].min_width > 60.0, "the amount column holds its widest amount: {:?}", mins(&r[1]));
+        // The colspan cell holds the two columns it spans (and the gap between them).
+        assert!((r[4][0].min_width - (r[3][0].min_width + r[3][1].min_width)).abs() < 0.01 && r[4][1].min_width == r[3][2].min_width, "{:?} {:?}", mins(&r[3]), mins(&r[4]));
+    }
+
+    #[test]
+    fn every_row_of_a_table_gets_the_same_column_edges() {
+        /// A table row's cells' places, its table's grid, and its gap.
+        type Placed = (Vec<(u16, u16)>, Arc<Grid>, f32);
+        fn grids(nodes: &[Node], out: &mut Vec<Placed>) {
+            for n in nodes {
+                match n {
+                    Node::Row { grid: Some(g), gap, .. } => out.push((g.spans.clone(), g.grid.clone(), *gap)),
+                    Node::Box { children, .. } => grids(children, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        grids(&parse(RECEIPT).nodes, &mut rows);
+        assert_eq!(rows.len(), 5);
+        for room in [200.0, 320.0, 520.0, 900.0] {
+            // The edges each row's cells end at, against the table's column edges.
+            let edges = |(spans, grid, gap): &Placed| {
+                let w = grid.widths(room, *gap);
+                assert!((w.iter().sum::<f32>() + gap * (w.len() - 1) as f32 - room).abs() < 0.01, "the columns fill the row: {w:?}");
+                spans.iter().map(|&(c, n)| w[..(c + n) as usize].iter().sum::<f32>() + gap * (c + n - 1) as f32).collect::<Vec<f32>>()
+            };
+            assert_eq!(edges(&rows[0]), edges(&rows[1]), "header and data rows at {room} pt");
+            assert_eq!(edges(&rows[1]), edges(&rows[2]));
+            let (three, total) = (edges(&rows[3]), edges(&rows[4]));
+            assert_eq!(total, [three[1], three[2]], "the colspan row ends where its columns do, at {room} pt");
+            assert!(Arc::ptr_eq(&rows[0].1, &rows[2].1) && Arc::ptr_eq(&rows[3].1, &rows[4].1), "one grid per table");
+        }
+        // Narrow: the amount column keeps its widest amount, the description gives way.
+        let w = rows[1].1.widths(320.0, rows[1].2);
+        assert!(w[1] >= rows[1].1.mins[1] && w[1] > 320.0 * 0.2, "{w:?}");
+    }
+
+    #[test]
+    fn column_widths_share_the_room_and_keep_minimums() {
+        let g = Grid { shares: vec![0.8, 0.2], mins: vec![40.0, 90.0] };
+        assert_eq!(g.widths(500.0, 0.0), [400.0, 100.0], "shares while every column fits");
+        assert_eq!(g.widths(300.0, 0.0), [210.0, 90.0], "a column held at its minimum, the other gives way");
+        assert_eq!(g.widths(100.0, 0.0), [100.0 * 40.0 / 130.0, 100.0 * 90.0 / 130.0], "minimums that don't fit shrink together");
+        assert_eq!(g.widths(0.0, 4.0), [0.0, 0.0], "no room");
+        let g = Grid { shares: vec![0.0, 0.0, 0.0], mins: vec![0.0; 3] };
+        assert_eq!(g.widths(90.0, 0.0), [30.0; 3], "no shares: equal");
     }
 
     #[test]

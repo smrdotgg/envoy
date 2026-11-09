@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use rune::{Color, El, Link, Span, Tx, col, el, rich, row, text};
 
-use envoy_core::html::{Align, BoxStyle, Doc, Family, Img, Len, LineHeight, Node, Para, Rgba, VAlign};
+use envoy_core::html::{Align, BoxStyle, Doc, Family, Img, Len, LineHeight, Node, Para, Rgba, RowGrid, VAlign};
 
 use crate::app::{App, ImageState};
 use crate::theme::Theme;
@@ -425,7 +425,7 @@ fn block_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
     e
 }
 
-fn cells(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], gap: f32, l: Local) -> El {
+fn cells(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], gap: f32, grid: Option<&RowGrid>, l: Local) -> El {
     // A row the email stacks on phones, in a narrow pane: its cells one under another.
     let filled = || cells.iter().filter(|(_, kids)| !kids.is_empty());
     if cx.content_width() < STACK_BELOW && filled().count() > 1 && filled().all(|(s, _)| s.stack) {
@@ -435,9 +435,25 @@ fn cells(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], gap: f32, l: Local) -> El {
         }
         return c;
     }
-    // The room the cells share, and their minimums (small fixed columns, longest words):
-    // as given while they all fit, so a cell may take more than its share at the expense of
-    // the others; scaled down together when they don't.
+    // A table's row: its columns' widths at this room, the same for every row of the table, so
+    // cells line up down it whatever each row holds. Each is drawn as its fraction of the room:
+    // the room is read in steps, a few points under the row's real width, and every row scales
+    // up to that alike, filling it.
+    if let Some(g) = grid.filter(|g| !l.tight && g.spans.len() == cells.len()) {
+        let widths = g.grid.widths(l.room, gap);
+        let mut r = row().w_full().gap(gap).items_stretch();
+        for ((s, kids), &(at, span)) in cells.iter().zip(&g.spans) {
+            let (a, b) = ((at as usize).min(widths.len()), ((at + span) as usize).min(widths.len()));
+            let w = widths[a..b].iter().sum::<f32>() + gap * b.saturating_sub(a + 1) as f32;
+            let share = if l.room > 0.0 { w / l.room } else { 0.0 };
+            r = r.child(styled_box(cx, s, kids, Local { tight: false, room: w, ..l }).w_frac(share).shrink());
+        }
+        return r;
+    }
+    // A row sized by its content (a menu, a button row) or without a table's grid: the room
+    // the cells share, and their minimums (small fixed columns, longest words) as given while
+    // they all fit, so a cell may take more than its share at the expense of the others;
+    // scaled down together when they don't.
     let free = (l.room - gap * cells.len().saturating_sub(1) as f32).max(0.0);
     let mins: f32 = cells.iter().map(|(s, _)| s.min_width.min(free)).sum();
     let scale = if mins > free && mins > 0.0 { free / mins } else { 1.0 };
@@ -547,7 +563,7 @@ fn node(cx: &Ctx, n: &Node, l: Local) -> El {
     match n {
         Node::Para(p) => para(cx, p, l),
         Node::Box { style, children } => block_box(cx, style, children, l),
-        Node::Row { cells: c, gap } => cells(cx, c, *gap, l),
+        Node::Row { cells: c, gap, grid } => cells(cx, c, *gap, grid.as_ref(), l),
         Node::Columns { cells: c, align, rtl } => columns(cx, c, *align, *rtl, l),
         Node::Image(img) => image(cx, img, l),
         Node::Rule => el().h(1.0).w_full().my(10.0).fill(k.c.border_muted),
