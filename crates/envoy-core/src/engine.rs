@@ -445,7 +445,7 @@ enum Job {
 }
 
 impl Job {
-    /// What it does, for the log.
+    /// What it does, for the debug log (it names the mailbox).
     fn what(&self) -> String {
         match self {
             Job::Bodies { mailbox, uids, .. } => format!("download {} message(s) in {mailbox}", uids.len()),
@@ -453,6 +453,23 @@ impl Job {
             Job::Sync => "check for mail".to_owned(),
         }
     }
+
+    /// What kind of job it is, naming nothing of the user's: for logs at default levels.
+    fn kind(&self) -> &'static str {
+        match self {
+            Job::Bodies { .. } => "download",
+            Job::SyncMailbox(_) => "sync",
+            Job::Sync => "check",
+        }
+    }
+}
+
+/// An account as logs at default levels name it: a short hash of its id (which is made from its
+/// address), the same for the account in every log line, and telling nothing of the address.
+fn account_tag(id: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(id.as_bytes());
+    format!("account {:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3])
 }
 
 /// What to send the UI once [`Job::Bodies`] has the messages.
@@ -1166,8 +1183,8 @@ fn queue_send(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, draft: &D
     let account = shared.account(&draft.account).ok_or_else(|| anyhow!("Choose an account to send from"))?;
     // The draft's files, as the store has them, read at once with their bytes.
     let (listed, files) = match draft_id {
-        // One transaction: another process can't change them between the two reads.
-        Some(d) => shared.with_writer(|st| st.transaction(|st| Ok((st.files_of(d)?, st.attached_files(d)?))))?,
+        // One snapshot: another process can't change them between the two reads.
+        Some(d) => shared.with_writer(|st| st.snapshot(|st| Ok((st.files_of(d)?, st.attached_files(d)?))))?,
         None if draft.attachments.is_empty() => (Vec::new(), Vec::new()),
         None => return Err(anyhow!("The attached files aren't saved with this message")),
     };
@@ -1604,7 +1621,8 @@ async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedRece
         match on_foreground(&mut ImapForeground { shared: &shared, account: &account }, &mut session, &job).await {
             Ok(()) => log::debug!("{}: foreground: {what}: done in {:?}", account.email, started.elapsed()),
             Err(e) => {
-                log::warn!("{}: foreground: {what}: {e:#} (after {:?}; left to the background connection)", account.email, started.elapsed());
+                log::warn!("{}: a foreground {} failed after {:?}: left to the background connection", account_tag(&account.id), job.kind(), started.elapsed());
+                log::debug!("{}: foreground: {what}: {e:#}", account.email);
                 let _ = fallback.send(job);
                 notify.notify_one();
             }
@@ -2356,6 +2374,17 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_level_logs_name_an_account_without_its_address() {
+        let id = accounts::new_id("alice.smith@example.com");
+        let tag = account_tag(&id);
+        assert!(!tag.contains("alice") && !tag.contains("example"), "{tag}");
+        assert_eq!((tag.len(), tag.clone()), ("account 0123abcd".len(), account_tag(&id)), "short, and the same each time");
+        assert_ne!(tag, account_tag(&accounts::new_id("bob@example.com")));
+        // Nor the mailbox a job is about.
+        assert_eq!(Job::SyncMailbox("Clients/Acme".into()).kind(), "sync");
+    }
 
     fn message(st: &Store, mailbox: &str, uid: u32, mid: &str, refs: &str, fl: u32) -> MessageId {
         message_in(st, "a", mailbox, uid, mid, refs, fl)
