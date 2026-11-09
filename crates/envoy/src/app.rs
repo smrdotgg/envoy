@@ -530,6 +530,8 @@ pub fn keybind(spec: &str) -> Keybind {
 
 impl App {
     pub fn new(demo: bool) -> App {
+        #[cfg(test)]
+        crate::test_home();
         let settings = if demo { Settings::default() } else { Settings::load() };
         let list_width = settings.f32("inbox.listWidth");
         let list_height = settings.f32("inbox.listHeight");
@@ -3982,6 +3984,23 @@ mod tests {
         assert_eq!(ids(&app.list), all);
         assert_eq!(app.open, Some(all[0]));
         assert_eq!(sent_since(&app, from, "UndoMove").len(), 1);
+    }
+
+    #[test]
+    fn tests_never_see_the_settings_of_the_machine_they_run_on() {
+        let mut app = App::new(true);
+        let home = crate::test_home();
+        use envoy_core::paths;
+        for file in [paths::settings_file(), paths::accounts_file(), paths::database_file(), envoy_core::drafts::recovery_dir(), paths::export_dir("html").0] {
+            assert!(file.starts_with(home), "{} isn't in the tests' folder {}", file.display(), home.display());
+        }
+        // An app the engine drives checks settings.json as it ticks: here, the tests' own, which
+        // has none, never the one of whoever runs them.
+        app.demo = false;
+        let _ = app.settings.set("reading.markAsRead", serde_json::json!("delay"));
+        app.tick(app.clock + 30.0, &mut Tx::default());
+        assert_eq!(app.settings.value("reading.markAsRead"), serde_json::json!("delay"), "not reloaded from anyone's settings.json");
+        assert!(app.toasts.is_empty(), "nothing said about settings");
     }
 
     #[test]

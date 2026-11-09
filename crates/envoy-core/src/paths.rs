@@ -5,36 +5,57 @@
 //! - data dir: the local mail cache (`mail.sqlite`) and, on Linux, `secrets.json` (0600).
 //!
 //! `ENVOY_HOME` overrides both (everything goes under that one folder), which is handy for
-//! portable installs and for tests.
+//! portable installs and for tests. Test builds that can't set it before they start (the app's
+//! unit tests) call [`use_home`].
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-fn dirs() -> &'static (PathBuf, PathBuf) {
-    static DIRS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+/// Where the files go: the config and data folders, and the one folder everything goes in, if
+/// there is one (`ENVOY_HOME`, or [`use_home`]'s).
+struct Dirs {
+    config: PathBuf,
+    data: PathBuf,
+    home: Option<PathBuf>,
+}
+
+impl Dirs {
+    fn home(home: PathBuf) -> Dirs {
+        Dirs { config: home.clone(), data: home.clone(), home: Some(home) }
+    }
+}
+
+/// Decided once, the first time any file's place is asked for.
+static DIRS: OnceLock<Dirs> = OnceLock::new();
+
+fn dirs() -> &'static Dirs {
     DIRS.get_or_init(|| {
         if let Some(home) = std::env::var_os("ENVOY_HOME") {
-            let home = PathBuf::from(home);
-            return (home.clone(), home);
+            return Dirs::home(PathBuf::from(home));
         }
         match directories::ProjectDirs::from("dev", "envoy", "Envoy") {
-            Some(p) => (p.config_dir().to_path_buf(), p.data_dir().to_path_buf()),
-            None => {
-                let fallback = PathBuf::from(".envoy");
-                (fallback.clone(), fallback)
-            }
+            Some(p) => Dirs { config: p.config_dir().to_path_buf(), data: p.data_dir().to_path_buf(), home: None },
+            None => Dirs { config: PathBuf::from(".envoy"), data: PathBuf::from(".envoy"), home: None },
         }
     })
 }
 
+/// Puts every file under `home` for the rest of the process, as `ENVOY_HOME` does, whatever
+/// `ENVOY_HOME` says: for tests, which must neither read nor change the user's settings, mail
+/// or drafts. It has to come before anything asks where a file goes: false, and nothing
+/// changes, if something did first (unless that put everything under `home` too).
+pub fn use_home(home: PathBuf) -> bool {
+    DIRS.get_or_init(|| Dirs::home(home.clone())).home.as_ref() == Some(&home)
+}
+
 pub fn config_dir() -> PathBuf {
-    let d = dirs().0.clone();
+    let d = dirs().config.clone();
     let _ = std::fs::create_dir_all(&d);
     d
 }
 
 pub fn data_dir() -> PathBuf {
-    let d = dirs().1.clone();
+    let d = dirs().data.clone();
     let _ = std::fs::create_dir_all(&d);
     d
 }
@@ -64,8 +85,8 @@ pub fn secrets_file() -> PathBuf {
 /// `ENVOY_HOME` keeps it under that folder. Asking for the default app runs `xdg-mime`, so call
 /// this off the UI thread.
 pub fn export_dir(ext: &str) -> (PathBuf, bool) {
-    if let Some(home) = std::env::var_os("ENVOY_HOME") {
-        return (PathBuf::from(home).join("exports"), false);
+    if let Some(home) = &dirs().home {
+        return (home.join("exports"), false);
     }
     if cfg!(any(target_os = "macos", windows)) {
         return (std::env::temp_dir().join("envoy-exports"), false);
@@ -83,7 +104,7 @@ pub fn export_dir(ext: &str) -> (PathBuf, bool) {
     let _ = ext;
     let dir = match directories::ProjectDirs::from("dev", "envoy", "Envoy") {
         Some(p) => p.cache_dir().join("exports"),
-        None => dirs().1.join("exports"),
+        None => dirs().data.join("exports"),
     };
     (dir, false)
 }

@@ -30,6 +30,21 @@ use envoy_core::model::{Role, View};
 
 use app::{App, Screen};
 
+/// The folder every file the tests touch goes in (settings.json, the cache, drafts kept at
+/// close, exports): this test run's own, emptied first, so no test reads the settings of the
+/// machine it runs on or writes anything of its user's. [`App::new`] sets it, before anything
+/// asks where a file goes.
+#[cfg(test)]
+pub(crate) fn test_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = std::env::temp_dir().join(format!("envoy-app-tests-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(envoy_core::paths::use_home(home.clone()), "something asked where Envoy's files go before the tests' folder was set");
+        home
+    })
+}
+
 fn is_demo() -> bool {
     std::env::var_os("ENVOY_DEMO").is_some() || std::env::args().any(|a| a == "--demo") || rune::extra_args().iter().any(|a| a == "demo" || a == "--demo")
 }
