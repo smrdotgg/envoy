@@ -261,7 +261,7 @@ impl Engine {
                 settings: RwLock::new(settings),
                 tokens: Mutex::new(HashMap::new()),
                 accounts: RwLock::new(accounts::load()),
-                watched: Mutex::new(HashSet::new()),
+                watched: Mutex::new(None),
                 synced: Mutex::new(HashMap::new()),
                 undo_keys: Mutex::new(HashMap::new()),
                 wakers: Mutex::new(HashMap::new()),
@@ -333,9 +333,10 @@ struct Shared {
     settings: RwLock<Settings>,
     tokens: Mutex<HashMap<String, (String, Instant)>>,
     accounts: RwLock<Vec<Account>>,
-    /// Mailboxes being looked at, `(account, name)`: synced with the inbox, and in between
+    /// The view on screen, whose mailboxes ([`Store::watched_boxes`], resolved by each worker
+    /// every round: Snoozed's buckets come and go) are synced with the inbox, and in between
     /// looked at for changes ([`changed_since_synced`]).
-    watched: Mutex<HashSet<(String, String)>>,
+    watched: Mutex<Option<View>>,
     /// Each mailbox's contents, `(account, name)`, as its last sync on either connection found
     /// them: what [`changed_since_synced`] compares with.
     synced: Mutex<HashMap<(String, String), imap::Contents>>,
@@ -966,30 +967,18 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             }
         }
         Command::Watch { view } => {
+            // The view is what's watched, not the mailboxes it has now: workers read those again
+            // every round (Snoozed's buckets wake, go and come while it's open).
+            let accts: Vec<String> = shared.accounts.read().map(|a| a.iter().map(|a| a.id.clone()).collect()).unwrap_or_default();
             let targets: Vec<(String, String)> = shared.with_writer(|st| {
-                let accts: Vec<String> = shared.accounts.read().map(|a| a.iter().map(|a| a.id.clone()).collect()).unwrap_or_default();
-                Ok(match &view {
-                    View::Mailbox { account, mailbox } => vec![(account.clone(), mailbox.clone())],
-                    // Every bucket not done with (and the server's own), of every account in the view.
-                    View::Role { account, role: Role::Snoozed } => {
-                        let mut boxes = Vec::new();
-                        for a in accts.iter().filter(|a| account.as_ref().is_none_or(|x| x == *a)) {
-                            let done = st.done_buckets(a)?;
-                            boxes.extend(st.mailboxes(a)?.into_iter().filter(|m| m.role == Role::Snoozed && m.selectable && !done.contains(&m.name)).map(|m| (a.clone(), m.name)));
-                        }
-                        boxes
-                    }
-                    View::Role { account, role } => accts
-                        .iter()
-                        .filter(|a| account.as_ref().is_none_or(|x| x == *a))
-                        .filter_map(|a| st.mailbox_for_role(a, *role).ok().flatten().map(|m| (a.clone(), m)))
-                        .collect(),
-                    View::Starred { .. } => vec![],
-                })
+                let mut targets = Vec::new();
+                for a in &accts {
+                    targets.extend(st.watched_boxes(&view, a)?.into_iter().map(|m| (a.clone(), m)));
+                }
+                Ok(targets)
             })?;
             if let Ok(mut w) = shared.watched.lock() {
-                w.clear();
-                w.extend(targets.iter().cloned());
+                *w = Some(view);
             }
             for (account, mailbox) in targets {
                 // A mailbox IDLE doesn't cover: the worker plans its wait again, to look at it
@@ -1972,7 +1961,7 @@ async fn foreground_job(shared: &Arc<Shared>, account: &Account, session: &mut S
 }
 
 /// Syncs one mailbox now (someone is looking at it), and its counts.
-async fn sync_one(shared: &Arc<Shared>, account: &Account, session: &mut Session, mailbox: &str) -> Result<()> {
+async fn sync_one(shared: &Arc<Shared>, account: &Account, session: &mut imap::Connection<impl imap::Io>, mailbox: &str) -> Result<()> {
     let id = &account.id;
     let window = shared.setting_u32("sync.initialMessages").max(50);
     let progress = {
@@ -2025,7 +2014,7 @@ async fn changed_since_synced(shared: &Shared, account: &str, session: &mut imap
 /// another message: nothing is stored, and the mailbox is synced again instead, so its cache
 /// starts over in the new one (the messages come back as new rows, to download when opened).
 /// Returns whether the bodies were downloaded.
-async fn download_bodies(shared: &Arc<Shared>, account: &Account, session: &mut Session, mailbox: &str, validity: u32, uids: &[u32]) -> Result<bool> {
+async fn download_bodies(shared: &Arc<Shared>, account: &Account, session: &mut imap::Connection<impl imap::Io>, mailbox: &str, validity: u32, uids: &[u32]) -> Result<bool> {
     match imap::fetch_bodies(session, &shared.writer, &account.id, mailbox, validity, uids).await {
         Ok(_) => Ok(true),
         Err(e) if e.downcast_ref::<imap::NewGeneration>().is_some() => {
@@ -2083,10 +2072,10 @@ async fn worker(shared: Arc<Shared>, id: String, mut jobs: mpsc::UnboundedReceiv
     }
 }
 
-async fn session_loop(
+async fn session_loop<T: imap::Io>(
     shared: &Arc<Shared>,
     account: &Account,
-    mut session: Session,
+    mut session: imap::Connection<T>,
     jobs: &mut mpsc::UnboundedReceiver<Job>,
     pending: &mut Vec<Job>,
     notify: &Arc<Notify>,
@@ -2169,9 +2158,9 @@ async fn session_loop(
             shared.emit_mailboxes(&id);
         }
 
-        let mailboxes = shared.with_writer(|st| st.mailboxes(&id))?;
-        let watched: Vec<String> =
-            shared.watched.lock().map(|w| w.iter().filter(|(a, _)| *a == id).map(|(_, m)| m.clone()).collect()).unwrap_or_default();
+        // The view on screen's mailboxes as they are now: after the folder list, wakes and cleanup.
+        let view = shared.watched.lock().ok().and_then(|w| w.clone());
+        let (mailboxes, watched) = shared.with_writer(|st| Ok((st.mailboxes(&id)?, view.map_or(Ok(Vec::new()), |v| st.watched_boxes(&v, &id))?)))?;
         // Which mailboxes to sync this round.
         let mut targets: Vec<String> = Vec::new();
         let mut push = |name: &str| {
@@ -2211,6 +2200,8 @@ async fn session_loop(
             }
             last_look = Instant::now();
         }
+        // Gone since it was asked for (a job from before, a bucket deleted): nothing to sync.
+        targets.retain(|t| mailboxes.iter().any(|m| m.name == *t && m.selectable));
         for name in &targets {
             shared.emit(Event::Sync { account: id.clone(), state: SyncState::Syncing(display_of(&mailboxes, name)) });
             let progress = {
@@ -2218,7 +2209,20 @@ async fn session_loop(
                 let id = id.clone();
                 move || shared.emit(Event::Changed { account: id.clone() })
             };
-            let out = imap::sync_mailbox(&mut session, &shared.writer, &id, name, window, &progress).await?;
+            let out = match imap::sync_mailbox(&mut session, &shared.writer, &id, name, window, &progress).await {
+                Ok(out) => out,
+                // Deleted on the server since the folder list (by another client, or another
+                // Envoy cleaning up a bucket): forgotten, and the round goes on. The session
+                // ending here would only meet it again on the next.
+                Err(e) if !imap::is_lost(&e) && !imap::listed(&mut session, name).await? => {
+                    log::info!("{}: {name} is gone from the server ({e:#}): forgotten", account.email);
+                    shared.with_writer(|st| st.forget_mailbox(&id, name))?;
+                    shared.emit(Event::Changed { account: id.clone() });
+                    changed = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             shared.synced(&id, name, out.contents);
             if mailboxes.iter().any(|m| m.role == Role::Inbox && m.name == *name) {
                 inbox_synced = Some(out.contents);
@@ -2346,7 +2350,7 @@ fn display_of(mailboxes: &[Mailbox], name: &str) -> String {
     mailboxes.iter().find(|m| m.name == name).map_or_else(|| name.to_owned(), |m| m.display.clone())
 }
 
-async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut Session, caps: imap::Caps) -> Result<bool> {
+async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut imap::Connection<impl imap::Io>, caps: imap::Caps) -> Result<bool> {
     replay_with(shared, account, &mut ImapRunner { shared, account, session, caps, buckets: HashSet::new() }).await
 }
 
@@ -2372,16 +2376,16 @@ trait OpRunner {
     fn create_bucket(&mut self, parent: &str, bucket: &str) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
-struct ImapRunner<'a> {
+struct ImapRunner<'a, T: imap::Io> {
     shared: &'a Arc<Shared>,
     account: &'a Account,
-    session: &'a mut Session,
+    session: &'a mut imap::Connection<T>,
     caps: imap::Caps,
     /// Buckets made (or found) this pass: a pass of snoozes to one time makes it once.
     buckets: HashSet<String>,
 }
 
-impl OpRunner for ImapRunner<'_> {
+impl<T: imap::Io> OpRunner for ImapRunner<'_, T> {
     async fn create_bucket(&mut self, parent: &str, bucket: &str) -> Result<()> {
         if !self.buckets.contains(bucket) {
             imap::ensure_bucket(self.session, parent, bucket).await?;
@@ -2749,12 +2753,12 @@ trait SnoozeServer {
     fn cleanup(&mut self, bucket: &str, inbox: &str) -> impl std::future::Future<Output = Result<bool>> + Send;
 }
 
-struct ImapSnooze<'a> {
-    session: &'a mut Session,
+struct ImapSnooze<'a, T: imap::Io> {
+    session: &'a mut imap::Connection<T>,
     caps: imap::Caps,
 }
 
-impl SnoozeServer for ImapSnooze<'_> {
+impl<T: imap::Io> SnoozeServer for ImapSnooze<'_, T> {
     async fn wake(&mut self, bucket: &str, inbox: &str) -> Result<imap::Woken> {
         imap::wake_bucket(self.session, self.caps, bucket, inbox).await
     }
@@ -3018,7 +3022,7 @@ mod tests {
             settings: RwLock::new(Settings::default()),
             tokens: Mutex::new(HashMap::new()),
             accounts: RwLock::new(vec![]),
-            watched: Mutex::new(HashSet::new()),
+            watched: Mutex::new(None),
             synced: Mutex::new(HashMap::new()),
             undo_keys: Default::default(),
             wakers: Default::default(),
@@ -5464,6 +5468,94 @@ mod tests {
         let buckets = shared.with_writer(|st| st.buckets("a")).unwrap();
         assert!(buckets.iter().all(|b| b.done));
         assert_eq!(restarted.next(&buckets, true, t + 4000), None);
+    }
+
+    /// A server for whole rounds of [`session_loop`]: an empty INBOX, the Snoozed parent, and
+    /// the buckets in `buckets` (the test changes them as it goes), each empty; MOVE, no IDLE.
+    /// A mailbox it hasn't got is NONEXISTENT to SELECT and STATUS, and missing from LIST.
+    fn loop_server(buckets: Arc<Mutex<Vec<String>>>) -> impl Fn(&str) -> Option<String> + Send + 'static {
+        move |c| {
+            let boxes = buckets.lock().unwrap().clone();
+            let name = c.split('"').nth(1).unwrap_or("").to_owned();
+            let has = |n: &str| n == "INBOX" || n == "Snoozed" || boxes.iter().any(|b| b == n);
+            Some(if c == "CAPABILITY" {
+                "* CAPABILITY IMAP4rev1 MOVE UIDPLUS\r\nTAG OK done\r\n".into()
+            } else if c == "LIST \"\" \"*\"" {
+                let mut out = "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasChildren) \"/\" \"Snoozed\"\r\n".to_owned();
+                for b in &boxes {
+                    out.push_str(&format!("* LIST (\\HasNoChildren) \"/\" \"{b}\"\r\n"));
+                }
+                out + "TAG OK done\r\n"
+            } else if c.starts_with("LIST ") {
+                let name = c.rsplit('"').nth(1).unwrap_or("");
+                if has(name) { format!("* LIST () \"/\" \"{name}\"\r\nTAG OK done\r\n") } else { "TAG OK done\r\n".into() }
+            } else if (c.starts_with("SELECT ") || c.starts_with("STATUS ")) && !has(&name) {
+                "TAG NO [NONEXISTENT] no such mailbox\r\n".into()
+            } else if c.starts_with("SELECT ") {
+                "* FLAGS (\\Seen \\Deleted)\r\n* 0 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 1] ok\r\nTAG OK [READ-WRITE] done\r\n".into()
+            } else if c.starts_with("STATUS ") {
+                format!("* STATUS \"{name}\" (MESSAGES 0 UNSEEN 0 UIDNEXT 1 UIDVALIDITY 7)\r\nTAG OK done\r\n")
+            } else {
+                return None;
+            })
+        }
+    }
+
+    /// Snoozed open through whole rounds of the session loop, its buckets changing under it: one
+    /// woken and done with is no longer synced; one deleted elsewhere is forgotten when it can't
+    /// be selected, and the session goes on; one that appears is synced.
+    #[tokio::test]
+    async fn the_snoozed_view_follows_its_buckets_as_they_wake_go_and_come() {
+        let t = now() / 60 * 60;
+        let (a, b, d, c) = (bucket_of(t - 2 * 3600), bucket_of(t + 3 * 3600), bucket_of(t + 4 * 3600), bucket_of(t + 5 * 3600));
+        // From the last run: a's time came while Envoy wasn't running.
+        let st = snooze_setup(&[t - 2 * 3600, t + 3 * 3600, t + 4 * 3600]);
+        let (shared, _rx) = engine_with(st);
+        shared.accounts.write().unwrap().push(account("a"));
+        handle(&shared, &mut HashMap::new(), Command::Watch { view: View::Role { account: Some("a".into()), role: Role::Snoozed } }).await.unwrap();
+        let on_server = Arc::new(Mutex::new(vec![a.clone(), b.clone(), d.clone()]));
+        let (session, log) = imap::fake::session(loop_server(on_server.clone())).await;
+        let (jobs, mut rx) = mpsc::unbounded_channel();
+        let notify = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let (shared, notify) = (shared.clone(), notify.clone());
+            async move { session_loop(&shared, &account("a"), session, &mut rx, &mut Vec::new(), &notify, &mut SnoozeClock::default()).await }
+        });
+        let selects = |m: &str| log.lock().unwrap().iter().filter(|c| **c == format!("SELECT \"{m}\"")).count();
+        let listed = |m: &str| log.lock().unwrap().iter().any(|c| *c == format!("LIST \"\" \"{m}\""));
+        let until = async |what: &str, done: &dyn Fn() -> bool| {
+            for _ in 0..1000 {
+                if done() || task.is_finished() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("{what}: {:?}", log.lock().unwrap());
+        };
+        let round = |job: Job| {
+            jobs.send(job).unwrap();
+            notify.notify_one();
+        };
+        // The first round wakes a (empty, and past its stragglers' hour: done with) and syncs
+        // the view's other buckets, not a.
+        until("the first round", &|| selects(&b) > 0 && selects(&d) > 0).await;
+        assert!(!task.is_finished());
+        assert_eq!(selects(&a), 1, "a: woken, not synced as a bucket on screen");
+        // d deleted elsewhere: forgotten once it can't be selected, and the session goes on.
+        on_server.lock().unwrap().retain(|m| *m != d);
+        round(Job::Sync);
+        until("the round after d went", &|| listed(&d)).await;
+        assert!(!task.is_finished(), "a mailbox gone doesn't end the session: {:?}", log.lock().unwrap());
+        assert!(!shared.with_writer(|st| Ok(st.mailboxes("a")?.iter().any(|m| m.name == d))).unwrap(), "d forgotten");
+        // c made elsewhere: synced once the folder list names it. A job for d, from before, is
+        // dropped: d is gone.
+        on_server.lock().unwrap().push(c.clone());
+        round(Job::SyncMailbox(d.clone()));
+        round(Job::Folders);
+        until("the round after c came", &|| selects(&c) > 0).await;
+        assert!(!task.is_finished(), "{:?}", log.lock().unwrap());
+        assert_eq!((selects(&a), selects(&d)), (1, 2), "neither again");
+        task.abort();
     }
 
     #[test]

@@ -262,6 +262,15 @@ impl Store {
         })
     }
 
+    /// `account`'s mailboxes that `view` shows now (Snoozed: its buckets not done with, soonest
+    /// first): what a worker keeps synced while the view's on screen, read again each round.
+    pub fn watched_boxes(&self, view: &View, account: &str) -> Result<Vec<String>> {
+        Ok(match self.scope(view)? {
+            Scope::Boxes(boxes) => boxes.into_iter().filter(|(a, _)| a == account).map(|(_, m)| m).collect(),
+            Scope::Starred(_) => Vec::new(),
+        })
+    }
+
     fn fts_hits(&self, query: &Query) -> Result<Hits> {
         let m: Vec<String> = query.text.iter().map(|t| fts_term(t)).collect();
         let mut stmt = self.conn.prepare_cached("SELECT rowid FROM fts WHERE fts MATCH ?1 ORDER BY rowid")?;

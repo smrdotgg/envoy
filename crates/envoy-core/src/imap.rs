@@ -497,6 +497,11 @@ impl Contents {
     }
 }
 
+/// Whether the server's folder list names `mailbox`: after it failed to open, whether it's gone.
+pub async fn listed(session: &mut Connection<impl Io>, mailbox: &str) -> Result<bool> {
+    wire::listed(session, mailbox).await
+}
+
 /// `mailbox`'s contents as a STATUS tells them, without selecting it: for
 /// [`Contents::moved_on`] against what its last sync found.
 pub async fn contents(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Contents> {
