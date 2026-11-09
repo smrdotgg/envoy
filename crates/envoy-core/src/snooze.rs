@@ -18,8 +18,11 @@
 //!   MOVE gets COPY and \Deleted (expunged only with UIDPLUS), each Envoy waiting up to
 //!   [`MAX_JITTER`] at random first, so two rarely copy the same messages; when they do, the
 //!   inbox keeps both copies (nothing there is deleted on a guess), and the list shows one.
-//! - **Cleanup**: a bucket is deleted only a day after its time ([`KEEP_EMPTY`]), and only when
-//!   the server says it's empty right before.
+//! - **Cleanup**: only on Gmail, where DELETE removes a label and never mail: a bucket a week
+//!   past its time ([`KEEP_EMPTY`]), once woken, when the server says it's empty right before.
+//!   Elsewhere DELETE takes a mailbox's messages, and one moved in between the STATUS and the
+//!   DELETE would go: buckets stay there, empty, and once woken and past the time a late message
+//!   could come, they're left alone (not looked into, synced or counted).
 //! - If the server already has a `Snoozed` mailbox of its own (`\Snoozed`, RFC 9979's
 //!   server-managed snoozes), or won't create one, the parent is `Envoy Snoozed` instead; buckets
 //!   under either are snoozes. The server's own is shown, never written into.
@@ -35,8 +38,8 @@ pub const PARENT: &str = "Snoozed";
 pub const FALLBACK_PARENT: &str = "Envoy Snoozed";
 /// A snooze reaching the server this many seconds or fewer before its time wakes instead.
 pub const TOO_CLOSE: i64 = 60;
-/// An empty bucket is deleted no sooner than this many seconds after its time.
-pub const KEEP_EMPTY: i64 = 24 * 3600;
+/// An empty bucket is deleted (on Gmail only) no sooner than this many seconds after its time.
+pub const KEEP_EMPTY: i64 = 7 * 24 * 3600;
 /// Without MOVE, each Envoy waits up to this many seconds (at random) before waking a bucket,
 /// so two of them rarely copy the same messages at once.
 pub const MAX_JITTER: i64 = 30;
@@ -161,7 +164,7 @@ pub fn due(wake: i64, jitter: i64, now: i64) -> bool {
     now >= wake + jitter
 }
 
-/// A bucket is old enough to delete (if it's empty): a day past its time.
+/// A bucket is old enough to delete (on Gmail, if it's empty): a week past its time.
 pub fn old_enough(wake: i64, now: i64) -> bool {
     now >= wake + KEEP_EMPTY
 }
