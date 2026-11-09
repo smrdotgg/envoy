@@ -91,7 +91,8 @@ All rebindable under Settings → Keyboard (`mod` = ⌘ on macOS, Ctrl elsewhere
 | `#` | delete | `mod+enter` | send |
 | `!` | report spam (from Spam: not spam) | `/` | search |
 | `v` | move to… | `l` | label… (Gmail) |
-| `z` | undo archive / delete / move / label / send | `esc` | close, or clear the selection |
+| `b` | snooze… (in Snoozed: a new time) | | |
+| `z` | undo archive / delete / move / label / snooze / send | `esc` | close, or clear the selection |
 | `s` | star | `mod+,` | settings |
 | `u` | toggle read | `mod+shift+b` | toggle sidebar |
 | `x` | select / unselect | `shift+j` / `shift+k` | select the next / previous too |
@@ -157,6 +158,30 @@ you write to first (writing to someone counts five times what hearing from them 
 ones you've been in touch with lately (a month ago counts half). Newsletters, lists and other
 bulk senders you've never written to come last, no-reply addresses not at all, and your own
 addresses never.
+
+## Snooze
+
+Press `b` (or the clock in the reader's toolbar, or over a selection) to put a message away until
+later: **Later today**, **Tonight**, **Tomorrow**, **This weekend**, **Next week**, or type a time
+into the picker's field, as you'd say it: `fri 9am`, `tomorrow 5pm`, `in 2 days`, `in 3 hours`,
+`dec 3`, `2026-12-03 09:00` (read on this computer, in your time zone). A conversation snoozes
+whole. It leaves the inbox at once, with **Undo** for the undo window, like an archive; undone,
+the server never hears of it.
+
+At its time it's back **at the top of your inbox**, unread and marked "Snoozed", until you deal
+with it (read it and move on, or archive it). **Snoozed** in the sidebar lists everything snoozed,
+soonest first, with when each comes back; `b` there picks a new time, and the inbox icon on a
+row brings it back now.
+
+**Snoozes live on your mail server, not on any Envoy server.** A snoozed message is in a
+folder named for when it wakes, under `Snoozed`: `Snoozed/20261110T0800Z` (UTC, to the minute);
+on Gmail, a label. Other mail apps show them as folders or labels, and every Envoy you run sees
+the same snoozes. Any Envoy that's running at the time brings a message back (and one that
+wasn't catches up when it starts); nothing happens while none is. An empty folder goes a day
+after its time. If your server already keeps a `Snoozed` folder of its own (or won't let Envoy
+make one), Envoy's go under `Envoy Snoozed` instead, and the server's own snoozes are shown in
+Snoozed but left to it. Snoozes made in Gmail's web app aren't visible over IMAP, so Envoy doesn't
+show them.
 
 ## Attachments
 
@@ -249,7 +274,7 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png -
 ```
 
 Run from the repository root (the attach script picks files in it), with a debug build: release
-builds leave headless runs out. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label toast toast-compose counts split split-newsletters split-moved split-search split-narrow split-empty split-off settings-rules`.
+builds leave headless runs out. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label snooze snooze-typed snoozed woken toast toast-compose counts split split-newsletters split-moved split-search split-narrow split-empty split-off settings-rules`.
 
 HTML rendering is tested against the mail in `crates/envoy-core/tests/fixtures/html` (sources and
 licenses in its `LICENSES.md`).
@@ -259,7 +284,10 @@ licenses in its `LICENSES.md`).
 flags both ways, archive, spam, trash and moves with the undo window (off the server during it,
 untouched by an undo, there after it), labels (a copy in another mailbox, the message staying
 put) and a two-message move under one undo key, delete forever, sending with undo send, drafts (saved,
-edited, sent, undone, discarded), and moves and a send held across a kill and a restart. It runs
+edited, sent, undone, discarded), moves and a send held across a kill and a restart, and snoozes
+(undone inside the window with the server untouched; let go into its `Snoozed/…` folder, made and
+subscribed; one whose time came first woken in place; a folder left past its time woken on the
+next check, unread and pinned; an old empty one deleted; unsnoozed from Snoozed). It runs
 twice: against GreenMail as it is (UIDPLUS, MOVE, IDLE), then through a proxy that takes UIDPLUS
 and MOVE away, so the fallbacks run too, and fails if Envoy sends a command that server lacks,
 or one that would expunge mail it didn't delete. To run it locally (the second pass needs
