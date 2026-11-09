@@ -942,8 +942,27 @@ impl Store {
         &self.conn
     }
 
+    /// Runs `f` with each commit on disk before it returns (`PRAGMA synchronous = FULL`), then
+    /// back to NORMAL, where a commit can roll back on a power cut or an OS crash (never on the
+    /// app's): for writes that something outside the database is deleted on the strength of.
+    pub fn durably<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("PRAGMA synchronous = FULL")?;
+        let out = f(self);
+        if let Err(e) = self.conn.execute_batch("PRAGMA synchronous = NORMAL") {
+            // Only slower: every commit is synced.
+            log::warn!("couldn't set the cache's commits back to NORMAL: {e}");
+        }
+        out
+    }
+
+    /// Runs `f` in one transaction, which takes the write lock as it begins. Begun deferred, a
+    /// transaction that reads before it writes would get SQLITE_BUSY at once, the busy timeout
+    /// ignored, if another connection (another Envoy on the same cache) held the lock when it
+    /// came to write: SQLite waits only for a lock asked for outside a transaction. Only the
+    /// writer runs these (the reader's snapshots are its own, [`Store::list`]), so within one
+    /// Envoy taking the lock at once costs nothing: its mutex already orders the writes.
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
         let out = f(self)?;
         tx.commit()?;
         Ok(out)
@@ -2133,6 +2152,54 @@ mod tests {
         assert!(!s.cancel_send(moved).unwrap(), "only sends are cancelled this way");
         assert_eq!(s.ops("a", 100).unwrap().len(), 1, "the move is still queued");
         assert_eq!(orphaned_holds(&s), 0);
+    }
+
+    #[test]
+    fn a_transaction_waits_for_another_envoys_writer_rather_than_failing() {
+        let dir = std::env::temp_dir().join(format!("envoy-store-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mail.sqlite");
+        let mine = Store::open(&db).unwrap();
+        let (held, released) = (std::sync::Barrier::new(2), std::time::Duration::from_millis(300));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Another Envoy, mid-write.
+                let other = Store::open(&db).unwrap();
+                other.conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO send_limits (account, size) VALUES ('b', 1)").unwrap();
+                held.wait();
+                std::thread::sleep(released);
+                other.conn.execute_batch("COMMIT").unwrap();
+            });
+            held.wait();
+            let start = std::time::Instant::now();
+            // Reads, then writes: a deferred transaction would hold a read snapshot by the time
+            // it wants the write lock, and SQLite answers that with SQLITE_BUSY at once, without
+            // waiting out the busy timeout.
+            let wrote = mine.transaction(|st| {
+                let before: i64 = st.conn.query_row("SELECT COUNT(*) FROM send_limits", [], |r| r.get(0))?;
+                st.conn.execute("INSERT INTO send_limits (account, size) VALUES ('a', ?1)", params![before])?;
+                Ok(())
+            });
+            assert!(wrote.is_ok(), "waited for the other writer: {wrote:?}");
+            assert!(start.elapsed() >= released / 2, "and it did wait: {:?}", start.elapsed());
+        });
+        let sizes: Vec<(String, i64)> = mine.conn.prepare("SELECT account, size FROM send_limits ORDER BY account").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(sizes, vec![("a".to_owned(), 1), ("b".to_owned(), 1)], "it read what the other one wrote");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_writes_are_synced_and_the_rest_go_back_to_normal() {
+        const FULL: i64 = 2;
+        const NORMAL: i64 = 1;
+        let s = Store::memory();
+        let synchronous = |s: &Store| s.conn.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(synchronous(&s), NORMAL);
+        assert_eq!(s.durably(|s| Ok(synchronous(s))).unwrap(), FULL);
+        assert_eq!(synchronous(&s), NORMAL);
+        assert!(s.durably(|_| -> Result<()> { anyhow::bail!("refused") }).is_err());
+        assert_eq!(synchronous(&s), NORMAL, "after an error too");
     }
 
     #[test]

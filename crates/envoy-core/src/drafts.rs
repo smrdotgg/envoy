@@ -120,7 +120,14 @@ fn write_recovered(dir: &Path, r: &Recovered) -> Result<()> {
 /// another, wait for the next import; one another importer took first is skipped. A file that
 /// isn't a draft is set aside (renamed), never removed. Stops at the first store error, leaving
 /// the rest for the next start. Returns how many were imported.
+///
+/// Each import is on disk before its file goes ([`Store::durably`]): a power cut can't take
+/// back the text and keep the file's deletion.
 pub fn import_recovery(dir: &Path, st: &Store, now: i64) -> Result<usize> {
+    st.durably(|st| import_files(dir, st, now))
+}
+
+fn import_files(dir: &Path, st: &Store, now: i64) -> Result<usize> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -449,26 +456,31 @@ mod tests {
                 folder
             })
             .collect();
-        // Envoys starting at once, each importing its own snapshots into the same database.
-        std::thread::scope(|s| {
-            for folder in &folders {
-                let db = &db;
-                s.spawn(move || {
-                    let st = Store::open(db).unwrap();
-                    for _ in 0..200 {
-                        let _ = import_recovery(folder, &st, 100); // busy: the rest waits for the next go
-                        if files(folder).is_empty() {
-                            break;
-                        }
-                    }
-                });
-            }
+        // Envoys starting at once, each importing its own snapshots into the same database, in
+        // one go: each waits its turn for the database, never giving up on a busy one.
+        let start = std::sync::Barrier::new(folders.len());
+        let results: Vec<Result<usize, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = folders
+                .iter()
+                .map(|folder| {
+                    let (db, start) = (&db, &start);
+                    s.spawn(move || {
+                        let st = Store::open(db).unwrap();
+                        start.wait();
+                        import_recovery(folder, &st, 100).map_err(|e| format!("{e:#}"))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        assert_eq!(results, vec![Ok(each as usize); importers as usize], "every importer took all of its snapshots");
+        assert!(folders.iter().all(|f| files(f).is_empty()), "and their files went");
         let st = Store::open(&db).unwrap();
-        let subjects: HashSet<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
-        let lost: Vec<String> = (0..importers).flat_map(|i| (0..each).map(move |j| format!("text {i}-{j}"))).filter(|t| !subjects.contains(t)).collect();
-        assert!(lost.is_empty(), "lost {} of {}: {lost:?}", lost.len(), importers * each);
-        assert!(folders.iter().all(|f| files(f).is_empty()));
+        let mut subjects: Vec<String> = st.drafts(None).unwrap().into_iter().map(|d| d.draft.subject).collect();
+        subjects.sort();
+        let mut want: Vec<String> = (0..importers).flat_map(|i| (0..each).map(move |j| format!("text {i}-{j}"))).collect();
+        want.sort();
+        assert_eq!(subjects, want, "each snapshot's text kept, once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
