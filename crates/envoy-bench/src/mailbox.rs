@@ -8,6 +8,11 @@
 //! 2–12; ~15% HTML newsletters and receipts (some HTML-only); ~9% with attachments; unread mail
 //! concentrated in the recent inbox. Every message has its body cached (the worst case for
 //! search: the full-text index covers all of them). The same seed always yields the same bytes.
+//!
+//! For the split inbox, mail carries the headers real mail does: newsletters `List-Unsubscribe`
+//! and `List-Id`, bots `Auto-Submitted`; some people's mail goes to a team address with you
+//! copied. The store sorts it as it's written, with the classifier the engine would set for this
+//! account (no rules, its address), so a run starts with nothing left to sort.
 
 use std::path::Path;
 
@@ -403,6 +408,7 @@ pub fn generate(home: &Path, count: usize, seed: u64) -> Result<Summary> {
     std::fs::write(home.join("settings.json"), "{}\n")?;
 
     let store = Store::open(&db).with_context(|| format!("opening {}", db.display()))?;
+    store.set_classifier(envoy_core::category::Classifier::new(Vec::new(), [ME.to_owned()]))?;
     for (name, display, role) in BOXES {
         store.upsert_mailbox(ACCOUNT, name, display, *role, "/", true)?;
     }
@@ -433,6 +439,8 @@ pub fn generate(home: &Path, count: usize, seed: u64) -> Result<Summary> {
         let mut attach = false;
         let mut from_me = false;
         let mut kind_box: Option<&str> = None;
+        // Headers of bulk and automated mail (no randomness: the mailbox stays the same).
+        let mut bulk = String::new();
 
         let reply_to_thread = roll < 0.33 && !open.is_empty();
         if reply_to_thread {
@@ -473,6 +481,7 @@ pub fn generate(home: &Path, count: usize, seed: u64) -> Result<Summary> {
             // Bots and notifications: short text.
             let (n, e) = rng.pick(BOTS);
             from = Person { name: n.to_string(), email: e.to_string() };
+            bulk = "Auto-Submitted: auto-generated\r\n".to_owned();
             let project = rng.pick(PROJECTS);
             subject = match rng.below(5) {
                 0 => format!("[{}] Pull request #{}: {}", project.to_lowercase(), rng.range(100, 9999), rng.pick(TOPICS)),
@@ -485,6 +494,8 @@ pub fn generate(home: &Path, count: usize, seed: u64) -> Result<Summary> {
         } else if roll < 0.66 {
             let (n, e) = rng.pick(NEWSLETTERS);
             from = Person { name: n.to_string(), email: e.to_string() };
+            let domain = e.split('@').nth(1).unwrap_or("example");
+            bulk = format!("List-Unsubscribe: <https://{domain}/unsubscribe?u={i}>, <mailto:unsubscribe@{domain}>\r\nList-Id: {n} <list.{domain}>\r\n");
             subject = format!("{}: {}", n, sentence(&mut rng).trim_end_matches(['.', '?']));
             let h = newsletter_html(&mut rng, &subject, n);
             if rng.chance(0.5) {
@@ -524,6 +535,12 @@ pub fn generate(home: &Path, count: usize, seed: u64) -> Result<Summary> {
             } else {
                 from = folks[others[0]].clone();
                 cc = others.iter().skip(1).map(|&p| folks[p].clone()).collect();
+                // Every other group message goes to the team, you copied.
+                if !cc.is_empty() && i % 2 == 0 {
+                    let company = from.email.split('@').nth(1).unwrap_or("example").to_owned();
+                    to = vec![Person { name: "Team".into(), email: format!("team@{company}") }];
+                    cc.push(me.clone());
+                }
             }
             let mut body = format!("Hi {},\n\n", if from_me { to[0].name.split(' ').next().unwrap_or("") } else { "there" });
             body.push_str(&paragraphs(&mut rng, 1, 6).join("\n\n"));
@@ -595,6 +612,7 @@ pub fn generate(home: &Path, count: usize, seed: u64) -> Result<Summary> {
             raw.push_str(&format!("Cc: {}\r\n", cc.iter().map(|p| addr(&p.name, &p.email)).collect::<Vec<_>>().join(", ")));
         }
         raw.push_str(&format!("Subject: {subject}\r\nDate: {}\r\nMessage-ID: {mid}\r\n", rfc2822(date)));
+        raw.push_str(&bulk);
         if !in_reply_to.is_empty() {
             raw.push_str(&format!("In-Reply-To: {in_reply_to}\r\nReferences: {references}\r\n"));
         }
@@ -742,6 +760,14 @@ mod tests {
             let rows = st.list(&inbox, &envoy_core::store::Query::parse(q), true, 3000, &me).unwrap();
             assert!(!rows.is_empty(), "{q} found nothing");
         }
+        // Every tab of the split inbox has mail, and the engine's classifier finds nothing to redo.
+        for c in envoy_core::model::Category::ALL {
+            let rows = st.list(&inbox, &envoy_core::store::Query::in_category(c), true, 3000, &me).unwrap();
+            eprintln!("inbox {}: {} conversations", c.label(), rows.len());
+            assert!(!rows.is_empty(), "no {} in the inbox", c.label());
+        }
+        st.set_classifier(envoy_core::category::Classifier::new(Vec::new(), [ME.to_owned()])).unwrap();
+        assert!(!st.recategorizing().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

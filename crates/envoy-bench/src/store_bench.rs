@@ -11,6 +11,11 @@
 //!   `REPEAT` more times; the gate is the median of those 21 runs, with the p90, the cold run
 //!   and the worst printed beside it. Every prefix typed on the way to two queries runs 5 times;
 //!   the gate is the worst keystroke's median.
+//! - Split inbox tabs: what the engine does for `Command::List` with a category: the tab's rows
+//!   (`list_paged` with the category), timed to the first page like search and gated like it
+//!   (median of 21), then every tab's unread count (`Store::category_counts`), which the whole
+//!   list's time includes. Switching tabs round and round is timed too (the worst switch's
+//!   median), beside the unsplit inbox.
 //! - Open: `Store::thread(id, conversations = true)`: reads the conversation, its bodies,
 //!   converts HTML to Markdown on first open (and writes it back, as the engine does), and
 //!   parses the HTML into the layout tree the reader draws. Each sample is a different message,
@@ -38,7 +43,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use envoy_core::engine::FIRST_PAGE;
-use envoy_core::model::{Role, View};
+use envoy_core::model::{Category, Role, View};
 use envoy_core::store::{Query, Store};
 
 use crate::mailbox::{ACCOUNT, END, FIRST, LAST, ME};
@@ -120,6 +125,7 @@ pub fn run(home: &Path, checks: &mut Vec<Check>, search: bool, open: bool) -> Re
     if search {
         run_search(&st, &me, checks)?;
         run_contacts(home, &st, &me, checks)?;
+        run_tabs(&st, &me, checks)?;
     }
     if open {
         run_open(&db, &st, checks)?;
@@ -292,6 +298,69 @@ fn time_contacts(st: &Store, me: &HashSet<String>, what: &str, lines: &mut Vec<S
     if !gate {
         checks.push(Check::info("search", "recipients: a huge address book", all_worst.0, "ms", format!("worst keystroke {} (median of {TYPED_RUNS}); {what}", all_worst.1)));
     }
+    Ok(())
+}
+
+/// A tab of the split inbox as the engine reads it: its rows, the first page sent ahead, then
+/// the tabs' counts. (ms to the rows shown first, ms to the whole list and the counts, rows.)
+fn timed_tab(st: &Store, view: &View, tab: Option<Category>, me: &HashSet<String>) -> Result<(f64, f64, usize)> {
+    let t = Instant::now();
+    let query = tab.map_or_else(Query::default, Query::in_category);
+    let mut first = None;
+    let rows = st.list_paged(view, &query, true, LIMIT, me, FIRST_PAGE, &mut |_| {
+        first.get_or_insert(t.elapsed());
+    })?;
+    if tab.is_some() {
+        st.category_counts(view, true)?;
+    }
+    let whole = t.elapsed();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    Ok((ms(first.unwrap_or(whole)), ms(whole), rows.len()))
+}
+
+fn run_tabs(st: &Store, me: &HashSet<String>, checks: &mut Vec<Check>) -> Result<()> {
+    let view = inbox();
+    let mut lines = Vec::new();
+    let tabs: Vec<Option<Category>> = std::iter::once(None).chain(Category::ALL.into_iter().map(Some)).collect();
+    for tab in &tabs {
+        let name = tab.map_or("unsplit (today's list)", |c| c.label());
+        let (cold, cold_whole, n) = timed_tab(st, &view, *tab, me)?;
+        let (mut runs, mut wholes) = (vec![cold], vec![cold_whole]);
+        for _ in 0..REPEAT {
+            let (shown, whole, _) = timed_tab(st, &view, *tab, me)?;
+            runs.push(shown);
+            wholes.push(whole);
+        }
+        let (p50, max) = p50_max(&runs);
+        let whole50 = p50_max(&wholes).0;
+        lines.push(format!("  inbox  {name:<22} {n:>5} rows  cold {cold:7.2} ms  p50 {p50:7.2} ms  max {max:7.2} ms  (whole list p50 {whole50:7.2} ms)"));
+        let detail = format!("median of {} (cold {cold:.2}, max {max:.2}); {n} conversations, the whole list in {whole50:.2}", REPEAT + 1);
+        match tab {
+            Some(c) => checks.push(Check::gated("search", format!("inbox tab: {}", c.label()), p50, "ms", budget::SEARCH_MS, 1.0, format!("{detail} (counts included)"))),
+            None => checks.push(Check::info("search", "inbox, unsplit", p50, "ms", detail)),
+        }
+    }
+    // Switching: each tab after the one before, round and round.
+    let mut switches: Vec<Vec<f64>> = vec![Vec::new(); Category::ALL.len()];
+    for _ in 0..TYPED_RUNS {
+        for (i, c) in Category::ALL.into_iter().enumerate() {
+            switches[i].push(timed_tab(st, &view, Some(c), me)?.0);
+        }
+    }
+    let (worst, which) = switches.iter().enumerate().map(|(i, runs)| (p50_max(runs).0, Category::ALL[i])).fold((0.0f64, Category::Important), |a, b| if b.0 > a.0 { b } else { a });
+    lines.push(format!("  inbox  switching tabs         worst switch (to {}) p50 {worst:7.2} ms over {TYPED_RUNS} rounds", which.label()));
+    checks.push(Check::gated("search", "inbox: switching tabs", worst, "ms", budget::SEARCH_MS, 1.0, format!("the slowest switch's median (to {}) over {TYPED_RUNS} rounds of all four", which.label())));
+    let t = Instant::now();
+    for _ in 0..REPEAT {
+        st.category_counts(&view, true)?;
+    }
+    let counts = t.elapsed().as_secs_f64() * 1000.0 / REPEAT as f64;
+    checks.push(Check::info("search", "  tab counts", counts, "ms", "Store::category_counts for the inbox, mean"));
+    println!("\nsplit inbox (list_paged with the category, conversations, limit {LIMIT}, first page {FIRST_PAGE}; then Store::category_counts):");
+    for l in &lines {
+        println!("{l}");
+    }
+    println!("  tab counts alone: {counts:.2} ms");
     Ok(())
 }
 
