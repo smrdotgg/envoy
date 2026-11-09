@@ -1,0 +1,24 @@
+diff --git a/vendor/rune/crates/rune/Cargo.toml b/vendor/rune/crates/rune/Cargo.toml
+index 094a381..a7a1a08 100644
+--- a/vendor/rune/crates/rune/Cargo.toml
++++ b/vendor/rune/crates/rune/Cargo.toml
+@@ -171,8 +171,17 @@ zbus = { version = "5.19", default-features = false, features = ["tokio"], optio
+ tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], optional = true }
+ futures-util = { version = "0.3", optional = true }
+ 
+-[target.'cfg(all(not(target_vendor = "apple"), not(target_arch = "wasm32")))'.dependencies]
+-wgpu = { version = "30", default-features = false, features = ["vulkan", "dx12"] }
++[target.'cfg(all(not(target_vendor = "apple"), not(target_arch = "wasm32"), not(target_os = "windows")))'.dependencies]
++wgpu = { version = "30", default-features = false, features = ["vulkan"] }
++
++# Windows draws with DX12 (`Gpu::wgpu_instance`), which always has an adapter there: DXGI lists
++# WARP, the software rasterizer, on every Windows that runs Rust's MSVC target (10 and later),
++# with or without a GPU. Vulkan was only the fallback for a DX12 that listed none, so it isn't
++# built: no Vulkan backend, SPIR-V writer or loader in Windows binaries (about 1.2 MB).
++[target.'cfg(target_os = "windows")'.dependencies.wgpu]
++version = "30"
++default-features = false
++features = ["dx12"]
+ 
+ [lints]
+ workspace = true
