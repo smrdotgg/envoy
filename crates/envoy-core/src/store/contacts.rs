@@ -6,7 +6,9 @@
 //! index's `jo…` range and nothing else ([`SUGGEST`]). `contact_sources` remembers the messages
 //! already counted, by Message-ID, so a message is counted once however many copies the cache
 //! holds or has held: in two mailboxes (Gmail's labels), or archived (its row goes when the
-//! move replays, and the Archive's copy comes later with a new UID).
+//! move replays, and the Archive's copy comes later with a new UID). It also remembers whether
+//! a message's Bcc was counted: only some copies of mail you sent carry it (Sent's, not All
+//! Mail's), so a copy with a Bcc adds those people when the copy counted first had none.
 //!
 //! A message's people are counted as it's first stored ([`Store::upsert_header`]); messages
 //! cached by a build from before, once, in the background, a chunk at a time
@@ -47,21 +49,25 @@ CREATE INDEX contact_terms_contact ON contact_terms (contact);
 CREATE TRIGGER contacts_terms_delete AFTER DELETE ON contacts BEGIN
     DELETE FROM contact_terms WHERE contact = old.id;
 END;
+CREATE INDEX contacts_email ON contacts (email);
 CREATE TABLE contact_sources (
     account TEXT NOT NULL,
     message INTEGER NOT NULL,
+    bcc INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, message)
 ) WITHOUT ROWID;
 ";
 
-/// Messages cached before contacts were kept, by id: `next` up to `upto` are still to count.
-/// Messages stored after it was made (ids above `upto`) are counted as they come.
+/// Messages cached before contacts were kept, by id: those after `next` (the last one counted)
+/// up to `upto` are still to count. Messages stored after it was made (ids above `upto`) are
+/// counted as they come.
 pub(super) const BACKFILL: &str = "CREATE TABLE contacts_backfill (next INTEGER NOT NULL, upto INTEGER NOT NULL)";
 
-/// A lookup: the contacts with a term in the typed word's range (`?1` ≤ term < `?2`, the
-/// word followed by the highest character), read through contact_terms' primary key.
+/// A lookup: every account's contact for each address that has a contact (in any account) with
+/// a term in the typed word's range (`?1` ≤ term < `?2`, the word followed by the highest
+/// character), read through contact_terms' primary key and then contacts_email.
 pub(super) const SUGGEST: &str = "SELECT email, name, name_src, name_at, sent, sent_at, got, cc, bulk, seen_at FROM contacts
-    WHERE id IN (SELECT contact FROM contact_terms WHERE term >= ?1 AND term < ?2)";
+    WHERE email IN (SELECT m.email FROM contacts m WHERE m.id IN (SELECT contact FROM contact_terms WHERE term >= ?1 AND term < ?2))";
 
 /// One message, as far as its people go.
 pub(super) struct Mail<'a> {
@@ -105,14 +111,22 @@ impl Store {
         if matches!(role, Role::Drafts | Role::Junk) {
             return Ok(());
         }
-        if !m.message_id.trim().is_empty() {
-            let new = self.conn.prepare_cached("INSERT OR IGNORE INTO contact_sources (account, message) VALUES (?1, ?2)")?.execute(params![account, contacts::message_hash(m.message_id)])?;
-            if new == 0 {
-                return Ok(());
-            }
-        }
         let me = self.me.borrow();
         let mine = |a: &Address| me.contains(&a.email.trim().to_lowercase());
+        let yours = role == Role::Sent || mine(m.from);
+        let with_bcc = yours && !m.bcc.is_empty();
+        // Only the Bcc of a message counted before from a copy without one.
+        let mut bcc_only = false;
+        if !m.message_id.trim().is_empty() {
+            let hash = contacts::message_hash(m.message_id);
+            let new = self.conn.prepare_cached("INSERT OR IGNORE INTO contact_sources (account, message, bcc) VALUES (?1, ?2, ?3)")?.execute(params![account, hash, with_bcc])?;
+            if new == 0 {
+                if !with_bcc || self.conn.prepare_cached("UPDATE contact_sources SET bcc = 1 WHERE account = ?1 AND message = ?2 AND bcc = 0")?.execute(params![account, hash])? == 0 {
+                    return Ok(());
+                }
+                bcc_only = true;
+            }
+        }
         let mut seen: Vec<(String, Seen)> = Vec::new();
         let mut note = |a: &Address, name_src: i64, f: &dyn Fn(&mut Stats)| {
             let email = a.email.trim().to_lowercase();
@@ -135,12 +149,19 @@ impl Store {
             }
         };
         let date = m.date;
-        if role == Role::Sent || mine(m.from) {
+        let sent = |s: &mut Stats| {
+            s.sent = 1;
+            s.sent_at = date;
+        };
+        if bcc_only {
+            // Its To and Cc were counted with it.
+            let counted: Vec<String> = m.recipients.iter().map(|a| a.email.trim().to_lowercase()).collect();
+            for a in m.bcc.iter().filter(|a| !counted.contains(&a.email.trim().to_lowercase())) {
+                note(a, source::YOURS, &sent);
+            }
+        } else if yours {
             for a in m.recipients.iter().chain(m.bcc) {
-                note(a, source::YOURS, &|s| {
-                    s.sent = 1;
-                    s.sent_at = date;
-                });
+                note(a, source::YOURS, &sent);
             }
         } else {
             let bulk = m.bulk;
@@ -226,8 +247,8 @@ impl Store {
         Ok(contacts::rank(candidates, &words, me, now, limit))
     }
 
-    /// Counts the people of the next `chunk` messages (by id) of a cache from before contacts
-    /// were kept ([`BACKFILL`]), or finishes once it's through. False when there's nothing
+    /// Counts the people of the next `chunk` messages (by id, however far apart their ids) of a
+    /// cache from before contacts were kept ([`BACKFILL`]), or finishes once it's through. False when there's nothing
     /// left to do. Each call is one short transaction, so the writer is free between.
     ///
     /// A message's people come from its row; whether it was bulk, and its Bcc, from its
@@ -241,27 +262,26 @@ impl Store {
                 st.conn.execute_batch("DROP TABLE contacts_backfill")?;
                 return Ok(false);
             };
-            if next > upto {
-                st.conn.execute_batch("DROP TABLE contacts_backfill")?;
-                return Ok(false);
-            }
-            let end = next.saturating_add(chunk.max(1)).min(upto + 1);
             type Row = (i64, String, String, String, String, String, String, i64, u32, bool);
             let rows: Vec<Row> = st
                 .conn
                 .prepare_cached(
                     "SELECT m.id, m.account, m.mailbox, m.message_id, m.from_name, m.from_email, m.recipients, m.date, m.flags, EXISTS (SELECT 1 FROM bodies b WHERE b.id = m.id)
-                     FROM messages m WHERE m.id >= ?1 AND m.id < ?2 ORDER BY m.id",
+                     FROM messages m WHERE m.id > ?1 AND m.id <= ?2 ORDER BY m.id LIMIT ?3",
                 )?
-                .query_map(params![next, end], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)))?
+                .query_map(params![next, upto, chunk.max(1)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)))?
                 .collect::<rusqlite::Result<_>>()?;
+            let Some(last) = rows.last().map(|r| r.0) else {
+                st.conn.execute_batch("DROP TABLE contacts_backfill")?;
+                return Ok(false);
+            };
             for (id, account, mailbox, message_id, from_name, from_email, recipients, date, fl, downloaded) in rows {
                 let (bcc, bulk) = if downloaded { st.peek_headers(id)? } else { (Vec::new(), false) };
                 let recipients: Vec<Address> = super::from_json(&recipients);
                 let from = Address { name: from_name, email: from_email };
                 st.add_people(&account, &mailbox, &Mail { message_id: &message_id, from: &from, recipients: &recipients, bcc: &bcc, bulk, date, flags: fl })?;
             }
-            st.conn.execute("UPDATE contacts_backfill SET next = ?1", params![end])?;
+            st.conn.execute("UPDATE contacts_backfill SET next = ?1", params![last])?;
             Ok(true)
         })?;
         if !more {
@@ -422,6 +442,67 @@ mod tests {
         assert_eq!(row(&s, "cy@x.com"), (1, 0, 0, 0));
         let mine: i64 = s.conn.query_row("SELECT COUNT(*) FROM contacts WHERE email = ?1", [ME], |r| r.get(0)).unwrap();
         assert_eq!(mine, 0, "you aren't your own contact");
+    }
+
+    #[test]
+    fn a_sent_copys_bcc_is_learnt_when_a_copy_without_it_came_first() {
+        let s = store();
+        let bare = raw(ME, "Ana <ana@x.com>", "Bo <bo@x.com>", "<1@x>", 1, "");
+        let with_bcc = raw(ME, "Ana <ana@x.com>", "Bo <bo@x.com>", "<1@x>", 1, "Bcc: Cy <cy@x.com>, Bo <bo@x.com>\r\n");
+        put(&s, "Archive", 1, &bare); // All Mail, say: no Bcc
+        put(&s, "Sent", 2, &with_bcc);
+        put(&s, "Label", 3, &with_bcc); // and once more
+        assert_eq!(row(&s, "cy@x.com"), (1, 0, 0, 0), "the Bcc of the richer copy, once");
+        assert_eq!((row(&s, "ana@x.com"), row(&s, "bo@x.com")), ((1, 0, 0, 0), (1, 0, 0, 0)), "the others aren't counted again");
+        // In a backfill too, whichever copy has the lower id.
+        s.conn.execute_batch("DELETE FROM contacts; DELETE FROM contact_sources; CREATE TABLE contacts_backfill (next INTEGER NOT NULL, upto INTEGER NOT NULL); INSERT INTO contacts_backfill VALUES (0, 99);").unwrap();
+        s.contacts_backfill.set(true);
+        while s.backfill_contacts(1).unwrap() {}
+        assert_eq!((row(&s, "ana@x.com"), row(&s, "cy@x.com")), ((1, 0, 0, 0), (1, 0, 0, 0)));
+    }
+
+    #[test]
+    fn the_backfill_steps_over_gaps_in_ids() {
+        let s = store();
+        for id in [1i64, 2, 3, 10_000_000] {
+            s.conn
+                .execute("INSERT INTO messages (id, account, mailbox, uid, message_id, from_email, recipients, date) VALUES (?1, 'a', 'INBOX', ?1, ?2, 'ana@x.com', '[]', 1)", params![id, format!("<{id}@x>")])
+                .unwrap();
+        }
+        s.conn.execute_batch("CREATE TABLE contacts_backfill (next INTEGER NOT NULL, upto INTEGER NOT NULL); INSERT INTO contacts_backfill VALUES (0, 10000000);").unwrap();
+        s.contacts_backfill.set(true);
+        let mut chunks = 0;
+        while s.backfill_contacts(2).unwrap() {
+            chunks += 1;
+            if chunks > 10 {
+                break;
+            }
+        }
+        assert!(chunks <= 3, "two messages a chunk, whatever the ids ({chunks} chunks and counting)");
+        assert_eq!(row(&s, "ana@x.com").1, 4);
+    }
+
+    #[test]
+    fn an_address_is_ranked_on_its_history_in_every_account() {
+        let s = store();
+        for (name, role) in [("INBOX", Role::Inbox), ("Sent", Role::Sent)] {
+            s.upsert_mailbox("b", name, name, role, "/", true).unwrap();
+        }
+        let put_b = |mailbox: &str, uid: u32, m: &str| {
+            s.upsert_header("b", mailbox, uid, 0, 10, 0, &mime::parse(m.as_bytes(), true).unwrap()).unwrap();
+        };
+        // Account a heard from Ana long ago, by name; account b writes to her often, by address only.
+        put(&s, "INBOX", 1, &raw("Ana Lima <ana@x.com>", ME, "", "<1@x>", 400, ""));
+        for i in 0..5 {
+            put_b("Sent", i + 1, &raw(ME, "ana@x.com", "", &format!("<b{i}@x>"), 1, ""));
+        }
+        put(&s, "Sent", 2, &raw(ME, "Lima Bean <bean@x.com>", "", "<2@x>", 10, ""));
+        assert_eq!(emails(&s, "lima"), vec!["ana@x.com", "bean@x.com"], "found by a's name, ranked on b's mail too");
+        assert_eq!(emails(&s, "ana lima"), vec!["ana@x.com"]);
+        // A no-reply address one account was written to from is someone you write to.
+        put(&s, "INBOX", 3, &raw("Alerts <noreply@alerts.example>", ME, "", "<3@x>", 1, ""));
+        put_b("Sent", 9, &raw(ME, "noreply@alerts.example", "", "<b9@x>", 1, ""));
+        assert_eq!(emails(&s, "alerts"), vec!["noreply@alerts.example"]);
     }
 
     #[test]
@@ -609,7 +690,8 @@ mod tests {
                 s.conn.prepare(&format!("EXPLAIN QUERY PLAN {SUGGEST}")).unwrap().query_map(params!["pe", "pe\u{10FFFF}"], |r| r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
             assert!(!plan.iter().any(|d| d.starts_with("SCAN")), "{stats}: {plan:?}");
             assert!(plan.iter().any(|d| d.starts_with("SEARCH contact_terms USING PRIMARY KEY (term>? AND term<?)")), "{stats}: {plan:?}");
-            assert!(plan.iter().any(|d| d.starts_with("SEARCH contacts USING INTEGER PRIMARY KEY (rowid=?)")), "{stats}: {plan:?}");
+            assert!(plan.iter().any(|d| d.starts_with("SEARCH m USING INTEGER PRIMARY KEY (rowid=?)")), "{stats}: {plan:?}");
+            assert!(plan.iter().any(|d| d.starts_with("SEARCH contacts USING INDEX contacts_email (email=?)")), "every account's row of each address found: {stats}: {plan:?}");
         }
         let both: HashSet<String> = s.suggest("person12 surname12", &me(), NOW, 8).unwrap().into_iter().map(|a| a.email).collect();
         assert_eq!(both, ["p12@x12.com".to_owned(), "p1273@x12.com".to_owned()].into(), "both words must match");

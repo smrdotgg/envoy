@@ -131,6 +131,8 @@ impl App {
         }
         s.field = Some(f);
         s.typed = typed.clone();
+        // Every edit makes earlier lookups stale, whether or not it asks for another.
+        s.req = req;
         if !looks_up(&typed) {
             s.items.clear();
             s.active = 0;
@@ -141,7 +143,6 @@ impl App {
         let active = s.items.get(s.active).map(|a| a.email.clone());
         s.items.retain(|a| contacts::matches(&words, &contacts::terms(&a.name, &a.email)));
         s.active = active.and_then(|e| s.items.iter().position(|a| a.email == e)).unwrap_or(0);
-        s.req = req;
         if demo {
             self.contacts_arrived(req, crate::demo::suggest(&typed));
         } else {
@@ -150,13 +151,15 @@ impl App {
     }
 
     /// The people for lookup `req` ([`envoy_core::engine::Event::Contacts`]): shown if it's
-    /// the newest, without those already in the message.
+    /// the newest and the entry at the caret is still the one it was for, and still one to look
+    /// up, without those already in the message.
     pub(super) fn contacts_arrived(&mut self, req: u64, contacts: Vec<Address>) {
         let Some(c) = &mut self.compose else { return };
-        if c.suggest.req != req {
+        let Some(f) = c.suggest.field else { return };
+        let typed = c.typed(f);
+        if c.suggest.req != req || typed != c.suggest.typed || !looks_up(&typed) {
             return;
         }
-        let Some(f) = c.suggest.field else { return };
         let present = c.present(f);
         let s = &mut c.suggest;
         let active = s.items.get(s.active).map(|a| a.email.clone());
@@ -336,6 +339,31 @@ mod tests {
         assert!(key(&mut app, Recipients::To, Key::Tab));
         assert_eq!(c(&app).to.text, "\"Lee, Bo\" <bo@x.com>, Ana <ana@x.com>");
         assert_eq!(c(&app).to.focus, "\"Lee, Bo\" <bo@x.com>".len());
+    }
+
+    #[test]
+    fn a_late_answer_never_reopens_over_a_completed_recipient() {
+        let mut app = app();
+        type_in(&mut app, Recipients::To, "Ana");
+        let (asked, _) = last_lookup(&app);
+        // A whole recipient pasted before the answer comes.
+        let to = &mut app.compose.as_mut().unwrap().to;
+        to.text = "Ana Lima <ana@x.com>".into();
+        to.set_caret(to.text.len());
+        app.recipients_edited(Recipients::To);
+        app.contacts_arrived(asked, vec![addr("Ana Bell", "bell@x.com")]);
+        assert!(shown(&app, Recipients::To).is_empty(), "the answer for \"Ana\" is stale");
+        assert!(!key(&mut app, Recipients::To, Key::Tab));
+        assert_eq!(c(&app).to.text, "Ana Lima <ana@x.com>");
+        // Nor does an answer that matches the newest lookup once the entry has stopped being one to look up.
+        type_in(&mut app, Recipients::To, ", bo");
+        let (asked, _) = last_lookup(&app);
+        let to = &mut app.compose.as_mut().unwrap().to;
+        to.text.push_str(" <bo@x.com>");
+        to.set_caret(to.text.len());
+        app.compose.as_mut().unwrap().suggest.typed = "bo <bo@x.com>".into();
+        app.contacts_arrived(asked, vec![addr("Bo", "bob@x.com")]);
+        assert!(shown(&app, Recipients::To).is_empty(), "not over an entry that isn't looked up");
     }
 
     #[test]

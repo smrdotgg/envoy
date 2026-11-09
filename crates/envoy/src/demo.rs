@@ -326,7 +326,9 @@ pub fn suggest(typed: &str) -> Vec<Address> {
             candidates.push(Candidate { email: DRAFT_TO.1.into(), name: DRAFT_TO.0.into(), name_rank: (source::COPIED, at), stats: Stats { cc: 1, seen_at: at, ..Stats::default() } });
         }
     }
-    candidates.retain(|c| contacts::matches(&words, &contacts::terms(&c.name, &c.email)));
+    // What the store's index gives: every row of each address one of whose rows matches.
+    let found: Vec<String> = candidates.iter().filter(|c| contacts::matches(&words, &contacts::terms(&c.name, &c.email))).map(|c| c.email.clone()).collect();
+    candidates.retain(|c| found.contains(&c.email));
     let me = [account().email].into();
     contacts::rank(candidates, &words, &me, now, envoy_core::engine::SUGGESTIONS)
 }

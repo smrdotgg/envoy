@@ -100,29 +100,46 @@ pub fn is_noreply(email: &str) -> bool {
 }
 
 /// The best `limit` suggestions for what's typed (`words`, from [`query_words`]) among
-/// `candidates` (each a contact of one account whose terms start with one of the words, as the
-/// store's index finds them): every word must match, and each address comes once, its accounts
-/// added up. Your own addresses (`me`, lowercase) are left out.
+/// `candidates`: every account's contact for each address one of whose contacts starts a term
+/// with [`probe`]'s word, as the store's index finds them. Each address comes once, ranked (and
+/// judged no-reply or bulk) on its history in all accounts added up; every word typed
+/// must start a term of one of its names or of the address. Your own addresses (`me`,
+/// lowercase) are left out.
 pub fn rank(candidates: impl IntoIterator<Item = Candidate>, words: &[String], me: &HashSet<String>, now: i64, limit: usize) -> Vec<Address> {
-    let mut by_email: HashMap<String, Candidate> = HashMap::new();
+    // Each address, its accounts added up, and every name it goes by.
+    let mut by_email: HashMap<String, (Candidate, Vec<String>)> = HashMap::new();
     for c in candidates {
-        if me.contains(&c.email) || !(words.len() <= 1 || matches(words, &terms(&c.name, &c.email))) {
+        if me.contains(&c.email) {
             continue;
         }
         match by_email.get_mut(&c.email) {
-            Some(have) => {
+            Some((have, names)) => {
                 have.stats.add(&c.stats);
+                if !c.name.is_empty() && !names.contains(&c.name) {
+                    names.push(c.name.clone());
+                }
                 if !c.name.is_empty() && c.name_rank > have.name_rank {
                     have.name = c.name;
                     have.name_rank = c.name_rank;
                 }
             }
             None => {
-                by_email.insert(c.email.clone(), c);
+                let names = if c.name.is_empty() { Vec::new() } else { vec![c.name.clone()] };
+                by_email.insert(c.email.clone(), (c, names));
             }
         }
     }
-    let mut scored: Vec<((u8, f64), Candidate)> = by_email.into_values().filter_map(|c| Some((relevance(&c.stats, &c.email, now)?, c))).collect();
+    let found = |c: &Candidate, names: &[String]| {
+        words.len() <= 1 || {
+            let mut all = terms("", &c.email);
+            for n in names {
+                all.extend(terms(n, ""));
+            }
+            matches(words, &all)
+        }
+    };
+    let mut scored: Vec<((u8, f64), Candidate)> =
+        by_email.into_values().filter(|(c, names)| found(c, names)).filter_map(|(c, _)| Some((relevance(&c.stats, &c.email, now)?, c))).collect();
     scored.sort_by(|(a, x), (b, y)| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then_with(|| x.email.cmp(&y.email)));
     scored.into_iter().take(limit).map(|(_, c)| Address { name: c.name, email: c.email }).collect()
 }
