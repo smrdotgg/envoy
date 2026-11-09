@@ -99,7 +99,43 @@ fn header(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
             text(mailbox_label).font(k.ty.text_xsmall_medium).color(k.c.text_muted).px(8.0).py(2.0).radius(6.0).fill(k.c.layer_02).mt(4.0),
         );
     }
+    if let Some(chip) = category_chip(s, t) {
+        title_row = title_row.child(chip);
+    }
     col().key("reader-header").w_full().gap(10.0).px(24.0).pt(14.0).pb(6.0).child(tools).child(title_row)
+}
+
+/// In a split inbox, the open conversation's tab, saying why it's there; pressing it offers
+/// the others (Move to…).
+fn category_chip(s: &App, t: &Theme) -> Option<El> {
+    let k = &t.k;
+    let (id, c, why) = s.explained.as_ref()?;
+    if s.open != Some(*id) || !s.split_applies() {
+        return None;
+    }
+    Some(
+        row()
+            .key("reader-category")
+            .role("button")
+            .label(format!("{}: {why}", c.label()))
+            .gap(4.0)
+            .px(8.0)
+            .py(2.0)
+            .mt(4.0)
+            .center_y()
+            .radius(6.0)
+            .fill(k.c.layer_02)
+            .hover(k.c.hover)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(|s: &mut App| s.open_picker(Picker::Move))
+            .help(format!(
+                "{why}. Move it to another tab with {} … {}",
+                crate::app::key_label(&s.settings, "keys.moveImportant"),
+                crate::app::key_label(&s.settings, "keys.moveNotifications")
+            ))
+            .child(icon(crate::view_mail::category_icon(*c), 12.0).color(k.c.icon_faint))
+            .child(text(c.label()).font(k.ty.text_xsmall_medium).color(k.c.text_muted)),
+    )
 }
 
 fn avatar(name: &str, email: &str, t: &Theme) -> El {

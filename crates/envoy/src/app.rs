@@ -10,7 +10,7 @@ use serde_json::Value;
 use envoy_core::accounts::{Account, AuthKind};
 use envoy_core::attach;
 use envoy_core::engine::{Command, Engine, Event, MoveTarget};
-use envoy_core::model::{Draft, DraftAttachment, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
+use envoy_core::model::{Category, Draft, DraftAttachment, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use envoy_core::settings::Settings;
 use envoy_core::store::DraftRev;
 
@@ -275,6 +275,8 @@ pub enum Undo {
     Move(Box<MovedAway>),
     /// A discarded composer.
     Discard(Box<Discarded>),
+    /// Conversations moved to a category of the split inbox, and the rules that came with it.
+    Category(Box<crate::categories::Recategorized>),
 }
 
 /// A discarded composer, as it was, to put back.
@@ -288,10 +290,11 @@ pub struct Discarded {
 pub struct MovedAway {
     /// The key the engine holds the move's ops under.
     pub key: i64,
-    /// The view and search they were removed from; they're put back only if those are still
-    /// showing (otherwise the reload after undo decides what belongs in the list).
+    /// The view, search and split inbox tab they were removed from; they're put back only if
+    /// those are still showing (otherwise the reload after undo decides what belongs in the list).
     pub view: View,
     pub query: String,
+    pub category: Option<Category>,
     pub rows: Vec<Summary>,
     /// The open message, if it was one of them.
     pub open: Option<MessageId>,
@@ -385,6 +388,14 @@ pub enum Action {
     Spam,
     MoveTo,
     Label,
+    ShowImportant,
+    ShowOther,
+    ShowNewsletters,
+    ShowNotifications,
+    MoveImportant,
+    MoveOther,
+    MoveNewsletters,
+    MoveNotifications,
 }
 
 /// Which picker: Move to… (`v`) or Label… (`l`, Gmail).
@@ -400,6 +411,8 @@ pub struct PickerCache {
     which: Picker,
     ids: Vec<MessageId>,
     mailboxes: u64,
+    /// The split inbox's categories were offered.
+    split: bool,
     options: Vec<ComboboxOption>,
     note: Option<String>,
 }
@@ -432,6 +445,14 @@ const ACTIONS: &[(Action, &str)] = &[
     (Action::Spam, "keys.spam"),
     (Action::MoveTo, "keys.moveTo"),
     (Action::Label, "keys.label"),
+    (Action::ShowImportant, "keys.showImportant"),
+    (Action::ShowOther, "keys.showOther"),
+    (Action::ShowNewsletters, "keys.showNewsletters"),
+    (Action::ShowNotifications, "keys.showNotifications"),
+    (Action::MoveImportant, "keys.moveImportant"),
+    (Action::MoveOther, "keys.moveOther"),
+    (Action::MoveNewsletters, "keys.moveNewsletters"),
+    (Action::MoveNotifications, "keys.moveNotifications"),
 ];
 
 pub struct App {
@@ -446,6 +467,12 @@ pub struct App {
     pub view: View,
     pub list: Vec<Summary>,
     pub list_req: u64,
+    /// The split inbox's tab shown ([`App::list_category`]).
+    pub category: Category,
+    /// A view's unread count per category ([`Event::CategoryCounts`]), for the tabs.
+    pub category_counts: Option<(View, [u32; 4])>,
+    /// Why an opened message is in its tab ([`Event::Explained`]), for the reader.
+    pub explained: Option<(MessageId, Category, String)>,
     /// The list asked for last hasn't all arrived: a change made here meanwhile asks again
     /// ([`App::list_changed_here`]).
     pub list_pending: bool,
@@ -558,6 +585,9 @@ impl App {
             view: View::Role { account: None, role: Role::Inbox },
             list: Vec::new(),
             list_req: 0,
+            category: Category::Important,
+            category_counts: None,
+            explained: None,
             list_pending: false,
             list_loaded: false,
             list_complete: true,
@@ -704,8 +734,8 @@ impl App {
                 }
             }
             Event::List { .. } => {}
-            // The split inbox's, for its tabs (not shown yet).
-            Event::CategoryCounts { .. } | Event::Explained { .. } => {}
+            Event::CategoryCounts { view, counts } => self.category_counts = Some((view, counts)),
+            Event::Explained { id, category, why } => self.explained = Some((id, category, why)),
             Event::Thread { req, id, messages } if req == self.thread_req && messages.is_empty() => {
                 // The open message is gone (moved, deleted, or an undo that came too late):
                 // close it rather than show an empty reader or mark it read later.
@@ -952,6 +982,7 @@ impl App {
     /// `at_once`: the user is waiting on a new list ([`App::request_list`]); otherwise the list
     /// on screen is read again ([`App::reload`]) and comes whole, changes animating.
     fn request_list_as(&mut self, at_once: bool) {
+        let category = self.list_category();
         if self.demo {
             let q = envoy_core::store::Query::parse(&self.applied_query);
             let words: Vec<String> = q.text.iter().map(|w| w.to_lowercase()).collect();
@@ -964,8 +995,13 @@ impl App {
                         && q.unread.is_none_or(|u| u == m.thread_unread)
                         && q.starred.is_none_or(|st| st == m.flagged())
                         && (!q.attachment || m.has_attachments)
+                        && q.category.is_none_or(|mask| mask & 1 << m.category.code() != 0)
+                        && category.is_none_or(|c| m.category == c)
                 })
                 .collect();
+            if category.is_some() {
+                self.category_counts = Some((self.view.clone(), crate::demo::category_counts(&self.view)));
+            }
             self.list_loaded = true;
             self.selection.retain(&self.list);
             return;
@@ -981,7 +1017,7 @@ impl App {
             conversations: self.conversations() && self.view_role() != Some(Role::Drafts),
             limit: 3000,
             stream: at_once,
-            category: None,
+            category,
         });
     }
 
@@ -1053,6 +1089,7 @@ impl App {
         if self.demo {
             self.thread = crate::demo::thread_for(id);
             self.thread_for = Some(id);
+            self.explained = self.list.iter().find(|s| s.id == id).map(|s| (id, s.category, crate::demo::why(s.category).to_owned()));
             self.expanded = self.thread.iter().filter(|m| !m.summary.seen()).map(|m| m.summary.id).collect();
             if let Some(last) = self.thread.last() {
                 self.expanded.insert(last.summary.id);
@@ -1170,7 +1207,7 @@ impl App {
     /// A change was just made here, optimistically, to rows on screen. A list read before it
     /// and still on its way would show them as they were for a moment (an archived row coming
     /// back, say), so it's asked for again: the engine reads the new one after the change.
-    fn list_changed_here(&mut self) {
+    pub(crate) fn list_changed_here(&mut self) {
         if self.list_pending {
             self.request_list_as(self.list_at_once);
         }
@@ -1261,7 +1298,8 @@ impl App {
     }
 
     pub fn apply_settings(&mut self, s: Settings) {
-        let conv_changed = s.bool("inbox.conversationView") != self.settings.bool("inbox.conversationView");
+        // Either changes which rows the list has (one per conversation, or the split inbox's tab).
+        let conv_changed = s.bool("inbox.conversationView") != self.settings.bool("inbox.conversationView") || s.bool("inbox.split") != self.settings.bool("inbox.split");
         let images_changed = s.value("reading.loadImages") != self.settings.value("reading.loadImages") || s.value("reading.imagesFrom") != self.settings.value("reading.imagesFrom");
         self.list_width = s.f32("inbox.listWidth");
         self.list_height = s.f32("inbox.listHeight");
@@ -1308,12 +1346,18 @@ impl App {
     // ── actions on messages ──
 
     fn after_remove(&mut self, removed: &[MessageId], tx: &mut Tx) {
-        let idx = self.index_of_open();
-        let was_open = self.open.is_some_and(|o| removed.contains(&o));
         let gone: Vec<Summary> = self.list.iter().filter(|s| removed.contains(&s.id)).cloned().collect();
         for (account, mailbox, unread, total) in self.counted(&gone) {
             self.bump_counts(&account, &mailbox, -unread, -total);
         }
+        self.drop_rows(removed, tx);
+    }
+
+    /// Takes rows off the list (they left it: moved away, or to another tab of the split inbox),
+    /// and opens what `behavior.afterRemove` says if the open one went.
+    pub(crate) fn drop_rows(&mut self, removed: &[MessageId], tx: &mut Tx) {
+        let idx = self.index_of_open();
+        let was_open = self.open.is_some_and(|o| removed.contains(&o));
         self.list.retain(|s| !removed.contains(&s.id));
         self.selection.retain(&self.list);
         if !was_open {
@@ -1396,11 +1440,12 @@ impl App {
     }
 
     /// What undo needs to put these rows back on screen.
-    fn snapshot(&self, key: i64, ids: &[MessageId]) -> MovedAway {
+    pub(crate) fn snapshot(&self, key: i64, ids: &[MessageId]) -> MovedAway {
         MovedAway {
             key,
             view: self.view.clone(),
             query: self.applied_query.clone(),
+            category: self.list_category(),
             rows: self.list.iter().filter(|s| ids.contains(&s.id)).cloned().collect(),
             open: self.open.filter(|o| ids.contains(o)),
             compose: None,
@@ -1411,7 +1456,7 @@ impl App {
     /// A number no earlier run or earlier call handed out: microseconds since the epoch. For
     /// [`Command::Move`]'s undo keys (held ops left from a previous run never collide with this
     /// run's), draft ids, and the order of draft saves.
-    fn next_stamp(&mut self) -> i64 {
+    pub(crate) fn next_stamp(&mut self) -> i64 {
         let now = chrono::Utc::now().timestamp_micros();
         self.last_stamp = now.max(self.last_stamp + 1);
         self.last_stamp
@@ -1436,6 +1481,7 @@ impl App {
             Some(Undo::Send(op)) => self.send(Command::UndoSend { op }),
             Some(Undo::Move(m)) => self.restore(*m, tx),
             Some(Undo::Discard(d)) => self.undo_discard(*d),
+            Some(Undo::Category(r)) => self.undo_category(*r, tx),
             None => {}
         }
     }
@@ -1464,8 +1510,8 @@ impl App {
 
     /// Re-inserts moved rows into the list if it still shows what they were moved from (same
     /// view, same search). False when it doesn't (the engine's reload will sort it out).
-    fn restore_rows(&mut self, m: &MovedAway) -> bool {
-        if self.view != m.view || self.applied_query != m.query || self.screen != Screen::Mail {
+    pub(crate) fn restore_rows(&mut self, m: &MovedAway) -> bool {
+        if self.view != m.view || self.applied_query != m.query || self.list_category() != m.category || self.screen != Screen::Mail {
             return false;
         }
         for row in &m.rows {
@@ -1586,7 +1632,7 @@ impl App {
 
     /// The rows (or the open message's summary) of these ids, in their order: one pass over the
     /// list, however many there are (a select-all of thousands).
-    fn rows_of(&self, ids: &[MessageId]) -> Vec<&Summary> {
+    pub(crate) fn rows_of(&self, ids: &[MessageId]) -> Vec<&Summary> {
         let wanted: HashSet<MessageId> = ids.iter().copied().collect();
         let mut found: HashMap<MessageId, &Summary> = self.list.iter().filter(|s| wanted.contains(&s.id)).map(|s| (s.id, s)).collect();
         for m in &self.thread {
@@ -1716,9 +1762,11 @@ impl App {
         // What the answer depends on: the picker, the targets, and the mailboxes (not their
         // counts). Checking that reads neither the list nor the rows.
         let mailboxes = self.mailboxes_fingerprint();
+        let split = which == Picker::Move && self.split_applies();
         if let Some(c) = self.picker_cache.borrow().as_ref()
             && c.which == which
             && c.mailboxes == mailboxes
+            && c.split == split
             && c.ids == ids
         {
             return (c.options.clone(), c.note.clone());
@@ -1728,9 +1776,19 @@ impl App {
         let mut accounts: Vec<&str> = places.iter().map(|(a, _)| *a).collect::<HashSet<_>>().into_iter().collect();
         accounts.sort_unstable();
         let boxes: Vec<&[Mailbox]> = accounts.iter().map(|a| self.mailboxes.get(*a).map_or(&[][..], |m| m.as_slice())).collect();
-        let options = Self::build_picker(which, &places, &boxes);
+        let mut options = Self::build_picker(which, &places, &boxes);
+        if split {
+            // The split inbox's tabs, after the folders' roles: moving there moves nothing on
+            // the server.
+            let at = options.iter().take_while(|o| o.id.starts_with("role:")).count();
+            for (i, c) in Category::ALL.into_iter().enumerate() {
+                let mut option = ComboboxOption::new(format!("cat:{}", c.as_str()), c.label());
+                option.detail = "Inbox tab".into();
+                options.insert(at + i, option);
+            }
+        }
         let note = (accounts.len() > 1).then(|| format!("Only folders all {} accounts have", accounts.len()));
-        *self.picker_cache.borrow_mut() = Some(PickerCache { which, ids: ids.to_vec(), mailboxes, options: options.clone(), note: note.clone() });
+        *self.picker_cache.borrow_mut() = Some(PickerCache { which, ids: ids.to_vec(), mailboxes, split, options: options.clone(), note: note.clone() });
         (options, note)
     }
 
@@ -1800,6 +1858,8 @@ impl App {
             (Picker::Move, o) => {
                 if let Some(name) = o.strip_prefix("mb:") {
                     self.move_to(ids, MoveTarget::Mailbox(name.to_owned()), tx);
+                } else if let Some(c) = o.strip_prefix("cat:").and_then(Category::parse) {
+                    self.move_to_category(ids, c, tx);
                 }
             }
             (Picker::Label, o) => {
@@ -1826,7 +1886,7 @@ impl App {
             return;
         };
         // Nothing to put back on screen: Undo only calls the copies back.
-        let snapshot = MovedAway { key, view: self.view.clone(), query: self.applied_query.clone(), rows: Vec::new(), open: None, compose: None, demo_drafts: Vec::new() };
+        let snapshot = MovedAway { key, view: self.view.clone(), query: self.applied_query.clone(), category: self.list_category(), rows: Vec::new(), open: None, compose: None, demo_drafts: Vec::new() };
         self.toast_seq += 1;
         self.toasts.push(Toast { id: self.toast_seq, text, undo: Some(Undo::Move(Box::new(snapshot))), until: self.clock + window as f64, error: false, open_path: None });
         while self.toasts.len() > 3 {
@@ -2746,6 +2806,10 @@ impl App {
         if action == Action::SelectAll && (typing || self.screen != Screen::Mail) {
             return false;
         }
+        // Alt+digit types a character in a field (on a Mac): not a correction then.
+        if typing && matches!(action, Action::MoveImportant | Action::MoveOther | Action::MoveNewsletters | Action::MoveNotifications) {
+            return false;
+        }
         if self.compose.is_some() {
             match action {
                 Action::Send => {
@@ -2853,6 +2917,14 @@ impl App {
             Action::GoInbox => self.go_role(Role::Inbox),
             Action::GoStarred => self.go_role(Role::Flagged),
             Action::GoSent => self.go_role(Role::Sent),
+            Action::ShowImportant => return self.screen == Screen::Mail && self.show_category(Category::Important),
+            Action::ShowOther => return self.screen == Screen::Mail && self.show_category(Category::Other),
+            Action::ShowNewsletters => return self.screen == Screen::Mail && self.show_category(Category::Newsletters),
+            Action::ShowNotifications => return self.screen == Screen::Mail && self.show_category(Category::Notifications),
+            Action::MoveImportant => return self.move_to_category(self.targets(), Category::Important, tx),
+            Action::MoveOther => return self.move_to_category(self.targets(), Category::Other, tx),
+            Action::MoveNewsletters => return self.move_to_category(self.targets(), Category::Newsletters, tx),
+            Action::MoveNotifications => return self.move_to_category(self.targets(), Category::Notifications, tx),
         }
         true
     }
@@ -4171,6 +4243,7 @@ mod tests {
     #[test]
     fn shift_and_mod_clicks_select_and_a_plain_click_opens() {
         let mut app = App::new(true);
+        let _ = app.settings.set("inbox.split", serde_json::json!(false)); // the whole inbox
         crate::demo::populate(&mut app);
         let mut tx = Tx::default();
         let all = ids(&app.list);
@@ -4272,13 +4345,15 @@ mod tests {
         crate::demo::populate(&mut app);
         let mut tx = Tx::default();
         let (mine, theirs) = two_accounts(&mut app);
-        // One Gmail message in the inbox: everywhere but the inbox, its labels included.
+        // One Gmail message in the inbox: everywhere but the inbox, its labels included, and the
+        // split inbox's tabs.
+        let tabs = ["cat:important", "cat:other", "cat:newsletters", "cat:notifications"];
         let (options, note) = app.picker_options(Picker::Move, &[mine]);
-        assert_eq!(option_ids(&options), ["role:archive", "role:junk", "role:trash", "mb:Receipts", "mb:Travel", "mb:Work"]);
+        assert_eq!(option_ids(&options), [&["role:archive", "role:junk", "role:trash"][..], &tabs[..], &["mb:Receipts", "mb:Travel", "mb:Work"][..]].concat());
         assert_eq!(note, None);
         // Both accounts: only what both have, each role resolved in its own account.
         let (options, note) = app.picker_options(Picker::Move, &[mine, theirs]);
-        assert_eq!(option_ids(&options), ["role:archive", "role:junk", "role:trash", "mb:Work"]);
+        assert_eq!(option_ids(&options), [&["role:archive", "role:junk", "role:trash"][..], &tabs[..], &["mb:Work"][..]].concat());
         assert_eq!(note.as_deref(), Some("Only folders all 2 accounts have"));
         // Moving there: one undoable move, and the toast names the folder.
         app.toggle_selected(mine);
@@ -4301,7 +4376,7 @@ mod tests {
         let ids = ids(&app.list);
         let started = std::time::Instant::now();
         let (options, _) = app.picker_options(Picker::Move, &ids);
-        assert_eq!(options.len(), 3 + 3 + 300, "archive, spam, trash, the three labels, the 300 folders");
+        assert_eq!(options.len(), 3 + 4 + 3 + 300, "archive, spam, trash, the four inbox tabs, the three labels, the 300 folders");
         assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}: quadratic in the selection?", started.elapsed());
         // Asked again (every frame the picker is open): the same answer, not built again.
         let started = std::time::Instant::now();
