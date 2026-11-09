@@ -434,6 +434,11 @@ fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[
                 n += 1;
             }
         }
+        // Messages a queued move or expunge is taking away are hidden as they land, before
+        // anyone sees them (after a reset, they come back as new rows).
+        if n > 0 {
+            st.rehide_queued(account, mailbox)?;
+        }
         Ok(n)
     })
 }
@@ -446,18 +451,16 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
     let uidvalidity = mb.uid_validity;
     let mut changed = false;
     let mut new_messages = 0;
-    let (local, max_uid, held) = {
+    let (local, max_uid) = {
         let st = store.lock().map_err(|_| anyhow!("store poisoned"))?;
-        // A new generation: the cached UIDs mean nothing now. Messages waiting to move away
-        // are hidden again in it once it's downloaded, by Message-ID.
-        let mut held = Vec::new();
+        // A new generation: the cached UIDs mean nothing now. Messages queued ops are taking
+        // away are hidden again as the new one downloads (store_fetched).
         if st.uidvalidity(account, mailbox)? != uidvalidity {
-            held = st.held_messages(account, mailbox)?;
             st.clear_mailbox(account, mailbox)?;
             st.set_uidvalidity(account, mailbox, uidvalidity)?;
             changed = true;
         }
-        (st.local_uids(account, mailbox)?, st.max_uid(account, mailbox)?, held)
+        (st.local_uids(account, mailbox)?, st.max_uid(account, mailbox)?)
     };
 
     if mb.exists == 0 {
@@ -492,9 +495,6 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
                 break;
             }
             hi = lo - 1;
-        }
-        if !held.is_empty() {
-            store.lock().map_err(|_| anyhow!("store poisoned"))?.rehide(account, mailbox, &held)?;
         }
     } else {
         let fetched = wire::fetch(session, true, &format!("{}:*", max_uid + 1), HEADER_QUERY, "FETCH new").await?;
@@ -1376,6 +1376,53 @@ mod tests {
         st.undo_batch(3).unwrap();
         assert_eq!(st.list(&crate::model::View::Mailbox { account: "a".into(), mailbox: "INBOX".into() }, &crate::store::Query::default(), false, 10, &HashSet::new()).unwrap().len(), 3);
         assert!(st.ops("a", i64::MAX).unwrap().iter().all(|q| q.id != op), "its move taken back");
+    }
+
+    #[tokio::test]
+    async fn a_reset_cut_off_between_chunks_still_hides_messages_waiting_to_move() {
+        // Cached in generation 6: one message, archived (its move held for the undo window).
+        let store = Mutex::new(Store::memory());
+        let op = {
+            let st = store.lock().unwrap();
+            st.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+            st.set_uidvalidity("a", "INBOX", 6).unwrap();
+            let p = mime::parse(b"From: a@x.com\r\nSubject: m350\r\nMessage-ID: <350@x>\r\n\r\n", true).unwrap();
+            let id = st.upsert_header("a", "INBOX", 5, 0, 100, 0, &p).unwrap();
+            let op = st.enqueue_held("a", &crate::store::Op::Move { mailbox: "INBOX".into(), uid: 5, dest: "Archive".into() }, i64::MAX, 3).unwrap();
+            assert!(st.hide_local(id, op).unwrap());
+            op
+        };
+        // The server reset INBOX: generation 7, 300 messages (UIDs 101–400), the archived one
+        // at UID 350. The first download comes in two chunks, and the connection drops before
+        // the second.
+        let server = |hang_up: bool| {
+            let inner = mailbox_server(300, 0..=0);
+            move |c: &str| {
+                if hang_up && c.starts_with("FETCH 1:100 ") {
+                    return Some(fake::HANG_UP.to_owned());
+                }
+                if c == "UID FETCH 201:400 (UID FLAGS)" {
+                    return Some((101..=300).map(|seq| format!("* {seq} FETCH (UID {} FLAGS ())\r\n", seq + 100)).collect::<String>() + "TAG OK done\r\n");
+                }
+                inner(c)
+            }
+        };
+        let shown = |store: &Mutex<Store>| -> Vec<u32> {
+            let st = store.lock().unwrap();
+            st.list(&crate::model::View::Mailbox { account: "a".into(), mailbox: "INBOX".into() }, &crate::store::Query::default(), false, 500, &HashSet::new()).unwrap().iter().map(|m| m.uid).collect()
+        };
+        let (mut s, _log) = fake::session(server(true)).await;
+        assert!(sync_mailbox(&mut s, &store, "a", "INBOX", 300, &|| {}).await.is_err(), "cut off");
+        let after = shown(&store);
+        assert_eq!(after.len(), 199, "the first chunk landed");
+        assert!(!after.contains(&350), "the archived message stays hidden");
+        // Envoy starts again: the cache is in generation 7 now, and the sync goes on from it.
+        let (mut s, _log) = fake::session(server(false)).await;
+        sync_mailbox(&mut s, &store, "a", "INBOX", 300, &|| {}).await.unwrap();
+        assert!(!shown(&store).contains(&350), "still hidden after the restart");
+        // And it's still its move's: undo brings it back.
+        store.lock().unwrap().undo_batch(3).unwrap();
+        assert!(shown(&store).contains(&350), "{op}");
     }
 
     fn sorted(mut v: Vec<u32>) -> Vec<u32> {
