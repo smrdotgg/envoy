@@ -664,6 +664,13 @@ impl App {
         self.settings.bool("inbox.conversationView")
     }
 
+    /// The list on screen is one row per conversation, and moving a row moves its conversation:
+    /// not in Drafts (two replies drafted in one conversation are two things to finish), nor in
+    /// Snoozed (each message is snoozed until its own time, in its own bucket).
+    pub fn grouped(&self) -> bool {
+        self.conversations() && !matches!(self.view_role(), Some(Role::Drafts | Role::Snoozed))
+    }
+
     // ── engine events ──
 
     /// Drains engine events; true when anything visible changed.
@@ -1021,8 +1028,7 @@ impl App {
             req: self.list_req,
             view: self.view.clone(),
             query: self.applied_query.clone(),
-            // Drafts one by one: two replies drafted in one conversation are two things to finish.
-            conversations: self.conversations() && self.view_role() != Some(Role::Drafts),
+            conversations: self.grouped(),
             limit: 3000,
             stream: at_once,
             category,
@@ -1454,7 +1460,7 @@ impl App {
             None => matches!(self.view, View::Role { role: Role::Trash, .. }),
         };
         let forever = to == MoveTarget::Trash && in_trash;
-        let thread = self.conversations();
+        let thread = self.grouped();
         self.take_away(ids, label, forever, tx, move |ids, undo| Command::Move { ids, to, thread, undo });
     }
 
@@ -1745,7 +1751,7 @@ impl App {
         }
         let when = fmt::snooze_until(until);
         let label = if ids.len() == 1 { format!("Snoozed until {when}") } else { format!("Snoozed {} until {when}", ids.len()) };
-        let thread = self.conversations();
+        let thread = self.grouped();
         self.take_away(ids, label, false, tx, move |ids, undo| Command::Snooze { ids, until, thread, undo });
     }
 
@@ -4680,6 +4686,27 @@ mod tests {
         app.unsnooze(vec![first], &mut tx);
         assert!(sent_since(&app, from, "Move")[0].contains("to: Inbox"));
         assert!(app.toasts.iter().any(|t| t.text == "Unsnoozed"));
+    }
+
+    #[test]
+    fn in_snoozed_each_row_is_one_message_acted_on_alone() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false; // to see the list asked for
+        let mut tx = Tx::default();
+        let from = app.sent.borrow().len();
+        app.go(View::Role { account: Some("demo".into()), role: Role::Snoozed });
+        assert!(sent_since(&app, from, "List").iter().all(|c| c.contains("conversations: false")), "{:?}", sent_since(&app, from, "List"));
+        app.demo = true;
+        app.go(View::Role { account: Some("demo".into()), role: Role::Inbox });
+        app.go(View::Role { account: Some("demo".into()), role: Role::Snoozed });
+        let (first, second) = (app.list[0].id, app.list[1].id);
+        let from = app.sent.borrow().len();
+        app.unsnooze(vec![first], &mut tx);
+        app.snooze(vec![second], 2_000_000_000, &mut tx);
+        let sent = sent_since(&app, from, "");
+        assert!(sent.iter().any(|c| c.starts_with("Move") && c.contains("thread: false")), "{sent:?}");
+        assert!(sent.iter().any(|c| c.starts_with("Snooze") && c.contains("thread: false")), "{sent:?}");
     }
 
     #[test]
