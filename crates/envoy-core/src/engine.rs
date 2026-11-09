@@ -241,6 +241,7 @@ impl Engine {
                 tokens: Mutex::new(HashMap::new()),
                 accounts: RwLock::new(accounts::load()),
                 watched: Mutex::new(HashSet::new()),
+                synced: Mutex::new(HashMap::new()),
                 undo_keys: Mutex::new(HashMap::new()),
                 wakers: Mutex::new(HashMap::new()),
             });
@@ -308,8 +309,12 @@ struct Shared {
     settings: RwLock<Settings>,
     tokens: Mutex<HashMap<String, (String, Instant)>>,
     accounts: RwLock<Vec<Account>>,
-    /// Mailboxes being looked at, `(account, name)`: synced every cycle.
+    /// Mailboxes being looked at, `(account, name)`: synced with the inbox, and in between
+    /// looked at for changes ([`changed_since_synced`]).
     watched: Mutex<HashSet<(String, String)>>,
+    /// Each mailbox's contents, `(account, name)`, as its last sync on either connection found
+    /// them: what [`changed_since_synced`] compares with.
+    synced: Mutex<HashMap<(String, String), imap::Contents>>,
     /// Undo keys of moves this run held ops for, with how many: to tell "too late" from
     /// "nothing to undo", and a partial undo from a full one.
     undo_keys: Mutex<HashMap<i64, usize>>,
@@ -363,6 +368,13 @@ impl Shared {
     fn emit_mailboxes(&self, account: &str) {
         if let Ok(mailboxes) = self.with_writer(|st| st.mailboxes(account)) {
             self.emit(Event::Mailboxes { account: account.to_owned(), mailboxes });
+        }
+    }
+
+    /// Records what a sync of `mailbox` found ([`imap::SyncOutcome::contents`]).
+    fn synced(&self, account: &str, mailbox: &str, contents: imap::Contents) {
+        if let Ok(mut s) = self.synced.lock() {
+            s.insert((account.to_owned(), mailbox.to_owned()), contents);
         }
     }
 
@@ -835,7 +847,13 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 w.extend(targets.iter().cloned());
             }
             for (account, mailbox) in targets {
+                // A mailbox IDLE doesn't cover: the worker plans its wait again, to look at it
+                // in a while (see session_loop).
+                let looked_at = shared.with_writer(|st| Ok(st.role_of(&account, &mailbox) != Role::Inbox)).unwrap_or(false);
                 poke(workers, &account, Job::SyncMailbox(mailbox));
+                if looked_at {
+                    wake(workers, &account);
+                }
             }
         }
         Command::AddAccount { account, secret } => {
@@ -1756,6 +1774,7 @@ async fn sync_one(shared: &Arc<Shared>, account: &Account, session: &mut Session
         move || shared.emit(Event::Changed { account: id.clone() })
     };
     let out = imap::sync_mailbox(session, &shared.writer, id, mailbox, window, &progress).await?;
+    shared.synced(id, mailbox, out.contents);
     // Counts are a nicety; a lost connection isn't, and ends the job here.
     match imap::status(session, mailbox).await {
         Ok((unread, total)) => shared.with_writer(|st| st.set_counts(id, mailbox, unread, total))?,
@@ -1767,6 +1786,31 @@ async fn sync_one(shared: &Arc<Shared>, account: &Account, session: &mut Session
         shared.emit(Event::Changed { account: id.clone() });
     }
     Ok(())
+}
+
+/// How often the background connection looks at the watched mailboxes IDLE doesn't cover, a
+/// STATUS each ([`changed_since_synced`]), while one is watched.
+const LOOK_EVERY: Duration = Duration::from_secs(30);
+
+/// Which of `mailboxes` changed since their last sync ([`Shared::synced`]), by a STATUS each
+/// ([`imap::contents`]); one with no sync on record counts as changed. One the server won't
+/// tell of (deleted meanwhile, say) doesn't; a lost connection ends it.
+async fn changed_since_synced(shared: &Shared, account: &str, session: &mut imap::Connection<impl imap::Io>, mailboxes: &[String]) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
+    for m in mailboxes {
+        match imap::contents(session, m).await {
+            Ok(now) => {
+                let synced = shared.synced.lock().ok().and_then(|s| s.get(&(account.to_owned(), m.clone())).copied());
+                if synced.is_none_or(|was| was.moved_on(now)) {
+                    log::debug!("{account}: {m} changed since it was synced ({synced:?}, now {now:?})");
+                    changed.push(m.clone());
+                }
+            }
+            Err(e) if imap::is_lost(&e) => return Err(e),
+            Err(e) => log::debug!("{account}: couldn't look at {m}: {e:#}"),
+        }
+    }
+    Ok(changed)
 }
 
 /// Downloads bodies whose UIDs are from generation `validity` of `mailbox`
@@ -1846,6 +1890,8 @@ async fn session_loop(
     let mut inbox_dirty = true;
     // The inbox as its last sync found it: mail that came after is checked for before IDLE.
     let mut inbox_synced: Option<imap::Contents> = None;
+    // The watched mailboxes IDLE doesn't cover, and when they were last synced or looked at.
+    let (mut looked, mut last_look) = (Vec::<String>::new(), Instant::now());
     loop {
         while let Ok(j) = jobs.try_recv() {
             pending.push(j);
@@ -1913,6 +1959,22 @@ async fn session_loop(
                 push(&m.name);
             }
         }
+        // Watched mailboxes IDLE doesn't cover (any but the inbox), between their syncs with the
+        // inbox: looked at every LOOK_EVERY, and as soon as ops replayed (one may have moved mail
+        // in), and synced if they changed. Mail filed into the one on screen, by another client
+        // or from another folder, shows in seconds rather than at the next full sync. One just
+        // opened is being synced by the foreground connection: its first look comes later.
+        let mut beyond_idle: Vec<String> = watched.iter().filter(|w| mailboxes.iter().all(|m| m.role != Role::Inbox || m.name != w.as_str())).cloned().collect();
+        beyond_idle.sort();
+        if inbox_dirty || full_due || beyond_idle != looked {
+            looked.clone_from(&beyond_idle);
+            last_look = Instant::now();
+        } else if !beyond_idle.is_empty() && (ran_ops || last_look.elapsed() >= LOOK_EVERY) {
+            for m in changed_since_synced(shared, &id, &mut session, &beyond_idle).await? {
+                push(&m);
+            }
+            last_look = Instant::now();
+        }
         for name in &targets {
             shared.emit(Event::Sync { account: id.clone(), state: SyncState::Syncing(display_of(&mailboxes, name)) });
             let progress = {
@@ -1921,6 +1983,7 @@ async fn session_loop(
                 move || shared.emit(Event::Changed { account: id.clone() })
             };
             let out = imap::sync_mailbox(&mut session, &shared.writer, &id, name, window, &progress).await?;
+            shared.synced(&id, name, out.contents);
             if mailboxes.iter().any(|m| m.role == Role::Inbox && m.name == *name) {
                 inbox_synced = Some(out.contents);
             }
@@ -1983,6 +2046,10 @@ async fn session_loop(
         let failed_due = shared.with_writer(|st| st.ops(&id, now() + 3600).map(|o| !o.is_empty()))?;
         if failed_due {
             wait = wait.min(Duration::from_secs(30));
+        }
+        // The next look at the watched mailboxes IDLE doesn't cover.
+        if !beyond_idle.is_empty() {
+            wait = wait.min(LOOK_EVERY.saturating_sub(last_look.elapsed()));
         }
         if wait.is_zero() {
             continue;
@@ -2461,6 +2528,7 @@ mod tests {
             tokens: Mutex::new(HashMap::new()),
             accounts: RwLock::new(vec![]),
             watched: Mutex::new(HashSet::new()),
+            synced: Mutex::new(HashMap::new()),
             undo_keys: Default::default(),
             wakers: Default::default(),
         });
@@ -3315,6 +3383,36 @@ mod tests {
         let commands = |i: usize| fg.logs[i].lock().unwrap().iter().filter(|c| !c.starts_with("LOGIN")).cloned().collect::<Vec<_>>();
         assert_eq!((commands(0), commands(1)), (vec!["NOOP".to_owned()], vec!["SELECT \"INBOX\"".to_owned()]));
         assert!(session.is_some(), "the new connection is kept for the next job");
+    }
+
+    #[tokio::test]
+    async fn a_watched_mailbox_is_synced_when_its_status_moved_on_since_its_sync() {
+        let (shared, _rx) = engine_with(setup());
+        let synced = |m: &str, exists, uid_next| shared.synced("a", m, imap::Contents { exists, uid_next: Some(uid_next) });
+        synced("Junk", 3, 10);
+        synced("Archive", 3, 10);
+        synced("Gone", 3, 10);
+        let (mut session, log) = imap::fake::session(|c| {
+            Some(match c {
+                // Filed into elsewhere, then nothing else.
+                "STATUS \"Junk\" (MESSAGES UNSEEN UIDNEXT)" => "* STATUS \"Junk\" (MESSAGES 4 UNSEEN 1 UIDNEXT 11)\r\nTAG OK done\r\n".into(),
+                "STATUS \"Archive\" (MESSAGES UNSEEN UIDNEXT)" => "* STATUS \"Archive\" (MESSAGES 3 UNSEEN 0 UIDNEXT 10)\r\nTAG OK done\r\n".into(),
+                "STATUS \"Gone\" (MESSAGES UNSEEN UIDNEXT)" => "TAG NO no such mailbox\r\n".into(),
+                _ => "* STATUS \"Receipts\" (MESSAGES 0 UNSEEN 0 UIDNEXT 1)\r\nTAG OK done\r\n".into(),
+            })
+        })
+        .await;
+        let watched = ["Junk", "Archive", "Gone", "Receipts"].map(String::from);
+        // Receipts has no sync on record: it's synced too.
+        assert_eq!(changed_since_synced(&shared, "a", &mut session, &watched).await.unwrap(), ["Junk", "Receipts"]);
+        assert_eq!(log.lock().unwrap().len(), 1 + watched.len(), "one STATUS each, after the LOGIN");
+        // Synced since: nothing to do.
+        synced("Junk", 4, 11);
+        synced("Receipts", 0, 1);
+        assert!(changed_since_synced(&shared, "a", &mut session, &watched).await.unwrap().is_empty());
+        // A connection lost while looking ends the round, as any lost command does.
+        let (mut session, _) = imap::fake::session(|_| Some(imap::fake::HANG_UP.to_owned())).await;
+        assert!(changed_since_synced(&shared, "a", &mut session, &watched).await.is_err_and(|e| imap::is_lost(&e)));
     }
 
     // ── drafts ──

@@ -285,6 +285,13 @@ fn scenario(pass: Pass) {
     d.send(Command::Watch { view: junk.clone() });
     d.until("Junk synced", 10, |d| (d.list(&junk, "", false).len() == 3).then_some(()));
     println!("✓ opened an unsynced folder: 3 messages in {:?}", t_junk.elapsed());
+    // Filed into the open folder by another client while it's open: shown at the next look at
+    // it (every 30 s), well before the next full sync (five minutes off), with nothing new in
+    // the inbox for IDLE to wake on.
+    let t_filed = Instant::now();
+    probe.append("Junk", "", &raw(user, "Filed here elsewhere", "<filed-1@elsewhere>"));
+    d.until("the message filed into the open folder", 45, |d| d.list(&junk, "", false).iter().any(|s| s.subject == "Filed here elsewhere").then_some(()));
+    println!("✓ filed into the open folder elsewhere: shown in {:?}", t_filed.elapsed());
 
     // ── Push: a new message arrives while idle ──
     let t_push = Instant::now();
