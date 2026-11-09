@@ -656,18 +656,97 @@ fn list_header(s: &App, t: &Theme) -> El {
     if s.split_applies() { col().key("list-head").w_full().child(title).child(category_tabs(s, t)) } else { title }
 }
 
+/// What the split inbox's tabs show of themselves: the most of it that fits the list
+/// ([`tab_names`]). Each is named in its tooltip whatever shows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TabNames {
+    /// Every tab's icon and name.
+    All,
+    /// Every tab's name, without icons.
+    NamesOnly,
+    /// Every tab's name, without icons, closer together, the ones not shown a size smaller.
+    Compact,
+    /// The shown tab's icon and name; the others' icons.
+    Shown,
+    /// Icons alone.
+    None,
+}
+
+/// How a tab shows ([`TabNames::of`]).
+struct TabLook {
+    icon: bool,
+    name: bool,
+    /// Its padding each side, and the gap between its icon, name and count.
+    px: f32,
+    gap: f32,
+    /// Its name a size smaller (not the shown tab's).
+    small: bool,
+}
+
+impl TabNames {
+    /// How a tab shows (`shown`: the tab shown, or last shown under a search; `selected`: shown
+    /// and chosen, not under a search).
+    fn of(self, shown: bool, selected: bool) -> TabLook {
+        let look = |icon, name, px, gap| TabLook { icon, name, px, gap, small: false };
+        match self {
+            TabNames::All => look(true, true, 10.0, 6.0),
+            TabNames::NamesOnly => look(false, true, 8.0, 6.0),
+            TabNames::Compact => TabLook { small: !selected, ..look(false, true, 6.0, 4.0) },
+            TabNames::Shown if shown => look(true, true, 10.0, 6.0),
+            TabNames::Shown | TabNames::None => look(true, false, 8.0, 6.0),
+        }
+    }
+}
+
+/// The tabs row's padding each side, the gap between tabs, and a tab's icon.
+const TABS_PX: f32 = 10.0;
+const TABS_GAP: f32 = 2.0;
+const TAB_ICON: f32 = 15.0;
+
+/// A tab's name's font: medium for the one chosen, a size smaller for `small` ones.
+fn tab_font(t: &Theme, selected: bool, small: bool) -> rune::TextStyle {
+    let k = &t.k;
+    match (selected, small) {
+        (true, _) => k.ty.text_small_medium,
+        (false, true) => k.ty.text_xsmall,
+        (false, false) => k.ty.text_small,
+    }
+}
+
+/// The most the tabs can show in a list `width` points wide, by measuring their names and
+/// counts: every name, with icons or without; the shown tab's; or none.
+fn tab_names(s: &App, t: &Theme, width: f32) -> TabNames {
+    let k = &t.k;
+    let room = width - 2.0 * TABS_PX - TABS_GAP * (Category::ALL.len() - 1) as f32;
+    let measure = |label: &str, font| rune::text::measure(label, &[], font, None).0;
+    let tab = |c: Category, names: TabNames| {
+        let selected = s.list_category() == Some(c);
+        let look = names.of(s.category == c, selected);
+        let n = s.category_count(c);
+        let parts = [look.icon.then_some(TAB_ICON), look.name.then(|| measure(c.label(), tab_font(t, selected, look.small))), (n > 0).then(|| 2.0 * 5.0 + measure(&count_label(n), k.ty.text_xsmall_medium))];
+        let parts: Vec<f32> = parts.into_iter().flatten().collect();
+        2.0 * look.px + parts.iter().sum::<f32>() + look.gap * parts.len().saturating_sub(1) as f32
+    };
+    // A point to spare for rounding.
+    let fits = |names: TabNames| Category::ALL.iter().map(|c| tab(*c, names)).sum::<f32>() + 1.0 <= room;
+    [TabNames::All, TabNames::NamesOnly, TabNames::Compact, TabNames::Shown].into_iter().find(|names| fits(*names)).unwrap_or(TabNames::None)
+}
+
 /// The split inbox's tabs: each category with its unread count, the one shown underlined in
-/// the accent colour (none while searching). Names where they fit: every tab's in a wide list,
-/// the shown tab's in the default one, none in a narrow one (icons and counts, the names in
-/// their tooltips).
+/// the accent colour (none while searching). Names wherever they fit ([`tab_names`]): every
+/// tab's in the default list and wider, the shown tab's in a narrower one, none in the
+/// narrowest (icons and counts, the names in their tooltips).
 fn category_tabs(s: &App, t: &Theme) -> El {
     let k = &t.k;
     let width = if s.settings.str("inbox.readingPane") == "right" { s.list_width } else { f32::MAX };
+    let names = tab_names(s, t, width);
     let keys = ["keys.showImportant", "keys.showOther", "keys.showNewsletters", "keys.showNotifications"];
-    let mut tabs = row().key("category-tabs").role("tablist").label("Inbox categories").focus_group().w_full().px(10.0).pb(6.0).gap(2.0);
+    // Onto a second line only when even icons and counts don't fit (thousands unread in a
+    // narrow list): out of the way, never out of sight.
+    let mut tabs = row().key("category-tabs").role("tablist").label("Inbox categories").focus_group().w_full().flex_wrap().px(TABS_PX).pb(6.0).gap(TABS_GAP);
     for (c, key) in Category::ALL.into_iter().zip(keys) {
         let selected = s.list_category() == Some(c);
-        let narrow = !(width >= 560.0 || (s.category == c && width >= 340.0));
+        let look = names.of(s.category == c, selected);
         let n = s.category_count(c);
         let fg = if selected { t.accent } else { k.c.text_muted };
         let mut tab = row()
@@ -677,8 +756,8 @@ fn category_tabs(s: &App, t: &Theme) -> El {
             .checked(selected)
             .focusable(true)
             .h(32.0)
-            .px(if narrow { 8.0 } else { 10.0 })
-            .gap(6.0)
+            .px(look.px)
+            .gap(look.gap)
             .center_y()
             .min_w(0.0)
             .radius(6.0)
@@ -690,11 +769,12 @@ fn category_tabs(s: &App, t: &Theme) -> El {
                 s.show_category(c);
             })
             .help(c.label())
-            .help_keys([crate::app::key_label(&s.settings, key)])
-            .child(icon(category_icon(c), 15.0).color(fg));
-        if !narrow {
-            let style = if selected { k.ty.text_small_medium } else { k.ty.text_small };
-            tab = tab.child(text(c.label()).font(style).color(if selected { t.accent } else { k.c.text_base }).truncate().min_w(0.0).shrink());
+            .help_keys([crate::app::key_label(&s.settings, key)]);
+        if look.icon {
+            tab = tab.child(icon(category_icon(c), TAB_ICON).color(fg));
+        }
+        if look.name {
+            tab = tab.child(text(c.label()).font(tab_font(t, selected, look.small)).color(if selected { t.accent } else { k.c.text_base }).truncate().min_w(0.0).shrink());
         }
         if n > 0 {
             tab = tab.child(
@@ -921,5 +1001,55 @@ mod tests {
         app.view = View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Sent Mail".into() };
         let sent = rows_env(&app, &t);
         assert!(drafts != starred && sent != starred && drafts != sent);
+    }
+
+    /// The app on the inbox with the list `list_width` points wide and these unread counts
+    /// on the tabs ([Important, Other, Newsletters, Notifications]), laid out.
+    fn tabs_at(list_width: f32, counts: [u32; 4]) -> rune::Runtime<App> {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.list_width = list_width;
+        let mut at = [0u32; 4];
+        for (c, n) in [Category::Important, Category::Other, Category::Newsletters, Category::Notifications].into_iter().zip(counts) {
+            at[c.code() as usize] = n;
+        }
+        app.category_counts = Some((app.view.clone(), at));
+        let mut rt = rune::Runtime::new(app, crate::view, (1280.0, 820.0), rune::Env::new(false, 1.0));
+        rt.frame(0.0);
+        rt.frame(0.0);
+        rt
+    }
+
+    /// The tabs whose names show, in order.
+    fn named_tabs(rt: &rune::Runtime<App>) -> Vec<&'static str> {
+        let els = rt.elements();
+        Category::ALL
+            .into_iter()
+            .filter(|c| els.iter().any(|e| e.text.as_deref() == Some(c.label()) && e.path.split('/').any(|p| p == format!("tab-{}", c.as_str()))))
+            .map(|c| c.label())
+            .collect()
+    }
+
+    /// QA: at the size the app opens at, only the shown tab had its name; the rest were icons to
+    /// recognise or hover. Every tab is named there now, and wherever the names fit; in a list
+    /// too narrow for them the shown tab's name, then none (each named in its tooltip). Nothing
+    /// reaches past the list, whatever the counts.
+    #[test]
+    fn the_tabs_are_named_wherever_the_names_fit() {
+        let all: Vec<&str> = Category::ALL.iter().map(|c| c.label()).collect();
+        assert_eq!(named_tabs(&tabs_at(App::new(true).settings.f32("inbox.listWidth"), [2, 0, 0, 1])), all, "at the default width");
+        assert_eq!(named_tabs(&tabs_at(420.0, [12, 3, 140, 7])), all, "with more to count");
+        assert_eq!(named_tabs(&tabs_at(700.0, [0, 0, 0, 0])), all);
+        assert_eq!(named_tabs(&tabs_at(280.0, [2, 0, 0, 1])), ["Important"], "narrow: the shown tab's");
+        for width in (280..=900).step_by(20) {
+            for counts in [[0, 0, 0, 0], [2, 0, 0, 1], [12, 3, 140, 7], [9999, 9999, 9999, 99999]] {
+                let rt = tabs_at(width as f32, counts);
+                let list = rt.elements().iter().find(|e| e.key.as_deref() == Some("list-pane")).unwrap().rect;
+                let (bad, _) = crate::html_view::fit_tests::overflow_between(&rt, list[0], list[0] + list[2], "category-tabs");
+                assert!(bad.is_empty(), "at {width} pt with {counts:?}: {bad:?}");
+                let help: Vec<String> = rt.elements().iter().filter(|e| e.key.as_deref().is_some_and(|k| k.starts_with("tab-"))).map(|e| e.label.clone().unwrap_or_default()).collect();
+                assert_eq!(help.len(), 4, "every tab there, named to assistive technology: {help:?}");
+            }
+        }
     }
 }
