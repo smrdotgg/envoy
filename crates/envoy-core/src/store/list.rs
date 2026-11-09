@@ -84,7 +84,7 @@ impl Filter {
             conds.push("m.has_attachments = 1".into());
         }
         // Codes the code writes, not the user: inlined.
-        let categories = query.category.map(|mask| Category::ALL.iter().map(|c| c.code()).filter(|c| mask & 1 << c != 0).collect::<Vec<i64>>());
+        let categories = query.categories().map(|mask| Category::ALL.iter().map(|c| c.code()).filter(|c| mask & 1 << c != 0).collect::<Vec<i64>>());
         if let Some(codes) = &categories {
             let list = if codes.is_empty() { "-1".to_owned() } else { codes.iter().map(i64::to_string).collect::<Vec<_>>().join(", ") };
             conds.push(format!("m.category IN ({list})"));

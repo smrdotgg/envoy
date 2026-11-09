@@ -18,12 +18,47 @@ use rune::Tx;
 
 use crate::app::{App, MovedAway, Toast, Undo};
 
-/// A correction in the split inbox, to take back: the engine's key for it, the rules before it
-/// (if it added any), and the rows it took off the list.
+/// A correction in the split inbox, to take back: the engine's key for it, what it did to the
+/// rules, and the rows it took off the list.
 pub struct Recategorized {
     pub key: i64,
-    pub rules: Option<Value>,
+    pub rules: RuleChange,
     pub rows: MovedAway,
+}
+
+/// What a correction did to `inbox.rules`, and only that, so taking it back leaves every other
+/// change alone (another correction's, a hand edit reloaded meanwhile): the rules it added, and
+/// the ones it replaced, each with where it was (the rule before it, and its index).
+#[derive(Default)]
+pub struct RuleChange {
+    pub added: Vec<Value>,
+    pub replaced: Vec<(Option<Value>, usize, Value)>,
+}
+
+impl RuleChange {
+    /// `rules` with this change taken back: its rules out, and those it replaced back after the
+    /// rule that was before each (or where it was, if that's gone). If its rules have gone
+    /// already (edited away), what they replaced stays gone too.
+    fn undo(&self, rules: &[Value]) -> Vec<Value> {
+        let mut list = rules.to_vec();
+        let mut found = self.added.is_empty();
+        for a in &self.added {
+            if let Some(i) = list.iter().position(|r| r == a) {
+                list.remove(i);
+                found = true;
+            }
+        }
+        if found {
+            for (before, index, rule) in &self.replaced {
+                if list.contains(rule) {
+                    continue;
+                }
+                let at = before.as_ref().and_then(|b| list.iter().position(|r| r == b)).map_or((*index).min(list.len()), |i| i + 1);
+                list.insert(at, rule.clone());
+            }
+        }
+        list
+    }
 }
 
 impl App {
@@ -78,22 +113,27 @@ impl App {
                 senders.push(s);
             }
         }
-        let before = self.settings.value("inbox.rules");
-        let rules = (!senders.is_empty()).then(|| {
-            let mut list = before.as_array().cloned().unwrap_or_default();
-            list.retain(|r| !senders.iter().any(|s| is_rule_for(r, s)));
-            for s in senders.iter().rev() {
-                list.insert(0, serde_json::json!({ "from": s, "category": c.as_str() }));
+        let mut change = RuleChange::default();
+        if !senders.is_empty() {
+            let mut list = self.settings.value("inbox.rules").as_array().cloned().unwrap_or_default();
+            let mut i = 0;
+            while i < list.len() {
+                if senders.iter().any(|s| is_rule_for(&list[i], s)) {
+                    let before = i.checked_sub(1).map(|b| list[b].clone());
+                    change.replaced.push((before, i, list.remove(i)));
+                } else {
+                    i += 1;
+                }
             }
-            Value::Array(list)
-        });
+            for s in senders.iter().rev() {
+                let rule = serde_json::json!({ "from": s, "category": c.as_str() });
+                list.insert(0, rule.clone());
+                change.added.insert(0, rule);
+            }
+            self.set_rules(list);
+        }
         let key = self.next_stamp();
         self.send(Command::MoveToCategory { ids: ids.clone(), category: c, undo: key });
-        if let Some(rules) = rules.clone() {
-            self.set_setting("inbox.rules", rules);
-            // Settings shows the rules as they are now, not as last typed there.
-            self.settings_ui.edits.remove("inbox.rules");
-        }
         let snapshot = self.snapshot(key, &ids);
         if self.list_category().is_some_and(|tab| tab != c) {
             self.drop_rows(&ids, tx);
@@ -112,7 +152,7 @@ impl App {
         };
         let window = self.settings.u32("behavior.undoSeconds").max(5);
         self.toast_seq += 1;
-        let undo = Undo::Category(Box::new(Recategorized { key, rules: rules.map(|_| before), rows: snapshot }));
+        let undo = Undo::Category(Box::new(Recategorized { key, rules: change, rows: snapshot }));
         self.toasts.push(Toast { id: self.toast_seq, text, undo: Some(undo), until: self.clock + window as f64, error: false, open_path: None });
         while self.toasts.len() > 3 {
             self.toasts.remove(0);
@@ -124,9 +164,10 @@ impl App {
     /// Takes back [`App::move_to_category`]: the rules as they were, the conversations where
     /// they were, and the rows back on the list if it's still the one they left.
     pub fn undo_category(&mut self, r: Recategorized, tx: &mut Tx) {
-        if let Some(rules) = r.rules {
-            self.set_setting("inbox.rules", rules);
-            self.settings_ui.edits.remove("inbox.rules");
+        let rules = self.settings.value("inbox.rules").as_array().cloned().unwrap_or_default();
+        let back = r.rules.undo(&rules);
+        if back != rules {
+            self.set_rules(back);
         }
         self.send(Command::UndoCategory { undo: r.key });
         let shown = self.restore_rows(&r.rows);
@@ -135,6 +176,12 @@ impl App {
             self.open_message(id);
             tx.scroll_into_view(crate::app::row_key(id));
         }
+    }
+
+    /// Saves `inbox.rules`; Settings then shows them as they are now, not as last typed there.
+    fn set_rules(&mut self, rules: Vec<Value>) {
+        self.set_setting("inbox.rules", Value::Array(rules));
+        self.settings_ui.edits.remove("inbox.rules");
     }
 }
 
@@ -259,6 +306,79 @@ mod tests {
         // Bound like any key: rebinding moves it.
         app.set_setting("keys.moveNewsletters", serde_json::json!("alt+n"));
         assert!(app.keys.iter().any(|(a, kb)| *a == Action::MoveNewsletters && kb.chords().len() == 1));
+    }
+
+    /// Undo takes back only what its own correction did to the rules: out of order, and around
+    /// an edit made meanwhile (settings.json reloaded), nothing else is lost.
+    #[test]
+    fn undo_reverses_only_its_own_rule_change() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let rule = |from: &str, c: &str| serde_json::json!({ "from": from, "category": c });
+        let id_of = |app: &App, email: &str| app.list.iter().find(|m| m.from.email == email).unwrap().id;
+        // Sam's address has a rule already; Priya's has none.
+        app.set_setting("inbox.rules", serde_json::json!([rule("x@y.example", "other"), rule("sam@ortiz.family", "newsletters")]));
+        let (sam, priya) = (id_of(&app, "sam@ortiz.family"), id_of(&app, "priya@acme.co"));
+        app.move_to_category(vec![sam], Category::Notifications, &mut tx);
+        let first = app.toasts.last().unwrap().id;
+        app.move_to_category(vec![priya], Category::Other, &mut tx);
+        let second = app.toasts.last().unwrap().id;
+        assert_eq!(
+            app.settings.value("inbox.rules"),
+            serde_json::json!([rule("priya@acme.co", "other"), rule("sam@ortiz.family", "notifications"), rule("x@y.example", "other")])
+        );
+        // settings.json edited by hand meanwhile, and reloaded: a rule appended.
+        let mut edited = app.settings.clone();
+        let mut rules = edited.value("inbox.rules").as_array().unwrap().clone();
+        rules.push(rule("@news.example", "newsletters"));
+        edited.set("inbox.rules", serde_json::Value::Array(rules)).unwrap();
+        app.apply_settings(edited);
+        // The first correction undone first: its rule goes, the one it replaced comes back where
+        // it was; the second correction's rule and the edit stay.
+        app.undo_toast(first, &mut tx);
+        assert_eq!(
+            app.settings.value("inbox.rules"),
+            serde_json::json!([rule("priya@acme.co", "other"), rule("x@y.example", "other"), rule("sam@ortiz.family", "newsletters"), rule("@news.example", "newsletters")])
+        );
+        app.undo_toast(second, &mut tx);
+        assert_eq!(app.settings.value("inbox.rules"), serde_json::json!([rule("x@y.example", "other"), rule("sam@ortiz.family", "newsletters"), rule("@news.example", "newsletters")]));
+    }
+
+    /// The tabs show while a search does, so their counts are asked for with its list too.
+    #[test]
+    fn the_tabs_counts_are_asked_for_while_searching_too() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false; // lists come from the engine
+        let last_list = |app: &App| app.sent.borrow().iter().rev().find(|c| c.starts_with("List")).cloned().unwrap();
+        app.applied_query = "dinner".into();
+        app.request_list();
+        assert!(last_list(&app).contains("category: None") && last_list(&app).contains("counts: true"), "{}", last_list(&app));
+        app.applied_query.clear();
+        app.request_list();
+        assert!(last_list(&app).contains("category: Some(Important)") && last_list(&app).contains("counts: true"), "{}", last_list(&app));
+        // No tabs (not an inbox): no counts.
+        app.go(envoy_core::model::View::Starred { account: None });
+        assert!(last_list(&app).contains("counts: false"), "{}", last_list(&app));
+    }
+
+    /// Counts answer a list request: an older request's, arriving after a newer one's, is
+    /// dropped rather than put back on the tabs.
+    #[test]
+    fn counts_for_an_older_list_are_dropped() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false; // lists come from the engine
+        let mut tx = Tx::default();
+        let view = app.view.clone();
+        app.request_list();
+        let older = app.list_req;
+        app.request_list(); // asked again: something changed
+        let newer = app.list_req;
+        app.apply(envoy_core::engine::Event::CategoryCounts { req: newer, view: view.clone(), counts: [1, 2, 3, 4] }, &mut tx);
+        app.apply(envoy_core::engine::Event::CategoryCounts { req: older, view: view.clone(), counts: [9, 9, 9, 9] }, &mut tx);
+        assert_eq!(Category::ALL.map(|c| app.category_count(c)), [4, 1, 2, 3], "the newer list's counts");
     }
 
     #[test]

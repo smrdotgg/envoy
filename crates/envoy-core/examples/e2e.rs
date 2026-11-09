@@ -733,7 +733,7 @@ impl Driver {
     fn list(&mut self, view: &View, query: &str, conversations: bool) -> Vec<Summary> {
         self.req += 1;
         let (req, from) = (self.req, self.mark());
-        self.send(Command::List { req, view: view.clone(), query: query.into(), conversations, limit: 500, stream: true, category: None });
+        self.send(Command::List { req, view: view.clone(), query: query.into(), conversations, limit: 500, stream: true, category: None, counts: false });
         self.wait(from, "list", 10, |e| match e {
             // The whole list, not the first page sent ahead of it.
             Event::List { req: r, items, more: false } if *r == req => Some(items.clone()),

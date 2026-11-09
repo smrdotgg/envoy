@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS messages (
     category INTEGER NOT NULL DEFAULT 0,
     signals INTEGER NOT NULL DEFAULT 0,
     list_id TEXT NOT NULL DEFAULT '',
+    to_count INTEGER NOT NULL DEFAULT -1,
     UNIQUE (account, mailbox, uid)
 );
 CREATE INDEX IF NOT EXISTS messages_thread ON messages (account, thread);
@@ -224,6 +225,9 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("messages", "category", "ALTER TABLE messages ADD COLUMN category INTEGER NOT NULL DEFAULT 0"),
     ("messages", "signals", "ALTER TABLE messages ADD COLUMN signals INTEGER NOT NULL DEFAULT 0"),
     ("messages", "list_id", "ALTER TABLE messages ADD COLUMN list_id TEXT NOT NULL DEFAULT ''"),
+    // How many of `recipients` (To, then Cc) were in To, -1 where not known: whether mail is to
+    // you, whatever your addresses are by then.
+    ("messages", "to_count", "ALTER TABLE messages ADD COLUMN to_count INTEGER NOT NULL DEFAULT -1"),
 ];
 
 /// [`MIGRATIONS`]'s step that gives queued ops a generation ([`At`]): unknown for the ones
@@ -387,10 +391,11 @@ CREATE TABLE messages_new (
     category INTEGER NOT NULL DEFAULT 0,
     signals INTEGER NOT NULL DEFAULT 0,
     list_id TEXT NOT NULL DEFAULT '',
+    to_count INTEGER NOT NULL DEFAULT -1,
     UNIQUE (account, mailbox, uid)
 );
-INSERT INTO messages_new (id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op, category, signals, list_id)
-    SELECT id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op, category, signals, list_id FROM messages;
+INSERT INTO messages_new (id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op, category, signals, list_id, to_count)
+    SELECT id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op, category, signals, list_id, to_count FROM messages;
 DROP TABLE messages;
 ALTER TABLE messages_new RENAME TO messages;
 CREATE INDEX messages_box_date ON messages (account, mailbox, date DESC);
@@ -649,17 +654,20 @@ pub struct Query {
     pub unread: Option<bool>,
     pub starred: Option<bool>,
     pub attachment: bool,
-    /// The categories to keep, a bit per [`crate::model::Category::code`]: `category:` (each
-    /// category whose name starts with what's typed, so `category:n` is both of Newsletters and
-    /// Notifications; one that names none keeps nothing), or the inbox tab shown. None: every
-    /// category, as search does unless asked.
+    /// `category:` as typed: the categories to keep, a bit per [`crate::model::Category::code`]
+    /// (each category whose name starts with what's typed, so `category:n` is both of
+    /// Newsletters and Notifications; one that names none keeps nothing). None: every category,
+    /// as search does unless asked.
     pub category: Option<u8>,
+    /// The split inbox's tab shown: where the list is, not something searched for (see
+    /// [`Query::is_search`]). It keeps its category unless `category:` is typed.
+    pub tab: Option<crate::model::Category>,
 }
 
 impl Query {
-    /// Only `category`, as the inbox's tab asks.
+    /// The inbox's tab `category`, nothing searched for.
     pub fn in_category(category: crate::model::Category) -> Query {
-        Query { category: Some(1 << category.code()), ..Query::default() }
+        Query { tab: Some(category), ..Query::default() }
     }
 
     pub fn parse(q: &str) -> Query {
@@ -694,8 +702,23 @@ impl Query {
         out
     }
 
+    /// No condition at all, a tab included.
     pub fn is_empty(&self) -> bool {
         *self == Query::default()
+    }
+
+    /// Something was searched for (`category:` included), as opposed to an inbox, or a tab of
+    /// the split inbox, as it is.
+    pub fn is_search(&self) -> bool {
+        // Every field named, so one added is placed here.
+        let Query { text, from, to, subject, unread, starred, attachment, category, tab: _ } = self;
+        !(text.is_empty() && from.is_empty() && to.is_empty() && subject.is_empty() && unread.is_none() && starred.is_none() && !attachment && category.is_none())
+    }
+
+    /// The categories to keep, a bit per [`crate::model::Category::code`]: `category:` as typed,
+    /// else the tab's. None: every category.
+    pub fn categories(&self) -> Option<u8> {
+        self.category.or(self.tab.map(|c| 1 << c.code()))
     }
 }
 
@@ -928,13 +951,13 @@ impl Store {
         recipients.extend(p.cc.iter().cloned());
         let date = p.date.filter(|d| *d > 0).unwrap_or(internal_date);
         // What the split inbox needs of the headers, read now: they aren't kept.
-        let signals = crate::category::signals_of(p, &self.classifier.borrow().me);
+        let signals = crate::category::signals_of(p);
         let (id, thread): (MessageId, String) = self.conn.query_row(
-            "INSERT INTO messages (account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, signals, list_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-             ON CONFLICT (account, mailbox, uid) DO UPDATE SET flags = ?11, signals = ?13, list_id = ?14
+            "INSERT INTO messages (account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, signals, list_id, to_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT (account, mailbox, uid) DO UPDATE SET flags = ?11, signals = ?13, list_id = ?14, to_count = ?15
              RETURNING id, thread",
-            params![account, mailbox, uid, p.message_id, thread, p.subject, p.from.name, p.from.email, json(&recipients), date, fl, size, signals, p.bulk_headers.list_id],
+            params![account, mailbox, uid, p.message_id, thread, p.subject, p.from.name, p.from.email, json(&recipients), date, fl, size, signals, p.bulk_headers.list_id, p.to.len()],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         self.stored(account, mailbox, &thread, &p.from.email, fl, &recipients)?;
@@ -1394,7 +1417,7 @@ impl Store {
         if query.attachment {
             conds.push("m.has_attachments = 1".into());
         }
-        if let Some(mask) = query.category {
+        if let Some(mask) = query.categories() {
             conds.push(format!("(1 << m.category) & {mask} != 0"));
         }
         let fetch = if conversations { limit.saturating_mul(4).max(2000) } else { limit };
@@ -2246,7 +2269,7 @@ mod tests {
         let all_queries = [
             "", "p", "pa", "pancakes", "plans p", "meeting", "zzz", "from:", "from:a", "from:ana", "from:LIMA", "from:émile", "to:bo", "subject:re", "subject:",
             "is:unread", "is:read", "is:starred", "has:attachment", "has:attachment is:unread", "from:ana is:unread", "re picnic", "to: from:c", "q",
-            // The split inbox's tabs, and category: searches.
+            // category: searches (the tabs are below).
             "category:important", "category:other", "category:newsletters", "category:n", "category:notifications is:unread", "category:imp p", "category:zzz",
         ];
         let mut compared = 0usize;
@@ -2261,19 +2284,22 @@ mod tests {
             // Every category in use, a conversation's the same on all its messages, as the store
             // keeps them.
             s.conn.execute("UPDATE messages SET category = (unicode(substr(thread, -4, 1)) + length(thread)) % 4", []).unwrap();
+            // The tabs, and `category:` typed over one.
+            let tabs = crate::model::Category::ALL.map(|c| (format!("tab {c:?}"), Query::in_category(c)));
+            let over = ("category:other, tab Important".to_owned(), Query { tab: Some(crate::model::Category::Important), ..Query::parse("category:other") });
+            let cases: Vec<(String, Query)> = queries.iter().map(|q| (q.to_string(), Query::parse(q))).chain(tabs).chain([over]).collect();
             for view in views {
-                for q in queries {
-                    let query = Query::parse(q);
+                for (q, query) in &cases {
                     for conversations in [true, false] {
-                        let all = s.list_reference(view, &query, conversations, 100_000, &me).unwrap();
+                        let all = s.list_reference(view, query, conversations, 100_000, &me).unwrap();
                         for &limit in limits {
                             let case = format!("seed {seed} ({n}) {view:?} {q:?} conversations={conversations} limit={limit}");
                             let want = &all[..all.len().min(limit as usize)];
-                            let got = s.list(view, &query, conversations, limit, &me).unwrap();
+                            let got = s.list(view, query, conversations, limit, &me).unwrap();
                             assert_eq!(got, want, "{case}");
                             let page = if n > 2000 { 100 } else { 3 };
                             let mut firsts = Vec::new();
-                            let paged = s.list_paged(view, &query, conversations, limit, &me, page, &mut |rows| firsts.push(rows)).unwrap();
+                            let paged = s.list_paged(view, query, conversations, limit, &me, page, &mut |rows| firsts.push(rows)).unwrap();
                             assert_eq!(paged, want, "paged: {case}");
                             if let Some(first) = firsts.first() {
                                 assert_eq!(first[..], want[..page as usize], "first page: {case}");
@@ -2285,6 +2311,25 @@ mod tests {
             }
         }
         assert!(compared > 100_000, "the cases cover long lists ({compared} rows)");
+    }
+
+    /// A tab of the split inbox isn't a search: other features (snooze's pinning) tell them
+    /// apart. Both keep categories; `category:` typed wins over the tab.
+    #[test]
+    fn a_tab_is_not_a_search() {
+        use crate::model::Category::{Important, Newsletters, Notifications, Other};
+        let tab = Query::in_category(Newsletters);
+        assert!(!tab.is_search(), "a tab");
+        assert_eq!((tab.tab, tab.categories()), (Some(Newsletters), Some(1 << Newsletters.code())));
+        assert!(!Query::default().is_search());
+        for q in ["dinner", "is:unread", "from:sam", "category:news", "category:zzz"] {
+            assert!(Query::parse(q).is_search(), "{q}");
+        }
+        let typed = Query::parse("category:n");
+        assert_eq!((typed.tab, typed.categories()), (None, Some(1 << Newsletters.code() | 1 << Notifications.code())));
+        let both = Query { tab: Some(Important), ..Query::parse("category:other") };
+        assert!(both.is_search());
+        assert_eq!(both.categories(), Some(1 << Other.code()), "what's typed wins");
     }
 
     #[test]

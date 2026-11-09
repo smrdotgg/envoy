@@ -286,7 +286,7 @@ fn people(field: &str) -> Vec<Address> {
 /// its subject, recipients or text, and the `to:` and `subject:` filters. A draft is read, not
 /// starred, from you (so Important) and has no attachments, which settles the other filters.
 fn matches(q: &Query, d: &Draft) -> bool {
-    if q.unread == Some(true) || q.starred == Some(true) || q.attachment || !q.from.is_empty() || q.category.is_some_and(|m| m & 1 << crate::model::Category::Important.code() == 0) {
+    if q.unread == Some(true) || q.starred == Some(true) || q.attachment || !q.from.is_empty() || q.categories().is_some_and(|m| m & 1 << crate::model::Category::Important.code() == 0) {
         return false;
     }
     let all = format!("{} {} {} {} {}", d.subject, d.to, d.cc, d.bcc, d.body).to_lowercase();
