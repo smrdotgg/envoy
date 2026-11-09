@@ -123,7 +123,18 @@ fn request(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, power
         compatible_surface: surface,
         apply_limit_buckets: false,
     }))
-    .map_err(|error| format!("no GPU adapter: {error}"))
+    .map_err(|error| no_adapter(&error))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn no_adapter(error: &dyn std::fmt::Display) -> String { format!("no GPU adapter: {error}") }
+
+/// Windows draws with DX12 alone (`Gpu::wgpu_instance`), whose adapter list always holds WARP
+/// when Direct3D 12 works at all: none means it didn't start.
+#[cfg(target_os = "windows")]
+fn no_adapter(error: &dyn std::fmt::Display) -> String {
+    format!("Direct3D 12 didn't start: no DX12 adapter, not even WARP, Windows' software renderer ({error}). \
+        Update or reinstall the graphics driver; if that doesn't help, repair Windows' graphics components (d3d12.dll, dxgi.dll)")
 }
 
 /// The first usable adapter whose name contains `name`, ignoring case.

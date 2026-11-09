@@ -534,23 +534,16 @@ impl Gpu {
         if crate::gpu::backend::wgpu_for(wanted) { Self::wgpu_instance() } else { Self::instance() }
     }
 
-    /// wgpu's own backends, whatever `RUNE_GPU_BACKEND` says: DX12 alone on Windows: it's the backend that composites transparent surfaces, and a
-    /// Vulkan instance loads every GPU's Vulkan driver, where a broken one (Intel's, on a hybrid
-    /// laptop) crashed the process before its first window (Hex #662). Vulkan only when no DX12
-    /// adapter exists.
-    /// The choice is made on the first GPU use in the process, not at launch, so a windowless
-    /// app (a tray app before it draws anything) touches no GPU: asking whether a DX12 adapter
-    /// exists makes a device on every adapter, over 100 ms.
+    /// wgpu's own backends, whatever `RUNE_GPU_BACKEND` says: DX12 alone on Windows. It's the
+    /// backend that composites transparent surfaces, and it always has an adapter: DXGI lists
+    /// WARP, the software rasterizer, on every Windows 10 and later, with or without a GPU. Windows
+    /// builds have no Vulkan (a Vulkan instance loads every GPU's Vulkan driver, where a broken one,
+    /// Intel's on a hybrid laptop, crashed the process before its first window: Hex #662). A DX12
+    /// that lists no adapter at all fails the pick with a message saying so (`gpu::pick`).
     #[cfg(target_os = "windows")]
     fn wgpu_instance() -> wgpu::Instance {
-        static DX12: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let _serial = GPU_INIT.lock().unwrap_or_else(|e| e.into_inner());
-        let dx12 = *DX12.get_or_init(|| {
-            let found = !pollster::block_on(Self::wgpu_instance_on(wgpu::Backends::DX12).enumerate_adapters(wgpu::Backends::DX12)).is_empty();
-            if !found { eprintln!("rune: no DX12 adapter; drawing with Vulkan"); }
-            found
-        });
-        Self::wgpu_instance_on(if dx12 { wgpu::Backends::DX12 } else { wgpu::Backends::VULKAN })
+        Self::wgpu_instance_on(wgpu::Backends::DX12)
     }
 
     /// wgpu's own backends, whatever `RUNE_GPU_BACKEND` says.
