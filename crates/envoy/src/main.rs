@@ -287,7 +287,7 @@ const SCENES: &[Scene] = &[
         s.list = demo::list_for(&s.view);
     }),
     ("woken", |s| {
-        // Back from a snooze: atop the inbox, marked, until it's dealt with.
+        // Back from a snooze: atop the inbox (its own tab of it), marked, until it's dealt with.
         s.list[3].flags |= envoy_core::model::flags::WOKEN;
         let back = s.list.remove(3);
         s.list.insert(0, back);

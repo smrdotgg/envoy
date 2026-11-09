@@ -91,14 +91,13 @@ All rebindable under Settings → Keyboard (`mod` = ⌘ on macOS, Ctrl elsewhere
 | `#` | delete | `mod+enter` | send |
 | `!` | report spam (from Spam: not spam) | `/` | search |
 | `v` | move to… | `l` | label… (Gmail) |
-| `b` | snooze… (in Snoozed: a new time) | | |
+| `b` | snooze… (in Snoozed: a new time) | `mod+shift+a` | attach files (in the composer) |
 | `z` | undo archive / delete / move / label / snooze / send | `esc` | close, or clear the selection |
 | `s` | star | `mod+,` | settings |
 | `u` | toggle read | `mod+shift+b` | toggle sidebar |
 | `x` | select / unselect | `shift+j` / `shift+k` | select the next / previous too |
 | `mod+a` | select all | `mod+1/2/3` | inbox / starred / sent |
 | `1` `2` `3` `4` | inbox tab: Important / Other / Newsletters / Notifications | `alt+1` … `alt+4` | move to that tab, with its sender |
-| | | `mod+shift+a` | attach files (in the composer) |
 
 With messages selected (also shift-click for a range, mod-click to add one), every key above
 acts on all of them, `j` and `k` move without opening, and one `z` undoes the whole batch.
@@ -168,10 +167,10 @@ into the picker's field, as you'd say it: `fri 9am`, `tomorrow 5pm`, `in 2 days`
 whole. It leaves the inbox at once, with **Undo** for the undo window, like an archive; undone,
 the server never hears of it.
 
-At its time it's back **at the top of your inbox**, unread and marked "Snoozed", until you deal
-with it (read it and move on, or archive it). **Snoozed** in the sidebar lists everything snoozed,
-soonest first, with when each comes back; `b` there picks a new time, and the inbox icon on a
-row brings it back now.
+At its time it's back **at the top of your inbox** (of its own tab, in the split inbox), unread and
+marked "Snoozed", until you deal with it (read it and move on, or archive it); a search lists it
+by date like any other. **Snoozed** in the sidebar lists everything snoozed, soonest first, with
+when each comes back; `b` there picks a new time, and the inbox icon on a row brings it back now.
 
 **Snoozes live on your mail server, not on any Envoy server.** A snoozed message is in a
 folder named for when it wakes, under `Snoozed`: `Snoozed/20261110T0800Z` (UTC, to the minute);
@@ -179,10 +178,10 @@ on Gmail, a label. Other mail apps show them as folders or labels, and every Env
 the same snoozes. Any Envoy that's running at the time brings a message back (and one that
 wasn't catches up when it starts); nothing happens while none is. On Gmail an empty label goes a
 week after its time; other servers keep the empty folders (deleting a folder there deletes what's
-in it, and another Envoy could be moving a message in), which Envoy then leaves alone. If your server already keeps a `Snoozed` folder of its own (or won't let Envoy
-make one), Envoy's go under `Envoy Snoozed` instead, and the server's own snoozes are shown in
-Snoozed but left to it. Snoozes made in Gmail's web app aren't visible over IMAP, so Envoy doesn't
-show them.
+in it, and another Envoy could be moving a message in), which Envoy then leaves alone. If your
+server already keeps a `Snoozed` folder of its own (or won't let Envoy make one), Envoy's go
+under `Envoy Snoozed` instead, and the server's own snoozes are shown in Snoozed but left to it.
+Snoozes made in Gmail's web app aren't visible over IMAP, so Envoy doesn't show them.
 
 ## Attachments
 
