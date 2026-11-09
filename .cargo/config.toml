@@ -1,0 +1,6 @@
+[env]
+# The bundled SQLite (rusqlite's `bundled`), less what libsqlite3-sys turns on that Envoy never
+# uses: the FTS3/FTS4 and R*Tree modules, the dbstat table, soundex(), loadable extensions,
+# deprecated APIs and shared cache. Search is FTS5, which stays, as do JSON (json_each) and STAT4.
+# About 0.3 MB of the shipped binary on every OS (docs/NORTH_STAR.md: < 30 MB).
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_SOUNDEX -USQLITE_ENABLE_LOAD_EXTENSION -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_SHARED_CACHE"
