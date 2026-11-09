@@ -96,6 +96,7 @@ All rebindable under Settings → Keyboard (`mod` = ⌘ on macOS, Ctrl elsewhere
 | `u` | toggle read | `mod+shift+b` | toggle sidebar |
 | `x` | select / unselect | `shift+j` / `shift+k` | select the next / previous too |
 | `mod+a` | select all | `mod+1/2/3` | inbox / starred / sent |
+| `1` `2` `3` `4` | inbox tab: Important / Other / Newsletters / Notifications | `alt+1` … `alt+4` | move to that tab, with its sender |
 | | | `mod+shift+a` | attach files (in the composer) |
 
 With messages selected (also shift-click for a range, mod-click to add one), every key above
@@ -104,8 +105,47 @@ Move to… and Label… search as you type; with messages from several accounts 
 offer only what every one of those accounts has.
 
 Search understands `from:`, `to:`, `subject:`, `is:unread`, `is:read`, `is:starred`,
-`has:attachment`, plus free text over subject, people and body (SQLite FTS5, instant,
-offline).
+`has:attachment`, `category:` (`category:newsletters`, or just `category:n`), plus free text
+over subject, people and body (SQLite FTS5, instant, offline). Search looks in every inbox tab
+unless you add `category:`; each result says which tab it's in.
+
+## Split inbox
+
+The inbox comes in four tabs, each with its unread count, so nothing is out of sight without a
+number on it:
+
+- **Important**: mail from people you've written to, mail sent to you directly, Gmail's
+  Important label, and every conversation you're part of.
+- **Other**: mail from people where you're only copied, or that went to a group.
+- **Newsletters**: anything with an unsubscribe link (`List-Unsubscribe`), mailing lists
+  (`List-Id`, `Precedence: bulk`), newsletter platforms. A list post from someone you've written
+  to stays in Other.
+- **Notifications**: automated mail: `Auto-Submitted`, GitHub/GitLab/Jira's own headers,
+  notifications@, alerts@, receipts@ and no-reply senders, receipts, bookings and alerts.
+
+A conversation goes where its strongest message does (a person beats a machine, and you beat
+anyone: reply to a newsletter and the conversation is Important). It's all worked out on your
+computer when mail arrives, from a few headers, and kept with the message, so a tab opens as
+fast as a folder; nothing about it ever reaches your mail server.
+
+Wrong tab? `alt+1` … `alt+4` (or Move to… `v`) moves the conversation, and future mail from
+its sender, with Undo. That writes a rule, and rules beat Envoy's own judgment. Rules live in
+`settings.json` (Settings → Inbox shows them one per line, as `from:*@github.com
+notifications`); the first that matches wins:
+
+```jsonc
+{
+  "inbox.rules": [
+    { "from": "*@github.com", "category": "notifications" },      // a pattern
+    { "from": "news@shop.example", "category": "newsletters" },   // one sender
+    { "from": "northwind.dev", "category": "important" },         // a domain and its subdomains
+    { "list": "rust-lang.org", "category": "newsletters" }        // a mailing list's List-Id
+  ]
+}
+```
+
+Changing rules re-sorts the cache in the background (a rule for one sender, at once). Turn the
+split off with `"inbox.split": false` (Settings → Inbox → Split inbox).
 
 ## Recipients
 
@@ -208,7 +248,7 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png -
 ```
 
 Run from the repository root (the attach script picks files in it), with a debug build: release
-builds leave headless runs out. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label toast toast-compose counts`.
+builds leave headless runs out. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label toast toast-compose counts split split-newsletters split-moved split-search split-narrow split-empty split-off settings-rules`.
 
 HTML rendering is tested against the mail in `crates/envoy-core/tests/fixtures/html` (sources and
 licenses in its `LICENSES.md`).

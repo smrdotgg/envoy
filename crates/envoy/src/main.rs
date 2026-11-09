@@ -7,6 +7,7 @@
 
 mod app;
 mod bench;
+mod categories;
 mod compose;
 mod demo;
 mod fmt;
@@ -169,8 +170,9 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
 }
 
 fn scene_open(s: &mut App) {
-    if let Some(id) = s.list.first().map(|m| m.id) {
+    if let Some((id, category)) = s.list.first().map(|m| (m.id, m.category)) {
         s.open = Some(id);
+        s.explained = Some((id, category, demo::why(category).into()));
         s.thread = demo::thread_for(id);
         s.thread_for = Some(id);
         for m in &s.thread {
@@ -292,6 +294,45 @@ const SCENES: &[Scene] = &[
         }
     }),
     ("drafts", scene_drafts),
+    // The split inbox: the Important tab, the first conversation open, every tab's count.
+    ("split", scene_open),
+    ("split-newsletters", |s| {
+        s.show_category(envoy_core::model::Category::Newsletters);
+        scene_open(s);
+    }),
+    // A newsletter moved to Important (alt+1): off the tab, a rule for its sender, Undo.
+    ("split-moved", |s| {
+        s.show_category(envoy_core::model::Category::Newsletters);
+        scene_open(s);
+        let ids = s.targets();
+        s.move_to_category(ids, envoy_core::model::Category::Important, &mut Tx::default());
+    }),
+    // A search looks in every tab; each result says which it's in.
+    ("split-search", |s| {
+        s.applied_query = "the".into();
+        s.search = rune::TextEdit::new("the");
+        s.request_list();
+    }),
+    ("split-narrow", |s| {
+        s.list_width = 330.0;
+        scene_open(s);
+    }),
+    ("split-empty", |s| {
+        s.show_category(envoy_core::model::Category::Other);
+        let ids: Vec<_> = s.list.iter().map(|m| m.id).collect();
+        s.archive(ids, &mut Tx::default());
+        s.toasts.clear();
+    }),
+    ("split-off", |s| {
+        let _ = s.settings.set("inbox.split", serde_json::json!(false));
+        s.request_list();
+        scene_open(s);
+    }),
+    ("settings-rules", |s| {
+        let _ = s.settings.set("inbox.rules", serde_json::json!([{ "from": "*@github.com", "category": "notifications" }, { "list": "rust-lang.org", "category": "newsletters" }, { "from": "maya@northwind.dev", "category": "important" }]));
+        s.screen = Screen::Settings;
+        s.settings_ui.category = Some(1);
+    }),
     ("draft", |s| {
         scene_drafts(s);
         if let Some(id) = s.list.first().map(|m| m.id) {

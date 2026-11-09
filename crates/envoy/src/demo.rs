@@ -214,6 +214,26 @@ pub fn list_with(view: &View, drafts: &Drafts) -> Vec<Summary> {
     list
 }
 
+/// The unread conversations per category of a view's sample mail, as the engine counts them for
+/// the split inbox's tabs ([`Category::code`] order).
+pub fn category_counts(view: &View) -> [u32; 4] {
+    let mut counts = [0; 4];
+    for m in list_for(view).iter().filter(|m| m.thread_unread) {
+        counts[m.category.code() as usize] += 1;
+    }
+    counts
+}
+
+/// Why sample mail is in its tab, as envoy-core would say of real mail like it.
+pub fn why(c: Category) -> &'static str {
+    match c {
+        Category::Important => "Sent directly to you",
+        Category::Other => "You're copied, or it went to a group",
+        Category::Newsletters => "Has an unsubscribe link",
+        Category::Notifications => "From a notifications address",
+    }
+}
+
 /// A sample draft, as it opens in the composer.
 pub fn draft_for(id: MessageId) -> Option<Draft> {
     let s = SAMPLES.get(usize::try_from(id - 1).ok()?).filter(|s| s.mailbox == DRAFTS)?;
@@ -307,8 +327,8 @@ pub fn populate(app: &mut App) {
     );
     app.sync.insert(ACCOUNT.into(), SyncState::Idle);
     app.view = View::Role { account: Some(ACCOUNT.into()), role: Role::Inbox };
-    app.list = list_for(&app.view);
-    app.list_loaded = true;
+    // As the app asks for it: the split inbox's tab, with every tab's count.
+    app.request_list();
 }
 
 /// Recipient suggestions from the sample mail, ranked as the store ranks a real cache's
