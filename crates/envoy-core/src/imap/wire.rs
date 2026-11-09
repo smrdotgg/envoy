@@ -99,24 +99,30 @@ pub(super) struct Selected {
     pub uid_next: Option<u32>,
     /// It also told of messages expunged (by another client, as it answered).
     pub expunged: bool,
+    /// Its PERMANENTFLAGS let a client keep keywords of its own on messages (`\*`), or the one
+    /// Envoy uses (`$new`, for woken snoozes). Not said: not assumed.
+    pub keywords: bool,
 }
 
 /// SELECTs `mailbox`. Every SELECT says FLAGS, EXISTS and UIDVALIDITY (RFC 3501 requires all
 /// three): an answer without one of them, even finished, isn't trusted to describe the mailbox.
 pub(super) async fn select(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Selected> {
-    let (mut flags, mut exists, mut uid_validity, mut uid_next, mut expunged) = (false, None, None, None, false);
+    let (mut flags, mut exists, mut uid_validity, mut uid_next, mut expunged, mut keywords) = (false, None, None, None, false, false);
     run(session, &format!("SELECT {}", quoted(mailbox)), "SELECT", COMMAND_TIMEOUT, |r| match r {
         Response::MailboxData(MailboxDatum::Flags(_)) => flags = true,
         Response::MailboxData(MailboxDatum::Exists(n)) => exists = Some(*n),
         Response::Data { status: Status::Ok, code: Some(ResponseCode::UidValidity(v)), .. } => uid_validity = Some(*v),
         Response::Data { status: Status::Ok, code: Some(ResponseCode::UidNext(n)), .. } => uid_next = Some(*n),
+        Response::Data { status: Status::Ok, code: Some(ResponseCode::PermanentFlags(f)), .. } => {
+            keywords = f.iter().any(|f| f.as_ref() == "\\*" || f.eq_ignore_ascii_case(crate::snooze::NEW_KEYWORD));
+        }
         Response::Expunge(_) => expunged = true,
         _ => {}
     })
     .await?;
     let missing: Vec<&str> = [(flags, "FLAGS"), (exists.is_some(), "EXISTS"), (uid_validity.is_some(), "UIDVALIDITY")].into_iter().filter(|(had, _)| !had).map(|(_, name)| name).collect();
     match (exists, uid_validity) {
-        (Some(exists), Some(uid_validity)) if flags => Ok(Selected { exists, uid_validity, uid_next, expunged }),
+        (Some(exists), Some(uid_validity)) if flags => Ok(Selected { exists, uid_validity, uid_next, expunged, keywords }),
         _ => bail!("SELECT {mailbox}: the server's answer didn't say {}", missing.join(", ")),
     }
 }
@@ -154,6 +160,40 @@ pub(super) async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> 
         (Some(unseen), Some(messages)) => Ok(Told { unseen, messages, uid_next, uid_validity }),
         _ => Err(anyhow!("STATUS {mailbox}: the server's answer didn't say {}", if unseen.is_none() && messages.is_none() { "MESSAGES, UNSEEN" } else if unseen.is_none() { "UNSEEN" } else { "MESSAGES" })),
     }
+}
+
+/// `mailbox`'s UIDNEXT, if a finished STATUS said it.
+pub(super) async fn uid_next(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Option<u32>> {
+    let mut next = None;
+    run(session, &format!("STATUS {} (UIDNEXT)", quoted(mailbox)), "STATUS", COMMAND_TIMEOUT, |r| {
+        if let Response::MailboxData(MailboxDatum::Status { mailbox: m, status }) = r
+            && (m.as_ref() == mailbox || (m.eq_ignore_ascii_case("INBOX") && mailbox.eq_ignore_ascii_case("INBOX")))
+        {
+            for item in status {
+                if let StatusAttribute::UidNext(n) = item {
+                    next = Some(*n);
+                }
+            }
+        }
+    })
+    .await?;
+    Ok(next)
+}
+
+/// Whether the server lists a mailbox of exactly this name (`LIST "" "name"`), one that doesn't
+/// exist (`\NonExistent`) aside. For names without LIST's wildcards (`*`, `%`).
+pub(super) async fn listed(session: &mut Connection<impl Io>, name: &str) -> Result<bool> {
+    let mut found = false;
+    run(session, &format!("LIST \"\" {}", quoted(name)), "LIST", COMMAND_TIMEOUT, |r| {
+        if let Response::MailboxData(MailboxDatum::List { name_attributes, name: n, .. }) = r
+            && n.as_ref() == name
+            && !name_attributes.iter().any(|a| matches!(a, NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent")))
+        {
+            found = true;
+        }
+    })
+    .await?;
+    Ok(found)
 }
 
 /// A mailbox a finished LIST named.

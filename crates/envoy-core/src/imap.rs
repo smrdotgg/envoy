@@ -14,6 +14,7 @@ use tokio_rustls::client::TlsStream;
 use crate::accounts::Account;
 use crate::mime;
 use crate::model::{Role, flags};
+use crate::snooze;
 use crate::store::Store;
 
 mod wire;
@@ -323,6 +324,9 @@ pub struct ListedMailbox {
     pub role: Role,
     pub delimiter: String,
     pub selectable: bool,
+    /// It has the `\Snoozed` attribute: the server's own snoozed mailbox (RFC 9979), shown and
+    /// never written into.
+    pub native_snoozed: bool,
 }
 
 fn role_from_name(name: &str) -> Role {
@@ -345,6 +349,7 @@ pub async fn list_mailboxes(session: &mut Connection<impl Io>) -> Result<Vec<Lis
     for n in names {
         let mut role = Role::Other;
         let mut selectable = true;
+        let native_snoozed = n.attributes.iter().any(|a| matches!(a, wire::Attribute::Other(s) if s == "\\snoozed"));
         for a in &n.attributes {
             match a {
                 wire::Attribute::NoSelect => selectable = false,
@@ -378,16 +383,39 @@ pub async fn list_mailboxes(session: &mut Connection<impl Io>) -> Result<Vec<Lis
         if name == "[Gmail]" || name == "[Google Mail]" {
             selectable = false;
         }
-        out.push(ListedMailbox { name, display, role, delimiter, selectable });
+        out.push(ListedMailbox { name, display, role, delimiter, selectable, native_snoozed });
     }
-    // Only one mailbox per role (the first): a server may mark two as \Sent.
+    // Only one mailbox per role (the first): a server may mark two as \Sent. Snoozed is many.
     let mut seen = HashSet::new();
     for m in out.iter_mut() {
-        if m.role != Role::Other && !seen.insert(m.role) {
+        if m.role != Role::Other && m.role != Role::Snoozed && !seen.insert(m.role) {
             m.role = Role::Other;
         }
     }
+    mark_snoozed(&mut out);
     Ok(out)
+}
+
+/// Where this account's snooze buckets go, from its mailbox list ([`snooze::choose_parent`]).
+pub fn snooze_parent(listed: &[ListedMailbox]) -> snooze::Parent {
+    let names: Vec<snooze::Listed> = listed.iter().map(|m| snooze::Listed { name: &m.name, delimiter: &m.delimiter, native: m.native_snoozed }).collect();
+    snooze::choose_parent(&names)
+}
+
+/// Gives the snooze buckets, their parents (either name, in the personal namespace) and the
+/// server's own snoozed mailbox their role, whatever they'd have had: they're shown together
+/// as Snoozed, not as folders.
+fn mark_snoozed(out: &mut [ListedMailbox]) {
+    let names: Vec<snooze::Listed> = out.iter().map(|m| snooze::Listed { name: &m.name, delimiter: &m.delimiter, native: m.native_snoozed }).collect();
+    let prefix = snooze::personal_prefix(&names);
+    let mut parents: HashSet<String> = [format!("{prefix}{}", snooze::PARENT), format!("{prefix}{}", snooze::FALLBACK_PARENT)].into();
+    parents.extend(out.iter().filter_map(|m| snooze::parent_of(&m.name)).map(str::to_owned));
+    for m in out.iter_mut() {
+        if m.native_snoozed || snooze::wake_of(&m.name).is_some() || parents.contains(&m.name) {
+            m.role = Role::Snoozed;
+            m.display = Role::Snoozed.label().to_owned();
+        }
+    }
 }
 
 pub fn flag_bits<'a>(it: impl Iterator<Item = Flag<'a>>) -> u32 {
@@ -399,6 +427,7 @@ pub fn flag_bits<'a>(it: impl Iterator<Item = Flag<'a>>) -> u32 {
             Flag::Answered => flags::ANSWERED,
             Flag::Draft => flags::DRAFT,
             Flag::Deleted => flags::DELETED,
+            Flag::Custom(k) if k.eq_ignore_ascii_case(snooze::NEW_KEYWORD) => flags::WOKEN,
             _ => 0,
         };
     }
@@ -422,6 +451,9 @@ pub fn flag_names(bits: u32) -> String {
     if bits & flags::DELETED != 0 {
         v.push("\\Deleted");
     }
+    if bits & flags::WOKEN != 0 {
+        v.push(snooze::NEW_KEYWORD);
+    }
     v.join(" ")
 }
 
@@ -430,11 +462,10 @@ pub fn flag_names(bits: u32) -> String {
 /// ([`mime::is_bulk`], [`mime::BULK_HEADERS`]): a few short lines.
 const HEADER_QUERY: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID LIST-UNSUBSCRIBE LIST-POST PRECEDENCE AUTO-SUBMITTED X-GITHUB-REASON X-GITLAB-PROJECT X-BUGZILLA-REASON X-JIRA-FINGERPRINT)])";
 
-fn store_header(store: &Store, account: &str, mailbox: &str, f: &Fetched) -> Result<bool> {
-    let (Some(uid), Some(header)) = (f.uid, f.header.as_deref()) else { return Ok(false) };
-    let Some(parsed) = mime::parse(header, true) else { return Ok(false) };
-    store.upsert_header(account, mailbox, uid, f.flags.unwrap_or(0), f.size.unwrap_or(0), f.internal_date.unwrap_or(0), &parsed)?;
-    Ok(true)
+fn store_header(store: &Store, account: &str, mailbox: &str, f: &Fetched) -> Result<Option<crate::model::MessageId>> {
+    let (Some(uid), Some(header)) = (f.uid, f.header.as_deref()) else { return Ok(None) };
+    let Some(parsed) = mime::parse(header, true) else { return Ok(None) };
+    Ok(Some(store.upsert_header(account, mailbox, uid, f.flags.unwrap_or(0), f.size.unwrap_or(0), f.internal_date.unwrap_or(0), &parsed)?))
 }
 
 pub struct SyncOutcome {
@@ -515,9 +546,18 @@ fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[
     let st = store.lock().map_err(|_| anyhow!("store poisoned"))?;
     st.transaction(|st| {
         let mut n = 0;
+        // Messages this Envoy woke from a snooze come back pinned, wherever the server can't
+        // keep `$new` for them.
+        let woken = st.has_woken(account)? && st.role_of(account, mailbox) == Role::Inbox;
         for f in fetched {
-            if f.uid.is_some_and(|u| u > above_uid) && store_header(st, account, mailbox, f)? {
+            if !f.uid.is_some_and(|u| u > above_uid) {
+                continue;
+            }
+            if let Some(id) = store_header(st, account, mailbox, f)? {
                 n += 1;
+                if woken {
+                    st.apply_woken(id)?;
+                }
             }
         }
         // Messages a queued move or expunge is taking away are hidden as they land, before
@@ -594,7 +634,8 @@ pub async fn sync_mailbox(session: &mut Connection<impl Io>, store: &Mutex<Store
     // Flags and deletions for what we already have.
     if let Some(&(min_uid, _)) = local.first() {
         let server = wire::uid_flags(session, min_uid, max_uid).await?;
-        changed |= store.lock().map_err(|_| anyhow!("store poisoned"))?.reconcile(account, mailbox, &local, &server, window)?;
+        // Where the server can't keep `$new`, a woken message's mark is this computer's.
+        changed |= store.lock().map_err(|_| anyhow!("store poisoned"))?.reconcile(account, mailbox, &local, &server, window, !mb.keywords)?;
     }
     store.lock().map_err(|_| anyhow!("store poisoned"))?.mark_synced(account, mailbox)?;
     Ok(SyncOutcome { changed, new_messages, contents })
@@ -687,10 +728,10 @@ impl std::error::Error for NewGeneration {}
 /// generation. Otherwise nothing is sent with the target's UID, and the error
 /// ([`NewGeneration`]) says where its message is now, if its Message-ID finds it once. An
 /// unknown generation (0) is never taken for the current one.
-async fn select_target(session: &mut Connection<impl Io>, mailbox: &str, target: &Target<'_>) -> Result<()> {
+async fn select_target(session: &mut Connection<impl Io>, mailbox: &str, target: &Target<'_>) -> Result<wire::Selected> {
     let selected = wire::select(session, mailbox).await?;
     if target.validity != 0 && selected.uid_validity == target.validity {
-        return Ok(());
+        return Ok(selected);
     }
     let found = match target.message_id {
         "" => None,
@@ -703,7 +744,10 @@ async fn select_target(session: &mut Connection<impl Io>, mailbox: &str, target:
 }
 
 pub async fn store_flags(session: &mut Connection<impl Io>, mailbox: &str, target: &Target<'_>, add: u32, remove: u32) -> Result<()> {
-    select_target(session, mailbox, target).await?;
+    let selected = select_target(session, mailbox, target).await?;
+    // `$new` goes to the server only where it keeps keywords; elsewhere it's this computer's.
+    let keep = if selected.keywords { u32::MAX } else { !flags::WOKEN };
+    let (add, remove) = (add & keep, remove & keep);
     let uid = target.uid;
     if add != 0 {
         wire::ok(session, &format!("UID STORE {uid} +FLAGS.SILENT ({})", flag_names(add)), "STORE").await?;
@@ -752,6 +796,178 @@ async fn delete_uids(session: &mut Connection<impl Io>, caps: Caps, uids: &[u32]
         wire::ok(session, &format!("UID EXPUNGE {set}"), "EXPUNGE").await?;
     }
     Ok(())
+}
+
+// ── Snoozes ([`crate::snooze`]) ──
+
+/// A mailbox Envoy needs couldn't be created: the server refused, and doesn't list it either.
+#[derive(Debug)]
+pub struct CantCreate {
+    pub mailbox: String,
+    pub why: String,
+}
+
+impl std::fmt::Display for CantCreate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "couldn't create {} ({})", self.mailbox, self.why)
+    }
+}
+
+impl std::error::Error for CantCreate {}
+
+/// Creates `name`, or finds it there already: success either way. A refusal is taken for "it's
+/// there" only when LIST names it (servers say so with ALREADYEXISTS, or with nothing at all).
+pub async fn create_mailbox(session: &mut Connection<impl Io>, name: &str) -> Result<()> {
+    match wire::ok(session, &format!("CREATE {}", quoted(name)), "CREATE").await {
+        Ok(()) => Ok(()),
+        Err(e) if is_lost(&e) => Err(e),
+        Err(e) if wire::listed(session, name).await? => {
+            log::debug!("CREATE {name}: {e:#}, and it's there");
+            Ok(())
+        }
+        Err(e) => Err(CantCreate { mailbox: name.to_owned(), why: format!("{e:#}") }.into()),
+    }
+}
+
+/// Subscribes to `name`, so other clients that show only subscribed folders show it. A refusal
+/// changes nothing (a server without subscriptions); a lost connection is still one.
+async fn subscribe(session: &mut Connection<impl Io>, name: &str, on: bool) -> Result<()> {
+    let verb = if on { "SUBSCRIBE" } else { "UNSUBSCRIBE" };
+    match wire::ok(session, &format!("{verb} {}", quoted(name)), verb).await {
+        Err(e) if is_lost(&e) => Err(e),
+        Err(e) => {
+            log::debug!("{verb} {name}: {e:#}");
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
+/// Makes sure snooze bucket `bucket` exists under `parent`, both subscribed. [`CantCreate`]
+/// when the server won't have either.
+pub async fn ensure_bucket(session: &mut Connection<impl Io>, parent: &str, bucket: &str) -> Result<()> {
+    create_mailbox(session, parent).await?;
+    create_mailbox(session, bucket).await?;
+    subscribe(session, parent, true).await?;
+    subscribe(session, bucket, true).await
+}
+
+/// What waking a bucket did ([`wake_bucket`]).
+#[derive(Debug, Default, PartialEq)]
+pub struct Woken {
+    /// How many messages went back to the inbox.
+    pub moved: usize,
+    /// Their Message-IDs (the ones they have), to know them by there.
+    pub message_ids: Vec<String>,
+}
+
+/// Wakes snooze bucket `bucket`: every message in it not flagged \Deleted goes back to `inbox`,
+/// unread, with `$new` where the server keeps keywords. With MOVE, one UID MOVE; without, a
+/// COPY, then the originals deleted (expunged only with UIDPLUS: Envoy never sends a plain
+/// EXPUNGE), and copies another Envoy made of the same messages at the same time put down to
+/// one. The same call on an emptied bucket (by another Envoy, or this one) sends nothing more
+/// than a SELECT. The messages are named by the UIDs a search just found, never `1:*`.
+pub async fn wake_bucket(session: &mut Connection<impl Io>, caps: Caps, bucket: &str, inbox: &str) -> Result<Woken> {
+    let selected = wire::select(session, bucket).await?;
+    if selected.exists == 0 {
+        return Ok(Woken::default());
+    }
+    let mut uids: Vec<u32> = wire::uid_search(session, "UNDELETED").await?.into_iter().collect();
+    if uids.is_empty() {
+        return Ok(Woken::default());
+    }
+    uids.sort_unstable();
+    let set = uid_set(&uids);
+    let message_ids = message_ids_of(session, &set).await?;
+    wire::ok(session, &format!("UID STORE {set} -FLAGS.SILENT (\\Seen)"), "STORE").await?;
+    if selected.keywords {
+        wire::ok(session, &format!("UID STORE {set} +FLAGS.SILENT ({})", snooze::NEW_KEYWORD), "STORE").await?;
+    }
+    if caps.moves {
+        wire::ok(session, &format!("UID MOVE {set} {}", quoted(inbox)), "MOVE").await?;
+    } else {
+        // Copies from here on are this wake's (or another Envoy's at the same moment).
+        let before = wire::uid_next(session, inbox).await?;
+        wire::ok(session, &format!("UID COPY {set} {}", quoted(inbox)), "COPY").await?;
+        delete_uids(session, caps, &uids).await?;
+        if let Some(before) = before {
+            dedupe_copies(session, caps, inbox, before, &message_ids).await?;
+        }
+    }
+    Ok(Woken { moved: uids.len(), message_ids })
+}
+
+/// After a wake by COPY: each of `message_ids` found more than once in `inbox` keeps its first
+/// copy, and the others made since `before` (UIDNEXT before the copy) are deleted.
+async fn dedupe_copies(session: &mut Connection<impl Io>, caps: Caps, inbox: &str, before: u32, message_ids: &[String]) -> Result<()> {
+    let mut wanted: Vec<&str> = message_ids.iter().map(String::as_str).filter(|m| !m.is_empty()).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    wire::select(session, inbox).await?;
+    let mut extra = Vec::new();
+    for message_id in wanted {
+        let mut found = uids_with_message_id(session, message_id).await?;
+        found.sort_unstable();
+        extra.extend(found.into_iter().skip(1).filter(|u| *u >= before));
+    }
+    extra.sort_unstable();
+    if !extra.is_empty() {
+        log::info!("{} woken message(s) were copied to {inbox} twice (another Envoy woke them at the same time): the extra copies go", extra.len());
+    }
+    delete_uids(session, caps, &extra).await
+}
+
+/// The Message-IDs of the selected mailbox's messages `set`, as their headers say.
+async fn message_ids_of(session: &mut Connection<impl Io>, set: &str) -> Result<Vec<String>> {
+    let fetched = wire::fetch(session, true, set, "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])", "FETCH ids").await?;
+    Ok(fetched.iter().filter_map(|f| f.header.as_deref().and_then(|h| mime::parse(h, true))).map(|p| p.message_id).filter(|m| !m.is_empty()).collect())
+}
+
+/// Deletes snooze bucket `bucket` if the server says it's empty right now (and unsubscribes
+/// it). The caller has checked it's a day past its time ([`snooze::may_delete`]). True when
+/// it's gone, deleted here or found gone already.
+pub async fn cleanup_bucket(session: &mut Connection<impl Io>, bucket: &str, inbox: &str) -> Result<bool> {
+    let messages = match wire::status(session, bucket).await {
+        Ok(told) => told.messages,
+        Err(e) if is_lost(&e) => return Err(e),
+        // Gone already (another Envoy, or the user).
+        Err(_) if !wire::listed(session, bucket).await? => return Ok(true),
+        Err(e) => return Err(e),
+    };
+    if messages != 0 {
+        return Ok(false);
+    }
+    // Never the selected mailbox.
+    wire::select(session, inbox).await?;
+    match wire::ok(session, &format!("DELETE {}", quoted(bucket)), "DELETE").await {
+        Ok(()) => {}
+        Err(e) if is_lost(&e) => return Err(e),
+        Err(_) if !wire::listed(session, bucket).await? => {}
+        Err(e) => return Err(e),
+    }
+    subscribe(session, bucket, false).await?;
+    Ok(true)
+}
+
+/// A UID set, runs folded: `3:5,8`.
+fn uid_set(sorted: &[u32]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i];
+        while i + 1 < sorted.len() && sorted[i + 1] == sorted[i] + 1 {
+            i += 1;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if sorted[i] == start { out.push_str(&start.to_string()) } else { out.push_str(&format!("{start}:{}", sorted[i])) }
+        i += 1;
+    }
+    out
 }
 
 pub async fn append(session: &mut Connection<impl Io>, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
@@ -1839,6 +2055,228 @@ mod tests {
         let (mut s, log) = fake::session(drafts_server("8", &[(8, "<d@envoy>")])).await;
         assert_eq!(purge_message_id(&mut s, caps(true), "Drafts", "<d@envoy>", Some((7, 5)), true).await.unwrap(), vec![5, 8]);
         assert_eq!(commands(&log).last().map(String::as_str), Some("UID EXPUNGE 5,8"));
+    }
+
+    // ── Snoozes ──
+
+    const BUCKET: &str = "Snoozed/20261110T0800Z";
+
+    /// A server whose snooze bucket holds UIDs 5 and 6 (`<a@x>`, `<b@x>`; `exists` messages in
+    /// all, some maybe flagged \Deleted: the search finds `undeleted`), keeping keywords if
+    /// `keywords`. INBOX is at UIDNEXT 40; after a COPY, `<a@x>` is there twice (12, from before,
+    /// and 40) and `<b@x>` once (41).
+    fn bucket_server(exists: u32, undeleted: &'static str, keywords: bool) -> impl Fn(&str) -> Option<String> + Send + 'static {
+        move |c: &str| {
+            let permanent = if keywords { "\\Seen \\Deleted \\*" } else { "\\Seen \\Deleted" };
+            Some(match c {
+                c if c == format!("SELECT \"{BUCKET}\"") => {
+                    format!("* FLAGS (\\Seen \\Deleted)\r\n* {exists} EXISTS\r\n* OK [UIDVALIDITY 9] ok\r\n* OK [PERMANENTFLAGS ({permanent})] ok\r\nTAG OK [READ-WRITE] done\r\n")
+                }
+                "SELECT \"INBOX\"" => fake::selected(7, 42),
+                "UID SEARCH UNDELETED" => format!("* SEARCH {undeleted}\r\nTAG OK done\r\n"),
+                c if c.starts_with("UID FETCH 5:6 ") => fake::message_ids(&[(5, "<a@x>"), (6, "<b@x>")]),
+                "STATUS \"INBOX\" (UIDNEXT)" => "* STATUS INBOX (UIDNEXT 40)\r\nTAG OK done\r\n".into(),
+                "UID SEARCH UNDELETED HEADER Message-ID \"<a@x>\"" => "* SEARCH 12 40\r\nTAG OK done\r\n".into(),
+                "UID SEARCH UNDELETED HEADER Message-ID \"<b@x>\"" => "* SEARCH 41\r\nTAG OK done\r\n".into(),
+                c if c.starts_with("UID FETCH 12,40 ") || c.starts_with("UID FETCH 40,12 ") => fake::message_ids(&[(12, "<a@x>"), (40, "<a@x>")]),
+                c if c.starts_with("UID FETCH 41 ") => fake::message_ids(&[(41, "<b@x>")]),
+                _ => return None,
+            })
+        }
+    }
+
+    fn moves(uidplus: bool) -> Caps {
+        Caps { moves: true, idle: false, uidplus }
+    }
+
+    #[tokio::test]
+    async fn waking_a_bucket_moves_its_messages_back_unread_and_new() {
+        let (mut s, log) = fake::session(bucket_server(2, "5 6", true)).await;
+        let woken = wake_bucket(&mut s, moves(true), BUCKET, "INBOX").await.unwrap();
+        assert_eq!(woken, Woken { moved: 2, message_ids: vec!["<a@x>".into(), "<b@x>".into()] });
+        assert_eq!(
+            commands(&log),
+            [
+                format!("SELECT \"{BUCKET}\""),
+                "UID SEARCH UNDELETED".into(),
+                "UID FETCH 5:6 (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])".into(),
+                "UID STORE 5:6 -FLAGS.SILENT (\\Seen)".into(),
+                "UID STORE 5:6 +FLAGS.SILENT ($new)".into(),
+                "UID MOVE 5:6 \"INBOX\"".into(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn waking_an_emptied_bucket_again_does_nothing() {
+        // Another Envoy (or this one) woke it already: only the SELECT.
+        let (mut s, log) = fake::session(bucket_server(0, "", true)).await;
+        assert_eq!(wake_bucket(&mut s, moves(true), BUCKET, "INBOX").await.unwrap(), Woken::default());
+        assert_eq!(commands(&log), [format!("SELECT \"{BUCKET}\"")]);
+        // Woken without UIDPLUS: what's left is flagged \Deleted, and not woken twice.
+        let (mut s, log) = fake::session(bucket_server(2, "", true)).await;
+        assert_eq!(wake_bucket(&mut s, caps(false), BUCKET, "INBOX").await.unwrap(), Woken::default());
+        assert_eq!(commands(&log), [format!("SELECT \"{BUCKET}\""), "UID SEARCH UNDELETED".into()]);
+    }
+
+    #[tokio::test]
+    async fn a_server_without_keywords_wakes_without_new() {
+        let (mut s, log) = fake::session(bucket_server(2, "5 6", false)).await;
+        wake_bucket(&mut s, moves(true), BUCKET, "INBOX").await.unwrap();
+        assert!(!commands(&log).iter().any(|c| c.contains("$new")), "{:?}", commands(&log));
+    }
+
+    #[tokio::test]
+    async fn without_move_a_wake_copies_deletes_exactly_and_puts_down_double_copies() {
+        let (mut s, log) = fake::session(bucket_server(2, "5 6", true)).await;
+        let woken = wake_bucket(&mut s, caps(true), BUCKET, "INBOX").await.unwrap();
+        assert_eq!(woken.moved, 2);
+        let cmds = commands(&log);
+        assert!(!cmds.iter().any(|c| c.starts_with("UID MOVE")) && !expunges_everything(&cmds), "{cmds:?}");
+        let after_fetch: Vec<&str> = cmds.iter().skip(3).map(String::as_str).filter(|c| !c.starts_with("UID SEARCH UNDELETED HEADER") && !c.starts_with("UID FETCH")).collect();
+        assert_eq!(
+            after_fetch,
+            [
+                "UID STORE 5:6 -FLAGS.SILENT (\\Seen)",
+                "UID STORE 5:6 +FLAGS.SILENT ($new)",
+                "STATUS \"INBOX\" (UIDNEXT)",
+                "UID COPY 5:6 \"INBOX\"",
+                "UID STORE 5,6 +FLAGS.SILENT (\\Deleted)",
+                "UID EXPUNGE 5,6",
+                "SELECT \"INBOX\"",
+                // <a@x> came twice: the copy made now (40) goes, the first (12) stays.
+                "UID STORE 40 +FLAGS.SILENT (\\Deleted)",
+                "UID EXPUNGE 40",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_move_or_uidplus_a_wake_never_expunges() {
+        let (mut s, log) = fake::session(bucket_server(2, "5 6", true)).await;
+        wake_bucket(&mut s, caps(false), BUCKET, "INBOX").await.unwrap();
+        let cmds = commands(&log);
+        assert!(!cmds.iter().any(|c| c.contains("EXPUNGE") || c.starts_with("UID MOVE")), "{cmds:?}");
+        assert!(cmds.contains(&"UID COPY 5:6 \"INBOX\"".to_owned()) && cmds.contains(&"UID STORE 5,6 +FLAGS.SILENT (\\Deleted)".to_owned()), "{cmds:?}");
+        assert!(cmds.contains(&"UID STORE 40 +FLAGS.SILENT (\\Deleted)".to_owned()), "the double copy is flagged: {cmds:?}");
+    }
+
+    #[tokio::test]
+    async fn a_wake_cut_short_is_lost_not_done() {
+        for how in BREAKS {
+            let inner = bucket_server(2, "5 6", true);
+            let (mut s, log) = fake::session(move |c: &str| if c.starts_with("UID MOVE") { Some(broken("* 1 EXPUNGE\r\n", how)) } else { inner(c) }).await;
+            assert!(wake_bucket(&mut s, moves(true), BUCKET, "INBOX").await.is_err(), "{how:?}");
+            assert!(commands(&log).iter().any(|c| c.starts_with("UID MOVE")));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_bucket_is_deleted_and_unsubscribed_one_with_mail_never() {
+        let status = |messages: u32| move |c: &str| match c {
+            c if c.starts_with("STATUS") => Some(format!("* STATUS \"{BUCKET}\" (MESSAGES {messages} UNSEEN 0)\r\nTAG OK done\r\n")),
+            c if c.starts_with("SELECT") => Some(fake::selected(7, 10)),
+            _ => None,
+        };
+        let (mut s, log) = fake::session(status(0)).await;
+        assert!(cleanup_bucket(&mut s, BUCKET, "INBOX").await.unwrap());
+        assert_eq!(commands(&log), [format!("STATUS \"{BUCKET}\" (MESSAGES UNSEEN)"), "SELECT \"INBOX\"".into(), format!("DELETE \"{BUCKET}\""), format!("UNSUBSCRIBE \"{BUCKET}\"")]);
+        let (mut s, log) = fake::session(status(1)).await;
+        assert!(!cleanup_bucket(&mut s, BUCKET, "INBOX").await.unwrap());
+        assert!(!commands(&log).iter().any(|c| c.starts_with("DELETE")));
+        // Gone already: nothing to delete.
+        let (mut s, log) = fake::session(|c: &str| c.starts_with("STATUS").then(|| "TAG NO [NONEXISTENT] no such mailbox\r\n".to_owned())).await;
+        assert!(cleanup_bucket(&mut s, BUCKET, "INBOX").await.unwrap());
+        assert!(!commands(&log).iter().any(|c| c.starts_with("DELETE")));
+        // A STATUS cut short deletes nothing.
+        for how in BREAKS.into_iter().filter(|h| !matches!(h, Breaks::No | Breaks::Bad)) {
+            let (mut s, log) = fake::session(move |c: &str| c.starts_with("STATUS").then(|| broken(&format!("* STATUS \"{BUCKET}\" (MESSAGES 0 UNSEEN 0)\r\n"), how))).await;
+            assert!(cleanup_bucket(&mut s, BUCKET, "INBOX").await.is_err());
+            assert!(!commands(&log).iter().any(|c| c.starts_with("DELETE")), "{how:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bucket_is_made_under_its_parent_and_subscribed() {
+        let (mut s, log) = fake::session(|_| None).await;
+        ensure_bucket(&mut s, "Snoozed", BUCKET).await.unwrap();
+        assert_eq!(commands(&log), ["CREATE \"Snoozed\"".to_owned(), format!("CREATE \"{BUCKET}\""), "SUBSCRIBE \"Snoozed\"".into(), format!("SUBSCRIBE \"{BUCKET}\"")]);
+        // Already there (said with ALREADYEXISTS, or not), and subscriptions refused: fine.
+        let (mut s, _log) = fake::session(|c: &str| match c {
+            c if c.starts_with("CREATE") => Some("TAG NO [ALREADYEXISTS] exists\r\n".into()),
+            c if c.starts_with("LIST") => Some(format!("* LIST () \"/\" {}\r\nTAG OK done\r\n", &c["LIST \"\" ".len()..])),
+            c if c.starts_with("SUBSCRIBE") => Some("TAG NO not supported\r\n".into()),
+            _ => None,
+        })
+        .await;
+        ensure_bucket(&mut s, "Snoozed", BUCKET).await.unwrap();
+        // Refused, and not there: the parent can't be had.
+        let (mut s, log) = fake::session(|c: &str| c.starts_with("CREATE").then(|| "TAG NO [CANNOT] reserved name\r\n".to_owned())).await;
+        let e = ensure_bucket(&mut s, "Snoozed", BUCKET).await.unwrap_err();
+        assert_eq!(e.downcast_ref::<CantCreate>().map(|c| c.mailbox.as_str()), Some("Snoozed"), "{e:#}");
+        assert!(!commands(&log).iter().any(|c| c.contains(BUCKET)), "nothing under a parent that isn't there");
+    }
+
+    #[tokio::test]
+    async fn permanentflags_say_whether_new_can_be_kept() {
+        let answer = |permanent: &'static str| move |c: &str| c.starts_with("SELECT").then(|| format!("* FLAGS (\\Seen)\r\n* 1 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n{permanent}TAG OK done\r\n"));
+        for (permanent, keywords) in [
+            ("* OK [PERMANENTFLAGS (\\Seen \\Deleted \\*)] ok\r\n", true),
+            ("* OK [PERMANENTFLAGS (\\Seen $New)] ok\r\n", true),
+            ("* OK [PERMANENTFLAGS (\\Seen \\Deleted $MDNSent)] ok\r\n", false),
+            ("", false),
+        ] {
+            let (mut s, _log) = fake::session(answer(permanent)).await;
+            assert_eq!(wire::select(&mut s, "INBOX").await.unwrap().keywords, keywords, "{permanent:?}");
+        }
+        // Where it can't, a queued change leaves `$new` out (it's this computer's mark there).
+        let (mut s, log) = fake::session(answer("* OK [PERMANENTFLAGS (\\Seen)] ok\r\n")).await;
+        store_flags(&mut s, "INBOX", &at(1), flags::WOKEN, flags::SEEN).await.unwrap();
+        store_flags(&mut s, "INBOX", &at(1), 0, flags::WOKEN).await.unwrap();
+        assert_eq!(commands(&log).into_iter().filter(|c| c.starts_with("UID STORE")).collect::<Vec<_>>(), ["UID STORE 1 -FLAGS.SILENT (\\Seen)"]);
+        let (mut s, log) = fake::session(answer("* OK [PERMANENTFLAGS (\\*)] ok\r\n")).await;
+        store_flags(&mut s, "INBOX", &at(1), 0, flags::WOKEN).await.unwrap();
+        assert_eq!(commands(&log).last().map(String::as_str), Some("UID STORE 1 -FLAGS.SILENT ($new)"));
+    }
+
+    #[test]
+    fn new_is_the_woken_mark() {
+        assert_eq!(flag_bits([Flag::Seen, Flag::Custom("$New".into()), Flag::Custom("$Junk".into())].into_iter()), flags::SEEN | flags::WOKEN);
+        assert_eq!(flag_names(flags::SEEN | flags::WOKEN), "\\Seen $new");
+    }
+
+    #[tokio::test]
+    async fn buckets_their_parents_and_the_servers_own_snoozed_are_listed_as_snoozed() {
+        let listing = "* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\HasChildren) \"/\" Snoozed\r\n* LIST (\\HasNoChildren) \"/\" \"Snoozed/20261110T0800Z\"\r\n\
+                       * LIST (\\HasNoChildren) \"/\" \"Envoy Snoozed/20261111T0800Z\"\r\n* LIST (\\HasNoChildren) \"/\" Work\r\n* LIST (\\HasNoChildren \\Archive) \"/\" Archive\r\nTAG OK done\r\n";
+        let (mut s, _log) = fake::session(move |c: &str| c.starts_with("LIST").then(|| listing.to_owned())).await;
+        let listed = list_mailboxes(&mut s).await.unwrap();
+        let roles: Vec<(&str, Role, &str)> = listed.iter().map(|m| (m.name.as_str(), m.role, m.display.as_str())).collect();
+        assert_eq!(
+            roles,
+            [
+                ("INBOX", Role::Inbox, "Inbox"),
+                ("Snoozed", Role::Snoozed, "Snoozed"),
+                ("Snoozed/20261110T0800Z", Role::Snoozed, "Snoozed"),
+                ("Envoy Snoozed/20261111T0800Z", Role::Snoozed, "Snoozed"),
+                ("Work", Role::Other, "Work"),
+                ("Archive", Role::Archive, "Archive"),
+            ]
+        );
+        assert_eq!(snooze_parent(&listed).name, "Snoozed");
+        // The server's own: shown as snoozed, and Envoy's go beside it.
+        let native = "* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\Snoozed) \"/\" Snoozed\r\nTAG OK done\r\n";
+        let (mut s, _log) = fake::session(move |c: &str| c.starts_with("LIST").then(|| native.to_owned())).await;
+        let listed = list_mailboxes(&mut s).await.unwrap();
+        assert!(listed[1].native_snoozed && listed[1].role == Role::Snoozed);
+        assert_eq!(snooze_parent(&listed).name, "Envoy Snoozed");
+    }
+
+    #[test]
+    fn uid_sets_fold_runs() {
+        assert_eq!(uid_set(&[3, 4, 5, 8, 10, 11]), "3:5,8,10:11");
+        assert_eq!(uid_set(&[7]), "7");
+        assert_eq!(uid_set(&[]), "");
     }
 
     #[test]

@@ -189,6 +189,20 @@ CREATE TABLE IF NOT EXISTS unfiled_sent (
     error TEXT NOT NULL,
     at INTEGER NOT NULL
 );
+-- Where each account's snooze buckets go, as its last mailbox list decided (snooze.rs).
+CREATE TABLE IF NOT EXISTS snooze_parents (
+    account TEXT PRIMARY KEY,
+    parent TEXT NOT NULL,
+    delimiter TEXT NOT NULL
+);
+-- Messages this Envoy woke from a snooze, by Message-ID: pinned when they land in the inbox,
+-- for servers that can't keep `$new` (snooze.rs). Forgotten once dealt with, or after a while.
+CREATE TABLE IF NOT EXISTS woken (
+    account TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    PRIMARY KEY (account, message_id)
+);
 "#;
 
 /// Columns added after the first release, for caches created before them. Each runs once,
@@ -279,6 +293,7 @@ CREATE INDEX IF NOT EXISTS messages_held ON messages (held_op) WHERE held_op != 
 CREATE INDEX IF NOT EXISTS messages_held_box ON messages (account, mailbox, flags, held_op) WHERE held_op != 0;
 CREATE INDEX IF NOT EXISTS messages_deleted_box ON messages (account, mailbox, flags, held_op) WHERE flags & 16 != 0;
 CREATE INDEX IF NOT EXISTS ops_batch ON ops (batch) WHERE batch != 0;
+CREATE INDEX IF NOT EXISTS messages_woken ON messages (account, mailbox) WHERE flags & 32 != 0;
 INSERT OR IGNORE INTO draft_attachments (draft, id, filename, mime, size)
     SELECT f.draft, f.id, json_extract(a.value, '$.filename'), json_extract(a.value, '$.mime'), json_extract(a.value, '$.size')
     FROM draft_files f JOIN drafts d ON d.id = f.draft AND json_valid(d.content) JOIN json_each(d.content, '$.attachments') a ON json_extract(a.value, '$.id') = f.id
@@ -1029,12 +1044,16 @@ impl Store {
     /// only kind [`crate::imap::ServerFlags`] can come from): new flags, deletions of the ones
     /// it left out, then trims the mailbox to its newest `window` messages. True when anything
     /// changed.
-    pub fn reconcile(&self, account: &str, mailbox: &str, local: &[(u32, u32)], server: &crate::imap::ServerFlags, window: u32) -> Result<bool> {
+    ///
+    /// `keep_woken`: the server can't keep `$new` here, so a message's [`flags::WOKEN`] is this
+    /// computer's, and stays whatever the server says.
+    pub fn reconcile(&self, account: &str, mailbox: &str, local: &[(u32, u32)], server: &crate::imap::ServerFlags, window: u32, keep_woken: bool) -> Result<bool> {
         let mut changed = false;
         let mut gone = Vec::new();
         self.transaction(|st| {
             for (uid, local_flags) in local {
-                match server.get(*uid) {
+                let theirs = server.get(*uid).map(|f| if keep_woken { f | (local_flags & flags::WOKEN) } else { f });
+                match theirs {
                     None => gone.push(*uid),
                     Some(f) if f != *local_flags => {
                         st.set_flags_by_uid(account, mailbox, *uid, f)?;
@@ -1680,6 +1699,25 @@ impl Store {
         })
     }
 
+    /// A snooze whose time came before it reached the server woke where it was (in the inbox):
+    /// what it hid shows again, unread and pinned ([`flags::WOKEN`]), remembered as woken, and
+    /// the op is done with. Its counts come back as an unread message's.
+    pub fn woke_in_place(&self, op: i64, now: i64) -> Result<()> {
+        self.transaction(|st| {
+            let held: Vec<(MessageId, String, String)> = st
+                .conn
+                .prepare_cached("SELECT id, account, message_id FROM messages WHERE held_op = ?1 AND held_op != 0")?
+                .query_map(params![op], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (id, account, message_id) in held {
+                st.conn.execute("UPDATE messages SET flags = (flags & ~?2) | ?3 WHERE id = ?1", params![id, flags::SEEN, flags::WOKEN])?;
+                st.add_woken(&account, &[message_id], now)?;
+            }
+            st.release(&[op])?;
+            Ok(())
+        })
+    }
+
     /// Gives up on an op the server keeps refusing. A message it was moving away shows again
     /// where it still is. Returns the op's account (None if it was already gone).
     pub fn op_dropped(&self, id: i64) -> Result<Option<String>> {
@@ -1792,6 +1830,8 @@ impl Store {
         self.conn.execute("DELETE FROM contacts WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM contact_sources WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM category_overrides WHERE account = ?1", params![account])?;
+        self.conn.execute("DELETE FROM snooze_parents WHERE account = ?1", params![account])?;
+        self.conn.execute("DELETE FROM woken WHERE account = ?1", params![account])?;
         Ok(())
     }
 
@@ -1814,6 +1854,99 @@ impl Store {
         }
         self.conn.execute("INSERT OR REPLACE INTO send_limits (account, size) VALUES (?1, ?2)", params![account, size])?;
         Ok(true)
+    }
+
+    // ── snoozes (snooze.rs) ──
+
+    /// Records where the account's snooze buckets go, as its mailbox list decided.
+    pub fn set_snooze_parent(&self, account: &str, parent: &str, delimiter: &str) -> Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO snooze_parents (account, parent, delimiter) VALUES (?1, ?2, ?3)", params![account, parent, delimiter])?;
+        Ok(())
+    }
+
+    /// Where the account's snooze buckets go, `(parent, delimiter)`: as recorded, else
+    /// `Snoozed` with its inbox's delimiter (before its mailboxes were first listed).
+    pub fn snooze_parent(&self, account: &str) -> Result<(String, String)> {
+        let found: Option<(String, String)> =
+            self.conn.query_row("SELECT parent, delimiter FROM snooze_parents WHERE account = ?1", params![account], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        if let Some(found) = found {
+            return Ok(found);
+        }
+        let delimiter: Option<String> =
+            self.conn.query_row("SELECT delimiter FROM mailboxes WHERE account = ?1 AND role = 'inbox'", params![account], |r| r.get(0)).optional()?;
+        Ok((crate::snooze::PARENT.to_owned(), delimiter.filter(|d| !d.is_empty()).unwrap_or_else(|| "/".to_owned())))
+    }
+
+    /// The bucket a message of `account` snoozed until `wake` goes to.
+    pub fn snooze_bucket(&self, account: &str, wake: i64) -> Result<String> {
+        let (parent, delimiter) = self.snooze_parent(account)?;
+        Ok(crate::snooze::bucket(&parent, &delimiter, wake))
+    }
+
+    /// The account's snooze buckets known here, `(name, wake time)`, soonest first.
+    pub fn buckets(&self, account: &str) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT name FROM mailboxes WHERE account = ?1 AND role = 'snoozed'")?;
+        let names = stmt.query_map(params![account], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out: Vec<(String, i64)> = names.into_iter().filter_map(|n| crate::snooze::wake_of(&n).map(|w| (n, w))).collect();
+        out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
+    /// A bucket just made on the server: known here at once, for its wake and the Snoozed view.
+    pub fn add_bucket(&self, account: &str, name: &str) -> Result<()> {
+        let (_, delimiter) = self.snooze_parent(account)?;
+        self.conn.execute(
+            "INSERT INTO mailboxes (account, name, display, role, delimiter, selectable) VALUES (?1, ?2, ?3, 'snoozed', ?4, 1)
+             ON CONFLICT (account, name) DO NOTHING",
+            params![account, name, crate::model::Role::Snoozed.label(), delimiter],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets a mailbox the server no longer has (a bucket deleted), with its cached mail.
+    pub fn forget_mailbox(&self, account: &str, name: &str) -> Result<()> {
+        self.clear_mailbox(account, name)?;
+        self.conn.execute("DELETE FROM mailboxes WHERE account = ?1 AND name = ?2", params![account, name])?;
+        Ok(())
+    }
+
+    /// Remembers messages this Envoy woke, by Message-ID, at `now`.
+    pub fn add_woken(&self, account: &str, message_ids: &[String], now: i64) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached("INSERT OR REPLACE INTO woken (account, message_id, at) VALUES (?1, ?2, ?3)")?;
+        for m in message_ids.iter().filter(|m| !m.is_empty()) {
+            stmt.execute(params![account, m, now])?;
+        }
+        Ok(())
+    }
+
+    /// Whether the account has woken messages to pin as they land.
+    pub fn has_woken(&self, account: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS (SELECT 1 FROM woken WHERE account = ?1)", params![account], |r| r.get(0))?)
+    }
+
+    /// Pins message `id` if it's one this Envoy woke.
+    pub fn apply_woken(&self, id: MessageId) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET flags = flags | ?2 WHERE id = ?1 AND message_id != ''
+               AND EXISTS (SELECT 1 FROM woken w WHERE w.account = messages.account AND w.message_id = messages.message_id)",
+            params![id, flags::WOKEN],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets that message `id` was woken (it was dealt with).
+    pub fn forget_woken(&self, id: MessageId) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM woken WHERE (account, message_id) IN (SELECT account, message_id FROM messages WHERE id = ?1 AND message_id != '')",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets woken messages remembered before `before` (they landed long ago, or never will).
+    pub fn prune_woken(&self, before: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM woken WHERE at < ?1", params![before])?;
+        Ok(())
     }
 
     /// Recomputes a mailbox's unread count from the local copy after a local change, so the
@@ -2463,6 +2596,35 @@ mod tests {
     }
 
     #[test]
+    fn a_woken_mark_is_the_servers_where_it_keeps_keywords_and_this_computers_elsewhere() {
+        let s = Store::memory();
+        s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        // This Envoy woke <1@x>: it lands pinned (the server can't keep `$new` here).
+        s.add_woken("a", &["<1@x>".to_owned()], 100).unwrap();
+        let woken = s.upsert_header("a", "INBOX", 1, 0, 10, 0, &parsed("Back", "<1@x>", "", "Ana <ana@x.com>", 1)).unwrap();
+        let other = s.upsert_header("a", "INBOX", 2, 0, 10, 0, &parsed("Other", "<2@x>", "", "Ana <ana@x.com>", 2)).unwrap();
+        s.apply_woken(woken).unwrap();
+        s.apply_woken(other).unwrap();
+        let flags_of = |id| s.summary(id).unwrap().unwrap().flags;
+        assert_eq!((flags_of(woken), flags_of(other)), (flags::WOKEN, 0));
+        // A sync that doesn't see `$new` on the server keeps it here, where the server can't...
+        let server = crate::imap::ServerFlags::finished([(1, 0), (2, 0)]);
+        let local = s.local_uids("a", "INBOX").unwrap();
+        assert!(!s.reconcile("a", "INBOX", &local, &server, 50, true).unwrap(), "nothing changed");
+        assert_eq!(flags_of(woken), flags::WOKEN);
+        // ...and takes the server's word where it can (another Envoy dealt with it).
+        assert!(s.reconcile("a", "INBOX", &local, &server, 50, false).unwrap());
+        assert_eq!(flags_of(woken), 0);
+        // Dealt with here: forgotten, so a copy landing later isn't pinned.
+        s.forget_woken(woken).unwrap();
+        assert!(!s.has_woken("a").unwrap());
+        // Remembered only so long.
+        s.add_woken("a", &["<3@x>".to_owned()], 100).unwrap();
+        s.prune_woken(101).unwrap();
+        assert!(!s.has_woken("a").unwrap());
+    }
+
+    #[test]
     fn trimming_the_cache_keeps_messages_waiting_to_move() {
         let s = Store::memory();
         s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
@@ -2475,12 +2637,12 @@ mod tests {
         // New mail arrives before the window ends, and the sync trims to the window.
         s.upsert_header("a", "INBOX", 4, 0, 10, 0, &parsed("New", "<4@x>", "", "Bo <bo@x.com>", 4)).unwrap();
         let server = crate::imap::ServerFlags::finished((1..=4).map(|uid| (uid, 0)));
-        assert!(!s.reconcile("a", "INBOX", &local, &server, 3).unwrap(), "three visible messages: nothing to trim");
+        assert!(!s.reconcile("a", "INBOX", &local, &server, 3, false).unwrap(), "three visible messages: nothing to trim");
         s.undo_batch(7).unwrap();
         assert!(inbox(&s).iter().any(|m| m.id == ids[0]), "undo still finds it");
         // Visible messages beyond the window still go.
         let local = s.local_uids("a", "INBOX").unwrap();
-        assert!(s.reconcile("a", "INBOX", &local, &server, 3).unwrap());
+        assert!(s.reconcile("a", "INBOX", &local, &server, 3, false).unwrap());
         assert_eq!(s.local_uids("a", "INBOX").unwrap().iter().map(|(u, _)| *u).collect::<Vec<_>>(), vec![2, 3, 4]);
     }
 
@@ -2657,7 +2819,7 @@ mod tests {
         with_deleted(&s);
         let local = s.local_uids("a", "INBOX").unwrap();
         let server = crate::imap::ServerFlags::finished(local.iter().copied());
-        s.reconcile("a", "INBOX", &local, &server, 5).unwrap();
+        s.reconcile("a", "INBOX", &local, &server, 5, false).unwrap();
         let shown: Vec<u32> = inbox(&s).iter().map(|m| m.uid).collect();
         assert_eq!(shown, vec![6, 5, 4, 3, 2], "five to show, not two");
     }
