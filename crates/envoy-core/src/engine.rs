@@ -1811,6 +1811,7 @@ fn spawn_worker(shared: Arc<Shared>, account: String) -> Worker {
         w.insert(account.clone(), notify.clone());
     }
     tokio::spawn(learn_server_size(shared.clone(), account.clone()));
+    tokio::spawn(watch_clock(Arc::downgrade(&notify)));
     let task = tokio::spawn(worker(shared.clone(), account.clone(), rx, notify.clone()));
     let fg_task = tokio::spawn(foreground(shared, account, now_rx, jobs.clone(), notify.clone()));
     Worker { jobs, now, notify, task, fg_task }
@@ -2795,6 +2796,49 @@ impl SnoozeClock {
     /// The first time any of `buckets` (not done with) is due here, as of `now`.
     fn next(&mut self, buckets: &[Bucket], moves: bool, now: i64) -> Option<i64> {
         buckets.iter().filter(|b| !b.done).map(|b| self.due_at(&b.name, b.wake, moves, now)).min()
+    }
+}
+
+/// How often a worker's clocks are compared ([`watch_clock`]), and how far apart they may drift
+/// in that time before it's woken.
+const CLOCK_CHECK: Duration = Duration::from_secs(30);
+const CLOCK_JUMP: Duration = Duration::from_secs(10);
+
+/// Both clocks, read together ([`clock_jumped`]).
+#[derive(Clone, Copy)]
+struct Clocks {
+    at: Instant,
+    wall: std::time::SystemTime,
+}
+
+impl Clocks {
+    fn now() -> Clocks {
+        Clocks { at: Instant::now(), wall: std::time::SystemTime::now() }
+    }
+}
+
+/// The wall clock moved differently from the monotonic one between `before` and `after`: the
+/// computer slept (the monotonic clock stands still meanwhile, on macOS and Linux), or the
+/// clock was set.
+fn clock_jumped(before: Clocks, after: Clocks) -> bool {
+    let mono = after.at.saturating_duration_since(before.at);
+    after.wall.duration_since(before.wall).map_or(true, |wall| wall.abs_diff(mono) > CLOCK_JUMP)
+}
+
+/// Wakes a worker (through `notify`, while it's there) when its clocks jump apart, so it looks
+/// at what's due by the wall clock (snoozes) then, not when a wait it planned by the monotonic
+/// clock ends: after the computer sleeps, or the clock is set.
+async fn watch_clock(notify: std::sync::Weak<Notify>) {
+    let mut last = Clocks::now();
+    loop {
+        tokio::time::sleep(CLOCK_CHECK).await;
+        let Some(notify) = notify.upgrade() else { return };
+        let now = Clocks::now();
+        if clock_jumped(last, now) {
+            log::info!("the clock jumped (asleep, or set): looking at what's due now");
+            notify.notify_one();
+        }
+        last = now;
     }
 }
 
@@ -5337,6 +5381,20 @@ mod tests {
         let waits: Vec<i64> = (0..50).map(|_| SnoozeClock::default().next(&buckets, false, t).unwrap() - t).collect();
         assert!(waits.iter().all(|w| (0..=snooze::MAX_JITTER).contains(w)), "{waits:?}");
         assert!(waits.iter().any(|w| *w > 0), "{waits:?}");
+    }
+
+    #[test]
+    fn the_clocks_jumping_apart_is_noticed() {
+        let before = Clocks::now();
+        let later = |mono: u64, wall: i64| Clocks {
+            at: before.at + Duration::from_secs(mono),
+            wall: if wall >= 0 { before.wall + Duration::from_secs(wall as u64) } else { before.wall - Duration::from_secs((-wall) as u64) },
+        };
+        assert!(!clock_jumped(before, later(30, 30)), "both went on");
+        assert!(!clock_jumped(before, later(30, 33)), "a little drift");
+        assert!(clock_jumped(before, later(30, 3630)), "asleep for an hour: the monotonic clock stood still");
+        assert!(clock_jumped(before, later(30, 600)), "the clock set forward");
+        assert!(clock_jumped(before, later(30, -60)), "the clock set back");
     }
 
     #[tokio::test]
