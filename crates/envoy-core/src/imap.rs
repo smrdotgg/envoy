@@ -21,7 +21,68 @@ mod wire;
 pub use wire::{Fetched, Lost, ServerFlags};
 
 pub type Stream = TlsStream<TcpStream>;
-pub type Session = async_imap::Session<Stream>;
+pub type Session = Connection<Stream>;
+
+/// A logged-in IMAP connection. Once an exchange on it doesn't finish (the connection closed
+/// or broke, a BYE, a timeout, a garbled answer), it's poisoned: what's left of that answer
+/// could be read as the next command's, so every later command fails as a lost connection,
+/// without being sent, and its owner connects again.
+pub struct Connection<T: Io> {
+    inner: async_imap::Session<T>,
+    poisoned: Option<String>,
+}
+
+impl<T: Io> Connection<T> {
+    pub fn new(inner: async_imap::Session<T>) -> Connection<T> {
+        Connection { inner, poisoned: None }
+    }
+
+    /// Ok while every exchange so far finished.
+    fn usable(&self) -> Result<()> {
+        match &self.poisoned {
+            Some(why) => Err(Lost(format!("an earlier command didn't finish ({why})")).into()),
+            None => Ok(()),
+        }
+    }
+
+    /// Passes `r` on, poisoning the connection if it says the exchange didn't finish.
+    fn finished<R>(&mut self, r: Result<R>) -> Result<R> {
+        if let Err(e) = &r
+            && is_lost(e)
+            && self.poisoned.is_none()
+        {
+            self.poisoned = Some(format!("{e:#}"));
+        }
+        r
+    }
+
+    pub async fn logout(&mut self) -> Result<()> {
+        self.usable()?;
+        let r = timed("LOGOUT", self.inner.logout()).await.and_then(|r| r.map_err(lost_if_transport));
+        self.finished(r)
+    }
+}
+
+/// async-imap's error as Envoy's: one of the connection's (I/O, closed, garbled) is [`Lost`];
+/// the server's refusals stay as they are.
+fn lost_if_transport(e: async_imap::error::Error) -> anyhow::Error {
+    use async_imap::error::Error;
+    match e {
+        Error::Io(_) | Error::ConnectionLost | Error::Parse(_) => anyhow::Error::new(Lost(format!("{e}"))),
+        e => anyhow::Error::new(e),
+    }
+}
+
+/// The exchange didn't finish because the connection failed (closed, broke, timed out, or
+/// sent what can't be parsed), not because the server refused: the session can't be trusted
+/// any more, and what was asked may be asked again on a new one. Told by the error's type,
+/// never its message.
+pub fn is_lost(e: &anyhow::Error) -> bool {
+    use async_imap::error::Error;
+    e.chain().any(|c| {
+        c.is::<Lost>() || c.is::<std::io::Error>() || matches!(c.downcast_ref::<Error>(), Some(Error::Io(_) | Error::ConnectionLost | Error::Parse(_)))
+    })
+}
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Short commands: a dead connection (laptop slept, Wi-Fi changed) is noticed quickly.
@@ -90,8 +151,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 }
 
 async fn timed<T>(what: &str, f: impl std::future::Future<Output = T>) -> Result<T> {
-    let limit = if what.starts_with("FETCH") { FETCH_TIMEOUT } else { COMMAND_TIMEOUT };
-    tokio::time::timeout(limit, f).await.map_err(|_| anyhow!("{what} timed out (connection lost?)"))
+    tokio::time::timeout(COMMAND_TIMEOUT, f).await.map_err(|_| anyhow::Error::new(Lost(format!("{what} timed out"))))
 }
 
 struct XOAuth2(String);
@@ -104,6 +164,10 @@ impl async_imap::Authenticator for &XOAuth2 {
 }
 
 pub async fn connect(account: &Account, cred: &Credential) -> Result<Session> {
+    connect_session(account, cred).await.map(Connection::new)
+}
+
+async fn connect_session(account: &Account, cred: &Credential) -> Result<async_imap::Session<Stream>> {
     let host = account.imap_host.as_str();
     let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, account.imap_port)))
         .await
@@ -213,13 +277,6 @@ pub fn failure(e: &anyhow::Error) -> Failure {
     }
 }
 
-/// The connection failed, rather than the server answering: lost, closed, timed out. A server's
-/// NO or BAD, a sign-in refused, or a request that can't succeed ([`Refused`]) is not.
-pub fn connection_trouble(e: &anyhow::Error) -> bool {
-    let answered = matches!(e.downcast_ref::<async_imap::error::Error>(), Some(async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_)));
-    !answered && !is_auth_error(e) && e.downcast_ref::<Refused>().is_none()
-}
-
 /// Decodes IMAP's modified UTF-7 mailbox names (`&AOk-t&AOk-` → `été`).
 pub fn decode_utf7(name: &str) -> String {
     use base64::Engine as _;
@@ -273,7 +330,7 @@ fn role_from_name(name: &str) -> Role {
     }
 }
 
-pub async fn list_mailboxes(session: &mut async_imap::Session<impl Io>) -> Result<Vec<ListedMailbox>> {
+pub async fn list_mailboxes(session: &mut Connection<impl Io>) -> Result<Vec<ListedMailbox>> {
     let names = wire::list(session).await?;
     let mut out = Vec::new();
     for n in names {
@@ -394,7 +451,7 @@ impl Contents {
 /// What the server said unasked before this is dropped first: it's older than the SELECT, which
 /// counts it, and the channel async-imap files it in holds only so much, dropping what comes
 /// once it's full, so [`idle`] would never hear of mail that arrives as it starts.
-pub async fn changed_since(session: &mut async_imap::Session<impl Io>, mailbox: &str, synced: Option<Contents>) -> Result<bool> {
+pub async fn changed_since(session: &mut Connection<impl Io>, mailbox: &str, synced: Option<Contents>) -> Result<bool> {
     news(session);
     let mb = wire::select(session, mailbox).await?;
     // A message expunged as the SELECT answered may be newer than its counts.
@@ -403,8 +460,8 @@ pub async fn changed_since(session: &mut async_imap::Session<impl Io>, mailbox: 
 
 /// Takes what the server said unasked (async-imap files it away) and says whether mail came or
 /// went: EXISTS, RECENT or EXPUNGE.
-fn news(session: &mut async_imap::Session<impl Io>) -> bool {
-    news_in(|| session.unsolicited_responses.try_recv().ok())
+fn news(session: &mut Connection<impl Io>) -> bool {
+    news_in(|| session.inner.unsolicited_responses.try_recv().ok())
 }
 
 /// [`news`], from what `next` takes off async-imap's channel until it's empty.
@@ -445,7 +502,7 @@ fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[
 
 /// Brings one mailbox's local copy up to date (see the module docs). `progress` runs after
 /// each chunk of a first download lands, so the UI can show it.
-pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, window: u32, progress: &(dyn Fn() + Send + Sync)) -> Result<SyncOutcome> {
+pub async fn sync_mailbox(session: &mut Connection<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, window: u32, progress: &(dyn Fn() + Send + Sync)) -> Result<SyncOutcome> {
     let mb = wire::select(session, mailbox).await?;
     let contents = Contents::of(&mb);
     let uidvalidity = mb.uid_validity;
@@ -515,12 +572,12 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
 }
 
 /// Unread and total counts for the sidebar.
-pub async fn status(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<(u32, u32)> {
+pub async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> Result<(u32, u32)> {
     wire::status(session, mailbox).await
 }
 
 /// Downloads whole messages by UID into the store. The mailbox must be selected.
-pub async fn fetch_bodies(session: &mut async_imap::Session<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, uids: &[u32]) -> Result<Vec<i64>> {
+pub async fn fetch_bodies(session: &mut Connection<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, uids: &[u32]) -> Result<Vec<i64>> {
     if uids.is_empty() {
         return Ok(vec![]);
     }
@@ -548,7 +605,7 @@ fn quoted(s: &str) -> String {
 pub trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send> Io for T {}
 
-pub async fn select(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<()> {
+pub async fn select(session: &mut Connection<impl Io>, mailbox: &str) -> Result<()> {
     wire::select(session, mailbox).await?;
     Ok(())
 }
@@ -585,7 +642,7 @@ impl std::error::Error for NewGeneration {}
 /// generation. Otherwise nothing is sent with the target's UID, and the error
 /// ([`NewGeneration`]) says where its message is now, if its Message-ID finds it once. An
 /// unknown generation (0) is never taken for the current one.
-async fn select_target(session: &mut async_imap::Session<impl Io>, mailbox: &str, target: &Target<'_>) -> Result<()> {
+async fn select_target(session: &mut Connection<impl Io>, mailbox: &str, target: &Target<'_>) -> Result<()> {
     let selected = wire::select(session, mailbox).await?;
     if target.validity != 0 && selected.uid_validity == target.validity {
         return Ok(());
@@ -600,7 +657,7 @@ async fn select_target(session: &mut async_imap::Session<impl Io>, mailbox: &str
     Err(NewGeneration { mailbox: mailbox.to_owned(), validity: selected.uid_validity, found }.into())
 }
 
-pub async fn store_flags(session: &mut async_imap::Session<impl Io>, mailbox: &str, target: &Target<'_>, add: u32, remove: u32) -> Result<()> {
+pub async fn store_flags(session: &mut Connection<impl Io>, mailbox: &str, target: &Target<'_>, add: u32, remove: u32) -> Result<()> {
     select_target(session, mailbox, target).await?;
     let uid = target.uid;
     if add != 0 {
@@ -612,7 +669,7 @@ pub async fn store_flags(session: &mut async_imap::Session<impl Io>, mailbox: &s
     Ok(())
 }
 
-pub async fn move_message(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, target: &Target<'_>, dest: &str) -> Result<()> {
+pub async fn move_message(session: &mut Connection<impl Io>, caps: Caps, mailbox: &str, target: &Target<'_>, dest: &str) -> Result<()> {
     select_target(session, mailbox, target).await?;
     let uid = target.uid;
     if caps.moves {
@@ -625,13 +682,13 @@ pub async fn move_message(session: &mut async_imap::Session<impl Io>, caps: Caps
 }
 
 /// Copies a message to `dest`, leaving it where it is: on Gmail, adds the label `dest`.
-pub async fn copy_message(session: &mut async_imap::Session<impl Io>, mailbox: &str, target: &Target<'_>, dest: &str) -> Result<()> {
+pub async fn copy_message(session: &mut Connection<impl Io>, mailbox: &str, target: &Target<'_>, dest: &str) -> Result<()> {
     select_target(session, mailbox, target).await?;
     let uid = target.uid;
     wire::ok(session, &format!("UID COPY {uid} {}", quoted(dest)), "COPY").await
 }
 
-pub async fn expunge(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, target: &Target<'_>) -> Result<()> {
+pub async fn expunge(session: &mut Connection<impl Io>, caps: Caps, mailbox: &str, target: &Target<'_>) -> Result<()> {
     select_target(session, mailbox, target).await?;
     delete_uids(session, caps, &[target.uid]).await
 }
@@ -640,7 +697,7 @@ pub async fn expunge(session: &mut async_imap::Session<impl Io>, caps: Caps, mai
 /// expunges exactly them (UID EXPUNGE). Without UIDPLUS they stay flagged, for the server or
 /// the user to remove: a plain EXPUNGE would also destroy anything else flagged \Deleted there,
 /// by the user or another client, so Envoy never sends one. Envoy's lists hide \Deleted mail.
-async fn delete_uids(session: &mut async_imap::Session<impl Io>, caps: Caps, uids: &[u32]) -> Result<()> {
+async fn delete_uids(session: &mut Connection<impl Io>, caps: Caps, uids: &[u32]) -> Result<()> {
     if uids.is_empty() {
         return Ok(());
     }
@@ -652,8 +709,8 @@ async fn delete_uids(session: &mut async_imap::Session<impl Io>, caps: Caps, uid
     Ok(())
 }
 
-pub async fn append(session: &mut async_imap::Session<impl Io>, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
-    timed("APPEND", append_uid(session, mailbox, if seen { "(\\Seen)" } else { "" }, raw)).await??;
+pub async fn append(session: &mut Connection<impl Io>, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
+    append_uid(session, mailbox, if seen { "(\\Seen)" } else { "" }, raw).await?;
     Ok(())
 }
 
@@ -675,7 +732,7 @@ pub struct Replaced {
 /// on record, or `maybe_strays` (an earlier upload was cut off and may have left a copy) does a
 /// search by the draft's Message-ID stand in, and then only if it finds the copy just made.
 pub async fn replace_draft(
-    session: &mut async_imap::Session<impl Io>,
+    session: &mut Connection<impl Io>,
     caps: Caps,
     mailbox: &str,
     raw: &[u8],
@@ -685,7 +742,7 @@ pub async fn replace_draft(
 ) -> Result<Replaced> {
     let before = wire::select(session, mailbox).await?;
     let validity = before.uid_validity;
-    let appended = timed("APPEND", append_uid(session, mailbox, "(\\Draft \\Seen)", raw)).await??;
+    let appended = append_uid(session, mailbox, "(\\Draft \\Seen)", raw).await?;
     let appended = appended.filter(|(v, _)| *v == validity || validity == 0);
     let validity = appended.map_or(validity, |(v, _)| v);
     let previous = previous.filter(|(v, _)| *v == validity && validity != 0).map(|(_, uid)| uid);
@@ -730,54 +787,63 @@ fn cleanup(appended: Option<u32>, uid_next: Option<u32>, previous: Option<u32>, 
 }
 
 /// APPENDs a message, returning its `(UIDVALIDITY, UID)` if the server reports it (APPENDUID,
-/// from UIDPLUS). async-imap's own APPEND drops that.
-async fn append_uid(session: &mut async_imap::Session<impl Io>, mailbox: &str, flags: &str, raw: &[u8]) -> Result<Option<(u32, u32)>> {
+/// from UIDPLUS). async-imap's own APPEND drops that. Read to its tagged status, as
+/// [`wire::run`] reads the others: anything short of that is a lost connection, and poisons it.
+async fn append_uid(session: &mut Connection<impl Io>, mailbox: &str, flags: &str, raw: &[u8]) -> Result<Option<(u32, u32)>> {
     use async_imap::imap_proto::{Response, ResponseCode, Status, UidSetMember};
     use tokio::io::AsyncWriteExt;
     use wire::refused;
+    session.usable()?;
     let flags = if flags.is_empty() { String::new() } else { format!(" {flags}") };
-    let tag = session.run_command(format!("APPEND {}{flags} {{{}}}", quoted(mailbox), raw.len())).await?;
-    let lost = |why: &str| anyhow::Error::new(Lost(format!("APPEND: {why}")));
-    loop {
-        let r = session.read_response().await.ok_or_else(|| lost("the connection closed before the server finished"))??;
-        match r.parsed() {
-            Response::Continue { .. } => break,
-            Response::Done { tag: t, status, code, information } if *t == tag => return Err(refused(status, code, information)),
-            Response::Data { status: Status::Bye, .. } => return Err(lost("the server said BYE")),
-            _ => {}
-        }
-    }
-    let stream = session.as_mut();
-    stream.write_all(raw).await?;
-    stream.write_all(b"\r\n").await?;
-    stream.flush().await?;
-    loop {
-        let r = session.read_response().await.ok_or_else(|| lost("the connection closed before the server finished"))??;
-        if let Response::Data { status: Status::Bye, .. } = r.parsed() {
-            return Err(lost("the server said BYE"));
-        }
-        if let Response::Done { tag: t, status, code, information } = r.parsed()
-            && *t == tag
-        {
-            if *status != Status::Ok {
-                return Err(refused(status, code, information));
+    let command = format!("APPEND {}{flags} {{{}}}", quoted(mailbox), raw.len());
+    let inner = &mut session.inner;
+    let exchange = async {
+        let lost = |why: &str| anyhow::Error::new(Lost(format!("APPEND: {why}")));
+        let tag = inner.run_command(command).await.map_err(lost_if_transport)?;
+        loop {
+            let r = inner.read_response().await.ok_or_else(|| lost("the connection closed before the server finished"))?.map_err(|e| lost(&e.to_string()))?;
+            match r.parsed() {
+                Response::Continue { .. } => break,
+                Response::Done { tag: t, status, code, information } if *t == tag => return Err(refused(status, code, information)),
+                Response::Data { status: Status::Bye, .. } => return Err(lost("the server said BYE")),
+                _ => {}
             }
-            return Ok(match code {
-                Some(ResponseCode::AppendUid(validity, uids)) => match uids.as_slice() {
-                    [UidSetMember::Uid(uid)] => Some((*validity, *uid)),
-                    _ => None,
-                },
-                _ => None,
-            });
         }
-    }
+        let stream = inner.as_mut();
+        stream.write_all(raw).await.map_err(|e| lost(&e.to_string()))?;
+        stream.write_all(b"\r\n").await.map_err(|e| lost(&e.to_string()))?;
+        stream.flush().await.map_err(|e| lost(&e.to_string()))?;
+        loop {
+            let r = inner.read_response().await.ok_or_else(|| lost("the connection closed before the server finished"))?.map_err(|e| lost(&e.to_string()))?;
+            if let Response::Data { status: Status::Bye, .. } = r.parsed() {
+                return Err(lost("the server said BYE"));
+            }
+            if let Response::Done { tag: t, status, code, information } = r.parsed()
+                && *t == tag
+            {
+                if *status != Status::Ok {
+                    return Err(refused(status, code, information));
+                }
+                return Ok(match code {
+                    Some(ResponseCode::AppendUid(validity, uids)) => match uids.as_slice() {
+                        [UidSetMember::Uid(uid)] => Some((*validity, *uid)),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+            }
+        }
+    };
+    // A big message on a slow link takes a while.
+    let r = tokio::time::timeout(FETCH_TIMEOUT, exchange).await.unwrap_or_else(|_| Err(anyhow::Error::new(Lost("APPEND timed out".into()))));
+    session.finished(r)
 }
 
 /// Deletes a draft's copies from `mailbox`: the one on record, `known` (`(UIDVALIDITY, UID)`),
 /// and, with `search`, any others the Message-ID search finds (headers checked). Returns their
 /// UIDs.
 pub async fn purge_message_id(
-    session: &mut async_imap::Session<impl Io>,
+    session: &mut Connection<impl Io>,
     caps: Caps,
     mailbox: &str,
     message_id: &str,
@@ -796,7 +862,7 @@ pub async fn purge_message_id(
 /// UIDs of the messages in the selected mailbox with exactly this Message-ID, not already
 /// flagged \Deleted. SEARCH matches substrings, and some servers match loosely, so each hit's
 /// header is checked: a draft's save must never delete anything else.
-async fn uids_with_message_id(session: &mut async_imap::Session<impl Io>, message_id: &str) -> Result<Vec<u32>> {
+async fn uids_with_message_id(session: &mut Connection<impl Io>, message_id: &str) -> Result<Vec<u32>> {
     let query = format!("UNDELETED HEADER Message-ID {}", quoted(message_id));
     let hits = wire::uid_search(session, &query).await?;
     if hits.is_empty() {
@@ -821,17 +887,18 @@ pub struct Caps {
     pub uidplus: bool,
 }
 
-pub async fn capabilities(session: &mut async_imap::Session<impl Io>) -> Result<Caps> {
+pub async fn capabilities(session: &mut Connection<impl Io>) -> Result<Caps> {
     let caps = wire::capabilities(session).await?;
     Ok(Caps { moves: caps.contains("MOVE"), idle: caps.contains("IDLE"), uidplus: caps.contains("UIDPLUS") })
 }
 
 /// Waits on IDLE for up to `wait`, returning early when the server reports a change or
 /// `interrupt` fires. Gives the session back either way.
-pub async fn idle<T: Io>(session: async_imap::Session<T>, wait: Duration, interrupt: Arc<tokio::sync::Notify>) -> Result<(async_imap::Session<T>, bool)> {
-    let unsolicited = session.unsolicited_responses.clone();
-    let mut handle = session.idle();
-    timed("IDLE", handle.init()).await??;
+pub async fn idle<T: Io>(session: Connection<T>, wait: Duration, interrupt: Arc<tokio::sync::Notify>) -> Result<(Connection<T>, bool)> {
+    session.usable()?;
+    let unsolicited = session.inner.unsolicited_responses.clone();
+    let mut handle = session.inner.idle();
+    timed("IDLE", handle.init()).await?.map_err(lost_if_transport)?;
     // Mail that arrived since the caller last looked ([`changed_since`]) may be told before the
     // server's go-ahead: async-imap files that away rather than ending the wait, so it's looked
     // for here, and the wait skipped.
@@ -840,16 +907,16 @@ pub async fn idle<T: Io>(session: async_imap::Session<T>, wait: Duration, interr
         tokio::pin!(fut);
         let mut stop = Some(stop);
         tokio::select! {
-            r = &mut fut => matches!(r?, async_imap::extensions::idle::IdleResponse::NewData(_)),
+            r = &mut fut => matches!(r.map_err(lost_if_transport)?, async_imap::extensions::idle::IdleResponse::NewData(_)),
             _ = interrupt.notified() => {
                 // Ask the wait to stop, and let it finish reading cleanly.
                 stop.take();
-                matches!(timed("IDLE stop", &mut fut).await??, async_imap::extensions::idle::IdleResponse::NewData(_))
+                matches!(timed("IDLE stop", &mut fut).await?.map_err(lost_if_transport)?, async_imap::extensions::idle::IdleResponse::NewData(_))
             }
         }
     };
     // Told as the IDLE ended, before its OK: filed away too.
-    let mut session = timed("DONE", handle.done()).await??;
+    let mut session = Connection::new(timed("DONE", handle.done()).await?.map_err(lost_if_transport)?);
     let changed = news(&mut session) | changed;
     Ok((session, changed))
 }
@@ -876,7 +943,7 @@ pub(crate) mod fake {
     /// the response lines, where `TAG` stands for the command's tag. `None` answers
     /// `TAG OK done`. An answer ending in [`HANG_UP`] closes the connection after what comes
     /// before it, as a server does with one left idle too long (or going away mid-answer).
-    pub async fn session(answer: impl Fn(&str) -> Option<String> + Send + 'static) -> (async_imap::Session<DuplexStream>, Log) {
+    pub async fn session(answer: impl Fn(&str) -> Option<String> + Send + 'static) -> (super::Connection<DuplexStream>, Log) {
         let (client, server) = tokio::io::duplex(1 << 20);
         let log: Log = Arc::default();
         let seen = log.clone();
@@ -920,7 +987,7 @@ pub(crate) mod fake {
         });
         let mut c = async_imap::Client::new(client);
         c.read_response().await.unwrap().unwrap();
-        (c.login("me", "pw").await.map_err(|e| e.0).unwrap(), log)
+        (super::Connection::new(c.login("me", "pw").await.map_err(|e| e.0).unwrap()), log)
     }
 
     /// What an answer ends with to close the connection there.
@@ -982,7 +1049,7 @@ mod tests {
         // SELECT answered with nothing: that mustn't empty the local copy, or pass at all.
         let (mut s, _log) = fake::session(|_| Some(fake::HANG_UP.to_owned())).await;
         let Err(e) = sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await else { panic!("a closed connection synced") };
-        assert!(connection_trouble(&e), "{e:#}");
+        assert!(is_lost(&e), "{e:#}");
         assert_eq!(cached(&store), 3, "the local copy is kept");
         let (mut s, _log) = fake::session(|_| Some(fake::HANG_UP.to_owned())).await;
         assert!(select(&mut s, "INBOX").await.is_err());
@@ -1209,6 +1276,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_connection_closing_inside_a_literal_is_lost() {
+        // The body's literal promises 100 bytes; the connection closes after a few. async-imap
+        // reports that as an I/O error ("bytes remaining in stream"), not a closed connection.
+        let store = synced_store().await;
+        let (mut s, _log) = fake::session(breaking("UID FETCH 101 (UID BODY.PEEK[])", "* 1 FETCH (UID 101 BODY[] {100}\r\nSubject: x\r\n", Breaks::Eof)).await;
+        select(&mut s, "INBOX").await.unwrap();
+        let e = fetch_bodies(&mut s, &store, "a", "INBOX", &[101]).await.unwrap_err();
+        assert!(e.downcast_ref::<Lost>().is_some(), "{e:#}: not taken for a lost connection");
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_answer_didnt_finish_isnt_used_again() {
+        // A command times out with its answer half told: what's left of it could be read as
+        // the next command's. The session is poisoned: nothing more is sent on it.
+        let (mut s, log) = fake::session(|c: &str| match c {
+            "NOOP" => Some("* 7 EXISTS\r\n".into()),
+            c => inbox_server(c),
+        })
+        .await;
+        let e = wire::run(&mut s, "NOOP", "NOOP", Duration::from_millis(200), |_| {}).await.unwrap_err();
+        assert!(e.downcast_ref::<Lost>().is_some(), "{e:#}");
+        let e = select(&mut s, "INBOX").await.unwrap_err();
+        assert!(e.downcast_ref::<Lost>().is_some(), "{e:#}");
+        assert!(!commands(&log).iter().any(|c| c.starts_with("SELECT")), "{:?}", commands(&log));
+    }
+
+    #[tokio::test]
     async fn messages_flagged_deleted_dont_fill_the_first_download() {
         // The newest four of ten are flagged \Deleted (removed elsewhere, not expunged yet).
         let (mut s, _log) = fake::session(mailbox_server(10, 7..=10)).await;
@@ -1284,7 +1378,7 @@ mod tests {
     async fn mail_told_before_idles_go_ahead_is_noticed() {
         // Delivered between the check and IDLE: the server tells of it before its "+".
         let (mut s, log) = fake::session(idle_server("* 4 EXISTS\r\n* 1 RECENT\r\n+ idling\r\n")).await;
-        s.noop().await.unwrap();
+        s.inner.noop().await.unwrap();
         assert!(!changed_since(&mut s, "INBOX", Some(SYNCED)).await.unwrap(), "what was told before the check is older than it");
         let notify = Arc::new(tokio::sync::Notify::new());
         let (_s, news) = tokio::time::timeout(Duration::from_secs(5), idle(s, Duration::from_secs(60), notify)).await.expect("no waiting for the timeout").unwrap();
@@ -1295,7 +1389,7 @@ mod tests {
     #[tokio::test]
     async fn idle_without_news_waits_it_out() {
         let (mut s, _log) = fake::session(idle_server("+ idling\r\n")).await;
-        s.noop().await.unwrap();
+        s.inner.noop().await.unwrap();
         assert!(!changed_since(&mut s, "INBOX", Some(SYNCED)).await.unwrap());
         let started = std::time::Instant::now();
         let (_s, news) = idle(s, Duration::from_millis(300), Arc::new(tokio::sync::Notify::new())).await.unwrap();

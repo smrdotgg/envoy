@@ -18,10 +18,11 @@ use anyhow::{Result, anyhow, bail};
 use async_imap::imap_proto::{AttributeValue, MailboxDatum, MessageSection, NameAttribute, Response, ResponseCode, SectionPath, Status, StatusAttribute};
 use async_imap::types::Flag;
 
-use super::{COMMAND_TIMEOUT, FETCH_TIMEOUT, Io, flag_bits, quoted};
+use super::{COMMAND_TIMEOUT, Connection, FETCH_TIMEOUT, Io, flag_bits, quoted};
 
-/// The connection went before the server finished answering: closed, BYE, or silent past the
-/// time limit. Nothing about the answer is known.
+/// The connection went before the server finished answering: closed (inside a literal too),
+/// broken, garbled, BYE, or silent past the time limit. Nothing about the answer is known, and
+/// the connection is done with ([`Connection`]).
 #[derive(Debug)]
 pub struct Lost(pub String);
 
@@ -43,24 +44,32 @@ pub(super) fn refused(status: &Status, code: &impl std::fmt::Debug, info: &impl 
 /// response to `each` as it comes. `each` only collects: what it collected may be used only if
 /// this returns Ok (the answer finished). `what` names the command in errors; `limit` bounds
 /// the whole exchange.
-pub(super) async fn run(session: &mut async_imap::Session<impl Io>, command: &str, what: &str, limit: Duration, mut each: impl FnMut(&Response<'_>) + Send) -> Result<()> {
+///
+/// A connection whose earlier exchange didn't finish is never used ([`Connection`]); one
+/// whose exchange here doesn't finish is poisoned. Every failure but the server's refusal is
+/// [`Lost`]: a write that fails, the connection closing (inside a literal too: async-imap's
+/// "bytes remaining in stream"), a garbled answer, a BYE, the time limit.
+pub(super) async fn run(session: &mut Connection<impl Io>, command: &str, what: &str, limit: Duration, mut each: impl FnMut(&Response<'_>) + Send) -> Result<()> {
+    session.usable()?;
+    let lost = |why: String| anyhow::Error::new(Lost(format!("{what}: {why}")));
+    let inner = &mut session.inner;
     let exchange = async {
-        let tag = session.run_command(command).await?;
+        let tag = inner.run_command(command).await.map_err(|e| lost(e.to_string()))?;
         loop {
-            let Some(next) = session.read_response().await else {
-                return Err(Lost(format!("{what}: the connection closed before the server finished")).into());
+            let Some(next) = inner.read_response().await else {
+                return Err(lost("the connection closed before the server finished".into()));
             };
-            let response = next?;
+            let response = next.map_err(|e| lost(e.to_string()))?;
             match response.parsed() {
                 Response::Done { tag: t, status, code, information } if *t == tag => {
                     return match status {
                         Status::Ok => Ok(()),
                         Status::No | Status::Bad => Err(refused(status, code, information)),
-                        other => Err(Lost(format!("{what}: the server ended with {other:?}")).into()),
+                        other => Err(lost(format!("the server ended with {other:?}"))),
                     };
                 }
                 Response::Data { status: Status::Bye, information, .. } => {
-                    return Err(Lost(format!("{what}: the server said BYE ({})", information.as_deref().unwrap_or(""))).into());
+                    return Err(lost(format!("the server said BYE ({})", information.as_deref().unwrap_or(""))));
                 }
                 // An earlier command's end (one that timed out, say): not this answer's.
                 Response::Done { .. } => {}
@@ -68,11 +77,12 @@ pub(super) async fn run(session: &mut async_imap::Session<impl Io>, command: &st
             }
         }
     };
-    tokio::time::timeout(limit, exchange).await.map_err(|_| anyhow::Error::new(Lost(format!("{what} timed out"))))?
+    let r = tokio::time::timeout(limit, exchange).await.unwrap_or_else(|_| Err(lost("timed out".into())));
+    session.finished(r)
 }
 
 /// Runs a command whose answer is just its tagged OK (STORE, UID EXPUNGE, COPY, MOVE).
-pub(super) async fn ok(session: &mut async_imap::Session<impl Io>, command: &str, what: &str) -> Result<()> {
+pub(super) async fn ok(session: &mut Connection<impl Io>, command: &str, what: &str) -> Result<()> {
     run(session, command, what, COMMAND_TIMEOUT, |_| {}).await
 }
 
@@ -88,7 +98,7 @@ pub(super) struct Selected {
 
 /// SELECTs `mailbox`. Every SELECT says FLAGS, EXISTS and UIDVALIDITY (RFC 3501 requires all
 /// three): an answer without one of them, even finished, isn't trusted to describe the mailbox.
-pub(super) async fn select(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<Selected> {
+pub(super) async fn select(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Selected> {
     let (mut flags, mut exists, mut uid_validity, mut uid_next, mut expunged) = (false, None, None, None, false);
     run(session, &format!("SELECT {}", quoted(mailbox)), "SELECT", COMMAND_TIMEOUT, |r| match r {
         Response::MailboxData(MailboxDatum::Flags(_)) => flags = true,
@@ -108,7 +118,7 @@ pub(super) async fn select(session: &mut async_imap::Session<impl Io>, mailbox: 
 
 /// `(unseen, messages)` of `mailbox`, each as the server said it: an answer missing either
 /// isn't read as zero.
-pub(super) async fn status(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<(u32, u32)> {
+pub(super) async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> Result<(u32, u32)> {
     let (mut unseen, mut messages) = (None, None);
     run(session, &format!("STATUS {} (MESSAGES UNSEEN)", quoted(mailbox)), "STATUS", COMMAND_TIMEOUT, |r| {
         if let Response::MailboxData(MailboxDatum::Status { mailbox: m, status }) = r
@@ -154,7 +164,7 @@ pub(super) enum Attribute {
 }
 
 /// Every mailbox (`LIST "" "*"`).
-pub(super) async fn list(session: &mut async_imap::Session<impl Io>) -> Result<Vec<Listed>> {
+pub(super) async fn list(session: &mut Connection<impl Io>) -> Result<Vec<Listed>> {
     let mut listed = Vec::new();
     run(session, "LIST \"\" \"*\"", "LIST", COMMAND_TIMEOUT, |r| {
         if let Response::MailboxData(MailboxDatum::List { name_attributes, delimiter, name }) = r {
@@ -220,7 +230,7 @@ impl Fetched {
 
 /// FETCH (`uid`: UID FETCH) of `set`, every response it gave, in order, including ones the
 /// server sent unasked meanwhile (another client's flag changes). Bodies get the longer limit.
-pub(super) async fn fetch(session: &mut async_imap::Session<impl Io>, uid: bool, set: &str, query: &str, what: &str) -> Result<Vec<Fetched>> {
+pub(super) async fn fetch(session: &mut Connection<impl Io>, uid: bool, set: &str, query: &str, what: &str) -> Result<Vec<Fetched>> {
     let command = format!("{}FETCH {set} {query}", if uid { "UID " } else { "" });
     let mut fetched = Vec::new();
     run(session, &command, what, FETCH_TIMEOUT, |r| {
@@ -255,13 +265,13 @@ impl ServerFlags {
 
 /// UID FETCH of `lo:hi`'s flags. A message without FLAGS in the answer (unasked news of another
 /// one, say) still counts as there.
-pub(super) async fn uid_flags(session: &mut async_imap::Session<impl Io>, lo: u32, hi: u32) -> Result<ServerFlags> {
+pub(super) async fn uid_flags(session: &mut Connection<impl Io>, lo: u32, hi: u32) -> Result<ServerFlags> {
     let fetched = fetch(session, true, &format!("{lo}:{hi}"), "(UID FLAGS)", "FETCH flags").await?;
     Ok(ServerFlags { flags: fetched.iter().filter_map(|f| Some((f.uid?, f.flags.unwrap_or(0)))).collect() })
 }
 
 /// UID SEARCH: the UIDs a finished search found.
-pub(super) async fn uid_search(session: &mut async_imap::Session<impl Io>, query: &str) -> Result<HashSet<u32>> {
+pub(super) async fn uid_search(session: &mut Connection<impl Io>, query: &str) -> Result<HashSet<u32>> {
     let mut found = HashSet::new();
     run(session, &format!("UID SEARCH {query}"), "SEARCH", COMMAND_TIMEOUT, |r| {
         if let Response::MailboxData(MailboxDatum::Search(uids)) = r {
@@ -273,7 +283,7 @@ pub(super) async fn uid_search(session: &mut async_imap::Session<impl Io>, query
 }
 
 /// CAPABILITY: the capabilities' names, uppercased.
-pub(super) async fn capabilities(session: &mut async_imap::Session<impl Io>) -> Result<HashSet<String>> {
+pub(super) async fn capabilities(session: &mut Connection<impl Io>) -> Result<HashSet<String>> {
     use async_imap::imap_proto::Capability;
     let mut names = HashSet::new();
     run(session, "CAPABILITY", "CAPABILITY", COMMAND_TIMEOUT, |r| {

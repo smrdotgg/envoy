@@ -422,6 +422,9 @@ pub enum Op {
     /// Delete for good (expunge), used in Trash.
     Expunge { mailbox: String, uid: u32 },
     Send { raw_b64: String, from: String, to: Vec<String>, sent_mailbox: Option<String>, reply_of: Option<(String, u32)> },
+    /// A send whose message is out (the SMTP server took it): what's left is a copy in Sent
+    /// (`sent_mailbox`, None once filed) and marking the original answered. Never sent again.
+    Delivered { raw_b64: String, sent_mailbox: Option<String>, reply_of: Option<(String, u32)> },
     /// Put a local draft's newest version in the Drafts mailbox, replacing the copies before
     /// it. Reads the draft when it runs, so one op covers any number of edits.
     SaveDraft { draft: i64 },
@@ -480,7 +483,7 @@ impl Op {
     pub fn located(&self) -> Option<(&str, u32)> {
         match self {
             Op::SetFlags { mailbox, uid, .. } | Op::Move { mailbox, uid, .. } | Op::Copy { mailbox, uid, .. } | Op::Expunge { mailbox, uid } => Some((mailbox, *uid)),
-            Op::Send { reply_of: Some((mailbox, uid)), .. } => Some((mailbox, *uid)),
+            Op::Send { reply_of: Some((mailbox, uid)), .. } | Op::Delivered { reply_of: Some((mailbox, uid)), .. } => Some((mailbox, *uid)),
             _ => None,
         }
     }
@@ -490,7 +493,7 @@ impl Op {
         let mut op = self.clone();
         match &mut op {
             Op::SetFlags { uid, .. } | Op::Move { uid, .. } | Op::Copy { uid, .. } | Op::Expunge { uid, .. } => *uid = to,
-            Op::Send { reply_of: Some((_, uid)), .. } => *uid = to,
+            Op::Send { reply_of: Some((_, uid)), .. } | Op::Delivered { reply_of: Some((_, uid)), .. } => *uid = to,
             _ => return None,
         }
         Some(op)
@@ -1288,6 +1291,13 @@ impl Store {
             st.release(&ids)?;
             Ok(ids.len())
         })
+    }
+
+    /// Replaces a queued op with the next stage of it (a send delivered, then filed), keeping
+    /// its place, claim and generation.
+    pub fn rewrite_op(&self, id: i64, op: &Op) -> Result<()> {
+        self.conn.execute("UPDATE ops SET op = ?2 WHERE id = ?1", params![id, json(op)])?;
+        Ok(())
     }
 
     /// An op's message, found again by its Message-ID in generation `validity` of its mailbox,
