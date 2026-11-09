@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rune::{KeyEvent, Keybind, TextEdit, Tx};
-use rune_kit::PaneState;
+use rune::{KeyEvent, Keybind, Mods, TextEdit, Tx};
+use rune_kit::{ComboboxOption, ComboboxState, PaneState};
 use serde_json::Value;
 
 use envoy_core::accounts::{Account, AuthKind};
@@ -14,6 +14,7 @@ use envoy_core::settings::Settings;
 use envoy_core::store::DraftRev;
 
 use crate::fmt;
+use crate::selection::Selection;
 
 pub enum ImageState {
     Loading,
@@ -357,6 +358,20 @@ pub enum Action {
     GoInbox,
     GoStarred,
     GoSent,
+    Select,
+    SelectNext,
+    SelectPrevious,
+    SelectAll,
+    Spam,
+    MoveTo,
+    Label,
+}
+
+/// Which picker: Move to… (`v`) or Label… (`l`, Gmail).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Picker {
+    Move,
+    Label,
 }
 
 const ACTIONS: &[(Action, &str)] = &[
@@ -380,6 +395,13 @@ const ACTIONS: &[(Action, &str)] = &[
     (Action::GoInbox, "keys.goInbox"),
     (Action::GoStarred, "keys.goStarred"),
     (Action::GoSent, "keys.goSent"),
+    (Action::Select, "keys.select"),
+    (Action::SelectNext, "keys.selectNext"),
+    (Action::SelectPrevious, "keys.selectPrevious"),
+    (Action::SelectAll, "keys.selectAll"),
+    (Action::Spam, "keys.spam"),
+    (Action::MoveTo, "keys.moveTo"),
+    (Action::Label, "keys.label"),
 ];
 
 pub struct App {
@@ -404,6 +426,12 @@ pub struct App {
     pub list_at_once: bool,
     /// j/k waiting for the rest of a list whose first page doesn't reach where they go.
     pub pending_step: isize,
+    /// Rows selected to act on together; while there are any, the reader shows them instead
+    /// of the open message, and every action applies to them ([`App::targets`]).
+    pub selection: Selection,
+    /// The Move to… and Label… pickers.
+    pub move_picker: ComboboxState,
+    pub label_picker: ComboboxState,
     /// The opened row (its newest message in conversation view).
     pub open: Option<MessageId>,
     pub thread: Vec<ThreadMessage>,
@@ -496,6 +524,9 @@ impl App {
             list_gen: 0,
             list_at_once: true,
             pending_step: 0,
+            selection: Selection::default(),
+            move_picker: ComboboxState::default(),
+            label_picker: ComboboxState::default(),
             open: None,
             thread: Vec::new(),
             thread_req: 0,
@@ -601,6 +632,7 @@ impl App {
                     && !self.accounts.iter().any(|a| &a.id == account)
                 {
                     self.view = View::Role { account: None, role: Role::Inbox };
+                    self.selection.clear();
                     reload = true;
                 }
                 // The first report is the accounts the engine started with, which the list
@@ -618,6 +650,11 @@ impl App {
                 self.list_loaded = true;
                 self.list_complete = !more;
                 self.list_gen += 1;
+                if !more {
+                    // Selected rows that went (moved elsewhere, say) drop out; the rest stay
+                    // selected wherever they are now. A first page isn't the whole list.
+                    self.selection.retain(&self.list);
+                }
                 if !more && self.pending_step != 0 {
                     let delta = std::mem::take(&mut self.pending_step);
                     self.step(delta, tx);
@@ -681,6 +718,7 @@ impl App {
                 self.screen = Screen::Mail;
                 self.toast(format!("Added {}. Syncing…", a.email), false);
                 self.view = View::Role { account: None, role: Role::Inbox };
+                self.selection.clear();
                 reload = true;
             }
             Event::AccountFailed(e) => {
@@ -876,6 +914,7 @@ impl App {
                 })
                 .collect();
             self.list_loaded = true;
+            self.selection.retain(&self.list);
             return;
         }
         self.list_req += 1;
@@ -900,6 +939,7 @@ impl App {
             self.list.clear();
             self.list_loaded = false;
             self.close_message();
+            self.selection.clear();
         }
         if self.demo {
             self.list = crate::demo::list_for(&self.view);
@@ -1134,6 +1174,7 @@ impl App {
         let idx = self.index_of_open();
         let was_open = self.open.is_some_and(|o| removed.contains(&o));
         self.list.retain(|s| !removed.contains(&s.id));
+        self.selection.retain(&self.list);
         if !was_open {
             return;
         }
@@ -1153,9 +1194,10 @@ impl App {
         }
     }
 
-    pub fn archive(&mut self, ids: Vec<MessageId>, tx: &mut Tx) {
+    pub fn archive(&mut self, mut ids: Vec<MessageId>, tx: &mut Tx) {
         // Drafts aren't archived (they're discarded, or sent).
-        if ids.is_empty() || ids.iter().all(|id| self.is_draft_row(*id)) {
+        ids.retain(|id| !self.is_draft_row(*id));
+        if ids.is_empty() {
             return;
         }
         let label = if ids.len() == 1 { "Archived".to_owned() } else { format!("Archived {}", ids.len()) };
@@ -1358,12 +1400,226 @@ impl App {
     }
 
     pub fn move_to(&mut self, ids: Vec<MessageId>, to: MoveTarget, tx: &mut Tx) {
+        if ids.is_empty() {
+            return;
+        }
+        let n = ids.len();
         let label = match &to {
-            MoveTarget::Junk => "Marked as spam",
-            MoveTarget::Inbox => "Moved to Inbox",
-            _ => "Moved",
+            MoveTarget::Junk if n == 1 => "Marked as spam".to_owned(),
+            MoveTarget::Junk => format!("Marked {n} as spam"),
+            MoveTarget::Archive if n == 1 => "Archived".to_owned(),
+            MoveTarget::Archive => format!("Archived {n}"),
+            MoveTarget::Trash if n == 1 => "Moved to Trash".to_owned(),
+            MoveTarget::Trash => format!("Moved {n} to Trash"),
+            MoveTarget::Inbox if n == 1 => "Moved to Inbox".to_owned(),
+            MoveTarget::Inbox => format!("Moved {n} to Inbox"),
+            MoveTarget::Mailbox(name) => {
+                let display = self.mailbox_display(&ids, name);
+                if n == 1 { format!("Moved to {display}") } else { format!("Moved {n} to {display}") }
+            }
         };
-        self.move_away(ids, to, label.into(), tx);
+        self.move_away(ids, to, label, tx);
+    }
+
+    // ── several at once ──
+
+    /// What an action applies to: the selected rows, else the open one.
+    pub fn targets(&self) -> Vec<MessageId> {
+        if self.selection.is_empty() { self.open.into_iter().collect() } else { self.selection.ids(&self.list) }
+    }
+
+    /// The rows (or the open message's summary) of these ids.
+    fn rows_of(&self, ids: &[MessageId]) -> Vec<&Summary> {
+        ids.iter().filter_map(|id| self.list.iter().find(|s| s.id == *id).or_else(|| self.thread.iter().map(|m| &m.summary).find(|s| s.id == *id))).collect()
+    }
+
+    /// What the sidebar calls mailbox `name` of the account these messages are in.
+    fn mailbox_display(&self, ids: &[MessageId], name: &str) -> String {
+        let account = self.rows_of(ids).first().map(|r| r.account.clone()).unwrap_or_default();
+        self.mailboxes.get(&account).and_then(|m| m.iter().find(|m| m.name == name)).map_or_else(|| name.to_owned(), |m| m.display.clone())
+    }
+
+    /// Every one of them is in Spam: `!` and the Spam button take them back to the inbox.
+    pub fn all_in_junk(&self, ids: &[MessageId]) -> bool {
+        let rows = self.rows_of(ids);
+        !rows.is_empty() && rows.iter().all(|r| self.role_of(&r.account, &r.mailbox) == Role::Junk)
+    }
+
+    /// Spam, or "not spam" for messages already in Spam.
+    pub fn spam(&mut self, ids: Vec<MessageId>, tx: &mut Tx) {
+        let to = if self.all_in_junk(&ids) { MoveTarget::Inbox } else { MoveTarget::Junk };
+        self.move_to(ids, to, tx);
+    }
+
+    /// Every one of them is in a Gmail account, where labels are a thing.
+    pub fn all_gmail(&self, ids: &[MessageId]) -> bool {
+        let rows = self.rows_of(ids);
+        !rows.is_empty() && rows.iter().all(|r| self.accounts.iter().any(|a| a.id == r.account && a.is_gmail()))
+    }
+
+    /// Selects or unselects a row (x on the keyboard's row, a row's checkbox, mod-click).
+    pub fn toggle_selected(&mut self, id: MessageId) {
+        self.selection.toggle(id);
+    }
+
+    /// A press on a row: shift selects the range to it, mod adds or takes it from the
+    /// selection; a plain press opens it, ending any selection.
+    pub fn press_row(&mut self, id: MessageId, mods: Mods, tx: &mut Tx) {
+        if mods.shift {
+            let from = self.selection.cursor().or(self.open);
+            self.selection.select_range(&self.list, from, id);
+        } else if mods.cmd {
+            if self.selection.is_empty()
+                && let Some(open) = self.open.filter(|o| *o != id)
+            {
+                // Mod-click beside the open message picks both, as in any list.
+                self.selection.toggle(open);
+            }
+            self.selection.toggle(id);
+        } else {
+            self.selection.clear();
+            self.open_message(id);
+            return;
+        }
+        tx.instant();
+    }
+
+    /// x: selects or unselects the keyboard's row (the open one, until a selection starts).
+    fn select_key(&mut self, tx: &mut Tx) {
+        let Some(id) = self.selection.cursor().or(self.open).or(self.list.first().map(|s| s.id)) else { return };
+        self.selection.toggle(id);
+        tx.scroll_into_view(row_key(id));
+        tx.instant();
+    }
+
+    /// shift+j, shift+k: selects the next (previous) row too.
+    fn extend_selection(&mut self, delta: isize, tx: &mut Tx) {
+        let Some(from) = self.selection.cursor().or(self.open).or(self.list.first().map(|s| s.id)) else { return };
+        if let Some(to) = self.selection.extend(&self.list, from, delta) {
+            tx.scroll_into_view(row_key(to));
+            tx.instant();
+        }
+    }
+
+    /// j, k while rows are selected: the keyboard's row moves; nothing opens.
+    fn move_cursor(&mut self, delta: isize, tx: &mut Tx) {
+        if let Some(to) = self.selection.move_cursor(&self.list, delta) {
+            tx.scroll_into_view(row_key(to));
+            tx.instant();
+        }
+    }
+
+    pub fn picker_state(&mut self, which: Picker) -> &mut ComboboxState {
+        match which {
+            Picker::Move => &mut self.move_picker,
+            Picker::Label => &mut self.label_picker,
+        }
+    }
+
+    /// Opens Move to… or Label… for the targets, its search field ready for typing.
+    pub fn open_picker(&mut self, which: Picker) {
+        let ids = self.targets();
+        if ids.is_empty() {
+            return;
+        }
+        if which == Picker::Label && !self.all_gmail(&ids) {
+            self.toast("Labels are for Gmail accounts. To file mail in a folder, use Move to… (V)", false);
+            return;
+        }
+        let state = self.picker_state(which);
+        state.open = true;
+        state.search.clear();
+        state.search.focused = true;
+        state.active = None;
+    }
+
+    /// What a picker offers for these messages, and a note on what it leaves out. Move to…:
+    /// the inbox, archive, spam and trash, then the account's own folders. Label…: the
+    /// account's labels. Messages from several accounts get only what every one of their
+    /// accounts has (each role by its own folder there, folders by name), so nothing is sent
+    /// to a folder its account lacks. Where every message already is isn't offered.
+    pub fn picker_options(&self, which: Picker, ids: &[MessageId]) -> (Vec<ComboboxOption>, Option<String>) {
+        let rows = self.rows_of(ids);
+        let mut accounts: Vec<&str> = rows.iter().map(|r| r.account.as_str()).collect();
+        accounts.sort_unstable();
+        accounts.dedup();
+        let boxes: Vec<&[Mailbox]> = accounts.iter().map(|a| self.mailboxes.get(*a).map_or(&[][..], |m| m.as_slice())).collect();
+        let Some(first) = boxes.first() else { return (Vec::new(), None) };
+        let has_role = |b: &[Mailbox], roles: &[Role]| b.iter().any(|m| roles.contains(&m.role) && m.selectable);
+        let mut out = Vec::new();
+        if which == Picker::Move {
+            let roles: [(&str, &str, &[Role]); 4] =
+                [("role:inbox", "Inbox", &[Role::Inbox]), ("role:archive", "Archive", &[Role::Archive, Role::All]), ("role:junk", "Spam", &[Role::Junk]), ("role:trash", "Trash", &[Role::Trash])];
+            for (id, label, wanted) in roles {
+                let everywhere = boxes.iter().all(|b| has_role(b, wanted));
+                let already = rows.iter().all(|r| wanted.contains(&self.role_of(&r.account, &r.mailbox)));
+                if everywhere && !already {
+                    out.push(ComboboxOption::new(id, label));
+                }
+            }
+        }
+        for m in first.iter().filter(|m| m.role == Role::Other && m.selectable) {
+            let everywhere = boxes.iter().all(|b| b.iter().any(|o| o.name == m.name && o.selectable));
+            let already = rows.iter().all(|r| r.mailbox == m.name);
+            if !everywhere || already {
+                continue;
+            }
+            let mut option = ComboboxOption::new(format!("mb:{}", m.name), m.display.clone());
+            // A nested folder says where it is: "Clients" in "Work".
+            let parent = m.name.rsplit_once(['/', '.']).map(|(p, _)| envoy_core::imap::decode_utf7(p)).unwrap_or_default();
+            if m.depth > 0 && parent != m.display {
+                option.detail = parent;
+            }
+            out.push(option);
+        }
+        let note = (accounts.len() > 1).then(|| format!("Only folders all {} accounts have", accounts.len()));
+        (out, note)
+    }
+
+    /// A picker's choice: moves (undoable, like archive) or labels the targets.
+    pub fn pick(&mut self, which: Picker, option: &str, tx: &mut Tx) {
+        let ids = self.targets();
+        match (which, option) {
+            (Picker::Move, "role:inbox") => self.move_to(ids, MoveTarget::Inbox, tx),
+            (Picker::Move, "role:archive") => self.archive(ids, tx),
+            (Picker::Move, "role:junk") => self.move_to(ids, MoveTarget::Junk, tx),
+            (Picker::Move, "role:trash") => self.delete(ids, tx),
+            (Picker::Move, o) => {
+                if let Some(name) = o.strip_prefix("mb:") {
+                    self.move_to(ids, MoveTarget::Mailbox(name.to_owned()), tx);
+                }
+            }
+            (Picker::Label, o) => {
+                if let Some(name) = o.strip_prefix("mb:") {
+                    self.label(ids, name.to_owned(), tx);
+                }
+            }
+        }
+    }
+
+    /// Adds label `mailbox` to messages: a copy there, leaving them where they are. Undo takes
+    /// it back while the undo window lasts (the copy hasn't gone to the server yet).
+    pub fn label(&mut self, ids: Vec<MessageId>, mailbox: String, tx: &mut Tx) {
+        if ids.is_empty() {
+            return;
+        }
+        let display = self.mailbox_display(&ids, &mailbox);
+        let text = if ids.len() == 1 { format!("Labeled \u{201c}{display}\u{201d}") } else { format!("Labeled {} \u{201c}{display}\u{201d}", ids.len()) };
+        let window = self.settings.u32("behavior.undoSeconds");
+        let key = (window > 0).then(|| self.next_stamp());
+        self.send(Command::Copy { ids, mailbox, thread: self.conversations(), undo: key });
+        let Some(key) = key else {
+            self.toast(text, false);
+            return;
+        };
+        // Nothing to put back on screen: Undo only calls the copies back.
+        let snapshot = MovedAway { key, view: self.view.clone(), query: self.applied_query.clone(), rows: Vec::new(), open: None, compose: None };
+        self.toast_seq += 1;
+        self.toasts.push(Toast { id: self.toast_seq, text, undo: Some(Undo::Move(Box::new(snapshot))), until: self.clock + window as f64, error: false, open_path: None });
+        while self.toasts.len() > 3 {
+            self.toasts.remove(0);
+        }
+        tx.wake_after(std::time::Duration::from_secs_f64(window as f64 + 0.05));
     }
 
     pub fn toggle_star(&mut self, id: MessageId) {
@@ -1382,16 +1638,41 @@ impl App {
 
     pub fn toggle_read(&mut self, id: MessageId) {
         let unread = self.list.iter().find(|s| s.id == id).map(|s| s.thread_unread).unwrap_or(false);
-        for s in self.list.iter_mut().filter(|s| s.id == id) {
-            s.thread_unread = !unread;
-            if unread { s.flags |= flags::SEEN } else { s.flags &= !flags::SEEN }
+        self.set_read(vec![id], unread);
+    }
+
+    /// Marks rows read (or unread), in one go. Marking the open message unread closes it, as
+    /// Gmail does, so it stays unread.
+    pub fn set_read(&mut self, ids: Vec<MessageId>, read: bool) {
+        if ids.is_empty() {
+            return;
         }
-        let (add, remove) = if unread { (flags::SEEN, 0) } else { (0, flags::SEEN) };
-        self.send(Command::SetFlags { ids: vec![id], add, remove, thread: self.conversations() });
-        if !unread && self.open == Some(id) {
-            // Marking the open message unread closes it, as Gmail does, so it stays unread.
+        for s in self.list.iter_mut().filter(|s| ids.contains(&s.id)) {
+            s.thread_unread = !read;
+            if read { s.flags |= flags::SEEN } else { s.flags &= !flags::SEEN }
+        }
+        let (add, remove) = if read { (flags::SEEN, 0) } else { (0, flags::SEEN) };
+        let open_too = self.open.is_some_and(|o| ids.contains(&o));
+        self.send(Command::SetFlags { ids, add, remove, thread: self.conversations() });
+        if !read && open_too {
             self.close_message();
         }
+    }
+
+    /// Stars rows (or unstars them), in one go: starring marks each row's message, unstarring a
+    /// conversation clears every star in it, as for one ([`App::toggle_star`]).
+    pub fn set_starred(&mut self, ids: Vec<MessageId>, star: bool) {
+        if ids.is_empty() {
+            return;
+        }
+        for s in self.list.iter_mut().filter(|s| ids.contains(&s.id)) {
+            if star { s.flags |= flags::FLAGGED } else { s.flags &= !flags::FLAGGED }
+        }
+        for m in self.thread.iter_mut().filter(|m| ids.contains(&m.summary.id)) {
+            if star { m.summary.flags |= flags::FLAGGED } else { m.summary.flags &= !flags::FLAGGED }
+        }
+        let (add, remove) = if star { (flags::FLAGGED, 0) } else { (0, flags::FLAGGED) };
+        self.send(Command::SetFlags { ids, add, remove, thread: !star && self.conversations() });
     }
 
     // ── compose ──
@@ -2215,6 +2496,10 @@ impl App {
         if typing && plain && !matches!(action, Action::Close) {
             return false;
         }
+        // Select all is the field's while typing (its text), and only for the mail list.
+        if action == Action::SelectAll && (typing || self.screen != Screen::Mail) {
+            return false;
+        }
         if self.compose.is_some() {
             match action {
                 Action::Send => {
@@ -2245,33 +2530,49 @@ impl App {
             }
             Action::ReplyAll => self.compose_reply(None, true, false),
             Action::Forward => self.compose_reply(None, false, true),
-            Action::Archive => {
-                if let Some(id) = self.open {
-                    self.archive(vec![id], tx);
-                }
-            }
-            Action::Delete => {
-                if let Some(id) = self.open {
-                    self.delete(vec![id], tx);
-                }
-            }
+            Action::Archive => self.archive(self.targets(), tx),
+            Action::Delete => self.delete(self.targets(), tx),
+            Action::Spam => self.spam(self.targets(), tx),
             Action::Undo => {
                 if !self.undo_last(tx) {
                     return false;
                 }
+            }
+            Action::Star if !self.selection.is_empty() => {
+                let ids = self.targets();
+                // Any not starred: star them all; all starred: unstar them.
+                let star = self.list.iter().filter(|s| ids.contains(&s.id)).any(|s| !s.flagged());
+                self.set_starred(ids, star);
             }
             Action::Star => {
                 if let Some(id) = self.thread.last().map(|m| m.summary.id).or(self.open) {
                     self.toggle_star(id);
                 }
             }
+            Action::ToggleRead if !self.selection.is_empty() => {
+                let ids = self.targets();
+                // Any unread: mark them all read; all read: unread.
+                let read = self.list.iter().filter(|s| ids.contains(&s.id)).any(|s| s.thread_unread);
+                self.set_read(ids, read);
+            }
             Action::ToggleRead => {
                 if let Some(id) = self.open {
                     self.toggle_read(id);
                 }
             }
+            Action::Next if !self.selection.is_empty() => self.move_cursor(1, tx),
+            Action::Previous if !self.selection.is_empty() => self.move_cursor(-1, tx),
             Action::Next => self.step(1, tx),
             Action::Previous => self.step(-1, tx),
+            Action::Select => self.select_key(tx),
+            Action::SelectNext => self.extend_selection(1, tx),
+            Action::SelectPrevious => self.extend_selection(-1, tx),
+            Action::SelectAll => {
+                self.selection.select_all(&self.list);
+                tx.instant();
+            }
+            Action::MoveTo => self.open_picker(Picker::Move),
+            Action::Label => self.open_picker(Picker::Label),
             Action::Search => {
                 self.screen = Screen::Mail;
                 self.search.focused = true;
@@ -2291,6 +2592,8 @@ impl App {
                     self.confirm_delete = None;
                 } else if self.screen != Screen::Mail && !self.accounts.is_empty() {
                     self.screen = Screen::Mail;
+                } else if !self.selection.is_empty() {
+                    self.selection.clear();
                 } else if !self.applied_query.is_empty() && self.open.is_none() {
                     self.search = TextEdit::new("");
                     self.applied_query.clear();
@@ -2973,7 +3276,7 @@ mod tests {
         app.compose.as_ref().unwrap().files.iter().map(|f| (f.filename.clone(), f.status.clone())).collect()
     }
 
-    fn ids(app: &App) -> Vec<i64> {
+    fn file_ids(app: &App) -> Vec<i64> {
         app.compose.as_ref().unwrap().files.iter().map(|f| f.id).collect()
     }
 
@@ -3011,7 +3314,7 @@ mod tests {
         app.compose_new();
         app.attach_paths(vec!["/files/Q3 report.pdf".into(), "/files/photo.png".into()]);
         assert_eq!(files(&app), vec![("Q3 report.pdf".into(), FileStatus::Attaching), ("photo.png".into(), FileStatus::Attaching)], "shown at once, as on their way");
-        let [a, b] = ids(&app)[..] else { panic!() };
+        let [a, b] = file_ids(&app)[..] else { panic!() };
         assert!(a > 0 && b > a, "stamps: {a}, {b}");
         // The draft is saved first, so the files have a draft to be listed with.
         let sent = app.sent.borrow().clone();
@@ -3045,7 +3348,7 @@ mod tests {
         assert_eq!(files(&app), vec![("slow.mov".into(), FileStatus::Attached)]);
         // And a file added now gets an id after every one the draft has, whatever the clock says.
         app.attach_paths(vec!["/files/more.pdf".into()]);
-        assert!(ids(&app)[1] > pending.id, "{:?}", ids(&app));
+        assert!(file_ids(&app)[1] > pending.id, "{:?}", file_ids(&app));
     }
 
     /// What closing the window makes again, through [`App::flush_files`].
@@ -3063,7 +3366,7 @@ mod tests {
         let mut app = App::new(true);
         let draft = composer_with_two_files(&mut app);
         assert!(flushed(&app).is_empty(), "both in: nothing to make again");
-        let a = ids(&app)[0];
+        let a = file_ids(&app)[0];
         app.attach_paths(vec!["/files/late.pdf".into()]);
         let late = app.compose.as_ref().unwrap().files[2].clone();
         app.remove_file(a);
@@ -3073,7 +3376,7 @@ mod tests {
         assert_eq!(flushed(&app), [FileOp::Detach { draft, file: a }]);
         // One taken off before it's in isn't attached on close.
         app.attach_paths(vec!["/files/oops.pdf".into()]);
-        let oops = ids(&app)[2];
+        let oops = file_ids(&app)[2];
         app.remove_file(oops);
         assert_eq!(flushed(&app), [FileOp::Detach { draft, file: a }, FileOp::Detach { draft, file: oops }]);
     }
@@ -3082,7 +3385,7 @@ mod tests {
     fn a_draft_written_again_on_close_takes_its_file_changes() {
         let mut app = App::new(true);
         let draft = composer_with_two_files(&mut app);
-        let a = ids(&app)[0];
+        let a = file_ids(&app)[0];
         app.attach_paths(vec!["/files/late.pdf".into()]);
         let late = app.compose.as_ref().unwrap().files[2].clone();
         app.remove_file(a);
@@ -3110,7 +3413,7 @@ mod tests {
         let mut app = App::new(true);
         let draft = composer_with_two_files(&mut app);
         app.attach_paths((0..100).map(|i| format!("/files/{i}.txt").into()).collect());
-        let taken: Vec<i64> = ids(&app);
+        let taken: Vec<i64> = file_ids(&app);
         for id in &taken {
             app.remove_file(*id);
         }
@@ -3122,9 +3425,9 @@ mod tests {
     fn the_composer_shows_its_files_as_the_store_has_them() {
         let mut app = App::new(true);
         let draft = composer_with_two_files(&mut app);
-        let [a, b] = ids(&app)[..] else { panic!() };
+        let [a, b] = file_ids(&app)[..] else { panic!() };
         app.attach_paths(vec!["/files/new.pdf".into()]);
-        let new = ids(&app)[2];
+        let new = file_ids(&app)[2];
         app.remove_file(b);
         // The store, before the engine got to either, and with a file another window added.
         let other = new + 1;
@@ -3141,7 +3444,7 @@ mod tests {
         assert!(!app.file_ops.iter().any(|op| matches!(op, FileOp::Attach { .. })), "listed: nothing left to make on close");
         // Another draft's files change nothing here.
         app.apply(Event::DraftFiles { draft: draft + 1, files: Vec::new() }, &mut Tx::default());
-        assert_eq!(ids(&app), [a, new]);
+        assert_eq!(file_ids(&app), [a, new]);
     }
 
     #[test]
@@ -3160,7 +3463,7 @@ mod tests {
     fn a_file_taken_off_leaves_the_draft_in_the_store_too() {
         let mut app = App::new(true);
         let draft = composer_with_two_files(&mut app);
-        let a = ids(&app)[0];
+        let a = file_ids(&app)[0];
         app.remove_file(a);
         assert_eq!(app.compose.as_ref().unwrap().draft().attachments.iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(), ["b.png"]);
         assert!(sent_commands(&app, "DetachFile").last().is_some_and(|c| c.contains(&format!("draft: {draft}, file: {a}"))), "{:?}", sent_commands(&app, "DetachFile"));
@@ -3177,7 +3480,7 @@ mod tests {
         app.attach_paths(vec!["/files/slow.mov".into()]);
         app.send_compose();
         assert_eq!(app.compose.as_ref().unwrap().error.as_deref(), Some("Still attaching slow.mov…"));
-        let slow = ids(&app)[2];
+        let slow = file_ids(&app)[2];
         app.apply(Event::AttachFailed { draft, file: slow, error: "slow.mov is 80.0 MB: more than a message can carry (25 MB)".into() }, &mut Tx::default());
         app.send_compose();
         assert_eq!(app.compose.as_ref().unwrap().error.as_deref(), Some("slow.mov isn't attached: remove it, or attach it again"));
@@ -3195,7 +3498,7 @@ mod tests {
         let error = app.compose.as_ref().unwrap().error.clone().unwrap();
         assert!(error.contains("takes in one message"), "30 MB encoded is over 40 MB: {error}");
         assert!(sent_commands(&app, "Send ").is_empty(), "nothing sent");
-        app.remove_file(ids(&app)[3]);
+        app.remove_file(file_ids(&app)[3]);
         app.send_compose();
         assert!(app.compose.is_none(), "sent");
         assert_eq!(sent_commands(&app, "Send ").len(), 1);
@@ -3281,6 +3584,245 @@ mod tests {
         assert!(matches!(&c.files[1].status, FileStatus::Failed(why) if why.contains("is a folder")));
         assert!(matches!(&c.files[2].status, FileStatus::Failed(why) if why.contains("more than a message can carry")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn press(app: &mut App, key: rune::Key, mods: Mods) -> bool {
+        app.on_key(&KeyEvent { key, mods }, &mut Tx::default())
+    }
+
+    fn key(app: &mut App, name: &str) -> bool {
+        press(app, rune::Key::Text(name.into()), Mods::default())
+    }
+
+    fn shift(app: &mut App, name: &str) -> bool {
+        press(app, rune::Key::Text(name.into()), Mods { shift: true, ..Mods::default() })
+    }
+
+    /// mod+`c`: ⌘ on macOS, Ctrl elsewhere.
+    fn primary(app: &mut App, c: char) -> bool {
+        let mac = cfg!(target_os = "macos");
+        press(app, rune::Key::Command(c), Mods { cmd: true, ctrl: !mac, logo: mac, ..Mods::default() })
+    }
+
+    fn ids(list: &[Summary]) -> Vec<MessageId> {
+        list.iter().map(|s| s.id).collect()
+    }
+
+    fn sent_since(app: &App, from: usize, kind: &str) -> Vec<String> {
+        app.sent.borrow()[from..].iter().filter(|c| c.starts_with(kind)).cloned().collect()
+    }
+
+    #[test]
+    fn the_keyboard_selects_rows_and_one_undo_takes_the_whole_batch_back() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let all = ids(&app.list);
+        app.open_message(all[0]);
+        // x on the open row, then shift+j twice.
+        assert!(key(&mut app, "x"));
+        assert!(shift(&mut app, "J") && shift(&mut app, "J"));
+        assert_eq!(app.selection.ids(&app.list), all[..3]);
+        // j moves the keyboard's row without opening anything; x adds it.
+        let open = app.open;
+        assert!(key(&mut app, "j"));
+        assert_eq!((app.open, app.selection.cursor()), (open, Some(all[3])));
+        assert!(key(&mut app, "x"));
+        assert_eq!(app.targets(), all[..4]);
+        // e archives all four in one command, under one undo key, with one toast.
+        let from = app.sent.borrow().len();
+        assert!(key(&mut app, "e"));
+        let moves = sent_since(&app, from, "Move");
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert!(moves[0].contains(&format!("ids: {:?}, to: Archive", &all[..4])), "{}", moves[0]);
+        assert!(app.selection.is_empty(), "the archived rows leave the selection");
+        assert_eq!(ids(&app.list), all[4..]);
+        assert_eq!(app.toasts.iter().filter(|t| t.undo.is_some()).map(|t| t.text.as_str()).collect::<Vec<_>>(), ["Archived 4"]);
+        // z: all four back where they were, and the open message with them.
+        assert!(key(&mut app, "z"));
+        assert_eq!(ids(&app.list), all);
+        assert_eq!(app.open, Some(all[0]));
+        assert_eq!(sent_since(&app, from, "UndoMove").len(), 1);
+    }
+
+    #[test]
+    fn escape_and_select_all() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.open_message(app.list[2].id);
+        assert!(key(&mut app, "x"));
+        assert!(press(&mut app, rune::Key::Escape, Mods::default()));
+        assert!(app.selection.is_empty());
+        assert_eq!(app.open, Some(app.list[2].id), "the open message stays open");
+        assert!(primary(&mut app, 'a'));
+        assert_eq!(app.selection.len(), app.list.len());
+        assert!(press(&mut app, rune::Key::Escape, Mods::default()) && app.selection.is_empty());
+        // Elsewhere than the mail list, mod+a isn't Envoy's.
+        app.screen = Screen::Settings;
+        assert!(!primary(&mut app, 'a'));
+    }
+
+    #[test]
+    fn read_star_and_spam_keys_apply_to_the_whole_selection() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let all = ids(&app.list);
+        // Two unread rows and a read, starred one.
+        for id in &all[..3] {
+            app.toggle_selected(*id);
+        }
+        let from = app.sent.borrow().len();
+        assert!(key(&mut app, "u"), "any unread: all read");
+        assert!(app.list[..3].iter().all(|s| !s.thread_unread));
+        assert!(sent_since(&app, from, "SetFlags")[0].contains(&format!("ids: {:?}, add: 1, remove: 0", &all[..3])));
+        assert!(key(&mut app, "u"), "all read: all unread");
+        assert!(app.list[..3].iter().all(|s| s.thread_unread));
+        assert!(key(&mut app, "s"), "any unstarred: all starred");
+        assert!(app.list[..3].iter().all(|s| s.flagged()));
+        assert!(key(&mut app, "s"), "all starred: none");
+        assert!(app.list[..3].iter().all(|s| !s.flagged()));
+        assert_eq!(app.selection.len(), 3, "marks keep the selection");
+        // ! reports them all as spam, at once and undoably.
+        let from = app.sent.borrow().len();
+        assert!(shift(&mut app, "!"));
+        assert!(sent_since(&app, from, "Move")[0].contains("to: Junk"));
+        assert_eq!(app.toasts.last().map(|t| t.text.as_str()), Some("Marked 3 as spam"));
+    }
+
+    #[test]
+    fn spam_from_spam_is_not_spam() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut row = app.list[0].clone();
+        row.mailbox = "[Gmail]/Spam".into();
+        app.list = vec![row.clone()];
+        app.open = Some(row.id);
+        let from = app.sent.borrow().len();
+        assert!(shift(&mut app, "!"));
+        assert!(sent_since(&app, from, "Move")[0].contains("to: Inbox"));
+    }
+
+    #[test]
+    fn the_selection_follows_the_list_by_id_and_ends_with_the_view() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let mut tx = Tx::default();
+        app.list = long_list(&app, 10);
+        for id in [2, 3, 5] {
+            app.toggle_selected(id);
+        }
+        // Read again: 3 went (moved on another device), new mail came on top.
+        app.reload();
+        let mut fresh: Vec<Summary> = long_list(&app, 10).into_iter().filter(|s| s.id != 3).collect();
+        fresh.insert(0, Summary { id: 99, date: 2_000_000, ..fresh[0].clone() });
+        app.apply(Event::List { req: app.list_req, items: fresh, more: false }, &mut tx);
+        assert_eq!(app.selection.ids(&app.list), vec![2, 5]);
+        // A search's first page isn't the whole list: nothing drops out until the rest comes.
+        app.applied_query = "x".into();
+        app.request_list();
+        app.apply(Event::List { req: app.list_req, items: long_list(&app, 10)[..1].to_vec(), more: true }, &mut tx);
+        assert_eq!(app.selection.len(), 2);
+        app.apply(Event::List { req: app.list_req, items: long_list(&app, 10)[..3].to_vec(), more: false }, &mut tx);
+        assert_eq!(app.selection.ids(&app.list), vec![2], "5 isn't in the results");
+        // Another view: nothing selected there.
+        app.go(View::Starred { account: None });
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn shift_and_mod_clicks_select_and_a_plain_click_opens() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let all = ids(&app.list);
+        app.open_message(all[1]);
+        let mod_click = Mods { cmd: true, ..Mods::default() };
+        // Mod-click beside the open message picks both.
+        app.press_row(all[3], mod_click, &mut tx);
+        assert_eq!(app.selection.ids(&app.list), vec![all[1], all[3]]);
+        // Shift-click: the range from the last one picked.
+        app.press_row(all[5], Mods { shift: true, ..Mods::default() }, &mut tx);
+        assert_eq!(app.selection.ids(&app.list), vec![all[1], all[3], all[4], all[5]]);
+        app.press_row(all[4], mod_click, &mut tx);
+        assert_eq!(app.selection.ids(&app.list), vec![all[1], all[3], all[5]]);
+        // A plain click opens the row and ends the selection.
+        app.press_row(all[6], Mods::default(), &mut tx);
+        assert!(app.selection.is_empty());
+        assert_eq!(app.open, Some(all[6]));
+    }
+
+    /// The demo account, and a second, non-Gmail one with a Work folder too; a row in each
+    /// account's inbox.
+    fn two_accounts(app: &mut App) -> (MessageId, MessageId) {
+        let mut other = crate::demo::account();
+        other.id = "fm".into();
+        other.imap_host = "imap.fastmail.com".into();
+        app.accounts.push(other);
+        let boxes = [("INBOX", Role::Inbox), ("Archive", Role::Archive), ("Junk", Role::Junk), ("Trash", Role::Trash), ("Work", Role::Other), ("Clients", Role::Other)];
+        app.mailboxes.insert(
+            "fm".into(),
+            boxes.iter().map(|(n, r)| Mailbox { account: "fm".into(), name: (*n).into(), display: (*n).into(), role: *r, unread: 0, total: 0, depth: 0, selectable: true }).collect(),
+        );
+        let mine = app.list[0].id;
+        app.list.push(Summary { id: 500, account: "fm".into(), mailbox: "INBOX".into(), ..app.list[0].clone() });
+        (mine, 500)
+    }
+
+    fn option_ids(options: &[ComboboxOption]) -> Vec<&str> {
+        options.iter().map(|o| o.id.as_str()).collect()
+    }
+
+    #[test]
+    fn move_to_offers_what_every_selected_account_has() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let (mine, theirs) = two_accounts(&mut app);
+        // One Gmail message in the inbox: everywhere but the inbox, its labels included.
+        let (options, note) = app.picker_options(Picker::Move, &[mine]);
+        assert_eq!(option_ids(&options), ["role:archive", "role:junk", "role:trash", "mb:Receipts", "mb:Travel", "mb:Work"]);
+        assert_eq!(note, None);
+        // Both accounts: only what both have, each role resolved in its own account.
+        let (options, note) = app.picker_options(Picker::Move, &[mine, theirs]);
+        assert_eq!(option_ids(&options), ["role:archive", "role:junk", "role:trash", "mb:Work"]);
+        assert_eq!(note.as_deref(), Some("Only folders all 2 accounts have"));
+        // Moving there: one undoable move, and the toast names the folder.
+        app.toggle_selected(mine);
+        app.toggle_selected(theirs);
+        let from = app.sent.borrow().len();
+        app.pick(Picker::Move, "mb:Work", &mut tx);
+        assert!(sent_since(&app, from, "Move")[0].contains("to: Mailbox(\"Work\")"));
+        assert_eq!(app.toasts.last().map(|t| (t.text.as_str(), t.undo.is_some())), Some(("Moved 2 to Work", true)));
+        assert!(!app.list.iter().any(|s| s.id == mine || s.id == theirs));
+    }
+
+    #[test]
+    fn labels_are_gmail_copies_with_undo() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let (mine, theirs) = two_accounts(&mut app);
+        // Not Gmail: no labels, and a word on what to do instead.
+        app.open = Some(theirs);
+        assert!(key(&mut app, "l"));
+        assert!(!app.label_picker.open);
+        assert!(app.toasts.last().unwrap().text.starts_with("Labels are for Gmail accounts"));
+        // Gmail: the labels (not the folders' roles), the one it's in left out.
+        app.open = Some(mine);
+        assert!(key(&mut app, "l"));
+        assert!(app.label_picker.open && app.label_picker.search.focused);
+        assert_eq!(option_ids(&app.picker_options(Picker::Label, &[mine]).0), ["mb:Receipts", "mb:Travel", "mb:Work"]);
+        let from = app.sent.borrow().len();
+        app.pick(Picker::Label, "mb:Travel", &mut tx);
+        let copies = sent_since(&app, from, "Copy");
+        assert!(copies[0].contains(&format!("ids: [{mine}], mailbox: \"Travel\", thread: true, undo: Some(")), "{copies:?}");
+        assert!(app.list.iter().any(|s| s.id == mine), "it stays where it is");
+        assert_eq!(app.toasts.last().map(|t| t.text.as_str()), Some("Labeled \u{201c}Travel\u{201d}"));
+        // Undo calls the copy back.
+        assert!(key(&mut app, "z"));
+        assert_eq!(sent_since(&app, from, "UndoMove").len(), 1);
+        // v opens Move to… for the open message.
+        assert!(key(&mut app, "v") && app.move_picker.open);
     }
 
     #[test]

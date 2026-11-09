@@ -12,8 +12,10 @@ mod fmt;
 mod html_view;
 mod icons;
 mod reader;
+mod selection;
 mod theme;
 mod toast;
+mod triage;
 mod view_account;
 mod view_mail;
 mod view_settings;
@@ -221,6 +223,23 @@ const SCENES: &[Scene] = &[
         s.view = View::Role { account: Some("demo".into()), role: Role::Sent };
         s.list = demo::list_for(&s.view);
     }),
+    ("select", scene_select),
+    ("select-off", |s| {
+        let _ = s.settings.set("inbox.readingPane", serde_json::json!("off"));
+        scene_select(s);
+    }),
+    ("picker", |s| {
+        scene_open(s);
+        s.open_picker(app::Picker::Move);
+    }),
+    ("picker-select", |s| {
+        scene_select(s);
+        s.open_picker(app::Picker::Move);
+    }),
+    ("label", |s| {
+        scene_open(s);
+        s.open_picker(app::Picker::Label);
+    }),
     ("toast", |s| {
         // The second conversation archived: its notice, with Undo, under the list and reader.
         scene_open(s);
@@ -250,6 +269,16 @@ const SCENES: &[Scene] = &[
         }
     }),
 ];
+
+/// The first conversation open, then it and the next two selected (x, shift+j, shift+j): the
+/// reader shows the selection, the keyboard on the third.
+fn scene_select(s: &mut App) {
+    scene_open(s);
+    let first = s.list[0].id;
+    s.toggle_selected(first);
+    let second = s.selection.extend(&s.list, first, 1).unwrap_or(first);
+    s.selection.extend(&s.list, second, 1);
+}
 
 fn scene_drafts(s: &mut App) {
     s.view = View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() };

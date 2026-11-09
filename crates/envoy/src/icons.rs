@@ -32,6 +32,7 @@ icon!(MAIL, "mail", r#"<rect x="3" y="5" width="18" height="14" rx="2"/><path d=
 icon!(MAIL_OPEN, "mail-open", r#"<path d="M3 10l9-6 9 6v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M3.5 10.5l8.5 5.5 8.5-5.5"/>"#);
 icon!(MAIL_DOT, "mail-dot", r#"<path d="M14 5H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-6"/><path d="M3.5 7.5l8.5 6 4-2.8"/><circle cx="19" cy="5.5" r="2.5"/>"#);
 icon!(LABEL, "label", r#"<path d="M3 5.5v5.3a1.5 1.5 0 0 0 .44 1.06l8.2 8.2a1.5 1.5 0 0 0 2.12 0l5.3-5.3a1.5 1.5 0 0 0 0-2.12l-8.2-8.2A1.5 1.5 0 0 0 9.8 4H4.5A1.5 1.5 0 0 0 3 5.5z"/><circle cx="7.5" cy="8.5" r="1"/>"#);
+icon!(FOLDER_MOVE, "folder-move", r#"<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 13h6"/><path d="M12.5 10.5L15 13l-2.5 2.5"/>"#);
 icon!(IMPORTANT, "important", r#"<path d="M4 6h11l5 6-5 6H4l4-6z"/>"#);
 icon!(PENCIL, "pencil", r#"<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4z"/><path d="M14.5 5.5l3 3"/>"#);
 icon!(REPLY, "reply", r#"<path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5V20"/>"#);
