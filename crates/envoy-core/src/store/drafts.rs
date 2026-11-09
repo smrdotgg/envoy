@@ -143,7 +143,7 @@ impl Store {
     pub fn save_draft_from(&self, id: i64, draft: &Draft, open: bool, at: DraftRev, now: i64, files_from: Option<i64>) -> Result<Option<bool>> {
         self.transaction(|st| {
             if let Some(from) = files_from.filter(|f| *f != id) {
-                st.copy_draft_files(from, id)?;
+                st.copy_draft_files(from, id, &draft.attachments)?;
             }
             let saved = st.put_draft(id, draft, open, Some(at.lifecycle), Some(at.rev), now)?;
             if saved.is_none() {
@@ -456,14 +456,27 @@ impl Store {
         Ok(())
     }
 
-    /// Copies draft `from`'s files to draft `id`, leaving any `id` has. Call inside a
-    /// transaction that saves draft `id`.
-    fn copy_draft_files(&self, from: i64, id: i64) -> Result<()> {
+    /// Copies draft `from`'s files to draft `id`, leaving any `id` has, or had. The files the
+    /// composer shows attached (`shown`) that `from` no longer has (they went with it) are
+    /// kept, as not attached, saying why. (Files it shows on their way may be ones it's about to
+    /// attach to `id`: their ids are left to them.) Call inside a transaction that saves draft
+    /// `id`.
+    fn copy_draft_files(&self, from: i64, id: i64, shown: &[DraftAttachment]) -> Result<()> {
         self.conn.execute(
             &format!("INSERT OR IGNORE INTO draft_attachments (draft, id, filename, mime, size, status, error, source) SELECT ?2, id, filename, mime, size, status, error, source FROM draft_attachments WHERE draft = ?1 AND status != {REMOVED}"),
             params![from, id],
         )?;
-        self.conn.execute("INSERT OR IGNORE INTO draft_files (draft, id, data) SELECT ?2, id, data FROM draft_files WHERE draft = ?1", params![from, id])?;
+        // Bytes only for files the draft has, attached: never behind one it took off.
+        self.conn.execute(
+            &format!("INSERT OR IGNORE INTO draft_files (draft, id, data) SELECT ?2, f.id, f.data FROM draft_files f JOIN draft_attachments a ON a.draft = ?2 AND a.id = f.id AND a.status = {ATTACHED} WHERE f.draft = ?1"),
+            params![from, id],
+        )?;
+        let mut lost = self.conn.prepare_cached(&format!(
+            "INSERT OR IGNORE INTO draft_attachments (draft, id, filename, mime, size, status, error) VALUES (?1, ?2, ?3, ?4, ?5, {FAILED}, 'Lost with the draft it was attached to: attach it again')"
+        ))?;
+        for f in shown.iter().filter(|f| f.status == FileStatus::Attached) {
+            lost.execute(params![id, f.id, f.filename, f.mime, f.size])?;
+        }
         Ok(())
     }
 
@@ -477,10 +490,11 @@ impl Store {
     }
 
     /// A new draft that carries on another's text ([`Store::insert_new_draft`]) gets the files
-    /// of draft `from`. Call inside a transaction.
-    pub fn take_files_from(&self, from: Option<i64>, id: i64) -> Result<()> {
+    /// of draft `from` (those `shown` that it lost, as not attached). Call inside a
+    /// transaction.
+    pub fn take_files_from(&self, from: Option<i64>, id: i64, shown: &[DraftAttachment]) -> Result<()> {
         match from.filter(|f| *f != id) {
-            Some(from) => self.copy_draft_files(from, id),
+            Some(from) => self.copy_draft_files(from, id, shown),
             None => Ok(()),
         }
     }
@@ -702,6 +716,15 @@ impl Store {
             self.queue_draft_upload(&d.account, id, now)?;
         }
         Ok(back)
+    }
+
+    /// Send op `op` can never go (its server won't take a message that big): it's off the
+    /// queue, and its draft is back in the composer, as Undo send gives it back.
+    pub fn send_bounced(&self, op: i64, now: i64) -> Result<Option<LocalDraft>> {
+        self.transaction(|st| {
+            st.conn.execute("DELETE FROM ops WHERE id = ?1", params![op])?;
+            st.unsend_draft(op, now)
+        })
     }
 
     /// Send op `op` went out: the drafts it carried are done with. One that may have copies on
@@ -1329,6 +1352,20 @@ mod tests {
         let before = (stored(&s, "draft_files"), stored(&s, "draft_attachments"));
         assert_eq!(s.save_draft_from(3, &draft("gone"), true, at(2), 104, Some(1)).unwrap(), None);
         assert_eq!((stored(&s, "draft_files"), stored(&s, "draft_attachments")), before, "no file without its draft");
+    }
+
+    #[test]
+    fn a_late_carry_over_brings_back_no_file_taken_off() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("x"), true, at(1), 100).unwrap();
+        attach(&s, 1, 10, "a.txt", b"a");
+        s.save_draft_from(2, &draft("x"), true, at(1), 101, Some(1)).unwrap();
+        assert!(s.remove_file(2, 10, 102).unwrap());
+        // A save still carrying where its files came from (a retry, say) copies again.
+        s.save_draft_from(2, &draft("x, again"), true, at(2), 103, Some(1)).unwrap();
+        assert!(s.files_of(2).unwrap().is_empty());
+        let bytes: i64 = s.conn.query_row("SELECT COUNT(*) FROM draft_files WHERE draft = 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(bytes, 0, "no bytes behind the file's tombstone");
     }
 
     #[test]
