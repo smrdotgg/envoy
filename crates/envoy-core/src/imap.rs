@@ -21,7 +21,46 @@ mod wire;
 
 pub use wire::{Fetched, Lost, ServerFlags};
 
-pub type Stream = TlsStream<TcpStream>;
+/// What a session runs over: TLS to the account's server, or, in demo mode, a pipe to the
+/// in-process server ([`crate::demo`]). Everything above it is the same code either way.
+#[derive(Debug)]
+pub enum Stream {
+    Tls(Box<TlsStream<TcpStream>>),
+    Local(tokio::io::DuplexStream),
+}
+
+impl tokio::io::AsyncRead for Stream {
+    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Stream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+            Stream::Local(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Stream {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Stream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+            Stream::Local(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Stream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+            Stream::Local(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Stream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+            Stream::Local(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 pub type Session = Connection<Stream>;
 
 /// A logged-in IMAP connection. Once an exchange on it doesn't finish (the connection closed
@@ -179,6 +218,7 @@ pub async fn connect(account: &Account, cred: &Credential) -> Result<Session> {
 
 async fn connect_session(account: &Account, cred: &Credential) -> Result<async_imap::Session<Stream>> {
     let host = account.imap_host.as_str();
+    crate::net::allowed(host)?;
     let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, account.imap_port)))
         .await
         .map_err(|_| anyhow!("Connecting to {host} timed out"))?
@@ -197,7 +237,7 @@ async fn connect_session(account: &Account, cred: &Credential) -> Result<async_i
     } else {
         tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp)).await.map_err(|_| anyhow!("TLS handshake timed out"))??
     };
-    let mut client = async_imap::Client::new(tls);
+    let mut client = async_imap::Client::new(Stream::Tls(Box::new(tls)));
     if account.imap_port != 143 {
         timed("greeting", client.read_response()).await?.ok_or_else(|| anyhow!("server closed the connection"))??;
     }

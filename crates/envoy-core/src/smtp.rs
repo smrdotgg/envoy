@@ -180,6 +180,7 @@ async fn connect(account: &Account, insecure: bool) -> Result<(AsyncSmtpConnecti
     use lettre::transport::smtp::commands::Ehlo;
     use lettre::transport::smtp::extension::ClientId;
     let host = account.smtp_host.as_str();
+    crate::net::allowed(host)?;
     let params = TlsParameters::builder(host.to_owned()).dangerous_accept_invalid_certs(insecure).dangerous_accept_invalid_hostnames(insecure).build_rustls()?;
     let wrapper = account.smtp_port == 465 || account.smtp_port == 3465;
     let hello = ClientId::default();
