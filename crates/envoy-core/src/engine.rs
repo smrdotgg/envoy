@@ -2025,22 +2025,37 @@ async fn deliver_and_file(shared: &Shared, account: &Account, runner: &mut impl 
     }
     q.op = delivered;
     shared.emit(Event::Toast("Message sent".into()));
-    file_delivered(account, runner, q).await
+    file_delivered(shared, account, runner, q).await
 }
 
-/// What's left of a send once its message is out: a copy in Sent. A lost connection keeps the
-/// op queued, to file it on a new one; other failures are given up on (the message is out, and
-/// this is a nicety).
-async fn file_delivered(account: &Account, runner: &mut impl OpRunner, q: &QueuedOp) -> Result<()> {
+/// What's left of a send once its message is out: a copy in Sent. Whatever filing it meets,
+/// the message is never sent again. A lost connection or a "not now" keeps the op queued, to
+/// file on a later try, with backoff (replay never gives up on it). A refusal for good, or
+/// one without a reason that keeps coming, keeps the message here instead
+/// ([`Store::keep_unfiled`]), and says so once.
+async fn file_delivered(shared: &Shared, account: &Account, runner: &mut impl OpRunner, q: &QueuedOp) -> Result<()> {
     let Op::Delivered { raw_b64, sent_mailbox: Some(sent) } = &q.op else { return Ok(()) };
-    match base64::engine::general_purpose::STANDARD.decode(raw_b64) {
-        Ok(raw) => match runner.file_sent(sent, &raw).await {
-            Err(e) if imap::is_lost(&e) => return Err(e),
-            Err(e) => log::warn!("{}: couldn't save to Sent: {e:#}", account.email),
-            Ok(()) => {}
-        },
-        Err(e) => log::warn!("{}: couldn't save to Sent: {e}", account.email),
+    let raw = match base64::engine::general_purpose::STANDARD.decode(raw_b64) {
+        Ok(raw) => raw,
+        Err(e) => {
+            log::warn!("{}: couldn't save to Sent: {e}", account.email);
+            return Ok(());
+        }
+    };
+    let Err(e) = runner.file_sent(sent, &raw).await else { return Ok(()) };
+    let for_good = !imap::is_lost(&e)
+        && match imap::failure(&e) {
+            imap::Failure::Temporary => false,
+            imap::Failure::Permanent => true,
+            imap::Failure::Unknown => q.attempts >= 5,
+        };
+    if !for_good {
+        return Err(e);
     }
+    let why = format!("{e:#}");
+    shared.with_writer(|st| st.keep_unfiled(q.id, &account.id, sent, &raw, &why, now()))?;
+    log::warn!("{}: {sent} refused a sent message's copy for good ({why}): kept here", account.email);
+    shared.emit(Event::Error(format!("Your message was sent, but {} wouldn't save a copy in {sent} ({why}). The copy is kept on this computer.", account.email)));
     Ok(())
 }
 
@@ -2065,7 +2080,7 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
         let mut r = match &q.op {
             Op::SaveDraft { .. } | Op::PurgeDraft { .. } => replay_draft(shared, account, runner, &q.op).await,
             Op::Send { .. } => deliver_and_file(shared, account, runner, &mut q).await,
-            Op::Delivered { .. } => file_delivered(account, runner, &q).await,
+            Op::Delivered { .. } => file_delivered(shared, account, runner, &q).await,
             op => runner.run(op, &q.at).await,
         };
         // The op's mailbox has a new generation since it was queued: its UID may name another
@@ -2366,6 +2381,8 @@ mod tests {
         /// Where sent messages were filed, and whether the next filing's connection drops.
         filed: Vec<String>,
         filing_drops: bool,
+        /// Filing in Sent is refused with this NO, until it's cleared.
+        filing_refusal: Option<&'static str>,
     }
 
     impl FakeServer {
@@ -2388,6 +2405,7 @@ mod tests {
                 lost: false,
                 filed: vec![],
                 filing_drops: false,
+                filing_refusal: None,
             }
         }
 
@@ -2440,7 +2458,13 @@ mod tests {
 
         fn file_sent(&mut self, mailbox: &str, _: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
             self.filed.push(mailbox.to_owned());
-            let r = if std::mem::take(&mut self.filing_drops) { Err(anyhow::Error::new(imap::Lost("APPEND: the connection closed".into()))) } else { Ok(()) };
+            let r = if std::mem::take(&mut self.filing_drops) {
+                Err(anyhow::Error::new(imap::Lost("APPEND: the connection closed".into())))
+            } else if let Some(no) = self.filing_refusal {
+                Err(anyhow::Error::new(async_imap::error::Error::No(no.into())))
+            } else {
+                Ok(())
+            };
             async move { r }
         }
 
@@ -2852,6 +2876,42 @@ mod tests {
         assert_eq!(sends(&server), 1, "{:?}", server.ran);
         assert_eq!(server.filed, ["Sent"]);
         assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sent_copy_the_server_cant_take_now_waits_to_be_filed() {
+        let (shared, _rx) = engine_with(setup());
+        queue_reply(&shared);
+        let mut server = FakeServer { filing_refusal: Some("code: Some(Unavailable), info: Some(\"[UNAVAILABLE] try again later\")"), ..FakeServer::new(&shared, |_: &Shared| {}) };
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        let queued = shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap();
+        assert!(matches!(&queued[..], [q] if matches!(&q.op, Op::Delivered { sent_mailbox: Some(_), .. })), "the copy waits, Delivered: {:?}", queued.iter().map(|q| &q.op).collect::<Vec<_>>());
+        // Not now, again and again: it keeps waiting, with backoff, however long.
+        for _ in 0..7 {
+            make_due(&shared);
+            replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        }
+        let queued = shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap();
+        assert_eq!((queued.len(), queued[0].attempts), (1, 8));
+        server.filing_refusal = None;
+        make_due(&shared);
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!((sends(&server), server.filed.len()), (1, 9), "filed at last, never sent again");
+        assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sent_copy_the_server_refuses_for_good_is_kept_here() {
+        let (shared, rx) = engine_with(setup());
+        queue_reply(&shared);
+        let mut server = FakeServer { filing_refusal: Some("code: Some(OverQuota), info: Some(\"[OVERQUOTA] mailbox full\")"), ..FakeServer::new(&shared, |_: &Shared| {}) };
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        let kept = shared.with_writer(|st| st.unfiled("a")).unwrap();
+        assert!(matches!(&kept[..], [(mailbox, raw, why)] if mailbox == "Sent" && raw.as_slice() == b"Subject: hi\r\n\r\nhello\r\n" && why.contains("OVERQUOTA")), "{kept:?}");
+        assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty());
+        assert_eq!(sends(&server), 1);
+        let notices: Vec<String> = rx.try_iter().filter_map(|e| if let Event::Error(m) = e { Some(m) } else { None }).collect();
+        assert!(matches!(&notices[..], [m] if m.contains("was sent") && m.contains("kept on this computer")), "one notice: {notices:?}");
     }
 
     #[test]

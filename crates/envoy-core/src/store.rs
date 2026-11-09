@@ -148,6 +148,16 @@ CREATE TABLE IF NOT EXISTS draft_ends (
     lifecycle INTEGER NOT NULL,
     sent INTEGER NOT NULL
 );
+-- Sent messages whose copy the server refused to file in Sent for good: kept here, never lost,
+-- never sent again. `op`: the send's, so keeping it twice replaces it.
+CREATE TABLE IF NOT EXISTS unfiled_sent (
+    op INTEGER PRIMARY KEY,
+    account TEXT NOT NULL,
+    mailbox TEXT NOT NULL,
+    raw BLOB NOT NULL,
+    error TEXT NOT NULL,
+    at INTEGER NOT NULL
+);
 "#;
 
 /// Columns added after the first release, for caches created before them. Each runs once,
@@ -1541,6 +1551,24 @@ impl Store {
         })
     }
 
+    /// Keeps a sent message whose copy `mailbox` (Sent) refused for good, so it's never lost;
+    /// its send, `op`, is then done with, and nothing sends it again.
+    pub fn keep_unfiled(&self, op: i64, account: &str, mailbox: &str, raw: &[u8], why: &str, now: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO unfiled_sent (op, account, mailbox, raw, error, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![op, account, mailbox, raw, why, now],
+        )?;
+        Ok(())
+    }
+
+    /// An account's sent messages that couldn't be filed in Sent ([`Store::keep_unfiled`]):
+    /// `(mailbox, raw, why)`, oldest first.
+    pub fn unfiled(&self, account: &str) -> Result<Vec<(String, Vec<u8>, String)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT mailbox, raw, error FROM unfiled_sent WHERE account = ?1 ORDER BY at, op")?;
+        let rows = stmt.query_map(params![account], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn pending_count(&self) -> Result<u32> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM ops", [], |r| r.get(0))?)
     }
@@ -1551,6 +1579,7 @@ impl Store {
         self.conn.execute("DELETE FROM ops WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM drafts WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM send_limits WHERE account = ?1", params![account])?;
+        self.conn.execute("DELETE FROM unfiled_sent WHERE account = ?1", params![account])?;
         Ok(())
     }
 
