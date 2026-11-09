@@ -1,5 +1,8 @@
 //! `--keys` and `--pointer`: screencast-style keycaps and click ripples drawn over headless
-//! frames. A separate runtime draws them, so they never enter the app's tree.
+//! frames. A separate runtime draws them, so they never enter the app's tree. Without the
+//! `keycaps` feature those flags are refused and `Overlay` can't be made, so that runtime isn't
+//! built.
+#![cfg_attr(not(feature = "keycaps"), allow(dead_code, unused_imports))]
 
 use crate::edit::{Key, KeyEvent, Mods};
 use crate::el::{El, col, el, text};
@@ -198,6 +201,7 @@ pub(crate) fn parse_theme(s: &str) -> Option<Option<bool>> {
 
 /// The overlay's own runtime: caps and ripples as keyed elements whose enter and exit run on
 /// the motion system's springs.
+#[cfg(feature = "keycaps")]
 pub(crate) struct Overlay {
     rt: Runtime<Scene>,
     keys: Option<Keycaps>,
@@ -205,6 +209,7 @@ pub(crate) struct Overlay {
     theme: Option<bool>,
 }
 
+#[cfg(feature = "keycaps")]
 impl Overlay {
     pub(crate) fn new(size: (f32, f32), scale: f32, keys: Option<Corner>, theme: Option<bool>, pointer: bool) -> Overlay {
         let scene = Scene { corner: keys.unwrap_or_default(), ..Scene::default() };
@@ -246,6 +251,25 @@ impl Overlay {
         }
         self.rt.frame(dt);
         &mut self.rt
+    }
+}
+
+/// Without the `keycaps` feature: none is ever made (`tooling::args` refuses `--keys` and
+/// `--pointer`), so the overlay's runtime is never built.
+#[cfg(not(feature = "keycaps"))]
+pub(crate) struct Overlay(());
+
+#[cfg(not(feature = "keycaps"))]
+impl Overlay {
+    pub(crate) fn new(_: (f32, f32), _: f32, _: Option<Corner>, _: Option<bool>, _: bool) -> Overlay {
+        unreachable!("--keys and --pointer require the rune/keycaps feature")
+    }
+    pub(crate) fn set_srgb_blend(&mut self, _: bool) {}
+    pub(crate) fn key(&mut self, _: f64, _: &KeyEvent) {}
+    pub(crate) fn chord(&mut self, _: f64, _: &crate::Shortcut) {}
+    pub(crate) fn press(&mut self, _: f64, _: f32, _: f32) {}
+    pub(crate) fn frame(&mut self, _: f64, _: f64, _: bool) -> &mut Runtime<Scene> {
+        unreachable!("--keys and --pointer require the rune/keycaps feature")
     }
 }
 
