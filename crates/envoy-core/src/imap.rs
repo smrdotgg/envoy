@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use async_imap::types::{Fetch, Flag, NameAttribute};
-use futures::TryStreamExt;
+use async_imap::types::Flag;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -16,6 +15,10 @@ use crate::accounts::Account;
 use crate::mime;
 use crate::model::{Role, flags};
 use crate::store::Store;
+
+mod wire;
+
+pub use wire::{Fetched, Lost};
 
 pub type Stream = TlsStream<TcpStream>;
 pub type Session = async_imap::Session<Stream>;
@@ -270,40 +273,38 @@ fn role_from_name(name: &str) -> Role {
     }
 }
 
-pub async fn list_mailboxes(session: &mut Session) -> Result<Vec<ListedMailbox>> {
-    let names: Vec<_> = timed("LIST", async { session.list(Some(""), Some("*")).await?.try_collect::<Vec<_>>().await }).await??;
+pub async fn list_mailboxes(session: &mut async_imap::Session<impl Io>) -> Result<Vec<ListedMailbox>> {
+    let names = wire::list(session).await?;
     let mut out = Vec::new();
-    for n in &names {
+    for n in names {
         let mut role = Role::Other;
         let mut selectable = true;
-        for a in n.attributes() {
+        for a in &n.attributes {
             match a {
-                NameAttribute::NoSelect => selectable = false,
-                NameAttribute::All => role = Role::All,
-                NameAttribute::Archive => role = Role::Archive,
-                NameAttribute::Drafts => role = Role::Drafts,
-                NameAttribute::Flagged => role = Role::Flagged,
-                NameAttribute::Junk => role = Role::Junk,
-                NameAttribute::Sent => role = Role::Sent,
-                NameAttribute::Trash => role = Role::Trash,
-                NameAttribute::Extension(s) => {
-                    let s = s.to_ascii_lowercase();
+                wire::Attribute::NoSelect => selectable = false,
+                wire::Attribute::All => role = Role::All,
+                wire::Attribute::Archive => role = Role::Archive,
+                wire::Attribute::Drafts => role = Role::Drafts,
+                wire::Attribute::Flagged => role = Role::Flagged,
+                wire::Attribute::Junk => role = Role::Junk,
+                wire::Attribute::Sent => role = Role::Sent,
+                wire::Attribute::Trash => role = Role::Trash,
+                wire::Attribute::Other(s) => {
                     if s == "\\important" {
                         role = Role::Important;
                     } else if s == "\\noselect" || s == "\\nonexistent" {
                         selectable = false;
                     }
                 }
-                _ => {}
             }
         }
-        let name = n.name().to_owned();
+        let name = n.name;
         if name.eq_ignore_ascii_case("INBOX") {
             role = Role::Inbox;
         } else if role == Role::Other {
             role = role_from_name(&name);
         }
-        let delimiter = n.delimiter().unwrap_or("/").to_owned();
+        let delimiter = n.delimiter.unwrap_or_else(|| "/".to_owned());
         let decoded = decode_utf7(&name);
         let leaf = decoded.strip_prefix("[Gmail]/").or_else(|| decoded.strip_prefix("[Google Mail]/")).unwrap_or(&decoded);
         let display = if role != Role::Other && role != Role::Important { role.label().to_owned() } else { leaf.rsplit(delimiter.as_str()).next().unwrap_or(leaf).to_owned() };
@@ -360,11 +361,10 @@ pub fn flag_names(bits: u32) -> String {
 
 const HEADER_QUERY: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])";
 
-fn store_header(store: &Store, account: &str, mailbox: &str, f: &Fetch) -> Result<bool> {
-    let (Some(uid), Some(header)) = (f.uid, f.header()) else { return Ok(false) };
+fn store_header(store: &Store, account: &str, mailbox: &str, f: &Fetched) -> Result<bool> {
+    let (Some(uid), Some(header)) = (f.uid, f.header.as_deref()) else { return Ok(false) };
     let Some(parsed) = mime::parse(header, true) else { return Ok(false) };
-    let date = f.internal_date().map(|d| d.timestamp()).unwrap_or(0);
-    store.upsert_header(account, mailbox, uid, flag_bits(f.flags()), f.size.unwrap_or(0), date, &parsed)?;
+    store.upsert_header(account, mailbox, uid, f.flags.unwrap_or(0), f.size.unwrap_or(0), f.internal_date.unwrap_or(0), &parsed)?;
     Ok(true)
 }
 
@@ -383,7 +383,7 @@ pub struct Contents {
 }
 
 impl Contents {
-    fn of(mb: &async_imap::types::Mailbox) -> Contents {
+    fn of(mb: &wire::Selected) -> Contents {
         Contents { exists: mb.exists, uid_next: mb.uid_next }
     }
 }
@@ -396,10 +396,9 @@ impl Contents {
 /// once it's full, so [`idle`] would never hear of mail that arrives as it starts.
 pub async fn changed_since(session: &mut async_imap::Session<impl Io>, mailbox: &str, synced: Option<Contents>) -> Result<bool> {
     news(session);
-    let mb = selected(session, mailbox).await?;
-    // Anything told unasked during the SELECT may be newer than its counts.
-    let told = news(session);
-    Ok(synced != Some(Contents::of(&mb)) || told)
+    let mb = wire::select(session, mailbox).await?;
+    // A message expunged as the SELECT answered may be newer than its counts.
+    Ok(synced != Some(Contents::of(&mb)) || mb.expunged)
 }
 
 /// Takes what the server said unasked (async-imap files it away) and says whether mail came or
@@ -423,7 +422,7 @@ fn news_in(mut next: impl FnMut() -> Option<async_imap::types::UnsolicitedRespon
 /// Headers per FETCH during a first download.
 const HEADER_CHUNK: u32 = 200;
 
-fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[Fetch], above_uid: u32) -> Result<u32> {
+fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[Fetched], above_uid: u32) -> Result<u32> {
     if fetched.is_empty() {
         return Ok(0);
     }
@@ -442,9 +441,9 @@ fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[
 /// Brings one mailbox's local copy up to date (see the module docs). `progress` runs after
 /// each chunk of a first download lands, so the UI can show it.
 pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, window: u32, progress: &(dyn Fn() + Send + Sync)) -> Result<SyncOutcome> {
-    let mb = selected(session, mailbox).await?;
+    let mb = wire::select(session, mailbox).await?;
     let contents = Contents::of(&mb);
-    let uidvalidity = mb.uid_validity.unwrap_or(0);
+    let uidvalidity = mb.uid_validity;
     let mut changed = false;
     let mut new_messages = 0;
     let (local, max_uid) = {
@@ -474,11 +473,10 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
         let mut hi = mb.exists;
         while hi >= 1 && wanted > 0 {
             let lo = hi.saturating_sub(HEADER_CHUNK.min(wanted) - 1).max(1);
-            let fetched: Vec<Fetch> =
-                timed("FETCH headers", async { session.fetch(format!("{lo}:{hi}"), HEADER_QUERY).await?.try_collect::<Vec<_>>().await }).await??;
+            let fetched = wire::fetch(session, false, &format!("{lo}:{hi}"), HEADER_QUERY, "FETCH headers").await?;
             // Messages, not the flag updates a server may send in among them (another client's
             // changes, as FETCH responses without a header).
-            let shown = fetched.iter().filter(|f| f.uid.is_some() && f.header().is_some() && flag_bits(f.flags()) & flags::DELETED == 0).count() as u32;
+            let shown = fetched.iter().filter(|f| f.uid.is_some() && f.header.is_some() && f.flags.unwrap_or(0) & flags::DELETED == 0).count() as u32;
             wanted = wanted.saturating_sub(shown);
             let n = store_fetched(store, account, mailbox, &fetched, 0)?;
             if n > 0 {
@@ -492,8 +490,7 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
             hi = lo - 1;
         }
     } else {
-        let fetched: Vec<Fetch> =
-            timed("FETCH new", async { session.uid_fetch(format!("{}:*", max_uid + 1), HEADER_QUERY).await?.try_collect::<Vec<_>>().await }).await??;
+        let fetched = wire::fetch(session, true, &format!("{}:*", max_uid + 1), HEADER_QUERY, "FETCH new").await?;
         let n = store_fetched(store, account, mailbox, &fetched, max_uid)?;
         if n > 0 {
             new_messages += n;
@@ -503,10 +500,8 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
 
     // Flags and deletions for what we already have.
     if let Some(&(min_uid, _)) = local.first() {
-        let flags: Vec<Fetch> =
-            timed("FETCH flags", async { session.uid_fetch(format!("{min_uid}:{max_uid}"), "(UID FLAGS)").await?.try_collect::<Vec<_>>().await })
-                .await??;
-        let server: std::collections::HashMap<u32, u32> = flags.iter().filter_map(|f| Some((f.uid?, flag_bits(f.flags())))).collect();
+        let flags = wire::fetch(session, true, &format!("{min_uid}:{max_uid}"), "(UID FLAGS)", "FETCH flags").await?;
+        let server: std::collections::HashMap<u32, u32> = flags.iter().filter_map(|f| Some((f.uid?, f.flags.unwrap_or(0)))).collect();
         changed |= store.lock().map_err(|_| anyhow!("store poisoned"))?.reconcile(account, mailbox, &local, &server, window)?;
     }
     store.lock().map_err(|_| anyhow!("store poisoned"))?.mark_synced(account, mailbox)?;
@@ -515,24 +510,20 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
 
 /// Unread and total counts for the sidebar.
 pub async fn status(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<(u32, u32)> {
-    let mb = timed("STATUS", session.status(mailbox, "(MESSAGES UNSEEN)")).await??;
-    // Nothing back (a closed connection reads as an empty answer, see `selected`): not zero.
-    let Some(unseen) = mb.unseen else { bail!("STATUS {mailbox} got no answer (connection lost?)") };
-    Ok((unseen, mb.exists))
+    wire::status(session, mailbox).await
 }
 
 /// Downloads whole messages by UID into the store. The mailbox must be selected.
-pub async fn fetch_bodies(session: &mut Session, store: &Mutex<Store>, account: &str, mailbox: &str, uids: &[u32]) -> Result<Vec<i64>> {
+pub async fn fetch_bodies(session: &mut async_imap::Session<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, uids: &[u32]) -> Result<Vec<i64>> {
     if uids.is_empty() {
         return Ok(vec![]);
     }
     let set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let fetched: Vec<Fetch> =
-        timed("FETCH bodies", async { session.uid_fetch(set, "(UID BODY.PEEK[])").await?.try_collect::<Vec<_>>().await }).await??;
+    let fetched = wire::fetch(session, true, &set, "(UID BODY.PEEK[])", "FETCH bodies").await?;
     let mut ids = Vec::new();
     let st = store.lock().map_err(|_| anyhow!("store poisoned"))?;
     for f in &fetched {
-        let (Some(uid), Some(raw)) = (f.uid, f.body()) else { continue };
+        let (Some(uid), Some(raw)) = (f.uid, f.body.as_deref()) else { continue };
         let Some(id) = st.id_for_uid(account, mailbox, uid)? else { continue };
         if let Some(parsed) = mime::parse(raw, false) {
             st.set_body(id, raw, &parsed)?;
@@ -552,34 +543,17 @@ pub trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::D
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send> Io for T {}
 
 pub async fn select(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<()> {
-    selected(session, mailbox).await?;
+    wire::select(session, mailbox).await?;
     Ok(())
 }
 
-/// SELECT, and what it said. async-imap reads a connection the server has closed (left idle
-/// too long: servers and NATs drop idle connections early, GreenMail after 30 s) as a SELECT
-/// answered with nothing at all, which would pass for an empty mailbox with a new UIDVALIDITY
-/// and empty its local copy: that's a lost connection. A real SELECT always says FLAGS and
-/// UIDVALIDITY (RFC 3501 requires both).
-async fn selected(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<async_imap::types::Mailbox> {
-    let mb = timed("SELECT", session.select(mailbox)).await??;
-    if mb.flags.is_empty() && mb.permanent_flags.is_empty() && mb.uid_validity.is_none() && mb.uid_next.is_none() {
-        bail!("SELECT {mailbox} got no answer (connection lost?)");
-    }
-    Ok(mb)
-}
-
-pub async fn store_flags(session: &mut Session, mailbox: &str, uid: u32, add: u32, remove: u32) -> Result<()> {
+pub async fn store_flags(session: &mut async_imap::Session<impl Io>, mailbox: &str, uid: u32, add: u32, remove: u32) -> Result<()> {
     select(session, mailbox).await?;
     if add != 0 {
-        timed("STORE", async { session.uid_store(uid.to_string(), format!("+FLAGS.SILENT ({})", flag_names(add))).await?.try_collect::<Vec<_>>().await })
-            .await??;
+        wire::ok(session, &format!("UID STORE {uid} +FLAGS.SILENT ({})", flag_names(add)), "STORE").await?;
     }
     if remove != 0 {
-        timed("STORE", async {
-            session.uid_store(uid.to_string(), format!("-FLAGS.SILENT ({})", flag_names(remove))).await?.try_collect::<Vec<_>>().await
-        })
-        .await??;
+        wire::ok(session, &format!("UID STORE {uid} -FLAGS.SILENT ({})", flag_names(remove)), "STORE").await?;
     }
     Ok(())
 }
@@ -587,10 +561,9 @@ pub async fn store_flags(session: &mut Session, mailbox: &str, uid: u32, add: u3
 pub async fn move_message(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
     select(session, mailbox).await?;
     if caps.moves {
-        timed("MOVE", session.uid_mv(uid.to_string(), dest)).await??;
+        wire::ok(session, &format!("UID MOVE {uid} {}", quoted(dest)), "MOVE").await?;
     } else {
-        // async-imap sends COPY's mailbox as given: quoted here, for names with spaces.
-        timed("COPY", session.uid_copy(uid.to_string(), quoted(dest))).await??;
+        wire::ok(session, &format!("UID COPY {uid} {}", quoted(dest)), "COPY").await?;
         delete_uids(session, caps, &[uid]).await?;
     }
     Ok(())
@@ -599,8 +572,7 @@ pub async fn move_message(session: &mut async_imap::Session<impl Io>, caps: Caps
 /// Copies a message to `dest`, leaving it where it is: on Gmail, adds the label `dest`.
 pub async fn copy_message(session: &mut async_imap::Session<impl Io>, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
     select(session, mailbox).await?;
-    timed("COPY", session.uid_copy(uid.to_string(), quoted(dest))).await??;
-    Ok(())
+    wire::ok(session, &format!("UID COPY {uid} {}", quoted(dest)), "COPY").await
 }
 
 pub async fn expunge(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, uid: u32, select_first: bool) -> Result<()> {
@@ -619,15 +591,15 @@ async fn delete_uids(session: &mut async_imap::Session<impl Io>, caps: Caps, uid
         return Ok(());
     }
     let set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    timed("STORE", async { session.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect::<Vec<_>>().await }).await??;
+    wire::ok(session, &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"), "STORE").await?;
     if caps.uidplus {
-        timed("EXPUNGE", async { session.uid_expunge(&set).await?.try_collect::<Vec<_>>().await }).await??;
+        wire::ok(session, &format!("UID EXPUNGE {set}"), "EXPUNGE").await?;
     }
     Ok(())
 }
 
-pub async fn append(session: &mut Session, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
-    timed("APPEND", session.append(mailbox, if seen { Some("(\\Seen)") } else { None }, None, raw)).await??;
+pub async fn append(session: &mut async_imap::Session<impl Io>, mailbox: &str, raw: &[u8], seen: bool) -> Result<()> {
+    timed("APPEND", append_uid(session, mailbox, if seen { "(\\Seen)" } else { "" }, raw)).await??;
     Ok(())
 }
 
@@ -657,8 +629,8 @@ pub async fn replace_draft(
     previous: Option<(u32, u32)>,
     maybe_strays: bool,
 ) -> Result<Replaced> {
-    let before = selected(session, mailbox).await?;
-    let validity = before.uid_validity.unwrap_or(0);
+    let before = wire::select(session, mailbox).await?;
+    let validity = before.uid_validity;
     let appended = timed("APPEND", append_uid(session, mailbox, "(\\Draft \\Seen)", raw)).await??;
     let appended = appended.filter(|(v, _)| *v == validity || validity == 0);
     let validity = appended.map_or(validity, |(v, _)| v);
@@ -708,17 +680,16 @@ fn cleanup(appended: Option<u32>, uid_next: Option<u32>, previous: Option<u32>, 
 async fn append_uid(session: &mut async_imap::Session<impl Io>, mailbox: &str, flags: &str, raw: &[u8]) -> Result<Option<(u32, u32)>> {
     use async_imap::imap_proto::{Response, ResponseCode, Status, UidSetMember};
     use tokio::io::AsyncWriteExt;
-    let tag = session.run_command(format!("APPEND {} {flags} {{{}}}", quoted(mailbox), raw.len())).await?;
-    // As async-imap reports a refusal, so errors read the same.
-    fn refused(status: &Status, code: &impl std::fmt::Debug, info: &impl std::fmt::Debug) -> anyhow::Error {
-        let what = format!("code: {code:?}, info: {info:?}");
-        anyhow::Error::new(if *status == Status::Bad { async_imap::error::Error::Bad(what) } else { async_imap::error::Error::No(what) })
-    }
+    use wire::refused;
+    let flags = if flags.is_empty() { String::new() } else { format!(" {flags}") };
+    let tag = session.run_command(format!("APPEND {}{flags} {{{}}}", quoted(mailbox), raw.len())).await?;
+    let lost = |why: &str| anyhow::Error::new(Lost(format!("APPEND: {why}")));
     loop {
-        let r = session.read_response().await.ok_or(async_imap::error::Error::ConnectionLost)??;
+        let r = session.read_response().await.ok_or_else(|| lost("the connection closed before the server finished"))??;
         match r.parsed() {
             Response::Continue { .. } => break,
             Response::Done { tag: t, status, code, information } if *t == tag => return Err(refused(status, code, information)),
+            Response::Data { status: Status::Bye, .. } => return Err(lost("the server said BYE")),
             _ => {}
         }
     }
@@ -727,7 +698,10 @@ async fn append_uid(session: &mut async_imap::Session<impl Io>, mailbox: &str, f
     stream.write_all(b"\r\n").await?;
     stream.flush().await?;
     loop {
-        let r = session.read_response().await.ok_or(async_imap::error::Error::ConnectionLost)??;
+        let r = session.read_response().await.ok_or_else(|| lost("the connection closed before the server finished"))??;
+        if let Response::Data { status: Status::Bye, .. } = r.parsed() {
+            return Err(lost("the server said BYE"));
+        }
         if let Response::Done { tag: t, status, code, information } = r.parsed()
             && *t == tag
         {
@@ -756,7 +730,7 @@ pub async fn purge_message_id(
     known: Option<(u32, u32)>,
     search: bool,
 ) -> Result<Vec<u32>> {
-    let validity = selected(session, mailbox).await?.uid_validity.unwrap_or(0);
+    let validity = wire::select(session, mailbox).await?.uid_validity;
     let mut uids = if search { uids_with_message_id(session, message_id).await? } else { Vec::new() };
     uids.extend(known.filter(|(v, _)| *v == validity && validity != 0).map(|(_, uid)| uid));
     uids.sort_unstable();
@@ -770,16 +744,15 @@ pub async fn purge_message_id(
 /// header is checked: a draft's save must never delete anything else.
 async fn uids_with_message_id(session: &mut async_imap::Session<impl Io>, message_id: &str) -> Result<Vec<u32>> {
     let query = format!("UNDELETED HEADER Message-ID {}", quoted(message_id));
-    let hits = timed("SEARCH", session.uid_search(query)).await??;
+    let hits = wire::uid_search(session, &query).await?;
     if hits.is_empty() {
         return Ok(Vec::new());
     }
     let set = hits.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let fetched: Vec<Fetch> =
-        timed("FETCH ids", async { session.uid_fetch(set, "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])").await?.try_collect::<Vec<_>>().await }).await??;
+    let fetched = wire::fetch(session, true, &set, "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])", "FETCH ids").await?;
     Ok(fetched
         .iter()
-        .filter(|f| f.header().and_then(|h| mime::parse(h, true)).is_some_and(|p| p.message_id == message_id))
+        .filter(|f| f.header.as_deref().and_then(|h| mime::parse(h, true)).is_some_and(|p| p.message_id == message_id))
         .filter_map(|f| f.uid)
         .filter(|u| hits.contains(u))
         .collect())
@@ -794,9 +767,9 @@ pub struct Caps {
     pub uidplus: bool,
 }
 
-pub async fn capabilities(session: &mut Session) -> Result<Caps> {
-    let caps = timed("CAPABILITY", session.capabilities()).await??;
-    Ok(Caps { moves: caps.has_str("MOVE"), idle: caps.has_str("IDLE"), uidplus: caps.has_str("UIDPLUS") })
+pub async fn capabilities(session: &mut async_imap::Session<impl Io>) -> Result<Caps> {
+    let caps = wire::capabilities(session).await?;
+    Ok(Caps { moves: caps.contains("MOVE"), idle: caps.contains("IDLE"), uidplus: caps.contains("UIDPLUS") })
 }
 
 /// Waits on IDLE for up to `wait`, returning early when the server reports a change or
@@ -847,8 +820,8 @@ pub(crate) mod fake {
 
     /// A logged-in session with a server that answers each command with `answer(command)`:
     /// the response lines, where `TAG` stands for the command's tag. `None` answers
-    /// `TAG OK done`; [`HANG_UP`] closes the connection instead, as a server does with one
-    /// left idle too long.
+    /// `TAG OK done`. An answer ending in [`HANG_UP`] closes the connection after what comes
+    /// before it, as a server does with one left idle too long (or going away mid-answer).
     pub async fn session(answer: impl Fn(&str) -> Option<String> + Send + 'static) -> (async_imap::Session<DuplexStream>, Log) {
         let (client, server) = tokio::io::duplex(1 << 20);
         let log: Log = Arc::default();
@@ -881,10 +854,13 @@ pub(crate) mod fake {
                 }
                 seen.lock().unwrap().push(command.clone());
                 let reply = if command.starts_with("LOGIN") { None } else { answer(&command) };
-                if reply.as_deref() == Some(HANG_UP) {
+                let reply = reply.unwrap_or_else(|| "TAG OK done\r\n".into()).replace("TAG", &tag);
+                // Some of an answer, then the connection closes.
+                if let Some(before) = reply.strip_suffix(HANG_UP) {
+                    let _ = w.write_all(before.as_bytes()).await;
+                    let _ = w.shutdown().await;
                     return;
                 }
-                let reply = reply.unwrap_or_else(|| "TAG OK done\r\n".into()).replace("TAG", &tag);
                 w.write_all(reply.as_bytes()).await.unwrap();
             }
         });
@@ -893,12 +869,12 @@ pub(crate) mod fake {
         (c.login("me", "pw").await.map_err(|e| e.0).unwrap(), log)
     }
 
-    /// What `answer` returns to close the connection rather than answer.
+    /// What an answer ends with to close the connection there.
     pub const HANG_UP: &str = "<hang up>";
 
     /// A SELECT's answer.
     pub fn selected(validity: u32, uid_next: u32) -> String {
-        format!("* 3 EXISTS\r\n* OK [UIDVALIDITY {validity}] ok\r\n* OK [UIDNEXT {uid_next}] ok\r\nTAG OK [READ-WRITE] done\r\n")
+        format!("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* 3 EXISTS\r\n* OK [UIDVALIDITY {validity}] ok\r\n* OK [UIDNEXT {uid_next}] ok\r\nTAG OK [READ-WRITE] done\r\n")
     }
 
     /// A UID FETCH of Message-ID headers' answer: `(uid, Message-ID)` each.
@@ -921,7 +897,7 @@ mod tests {
     fn mailbox_server(n: u32, deleted: std::ops::RangeInclusive<u32>) -> impl Fn(&str) -> Option<String> + Send + 'static {
         move |c: &str| {
             if c.starts_with("SELECT") {
-                return Some(format!("* {n} EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT {}] ok\r\nTAG OK [READ-WRITE] done\r\n", n + 101));
+                return Some(format!("* FLAGS (\\Seen \\Deleted)\r\n* {n} EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT {}] ok\r\nTAG OK [READ-WRITE] done\r\n", n + 101));
             }
             let range = c.strip_prefix("FETCH ")?.split(' ').next()?;
             let (lo, hi) = range.split_once(':')?;
@@ -960,6 +936,222 @@ mod tests {
         assert!(changed_since(&mut s, "INBOX", None).await.is_err());
         let (mut s, _log) = fake::session(|_| Some(fake::HANG_UP.to_owned())).await;
         assert!(status(&mut s, "INBOX").await.is_err(), "not zero unread of zero");
+    }
+
+    // ── Answers are trusted only once the server finishes them (its tagged OK) ──
+
+    /// How an answer goes wrong partway: the connection closes, the server refuses (tagged
+    /// NO or BAD), or says BYE and goes.
+    #[derive(Clone, Copy, Debug)]
+    enum Breaks {
+        Eof,
+        No,
+        Bad,
+        Bye,
+    }
+
+    const BREAKS: [Breaks; 4] = [Breaks::Eof, Breaks::No, Breaks::Bad, Breaks::Bye];
+
+    /// `partial` (some of a command's answer), then it goes wrong `how`.
+    fn broken(partial: &str, how: Breaks) -> String {
+        match how {
+            Breaks::Eof => format!("{partial}{}", fake::HANG_UP),
+            Breaks::No => format!("{partial}TAG NO [UNAVAILABLE] try later\r\n"),
+            Breaks::Bad => format!("{partial}TAG BAD what was that\r\n"),
+            Breaks::Bye => format!("{partial}* BYE going away\r\n{}", fake::HANG_UP),
+        }
+    }
+
+    const SELECT_INBOX: &str = "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* 3 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 104] ok\r\nTAG OK [READ-WRITE] done\r\n";
+
+    /// A server whose INBOX holds UIDs 101–103 (sequence 1–3, UIDVALIDITY 7; 101 read) and a
+    /// draft in Drafts, answering everything Envoy asks in full.
+    fn inbox_server(c: &str) -> Option<String> {
+        let header = |uid: u32| format!("From: a@x.com\r\nSubject: m{uid}\r\nMessage-ID: <{uid}@x>\r\n\r\n");
+        let headers = |seqs: std::ops::RangeInclusive<u32>| {
+            seqs.map(|seq| {
+                let (uid, h) = (seq + 100, header(seq + 100));
+                let flags = if uid == 101 { "\\Seen" } else { "" };
+                format!("* {seq} FETCH (UID {uid} FLAGS ({flags}) INTERNALDATE \"03-Mar-2026 10:00:00 +0000\" RFC822.SIZE 100 BODY[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)] {{{}}}\r\n{h})\r\n", h.len())
+            })
+            .collect::<String>()
+        };
+        Some(match c {
+            c if c.starts_with("SELECT") => SELECT_INBOX.to_owned(),
+            c if c.starts_with("FETCH 1:3 ") => headers(1..=3) + "TAG OK done\r\n",
+            c if c.starts_with("UID FETCH 104:* ") => "TAG OK done\r\n".to_owned(),
+            "UID FETCH 101:103 (UID FLAGS)" => "* 1 FETCH (UID 101 FLAGS (\\Seen))\r\n* 2 FETCH (UID 102 FLAGS ())\r\n* 3 FETCH (UID 103 FLAGS ())\r\nTAG OK done\r\n".to_owned(),
+            c if c.starts_with("UID FETCH 101 (UID BODY.PEEK[])") => {
+                let body = format!("{}hi\r\n", header(101));
+                format!("* 1 FETCH (UID 101 BODY[] {{{}}}\r\n{body})\r\nTAG OK done\r\n", body.len())
+            }
+            c if c.starts_with("STATUS") => "* STATUS INBOX (MESSAGES 3 UNSEEN 2)\r\nTAG OK done\r\n".to_owned(),
+            c if c.starts_with("LIST") => "* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\HasNoChildren \\Drafts) \"/\" Drafts\r\n* LIST (\\HasNoChildren) \"/\" Work\r\nTAG OK done\r\n".to_owned(),
+            c if c.starts_with("UID SEARCH") => "* SEARCH 5\r\nTAG OK done\r\n".to_owned(),
+            c if c.starts_with("UID FETCH 5 (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])") => fake::message_ids(&[(5, "<d@envoy>")]),
+            _ => return None,
+        })
+    }
+
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// [`inbox_server`], except that its answer to the command starting with `target` is
+    /// `partial` and then goes wrong `how`.
+    fn breaking(target: &'static str, partial: &'static str, how: Breaks) -> impl Fn(&str) -> Option<String> + Send + 'static {
+        move |c: &str| if c.starts_with(target) { Some(broken(partial, how)) } else { inbox_server(c) }
+    }
+
+    /// A store with INBOX synced from [`inbox_server`]: three messages, UIDVALIDITY 7, counts
+    /// 2 unread of 3.
+    async fn synced_store() -> Mutex<Store> {
+        let store = Mutex::new(Store::memory());
+        store.lock().unwrap().upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        let (mut s, _log) = fake::session(inbox_server).await;
+        sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await.unwrap();
+        store.lock().unwrap().set_counts("a", "INBOX", 2, 3).unwrap();
+        assert_eq!(cache(&store), (vec![101, 102, 103], 7, (2, 3)));
+        store
+    }
+
+    /// INBOX as cached: its UIDs, UIDVALIDITY, and (unread, total).
+    fn cache(store: &Mutex<Store>) -> (Vec<u32>, u32, (u32, u32)) {
+        let st = store.lock().unwrap();
+        let inbox = st.mailboxes("a").unwrap().into_iter().find(|m| m.name == "INBOX").unwrap();
+        (st.local_uids("a", "INBOX").unwrap().into_iter().map(|(u, _)| u).collect(), st.uidvalidity("a", "INBOX").unwrap(), (inbox.unread, inbox.total))
+    }
+
+    #[tokio::test]
+    async fn a_sync_cut_short_anywhere_changes_nothing_here() {
+        // Each command a sync of a cached mailbox sends, cut short each way, with some of its
+        // answer in first: the SELECT says FLAGS but not yet UIDVALIDITY; the flag listing
+        // has 101 but not 102 and 103.
+        let cases: [(&str, &str); 3] = [
+            ("SELECT", "* FLAGS (\\Seen \\Deleted)\r\n"),
+            ("UID FETCH 104:* ", ""),
+            ("UID FETCH 101:103 (UID FLAGS)", "* 1 FETCH (UID 101 FLAGS (\\Seen))\r\n"),
+        ];
+        for (target, partial) in cases {
+            for how in BREAKS {
+                let store = synced_store().await;
+                let (mut s, _log) = fake::session(breaking(target, partial, how)).await;
+                let r = sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await;
+                assert!(r.is_err(), "{target} {how:?}: a sync cut short passed");
+                assert_eq!(cache(&store), (vec![101, 102, 103], 7, (2, 3)), "{target} {how:?}: the cache changed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_first_download_cut_short_isnt_success() {
+        for how in BREAKS {
+            let store = Mutex::new(Store::memory());
+            store.lock().unwrap().upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+            let h = "Subject: m101\r\n\r\n";
+            let one = leak(format!("* 1 FETCH (UID 101 FLAGS () BODY[HEADER.FIELDS (FROM SUBJECT)] {{{}}}\r\n{h})\r\n", h.len()));
+            let (mut s, _log) = fake::session(breaking("FETCH 1:3 ", one, how)).await;
+            assert!(sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await.is_err(), "{how:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_select_must_say_flags_exists_and_uidvalidity() {
+        // Finished with a tagged OK, but missing what every SELECT says: not an empty mailbox.
+        let incomplete = [
+            "* FLAGS (\\Seen)\r\n* OK [UIDVALIDITY 7] ok\r\nTAG OK done\r\n",
+            "* FLAGS (\\Seen)\r\n* 3 EXISTS\r\nTAG OK done\r\n",
+            "* 3 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\nTAG OK done\r\n",
+        ];
+        for answer in incomplete {
+            let store = synced_store().await;
+            let (mut s, _log) = fake::session(move |c| if c.starts_with("SELECT") { Some(answer.to_owned()) } else { inbox_server(c) }).await;
+            assert!(sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await.is_err(), "{answer:?}");
+            assert_eq!(cache(&store), (vec![101, 102, 103], 7, (2, 3)), "{answer:?}");
+        }
+        // A mailbox that really is empty now still syncs empty.
+        let store = synced_store().await;
+        let (mut s, _log) = fake::session(|c| {
+            if c.starts_with("SELECT") { Some("* FLAGS (\\Seen)\r\n* 0 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\nTAG OK done\r\n".into()) } else { inbox_server(c) }
+        })
+        .await;
+        sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await.unwrap();
+        assert!(cache(&store).0.is_empty(), "emptied on the server: emptied here");
+    }
+
+    #[tokio::test]
+    async fn status_needs_every_count_it_asked_for() {
+        for how in BREAKS {
+            let (mut s, _log) = fake::session(breaking("STATUS", "* STATUS INBOX (MESSAGES 3 UNSEEN 2)\r\n", how)).await;
+            assert!(status(&mut s, "INBOX").await.is_err(), "{how:?}");
+        }
+        for answer in ["* STATUS INBOX (MESSAGES 3)\r\nTAG OK done\r\n", "* STATUS INBOX (UNSEEN 2)\r\nTAG OK done\r\n", "TAG OK done\r\n"] {
+            let (mut s, _log) = fake::session(move |c| c.starts_with("STATUS").then(|| answer.to_owned())).await;
+            assert!(status(&mut s, "INBOX").await.is_err(), "{answer:?}: not zero");
+        }
+        let (mut s, _log) = fake::session(inbox_server).await;
+        assert_eq!(status(&mut s, "INBOX").await.unwrap(), (2, 3));
+    }
+
+    #[tokio::test]
+    async fn a_mailbox_list_cut_short_isnt_the_list() {
+        for how in BREAKS {
+            let (mut s, _log) = fake::session(breaking("LIST", "* LIST (\\HasNoChildren) \"/\" INBOX\r\n", how)).await;
+            assert!(list_mailboxes(&mut s).await.is_err(), "{how:?}: Drafts and Work would be forgotten");
+        }
+        let (mut s, _log) = fake::session(inbox_server).await;
+        assert_eq!(list_mailboxes(&mut s).await.unwrap().iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["INBOX", "Drafts", "Work"]);
+    }
+
+    #[tokio::test]
+    async fn bodies_cut_short_store_nothing() {
+        for how in BREAKS {
+            let store = synced_store().await;
+            let partial = "* 1 FETCH (UID 101 BODY[] {12}\r\nSubject: x\r\n)\r\n";
+            let (mut s, _log) = fake::session(breaking("UID FETCH 101 (UID BODY.PEEK[])", partial, how)).await;
+            select(&mut s, "INBOX").await.unwrap();
+            assert!(fetch_bodies(&mut s, &store, "a", "INBOX", &[101]).await.is_err(), "{how:?}");
+        }
+        let store = synced_store().await;
+        let (mut s, _log) = fake::session(inbox_server).await;
+        select(&mut s, "INBOX").await.unwrap();
+        assert_eq!(fetch_bodies(&mut s, &store, "a", "INBOX", &[101]).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_search_cut_short_deletes_nothing() {
+        let found = leak(fake::message_ids(&[(5, "<d@envoy>")]).replace("TAG OK done\r\n", ""));
+        for (target, partial) in [("UID SEARCH", "* SEARCH 5\r\n"), ("UID FETCH 5 (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])", found)] {
+            for how in BREAKS {
+                let (mut s, log) = fake::session(breaking(target, partial, how)).await;
+                assert!(purge_message_id(&mut s, caps(true), "Drafts", "<d@envoy>", None, true).await.is_err(), "{target} {how:?}");
+                assert!(!commands(&log).iter().any(|c| c.starts_with("UID STORE") || c.contains("EXPUNGE")), "{target} {how:?}: {:?}", commands(&log));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_the_server_didnt_finish_arent_done() {
+        // Each command a queued change replays, cut short each way: the op must stay queued
+        // (an error), never be taken as done (its message deleted here, a deletion reported).
+        for how in BREAKS {
+            let (mut s, _log) = fake::session(breaking("UID STORE", "* 1 FETCH (UID 101 FLAGS (\\Seen))\r\n", how)).await;
+            assert!(store_flags(&mut s, "INBOX", 101, flags::SEEN, 0).await.is_err(), "STORE {how:?}");
+            // Without UIDPLUS the \Deleted STORE is the whole deletion.
+            let (mut s, _log) = fake::session(breaking("UID STORE", "", how)).await;
+            assert!(expunge(&mut s, caps(false), "INBOX", 101, true).await.is_err(), "STORE \\Deleted {how:?}");
+            let (mut s, _log) = fake::session(breaking("UID EXPUNGE", "* 1 EXPUNGE\r\n", how)).await;
+            assert!(expunge(&mut s, caps(true), "INBOX", 101, true).await.is_err(), "UID EXPUNGE {how:?}");
+            let (mut s, _log) = fake::session(breaking("UID COPY", "", how)).await;
+            assert!(copy_message(&mut s, "INBOX", 101, "Work").await.is_err(), "COPY {how:?}");
+            let (mut s, log) = fake::session(breaking("UID COPY", "", how)).await;
+            assert!(move_message(&mut s, caps(false), "INBOX", 101, "Work").await.is_err(), "COPY to move {how:?}");
+            assert!(!commands(&log).iter().any(|c| c.starts_with("UID STORE")), "not deleted where it was: {how:?}");
+            let (mut s, _log) = fake::session(breaking("UID MOVE", "* 1 EXPUNGE\r\n", how)).await;
+            assert!(move_message(&mut s, Caps { moves: true, ..caps(true) }, "INBOX", 101, "Work").await.is_err(), "MOVE {how:?}");
+            let (mut s, _log) = fake::session(breaking("APPEND", "", how)).await;
+            assert!(append(&mut s, "Sent", b"Subject: x\r\n\r\nhi\r\n", true).await.is_err(), "APPEND {how:?}");
+        }
     }
 
     #[tokio::test]
@@ -1006,7 +1198,7 @@ mod tests {
         let (d, inner) = (delivered.clone(), mailbox_server(10, 0..=0));
         let (mut s, _log) = fake::session(move |c| {
             if c.starts_with("SELECT") && d.load(std::sync::atomic::Ordering::SeqCst) {
-                return Some("* 11 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 112] ok\r\nTAG OK [READ-WRITE] done\r\n".into());
+                return Some("* FLAGS (\\Seen \\Deleted)\r\n* 11 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 112] ok\r\nTAG OK [READ-WRITE] done\r\n".into());
             }
             inner(c)
         })
