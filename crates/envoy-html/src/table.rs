@@ -174,7 +174,7 @@ pub fn estimate_capped(nodes: &[Node], cap: f32) -> (f32, f32) {
                     _ => (a + edge, b + edge),
                 }
             }
-            Node::Row { cells, gap } => {
+            Node::Row { cells, gap, .. } => {
                 let mut a = 0.0;
                 let mut b = 0.0;
                 for (s, kids) in cells {
