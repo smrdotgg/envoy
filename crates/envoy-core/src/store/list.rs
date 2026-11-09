@@ -116,6 +116,10 @@ const HIDDEN_OUT: &str = "m.held_op = 0";
 const MOVING: &str = "SELECT m.id, m.account, o.op FROM messages m JOIN ops o ON o.id = m.held_op WHERE m.held_op != 0";
 /// The ops held for an undo window, by `ops_batch`: never a send, whose op carries its message.
 const HELD_OPS: &str = "SELECT account, op FROM ops WHERE batch != 0";
+/// Message `?1`, by its Message-ID, in mailbox `?2` already (and showing there), by the
+/// conversation's index: a few rows, however big the mailbox.
+const ALREADY_THERE: &str = "SELECT 1 FROM messages a JOIN messages m INDEXED BY messages_thread ON m.account = a.account AND m.thread = a.thread
+    WHERE a.id = ?1 AND a.message_id != '' AND m.mailbox = ?2 AND m.message_id = a.message_id AND m.held_op = 0 AND m.flags & 16 = 0";
 
 /// A message on its way into `dest`, one of `account`'s mailboxes: moved or copied there (a
 /// label) by an op that hasn't reached the server yet, held for the undo window or waiting to
@@ -327,9 +331,18 @@ impl Store {
         Ok(out)
     }
 
-    /// The messages on their way into `boxes`, `(account, name)`s.
+    /// The messages on their way into `boxes`, `(account, name)`s, but those there already: on
+    /// Gmail, archiving takes a message to All Mail, which has it (synced, it's that copy that
+    /// shows, to act on).
     pub(super) fn arrivals_into(&self, boxes: &[(String, String)]) -> Result<Vec<Arrival>> {
-        Ok(self.arrivals()?.into_iter().filter(|a| boxes.iter().any(|(acc, b)| *acc == a.account && *b == a.dest)).collect())
+        let mut there = self.conn.prepare_cached(ALREADY_THERE)?;
+        let mut out = Vec::new();
+        for a in self.arrivals()?.into_iter().filter(|a| boxes.iter().any(|(acc, b)| *acc == a.account && *b == a.dest)) {
+            if !there.exists(rusqlite::params![a.id, a.dest])? {
+                out.push(a);
+            }
+        }
+        Ok(out)
     }
 
     /// The messages on their way into `account`'s snooze buckets (every account's: None),
@@ -803,6 +816,8 @@ mod tests {
         assert!(moving.iter().any(|p| p.contains("INDEX messages_held")) && !moving.iter().any(|p| p.starts_with("SCAN m") && !p.contains("INDEX")), "{moving:?}");
         let held = plan(&st, HELD_OPS, &[]);
         assert!(held.iter().any(|p| p.contains("INDEX ops_batch")), "{held:?}");
+        let there = plan(&st, ALREADY_THERE, &[1i64.into(), "INBOX".to_owned().into()]);
+        assert!(there.iter().any(|p| p.contains("INDEX messages_thread")) && !there.iter().any(|p| p.starts_with("SCAN")), "{there:?}");
     }
 
     /// The inbox's woken messages are found by their own small index, not by reading the inbox:

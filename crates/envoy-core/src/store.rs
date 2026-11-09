@@ -2226,6 +2226,15 @@ mod tests {
         s.undo_batch(9).unwrap();
         assert_eq!(ids(&inbox(&s)), [invoice]);
         assert_eq!(ids(&list(&mailbox("Trash"), "", true)), [trashed], "back in Trash");
+        // Archived where the archive has it already (Gmail's All Mail, synced first): it's that
+        // copy that shows, to act on.
+        s.upsert_mailbox("a", "All", "All Mail", Role::All, "/", true).unwrap();
+        let copy = put("All", 8, "Receipt", "<rc@x>", "", flags::SEEN);
+        let receipt = put("INBOX", 8, "Receipt", "<rc@x>", "", flags::SEEN);
+        let op = s.enqueue_held("a", &Op::Move { mailbox: "INBOX".into(), uid: 8, dest: "All".into() }, i64::MAX, 10).unwrap();
+        assert!(s.hide_local(receipt, op).unwrap());
+        let all = list(&mailbox("All"), "", true);
+        assert_eq!((ids(&all), all[0].flags & flags::ARRIVING), (vec![copy], 0));
     }
 
     fn unread(s: &Store) -> u32 {
