@@ -19,6 +19,10 @@ there, or took the change) stops the script: drop it or redo it.
 - 0004-keycaps-feature: the `--keys`/`--pointer` overlay of headless runs behind a
   `keycaps` feature (in Rune's defaults; Envoy leaves it off), so its second
   runtime isn't built into Envoy.
+- 0005-headless-feature: headless runs (`--snap`, `--script`, `--tree`...) in
+  release builds behind a `headless` feature (in Rune's defaults; Envoy leaves it
+  off). Debug builds always have them, so Envoy's screenshots and UI scripts work
+  as before; the shipped binary doesn't carry the offscreen loop.
 
 Usage: scripts/vendor-rune.py <path-to-rune-checkout>
 """

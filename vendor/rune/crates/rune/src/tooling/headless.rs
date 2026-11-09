@@ -23,12 +23,23 @@ pub(crate) fn straight_alpha(pixels: &mut [u8]) {
     }
 }
 
+/// Whether this build renders headless: always in debug builds, and in release builds with the
+/// `headless` feature. Without it the two ways in, `try_headless` and `headless_configured`,
+/// refuse, so the offscreen loop and everything only it reaches (recorder, scripts, HTML export,
+/// `--desktop`, the motion lint, PNG and video writers) aren't built into the binary.
+const HEADLESS: bool = cfg!(any(feature = "headless", debug_assertions));
+
+fn refuse() -> ! {
+    die("headless runs (--snap, --tree, --html, --script, --trace without --native, --video, --strip, --desktop, --list-scenes, --list-windows, --first-pixels) aren't in this release build: use a debug build, or build with the rune/headless feature")
+}
+
 pub fn headless<S: 'static>(app: crate::app::App<S>, args: Args) {
     started(try_headless(app, args));
 }
 
 /// `headless`, returning the error when a window whose own arguments aren't headless can't open.
 pub(crate) fn try_headless<S: 'static>(mut app: crate::app::App<S>, args: Args) -> Result<(), String> {
+    if !HEADLESS { refuse() }
     crate::render::discard_prewarm();
     if args.html.is_some() { return crate::tooling::html::export(app, &args); }
     if app.windows.is_empty() && args.desktop.is_none() {
@@ -52,6 +63,7 @@ pub(crate) fn try_headless<S: 'static>(mut app: crate::app::App<S>, args: Args) 
 }
 
 pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args: Args, transparent: bool) {
+    if !HEADLESS { refuse() }
     // RUNE_HEADLESS_WAIT=SECS holds the run before it starts, so a sampling profiler can attach.
     if let Some(secs) = std::env::var("RUNE_HEADLESS_WAIT").ok().and_then(|s| s.parse::<f64>().ok()) {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs));

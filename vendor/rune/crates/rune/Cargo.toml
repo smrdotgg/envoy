@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["accessibility", "dbus", "embedded-fonts", "keycaps", "metal-backend", "ogg-audio", "svg"]
+default = ["accessibility", "dbus", "embedded-fonts", "headless", "keycaps", "metal-backend", "ogg-audio", "svg"]
 # On web, bundle Inter (Regular, Medium, SemiBold) and IBM Plex Mono as built-in fallback fonts.
 # Disable when AppSpec::fonts supplies the app's own fonts to omit the bytes from the wasm.
 # Native builds always bundle Inter.
@@ -14,6 +14,12 @@ embedded-fonts = []
 webgl = ["wgpu/webgl"]
 # Headless benchmark instrumentation; ordinary builds contain no phase clocks.
 frame-profile = ["dep:procwatch"]
+# Headless runs in release builds (`--snap`, `--tree`, `--html`, `--script`, `--video`, `--strip`,
+# `--desktop`...): an offscreen render loop with its recorder, script player, HTML export and
+# motion lint, about 1 MB. Debug builds always have them. Off, a release build's headless flags
+# exit with a message; its window, and `--scene`, `--playground` and `--native --trace` in it,
+# work as before.
+headless = []
 # `--keys` and `--pointer`: screencast keycaps and click ripples over headless frames. Their
 # overlay is a runtime of its own, so the runtime's generic code is built a second time for it
 # (about 1 MB). Off, those flags exit with a message.

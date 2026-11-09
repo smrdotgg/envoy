@@ -2,7 +2,8 @@
 //! Envoy: a fast, native, configurable email client built on Rune.
 //!
 //! `envoy` opens the app. `envoy --demo` opens it with sample mail and no network.
-//! Rune's headless tooling works too: `envoy --demo --snap out.png --scene open`.
+//! Rune's headless tooling works too, in debug builds: `envoy --demo --snap out.png --scene open`.
+//! Release builds leave it out (Rune's `headless` feature is off).
 
 mod app;
 mod bench;
