@@ -104,6 +104,9 @@ pub enum Command {
     Settings(Box<Settings>),
     /// Download (or read from the message, for `cid:`) and decode an image in an HTML mail.
     FetchImage { url: String, message: MessageId },
+    /// People to suggest for what's typed in a recipients field ([`Store::suggest`]), from the
+    /// local cache only. Answered with [`Event::Contacts`] carrying the same `req`.
+    Contacts { req: u64, typed: String },
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +171,8 @@ pub enum Event {
     /// Draft `id` was discarded from the Drafts list ([`Command::DiscardDraftRow`]), under
     /// `undo`: a composer holding it closes.
     DraftDiscarded { id: i64, undo: Option<i64> },
+    /// The people to suggest for [`Command::Contacts`] `req`, best first.
+    Contacts { req: u64, contacts: Vec<crate::model::Address> },
 }
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -175,6 +180,15 @@ type Waker = Arc<dyn Fn() + Send + Sync>;
 /// How many rows of a long list are sent ahead of the rest: more than a screenful, and what
 /// the list mounts around it, but a small part of the work.
 pub const FIRST_PAGE: u32 = 100;
+
+/// How many people a [`Command::Contacts`] brings: what the composer shows, and a few more for
+/// it to leave out the ones already in the message.
+pub const SUGGESTIONS: usize = 12;
+
+/// How many messages of an old cache [`Store::backfill_contacts`] counts at a time: the writer
+/// is held about 20 ms a chunk on envoy-bench's 100k-message cache (500 held it 33 ms), and the
+/// whole cache takes about 10 s, in the background.
+pub const CONTACTS_CHUNK: i64 = 200;
 
 pub struct Engine {
     tx: mpsc::UnboundedSender<Command>,
@@ -230,6 +244,7 @@ impl Engine {
                 undo_keys: Mutex::new(HashMap::new()),
                 wakers: Mutex::new(HashMap::new()),
             });
+            shared.store_me();
             let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("envoy-io").build() {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -324,6 +339,14 @@ impl Shared {
 
     fn me(&self) -> HashSet<String> {
         self.accounts.read().map(|a| a.iter().map(|a| a.email.to_lowercase()).collect()).unwrap_or_default()
+    }
+
+    /// Tells the store your addresses, as accounts come and go ([`Store::set_me`]).
+    fn store_me(&self) {
+        let me = self.me();
+        if let Ok(st) = self.writer.lock() {
+            st.set_me(me);
+        }
     }
 
     /// Who an account's mail is from, for rows that have no message to take it from.
@@ -485,6 +508,7 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
     resume_attaching(&shared, &workers);
     shared.emit_pending();
     tokio::spawn(upgrade_search(shared.clone()));
+    tokio::spawn(backfill_contacts(shared.clone()));
     while let Some(cmd) = rx.recv().await {
         if let Err(e) = handle(&shared, &mut workers, cmd).await {
             shared.emit(Event::Error(format!("{e:#}")));
@@ -522,6 +546,25 @@ async fn upgrade_search(shared: Arc<Shared>) {
             Ok(Ok(false)) => return,
             Ok(Err(e)) => {
                 log::warn!("upgrading the search index: {e:#}");
+                return;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Counts the people in an old cache's mail for recipient suggestions
+/// ([`Store::backfill_contacts`]), as [`upgrade_search`] goes: a few hundred messages at a time,
+/// the writer free in between, once startup is out of the way.
+async fn backfill_contacts(shared: Arc<Shared>) {
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    loop {
+        let s = shared.clone();
+        match tokio::task::spawn_blocking(move || s.with_writer(|st| st.backfill_contacts(CONTACTS_CHUNK))).await {
+            Ok(Ok(true)) => tokio::time::sleep(Duration::from_millis(25)).await,
+            Ok(Ok(false)) => return,
+            Ok(Err(e)) => {
+                log::warn!("counting the cache's contacts: {e:#}");
                 return;
             }
             Err(_) => return,
@@ -801,6 +844,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 accounts::save(&accts)?;
                 accts.clone()
             };
+            shared.store_me();
             shared.emit(Event::Accounts(list));
             shared.emit(Event::AccountAdded(account.clone()));
             workers.insert(account.id.clone(), spawn_worker(shared.clone(), account.id.clone()));
@@ -820,6 +864,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 accounts::save(&accts)?;
                 accts.clone()
             };
+            shared.store_me();
             shared.with_writer(|st| st.forget_account(&id))?;
             shared.emit(Event::Accounts(list));
             shared.emit(Event::Changed { account: id });
@@ -883,6 +928,17 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             for w in workers.values() {
                 w.notify.notify_one();
             }
+        }
+        Command::Contacts { req, typed } => {
+            // Off the engine's loop: a list being read holds the reader a moment.
+            let shared = shared.clone();
+            tokio::task::spawn_blocking(move || {
+                let me = shared.me();
+                match shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| st.suggest(&typed, &me, now(), SUGGESTIONS)) {
+                    Ok(contacts) => shared.emit(Event::Contacts { req, contacts }),
+                    Err(e) => log::warn!("recipient suggestions: {e:#}"),
+                }
+            });
         }
     }
     Ok(())
@@ -3771,6 +3827,37 @@ mod tests {
             seen.push(e);
         }
         seen
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suggestions_come_back_with_their_request_and_leave_out_my_addresses() {
+        let st = setup();
+        st.upsert_mailbox("a", "Sent", "Sent", Role::Sent, "/", true).unwrap();
+        for (uid, (mailbox, from, to)) in [("Sent", "Me <a@x.com>", "Ana Lima <ana@x.com>"), ("INBOX", "Andy <andy@y.org>", "a@x.com"), ("INBOX", "a@x.com", "a@x.com")].into_iter().enumerate() {
+            let raw = format!("From: {from}\r\nTo: {to}\r\nSubject: hi\r\nMessage-ID: <{uid}@x>\r\nDate: {}\r\n\r\nhi\r\n", chrono::Utc::now().to_rfc2822());
+            st.upsert_header("a", mailbox, uid as u32 + 1, flags::SEEN, 10, 0, &crate::mime::parse(raw.as_bytes(), true).unwrap()).unwrap();
+        }
+        let (shared, rx) = engine_with(Store::memory());
+        *shared.reader.lock().unwrap() = st;
+        shared.accounts.write().unwrap().push(account("a"));
+        handle(&shared, &mut HashMap::new(), Command::Contacts { req: 7, typed: "a".into() }).await.unwrap();
+        let events = wait_for(&rx, 1, |e| matches!(e, Event::Contacts { .. }));
+        let Some(Event::Contacts { req, contacts }) = events.last() else { unreachable!() };
+        assert_eq!(*req, 7);
+        assert_eq!(contacts.iter().map(|a| a.email.as_str()).collect::<Vec<_>>(), vec!["ana@x.com", "andy@y.org"], "the one I wrote to first; never me");
+        assert_eq!(contacts[0].name, "Ana Lima");
+    }
+
+    #[test]
+    fn the_store_learns_my_addresses_as_accounts_come_and_go() {
+        let (shared, _rx) = engine_with(setup());
+        shared.accounts.write().unwrap().push(account("a"));
+        shared.store_me();
+        let sent = "From: a@x.com\r\nTo: Bo <bo@y.org>\r\nSubject: hi\r\nMessage-ID: <1@x>\r\n\r\nhi\r\n";
+        shared.with_writer(|st| st.upsert_header("a", "Archive", 1, 0, 10, 0, &crate::mime::parse(sent.as_bytes(), true).unwrap())).unwrap();
+        let suggest = |typed: &str| shared.with_writer(|st| st.suggest(typed, &HashSet::new(), now(), 5)).unwrap();
+        assert_eq!(suggest("bo").len(), 1);
+        assert!(suggest("a@").is_empty(), "mail from my address, outside Sent, is mine: its sender isn't a contact");
     }
 
     fn attached(events: &[Event]) -> Vec<crate::model::DraftAttachment> {

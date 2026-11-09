@@ -11,6 +11,7 @@
 //! never reused, so a stale id can't reach a newer op.
 //!
 //! Drafts (what the composer holds, saved as it's typed) live here too: see `store/drafts.rs`.
+//! So do the people in the cached mail, for recipient suggestions: see `store/contacts.rs`.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::mime::{self, Parsed};
 use crate::model::{Address, Attachment, Body, Mailbox, MessageId, Role, Summary, ThreadMessage, View, flags};
 
+mod contacts;
 mod drafts;
 mod list;
 pub use drafts::{DraftRev, DraftUpload, LocalDraft};
@@ -413,6 +415,18 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !fts.contains("prefix") && !has_table(conn, "fts_next")? {
         conn.execute_batch(&format!("BEGIN; {FTS_NEXT} COMMIT;"))?;
     }
+    // Contacts for recipient suggestions: a cache that has mail already gets its people
+    // counted in the background (store/contacts.rs).
+    if !has_table(conn, "contacts")? {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(contacts::CONTACTS)?;
+        let upto: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?;
+        if upto > 0 {
+            tx.execute_batch(contacts::BACKFILL)?;
+            tx.execute("INSERT INTO contacts_backfill (next, upto) VALUES (0, ?1)", params![upto])?;
+        }
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -536,6 +550,11 @@ pub struct Store {
     /// An old cache's search index is being copied into `fts_next` (see [`FTS_NEXT`]): every
     /// write to `fts` goes there too.
     fts_next: std::cell::Cell<bool>,
+    /// An old cache's messages are still having their people counted
+    /// ([`Store::backfill_contacts`]).
+    contacts_backfill: std::cell::Cell<bool>,
+    /// Your addresses, lowercase ([`Store::set_me`]).
+    me: std::cell::RefCell<HashSet<String>>,
 }
 
 fn json<T: Serialize>(v: &T) -> String {
@@ -651,7 +670,8 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         let fts_next = std::cell::Cell::new(has_table(&conn, "fts_next")?);
-        Ok(Store { conn, fts_next })
+        let contacts_backfill = std::cell::Cell::new(has_table(&conn, "contacts_backfill")?);
+        Ok(Store { conn, fts_next, contacts_backfill, me: Default::default() })
     }
 
     #[cfg(test)]
@@ -659,7 +679,7 @@ impl Store {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         migrate(&conn).unwrap();
-        Store { conn, fts_next: std::cell::Cell::new(false) }
+        Store { conn, fts_next: std::cell::Cell::new(false), contacts_backfill: std::cell::Cell::new(false), me: Default::default() }
     }
 
     /// Copies the next `chunk` message ids' worth of an old cache's search index into
@@ -804,9 +824,11 @@ impl Store {
             .query_row("SELECT COALESCE(MAX(uid), 0) FROM messages WHERE account = ?1 AND mailbox = ?2", params![account, mailbox], |r| r.get(0))?)
     }
 
-    /// Inserts (or refreshes the flags of) a message from its headers. Returns its id.
+    /// Inserts (or refreshes the flags of) a message from its headers. Returns its id. A new
+    /// message's people are counted for recipient suggestions (store/contacts.rs).
     #[allow(clippy::too_many_arguments)] // one per IMAP FETCH item
     pub fn upsert_header(&self, account: &str, mailbox: &str, uid: u32, fl: u32, size: u32, internal_date: i64, p: &Parsed) -> Result<MessageId> {
+        let new = self.id_for_uid(account, mailbox, uid)?.is_none();
         let thread = mime::thread_id(&p.message_id, &p.in_reply_to, &p.references);
         let thread = if thread.is_empty() { format!("uid:{mailbox}:{uid}") } else { thread };
         let mut recipients = p.to.clone();
@@ -831,6 +853,10 @@ impl Store {
         if self.fts_next.get() {
             self.conn.execute("DELETE FROM fts_next WHERE rowid = ?1", params![id])?;
             self.conn.execute("INSERT INTO fts_next (rowid, subject, people, body) VALUES (?1, ?2, ?3, '')", params![id, p.subject, people])?;
+        }
+        if new {
+            let mail = contacts::Mail { message_id: &p.message_id, from: &p.from, recipients: &recipients, bcc: &p.bcc, bulk: p.bulk, date, flags: fl };
+            self.add_people(account, mailbox, &mail)?;
         }
         Ok(id)
     }
@@ -1580,6 +1606,8 @@ impl Store {
         self.conn.execute("DELETE FROM drafts WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM send_limits WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM unfiled_sent WHERE account = ?1", params![account])?;
+        self.conn.execute("DELETE FROM contacts WHERE account = ?1", params![account])?;
+        self.conn.execute("DELETE FROM contact_sources WHERE account = ?1", params![account])?;
         Ok(())
     }
 

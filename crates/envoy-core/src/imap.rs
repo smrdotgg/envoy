@@ -416,7 +416,10 @@ pub fn flag_names(bits: u32) -> String {
     v.join(" ")
 }
 
-const HEADER_QUERY: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])";
+/// Bcc (in copies of mail you sent) and the headers that tell bulk mail ([`mime::is_bulk`]) are
+/// for recipient suggestions.
+const HEADER_QUERY: &str =
+    "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID LIST-UNSUBSCRIBE PRECEDENCE AUTO-SUBMITTED)])";
 
 fn store_header(store: &Store, account: &str, mailbox: &str, f: &Fetched) -> Result<bool> {
     let (Some(uid), Some(header)) = (f.uid, f.header.as_deref()) else { return Ok(false) };
