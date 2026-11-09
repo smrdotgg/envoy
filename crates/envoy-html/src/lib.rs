@@ -1567,7 +1567,11 @@ impl Builder {
         let hints = self.blank_hint;
         let mut inner = Vec::new();
         let mut p = Para::default();
-        self.children(h, ctx, &mut inner, &mut p);
+        if style(st, "display").is_some_and(|d| matches!(d, "flex" | "grid")) {
+            self.items(h, ctx, &mut inner, &mut p);
+        } else {
+            self.children(h, ctx, &mut inner, &mut p);
+        }
         flush(&mut inner, &mut p);
         ctx.avail = saved;
         space(out, mt);
@@ -1577,6 +1581,24 @@ impl Builder {
             push_placed(out, place, bs, tidy(inner));
         }
         space(out, mb);
+    }
+
+    /// The children of a flex or grid container. CSS makes each child element an item laid
+    /// out as a block, and each run of text between them: side by side or on a grid in a
+    /// browser, one under another here, but never run together ("Edge caching" over "Cut
+    /// latency…", not "Edge cachingCut latency…").
+    fn items(&mut self, h: &Handle, ctx: &Ctx, out: &mut Vec<Node>, para: &mut Para) {
+        let kids: Vec<Handle> = h.children.borrow().iter().cloned().collect();
+        for c in &kids {
+            let element = matches!(c.data, NodeData::Element { .. });
+            if element {
+                flush(out, para);
+            }
+            self.node(c, ctx, out, para);
+            if element {
+                flush(out, para);
+            }
+        }
     }
 
     fn image(&mut self, h: &Handle, st: &[(Rc<str>, Rc<str>)], ctx: &Ctx, out: &mut Vec<Node>, para: &mut Para) {
@@ -2345,6 +2367,16 @@ mod tests {
                <img src="https://img.example/hero.png" width="600" style="max-width:100%;height:auto">"#,
         );
         assert_eq!(doc.images, ["https://img.example/min.jpg", "https://img.example/wide.png", "https://img.example/hero.png"]);
+    }
+
+    #[test]
+    fn flex_and_grid_items_are_blocks_of_their_own() {
+        // The layouts themselves can't be drawn, but their items mustn't run together.
+        let doc = parse(
+            r#"<div style="display:grid"><div style="display:flex;flex-direction:column"><b>Edge caching</b><span>Cut latency.</span></div></div>
+               <div style="display:flex">Plain text <i>then</i> more</div><p>A <b>bold</b> word</p>"#,
+        );
+        assert_eq!(plain(&doc), "Edge caching\n\nCut latency.\n\nPlain text\n\nthen\n\nmore\n\nA bold word");
     }
 
     #[test]
