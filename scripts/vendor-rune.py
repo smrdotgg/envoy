@@ -23,6 +23,9 @@ there, or took the change) stops the script: drop it or redo it.
   release builds behind a `headless` feature (in Rune's defaults; Envoy leaves it
   off). Debug builds always have them, so Envoy's screenshots and UI scripts work
   as before; the shipped binary doesn't carry the offscreen loop.
+- 0006-global-shortcuts-feature: system-wide shortcuts' backends (Wayland portal,
+  X11 grabs, RegisterHotKey, Carbon hot keys) behind a `global-shortcuts` feature
+  (in Rune's defaults; Envoy, which registers none, leaves it off).
 
 Usage: scripts/vendor-rune.py <path-to-rune-checkout>
 """
