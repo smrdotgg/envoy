@@ -14,6 +14,11 @@ pub mod flags {
     /// `$new` keyword where it keeps keywords; elsewhere this computer's alone
     /// ([`crate::snooze`]).
     pub const WOKEN: u32 = 32;
+    /// On its way here: a row a list shows where a queued move or label is taking its message,
+    /// before the server has it there (the move held for its undo window, or waiting to
+    /// replay). Never stored: set on the rows [`crate::store::Store::list`] adds for it, and
+    /// on the message [`crate::store::Store::thread`] opens for one. Undo takes it back out.
+    pub const ARRIVING: u32 = 1 << 16;
 }
 
 /// What a mailbox is for, from IMAP SPECIAL-USE attributes (or well-known names).

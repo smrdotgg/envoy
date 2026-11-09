@@ -1118,7 +1118,8 @@ impl App {
         }
         // Marked read once it actually shows: the engine may find nothing (it was moved, or a
         // late undo reopened a message that's still on its way out).
-        let unread = self.list.iter().find(|s| s.id == id).is_some_and(|s| s.thread_unread);
+        // Not one still on its way here: nothing is done to it until it's there.
+        let unread = self.list.iter().find(|s| s.id == id).is_some_and(|s| s.thread_unread && s.flags & flags::ARRIVING == 0);
         self.mark_read_when_shown = unread.then_some(id);
         if !self.thread.is_empty() {
             self.shown(id);
@@ -1467,7 +1468,8 @@ impl App {
     /// [`App::move_away`]'s part shared with snoozing: off the list at once, `command(ids,
     /// undo key)` to the engine, and a toast with Undo for the undo window (none when
     /// `forever`). Messages the server snoozed itself are left alone: they're its to move.
-    fn take_away(&mut self, mut ids: Vec<MessageId>, label: String, forever: bool, tx: &mut Tx, command: impl FnOnce(Vec<MessageId>, Option<i64>) -> Command) {
+    fn take_away(&mut self, ids: Vec<MessageId>, label: String, forever: bool, tx: &mut Tx, command: impl FnOnce(Vec<MessageId>, Option<i64>) -> Command) {
+        let mut ids = self.settled(ids);
         let before = ids.len();
         ids.retain(|id| !self.snoozed_by_server(*id));
         if ids.len() < before {
@@ -1776,6 +1778,25 @@ impl App {
         if self.selection.is_empty() { self.open.into_iter().collect() } else { self.selection.ids(&self.list) }
     }
 
+    /// Row `id` is shown where a move or label not on the server yet is taking it
+    /// ([`flags::ARRIVING`]): its undo window is still open, or it's waiting to go.
+    pub fn is_arriving(&self, id: MessageId) -> bool {
+        self.list.iter().find(|s| s.id == id).map_or_else(|| self.thread.iter().any(|m| m.summary.id == id && m.summary.flags & flags::ARRIVING != 0), |s| s.flags & flags::ARRIVING != 0)
+    }
+
+    /// `ids` but the rows still on their way where they show ([`App::is_arriving`]): nothing is
+    /// done to those until they're there (Undo takes them back meanwhile). If that leaves
+    /// nothing to act on, says why.
+    pub(crate) fn settled(&mut self, mut ids: Vec<MessageId>) -> Vec<MessageId> {
+        let before = ids.len();
+        ids.retain(|id| !self.is_arriving(*id));
+        if ids.is_empty() && before > 0 {
+            let what = if before == 1 { "That's" } else { "Those are" };
+            self.toast(format!("{what} still on the way here: undo the move, or try again in a moment"), false);
+        }
+        ids
+    }
+
     /// The rows (or the open message's summary) of these ids, in their order: one pass over the
     /// list, however many there are (a select-all of thousands).
     pub(crate) fn rows_of(&self, ids: &[MessageId]) -> Vec<&Summary> {
@@ -2028,6 +2049,7 @@ impl App {
     /// Adds label `mailbox` to messages: a copy there, leaving them where they are. Undo takes
     /// it back while the undo window lasts (the copy hasn't gone to the server yet).
     pub fn label(&mut self, ids: Vec<MessageId>, mailbox: String, tx: &mut Tx) {
+        let ids = self.settled(ids);
         if ids.is_empty() {
             return;
         }
@@ -2051,6 +2073,9 @@ impl App {
     }
 
     pub fn toggle_star(&mut self, id: MessageId) {
+        if self.settled(vec![id]).is_empty() {
+            return;
+        }
         let starred = self.list.iter().find(|s| s.id == id).map(|s| s.flagged()).or_else(|| self.thread.iter().find(|m| m.summary.id == id).map(|m| m.summary.flagged()));
         let starred = starred.unwrap_or(false);
         for s in self.list.iter_mut().filter(|s| s.id == id) {
@@ -2073,6 +2098,7 @@ impl App {
     /// Marks rows read (or unread), in one go. Marking the open message unread closes it, as
     /// Gmail does, so it stays unread.
     pub fn set_read(&mut self, ids: Vec<MessageId>, read: bool) {
+        let ids = self.settled(ids);
         if ids.is_empty() {
             return;
         }
@@ -2097,6 +2123,7 @@ impl App {
     /// Stars rows (or unstars them), in one go: starring marks each row's message, unstarring a
     /// conversation clears every star in it, as for one ([`App::toggle_star`]).
     pub fn set_starred(&mut self, ids: Vec<MessageId>, star: bool) {
+        let ids = self.settled(ids);
         if ids.is_empty() {
             return;
         }

@@ -13,6 +13,8 @@ mod demo;
 mod fmt;
 mod html_view;
 mod icons;
+#[cfg(test)]
+mod live_tests;
 mod reader;
 mod selection;
 mod theme;
@@ -334,6 +336,12 @@ const SCENES: &[Scene] = &[
     }),
     ("split-narrow", |s| {
         s.list_width = 330.0;
+        scene_open(s);
+    }),
+    // The reader dragged narrow, about 300 points at the default size: Reply, Reply all and
+    // Forward as icons, the subject's chips below it.
+    ("reader-narrow", |s| {
+        s.list_width = 715.0;
         scene_open(s);
     }),
     ("split-empty", |s| {

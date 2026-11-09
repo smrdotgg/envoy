@@ -170,7 +170,7 @@ the server never hears of it.
 At its time it's back **at the top of your inbox** (of its own tab, in the split inbox), unread and
 marked "Snoozed", until you deal with it (read it and move on, or archive it); a search lists it
 by date like any other. **Snoozed** in the sidebar lists everything snoozed, soonest first, with
-when each comes back; `b` there picks a new time, and the inbox icon on a row brings it back now.
+when each comes back (one just snoozed too); `b` there picks a new time, and the inbox icon on a row brings it back now.
 
 **Snoozes live on your mail server, not on any Envoy server.** A snoozed message is in a
 folder named for when it wakes, under `Snoozed`: `Snoozed/20261110T0800Z` (UTC, to the minute);
@@ -229,7 +229,9 @@ until it succeeds, across restarts and offline periods. Sending waits `compose.u
 in that queue so it can be undone; archive, delete, spam, other moves and labels (on Gmail a
 label is a copy in the label's mailbox) wait `behavior.undoSeconds` (5 s) the same way, with
 the messages hidden rather than deleted locally, so **Undo** in the toast (or `z`) puts them
-back exactly as they were and the server never sees the move. Once the toast is gone the move goes through; if the app quits first, it
+back exactly as they were and the server never sees the move. Meanwhile they're shown where
+they're going too (the folder, Trash, the label, Snoozed), to read but not to act on until they're
+there (Undo takes them back out). Once the toast is gone the move goes through; if the app quits first, it
 goes through on the next start. Deleting from Trash is permanent and has no undo. The worker
 uses IMAP IDLE for push, reconnects with
 backoff, and times out dead connections in 30 s.
@@ -274,7 +276,7 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png -
 ```
 
 Run from the repository root (the attach script picks files in it), with a debug build: release
-builds leave headless runs out. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label snooze snooze-typed snoozed woken toast toast-compose counts split split-newsletters split-moved split-search split-narrow split-empty split-off settings-rules`.
+builds leave headless runs out. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label snooze snooze-typed snoozed woken toast toast-compose counts split split-newsletters split-moved split-search split-narrow split-empty split-off settings-rules reader-narrow`.
 
 HTML rendering is tested against the mail in `crates/envoy-core/tests/fixtures/html` (sources and
 licenses in its `LICENSES.md`).

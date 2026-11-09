@@ -330,9 +330,19 @@ fn scenario(pass: Pass) {
     assert_hold("the label", label_undone, before, epoch(), MOVE_HOLD);
     assert_hold("the batch move", batch_undone, before, epoch(), MOVE_HOLD);
     assert_eq!((in_inbox(&mut d, &batch), in_inbox(&mut d, &[digest.id])), (0, 1), "the batch leaves the inbox at once, the labeled message stays");
+    // And they're where they're going at once, on their way there (the server has neither).
+    let arriving = |d: &mut Driver, mailbox: &str| {
+        let mut ids: Vec<i64> = d.list(&View::Mailbox { account: ACCOUNT.into(), mailbox: mailbox.into() }, "", false).iter().filter(|s| s.flags & flags::ARRIVING != 0 && s.mailbox == mailbox).map(|s| s.id).collect();
+        ids.sort();
+        ids
+    };
+    let mut moving = batch.clone();
+    moving.sort();
+    assert_eq!((arriving(&mut d, "Receipts"), arriving(&mut d, "Old Projects")), (vec![digest.id], moving), "labeled and moved: there at once");
     d.send(Command::UndoMove { undo: 30 });
     d.send(Command::UndoMove { undo: 32 });
     assert_eq!(in_inbox(&mut d, &batch), 2, "one undo brings both back");
+    assert!(arriving(&mut d, "Receipts").is_empty() && arriving(&mut d, "Old Projects").is_empty(), "and takes them out of where they went");
     untouched_until(&mut d, "the undone label or batch reached the server", label_undone.max(batch_undone) as f64 + 3.0, || {
         probe.live("Receipts").is_empty() && probe.live("Old Projects") == [ping.subject.clone()] && probe.live("INBOX").iter().filter(|s| s.starts_with("Batch ")).count() == 2
     });
@@ -493,7 +503,8 @@ fn scenario(pass: Pass) {
     // connection read as an empty Trash, and nothing synced it again for the 300 s interval).
     let trash = View::Role { account: Some(ACCOUNT.into()), role: Role::Trash };
     d.send(Command::Watch { view: trash.clone() });
-    let trashed = d.until("the message in Trash here", 20, |d| d.list(&trash, "", false).into_iter().find(|s| s.subject == digest.subject));
+    // The server's copy, synced (not the one shown on its way there before the move went).
+    let trashed = d.until("the message in Trash here", 20, |d| d.list(&trash, "", false).into_iter().find(|s| s.subject == digest.subject && s.flags & flags::ARRIVING == 0));
     let mark = d.mark();
     d.send(Command::Move { ids: vec![trashed.id], to: MoveTarget::Trash, thread: false, undo: Some(6) });
     let held = d.wait(mark, "the delete", 5, |e| match e {
@@ -660,6 +671,10 @@ fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) 
     d.wait(mark, "the snooze held", 5, |e| matches!(e, Event::Held { undo: 41, ops: 1 }).then_some(()));
     let due = deadline("batch = 41");
     assert_hold("the snooze", due, before, epoch(), MOVE_HOLD);
+    // In Snoozed here at once, in the bucket it's going to (not made yet), saying when.
+    let snoozed = View::Role { account: Some(ACCOUNT.into()), role: Role::Snoozed };
+    let on_its_way = d.list(&snoozed, "", false).into_iter().find(|s| s.id == later.id).expect("in Snoozed at once");
+    assert_eq!((on_its_way.mailbox, on_its_way.flags & flags::ARRIVING != 0), (snooze::bucket("Snoozed", &delimiter, until), true));
     watch_holds(d, vec![Hold { what: "the snooze", deadline: due, on_server: Box::new(|| bucket_for(until).is_some() || !probe.live("INBOX").iter().any(|s| s == "Snooze me")) }]);
     let bucket = d.until("in its bucket on the server, gone from the inbox", 15, |_| {
         let bucket = bucket_for(until)?;

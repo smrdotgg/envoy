@@ -130,6 +130,13 @@ fn ink(run: &AkNode) -> Option<(f32, f32)> {
 /// text box. Also the lines measured. A text's lines come from the accessibility tree, which
 /// has them for selectable text (all text in mail is, under test: `aside`).
 fn overflow<T: 'static>(rt: &Runtime<T>, width: f32, scope: &str) -> (Vec<String>, Vec<String>) {
+    overflow_between(rt, 0.0, width, scope)
+}
+
+/// [`overflow`] for what's laid out between `left` and `right`, a pane of a window: the
+/// reader beside the list, say.
+pub(crate) fn overflow_between<T: 'static>(rt: &Runtime<T>, left: f32, right: f32, scope: &str) -> (Vec<String>, Vec<String>) {
+    let width = right;
     let mut out = Vec::new();
     let els = rt.elements();
     let inside = |path: &str| path.split('/').any(|p| p == scope);
@@ -142,7 +149,7 @@ fn overflow<T: 'static>(rt: &Runtime<T>, width: f32, scope: &str) -> (Vec<String
         let [x, _, w, _] = e.rect;
         if !(x.is_finite() && w.is_finite() && w >= 0.0) {
             out.push(format!("{} has no proper box: {:?}", name(i), e.rect));
-        } else if outside(x, x + w, 0.0, width) {
+        } else if outside(x, x + w, left, width) {
             out.push(format!("{} spans {x:.1}..{:.1}", name(i), x + w));
         } else if let Some(p) = e.parent.filter(|&p| inside(&els[p].path) && !e.path.contains("#link-")) {
             // (A link's hit area covers its text's lines, hanging spaces too: those are
@@ -163,7 +170,7 @@ fn overflow<T: 'static>(rt: &Runtime<T>, width: f32, scope: &str) -> (Vec<String
         for run in runs {
             lines.push(run.value().unwrap_or("").trim_end().to_owned());
             let Some((l, r)) = ink(run) else { continue };
-            if outside(l, r, bx0.max(0.0), bx1.min(width)) {
+            if outside(l, r, bx0.max(left), bx1.min(width)) {
                 let what: String = run.value().unwrap_or("").chars().take(40).collect();
                 out.push(format!("the line {what:?} spans {l:.1}..{r:.1}, out of its text at {bx0:.1}..{bx1:.1}"));
             }

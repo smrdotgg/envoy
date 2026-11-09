@@ -57,7 +57,7 @@ struct Filter {
 
 impl Filter {
     fn new(query: &Query) -> Filter {
-        let mut conds: Vec<String> = vec!["m.flags & 16 = 0".into(), "m.held_op = 0".into()];
+        let mut conds: Vec<String> = vec!["m.flags & 16 = 0".into(), HIDDEN_OUT.into()];
         let mut args: Vec<SqlValue> = Vec::new();
         let like = |v: &str| SqlValue::from(format!("%{v}%"));
         // LIKE ignores ASCII case and SQLite's lower() only lowers ASCII, so this matches what
@@ -99,6 +99,36 @@ impl Filter {
     fn sql(&self) -> String {
         self.conds.join(" AND ")
     }
+
+    /// The conditions on a message on its way into the view ([`Arrival`]): the same, but for
+    /// the one that leaves out hidden messages (a moved one is hidden where it's leaving).
+    /// Takes the same arguments.
+    fn sql_arriving(&self) -> String {
+        self.conds.iter().filter(|c| c.as_str() != HIDDEN_OUT).cloned().collect::<Vec<_>>().join(" AND ")
+    }
+}
+
+/// [`Filter`]'s condition leaving out messages hidden for a move.
+const HIDDEN_OUT: &str = "m.held_op = 0";
+
+/// The messages hidden for an op, with it ([`Store::arrivals`]): by `messages_held` (the `!= 0`
+/// lets SQLite use it), a few rows.
+const MOVING: &str = "SELECT m.id, m.account, o.op FROM messages m JOIN ops o ON o.id = m.held_op WHERE m.held_op != 0";
+/// The ops held for an undo window, by `ops_batch`: never a send, whose op carries its message.
+const HELD_OPS: &str = "SELECT account, op FROM ops WHERE batch != 0";
+/// Message `?1`, by its Message-ID, in mailbox `?2` already (and showing there), by the
+/// conversation's index: a few rows, however big the mailbox.
+const ALREADY_THERE: &str = "SELECT 1 FROM messages a JOIN messages m INDEXED BY messages_thread ON m.account = a.account AND m.thread = a.thread
+    WHERE a.id = ?1 AND a.message_id != '' AND m.mailbox = ?2 AND m.message_id = a.message_id AND m.held_op = 0 AND m.flags & 16 = 0";
+
+/// A message on its way into `dest`, one of `account`'s mailboxes: moved or copied there (a
+/// label) by an op that hasn't reached the server yet, held for the undo window or waiting to
+/// replay. A list of `dest` shows it at once ([`flags::ARRIVING`]); an Undo takes it back out,
+/// and once the op has gone the server's copy, synced, takes its place.
+pub(super) struct Arrival {
+    pub id: i64,
+    pub account: String,
+    pub dest: String,
 }
 
 /// Message ids the free text matched.
@@ -170,6 +200,8 @@ struct Grouper<'a> {
     /// Scratch keys, so a row that's skipped or joins a conversation allocates nothing.
     key: String,
     tkey: String,
+    /// The messages on their way into the view ([`Arrival`]), each with where it's going.
+    arriving: &'a HashMap<i64, String>,
 }
 
 enum Took {
@@ -271,6 +303,60 @@ impl Store {
         })
     }
 
+    /// Every message on its way somewhere ([`Arrival`]). A move hides its message where it's
+    /// leaving ([`Store::hide_local`]), so moves are found by the hidden messages' index; a copy
+    /// leaves its message where it is, and is found among the ops held for an undo window
+    /// (moves, copies and discards: small ones; a send's carries its whole message, and isn't
+    /// read). A copy queued with Undo off goes at once when online, and shows once it's synced.
+    pub(super) fn arrivals(&self) -> Result<Vec<Arrival>> {
+        let mut out = Vec::new();
+        let mut moves = self.conn.prepare_cached(MOVING)?;
+        let rows = moves.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        for row in rows {
+            let (id, account, op) = row?;
+            if let Ok(super::Op::Move { dest, .. }) = serde_json::from_str(&op) {
+                out.push(Arrival { id, account, dest });
+            }
+        }
+        let held: Vec<(String, String)> =
+            self.conn.prepare_cached(HELD_OPS)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (account, op) in held {
+            if let Ok(super::Op::Copy { mailbox, uid, dest }) = serde_json::from_str(&op)
+                && let Some(id) = self.id_for_uid(&account, &mailbox, uid)?
+                && !out.iter().any(|a: &Arrival| a.id == id && a.dest == dest)
+            {
+                out.push(Arrival { id, account, dest });
+            }
+        }
+        Ok(out)
+    }
+
+    /// The messages on their way into `boxes`, `(account, name)`s, but those there already: on
+    /// Gmail, archiving takes a message to All Mail, which has it (synced, it's that copy that
+    /// shows, to act on).
+    pub(super) fn arrivals_into(&self, boxes: &[(String, String)]) -> Result<Vec<Arrival>> {
+        let mut there = self.conn.prepare_cached(ALREADY_THERE)?;
+        let mut out = Vec::new();
+        for a in self.arrivals()?.into_iter().filter(|a| boxes.iter().any(|(acc, b)| *acc == a.account && *b == a.dest)) {
+            if !there.exists(rusqlite::params![a.id, a.dest])? {
+                out.push(a);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The messages on their way into `account`'s snooze buckets (every account's: None),
+    /// whether the bucket is made yet or not (it's made as the snooze goes): Snoozed's.
+    fn snoozing(&self, account: Option<&str>) -> Result<Vec<Arrival>> {
+        let mut out = Vec::new();
+        for a in self.arrivals()? {
+            if account.is_none_or(|x| x == a.account) && self.bucket_of(&a.account, &a.dest)?.is_some() {
+                out.push(a);
+            }
+        }
+        Ok(out)
+    }
+
     fn fts_hits(&self, query: &Query) -> Result<Hits> {
         let m: Vec<String> = query.text.iter().map(|t| fts_term(t)).collect();
         let mut stmt = self.conn.prepare_cached("SELECT rowid FROM fts WHERE fts MATCH ?1 ORDER BY rowid")?;
@@ -292,7 +378,17 @@ impl Store {
         first: &mut dyn FnMut(Vec<Summary>),
     ) -> Result<Vec<Summary>> {
         let scope = self.scope(view)?;
-        if limit == 0 || matches!(&scope, Scope::Boxes(b) if b.is_empty()) {
+        // One snapshot for what's on its way, the scan, the thread pass and the full reads,
+        // while sync writes.
+        let _read = self.conn.unchecked_transaction()?;
+        // Moved, labeled or snoozed here, and not on the server yet: here already, by date (in
+        // Snoozed, by when it comes back, its bucket made or not).
+        let arrivals = match (&scope, view) {
+            (Scope::Boxes(_), View::Role { account, role: Role::Snoozed }) => self.snoozing(account.as_deref())?,
+            (Scope::Boxes(boxes), _) => self.arrivals_into(boxes)?,
+            (Scope::Starred(_), _) => Vec::new(),
+        };
+        if limit == 0 || (matches!(&scope, Scope::Boxes(b) if b.is_empty()) && arrivals.is_empty()) {
             return Ok(Vec::new());
         }
         let filter = Filter::new(query);
@@ -306,6 +402,7 @@ impl Store {
         // Messages back from a snooze come first in the inbox, and in their own tab of the split
         // inbox (the filter keeps its category), until they're dealt with; a search goes by date.
         let pinned = if query.is_search() { Vec::new() } else { self.pinned_boxes(view, &scope) };
+        let arriving: HashMap<i64, String> = arrivals.iter().map(|a| (a.id, a.dest.clone())).collect();
         let (limit, page) = (limit as usize, page as usize);
         let mut g = Grouper {
             conversations,
@@ -318,13 +415,13 @@ impl Store {
             counted: HashSet::new(),
             key: String::new(),
             tkey: String::new(),
+            arriving: &arriving,
         };
 
         // The scan, newest first.
         let few = hits.as_ref().filter(|h| h.ids.len() <= FEW_HITS);
-        let (sql, args) = scan_sql(&scope, &filter, few);
-        // One snapshot for the scan, the thread pass and the full reads, while sync writes.
-        let _read = self.conn.unchecked_transaction()?;
+        let arriving_ids: Vec<i64> = arriving.keys().copied().collect();
+        let (sql, args) = scan_sql(&scope, &filter, few, (!arriving_ids.is_empty()).then_some(arriving_ids.as_slice()));
         let mut pages = Pages { limit, shown: Vec::new(), done: 0, first };
         // Every pinned row before any other: they're the list's top, first page or not.
         let mut passes = Vec::new();
@@ -334,11 +431,21 @@ impl Store {
         passes.push((sql, args));
         let mut stopped = false;
         if let (true, Scope::Boxes(boxes)) = (snoozed, &scope) {
-            // One statement, run for each bucket in turn: its shape doesn't grow with them.
+            // One statement, run for each bucket in turn: its shape doesn't grow with them. A
+            // bucket with snoozes on their way in has them merged in by a second.
             let mut stmt = self.conn.prepare(&box_sql(&filter))?;
-            'boxes: for (a, b) in boxes {
-                let args: Vec<SqlValue> = [SqlValue::from(a.clone()), SqlValue::from(b.clone())].into_iter().chain(filter.args.iter().cloned()).collect();
-                let mut rows = stmt.query(params_from_iter(args.iter()))?;
+            let mut with_arriving = if arrivals.is_empty() { None } else { Some(self.conn.prepare(&box_arriving_sql(&filter))?) };
+            'boxes: for (a, b) in snoozed_buckets(boxes, &arrivals) {
+                let here: Vec<i64> = arrivals.iter().filter(|x| x.account == a && x.dest == b).map(|x| x.id).collect();
+                let mut args: Vec<SqlValue> = [SqlValue::from(a), SqlValue::from(b)].into_iter().chain(filter.args.iter().cloned()).collect();
+                let mut rows = match &mut with_arriving {
+                    Some(merged) if !here.is_empty() => {
+                        args.push(SqlValue::from(ids_json(&here)));
+                        args.extend(filter.args.iter().cloned());
+                        merged.query(params_from_iter(args.iter()))?
+                    }
+                    _ => stmt.query(params_from_iter(args.iter()))?,
+                };
                 while let Some(r) = rows.next()? {
                     if self.take_paged(&mut g, r, &mut pages, &scope, &filter)? {
                         stopped = true;
@@ -364,7 +471,7 @@ impl Store {
         if conversations && stopped {
             self.complete(&mut g, done, &scope, &filter)?;
         }
-        let rest = self.read_full(&g.out[done..])?;
+        let rest = self.read_full(&g.out[done..], g.arriving)?;
         shown.extend(rest);
         Ok(shown)
     }
@@ -377,7 +484,7 @@ impl Store {
         let mut took = g.take(r, true)?;
         if matches!(took, Took::Full) && g.limit < pages.limit {
             self.complete(g, 0, scope, filter)?;
-            pages.shown = self.read_full(&g.out)?;
+            pages.shown = self.read_full(&g.out, g.arriving)?;
             pages.done = g.out.len();
             (pages.first)(pages.shown.clone());
             g.limit = pages.limit;
@@ -434,8 +541,9 @@ impl Store {
         Ok(())
     }
 
-    /// `rows` read in full, with what grouping found.
-    fn read_full(&self, rows: &[Row1]) -> Result<Vec<Summary>> {
+    /// `rows` read in full, with what grouping found. A message on its way into the view is
+    /// shown as it will be there: in the mailbox it's going to, marked [`flags::ARRIVING`].
+    fn read_full(&self, rows: &[Row1], arriving: &HashMap<i64, String>) -> Result<Vec<Summary>> {
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         let mut full: HashMap<i64, Summary> = HashMap::with_capacity(ids.len());
         {
@@ -459,34 +567,40 @@ impl Store {
                 // Oldest participant first, as Gmail shows them.
                 s.participants = row.names.iter().rev().cloned().collect::<Vec<_>>().join(", ");
             }
+            if let Some(dest) = arriving.get(&s.id) {
+                s.mailbox.clone_from(dest);
+                s.flags |= flags::ARRIVING;
+            }
             out.push(s);
         }
         Ok(out)
     }
 }
 
-/// The scan's SQL and its arguments: a view's matches in [`ORDER`].
-fn scan_sql(scope: &Scope, filter: &Filter, few: Option<&Hits>) -> (String, Vec<SqlValue>) {
+/// The scan's SQL and its arguments: a view's matches in [`ORDER`], with the messages
+/// `arriving` ([`Arrival`], read by id: a few) among them, when there are any.
+fn scan_sql(scope: &Scope, filter: &Filter, few: Option<&Hits>, arriving: Option<&[i64]>) -> (String, Vec<SqlValue>) {
     let mut args: Vec<SqlValue> = Vec::new();
-    let sql = match (scope, few) {
+    // Each a SELECT of LIGHT_COLS in ORDER (or sorted into it).
+    let mut arms: Vec<String> = Vec::new();
+    match (scope, few) {
         (_, Some(h)) => {
             // Few matches: fetch them by id and sort; no need to scan the folder.
             args.push(SqlValue::from(ids_json(&h.ids)));
             args.extend(filter.args.iter().cloned());
             let within = scope_sql(scope, &mut args);
-            format!("SELECT {LIGHT_COLS} FROM messages m WHERE m.id IN (SELECT value FROM json_each(?)) AND {} AND {within} ORDER BY {ORDER}", filter.sql())
+            arms.push(format!("SELECT {LIGHT_COLS} FROM messages m WHERE m.id IN (SELECT value FROM json_each(?)) AND {} AND {within}", filter.sql()));
         }
         (Scope::Boxes(boxes), None) if boxes.len() > MERGED_BOXES => {
             // Many mailboxes: one query whatever their number (its rows sorted).
             args.extend(filter.args.iter().cloned());
             let within = scope_sql(scope, &mut args);
-            format!("SELECT {LIGHT_COLS} FROM messages m WHERE {} AND {within} ORDER BY {ORDER}", filter.sql())
+            arms.push(format!("SELECT {LIGHT_COLS} FROM messages m WHERE {} AND {within}", filter.sql()));
         }
         (Scope::Boxes(boxes), None) => {
             // One ordered index scan per mailbox; SQLite merges them by date. With categories,
             // one per mailbox and category, each a range of `messages_by_category` in the same
             // order: a category of the inbox reads like a folder of its own.
-            let mut arms: Vec<String> = Vec::new();
             for (a, b) in boxes {
                 let mut arm = |category: Option<i64>| {
                     args.push(a.clone().into());
@@ -508,15 +622,20 @@ fn scan_sql(scope: &Scope, filter: &Filter, few: Option<&Hits>) -> (String, Vec<
                 args.extend(filter.args.iter().cloned());
                 return (format!("SELECT {LIGHT_COLS} FROM messages m WHERE 0 AND {}", filter.sql()), args);
             }
-            // Columns 5 and 1 of LIGHT_COLS: date, id.
-            if arms.len() == 1 { format!("{} ORDER BY {ORDER}", arms[0]) } else { format!("{} ORDER BY 5 DESC, 1 DESC", arms.join(" UNION ALL ")) }
         }
         (Scope::Starred(_), None) => {
             args.extend(filter.args.iter().cloned());
             let within = scope_sql(scope, &mut args);
-            format!("SELECT {LIGHT_COLS} FROM messages m WHERE {} AND {within} ORDER BY {ORDER}", filter.sql())
+            arms.push(format!("SELECT {LIGHT_COLS} FROM messages m WHERE {} AND {within}", filter.sql()));
         }
-    };
+    }
+    if let Some(ids) = arriving {
+        args.push(SqlValue::from(ids_json(ids)));
+        args.extend(filter.args.iter().cloned());
+        arms.push(format!("SELECT {LIGHT_COLS} FROM messages m WHERE m.id IN (SELECT value FROM json_each(?)) AND {}", filter.sql_arriving()));
+    }
+    // Columns 5 and 1 of LIGHT_COLS: date, id.
+    let sql = if arms.len() == 1 { format!("{} ORDER BY {ORDER}", arms[0]) } else { format!("{} ORDER BY 5 DESC, 1 DESC", arms.join(" UNION ALL ")) };
     (sql, args)
 }
 
@@ -556,6 +675,38 @@ fn box_sql(filter: &Filter) -> String {
     format!("SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_by_date WHERE m.account = ? AND m.mailbox = ? AND {} ORDER BY {ORDER}", filter.sql())
 }
 
+/// [`box_sql`] with the messages on their way into the bucket merged in ([`Arrival`]): its
+/// arguments, then their ids (`[1,2]`) and the filter's again.
+fn box_arriving_sql(filter: &Filter) -> String {
+    format!(
+        "SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_by_date WHERE m.account = ? AND m.mailbox = ? AND {}
+         UNION ALL SELECT {LIGHT_COLS} FROM messages m WHERE m.id IN (SELECT value FROM json_each(?)) AND {} ORDER BY 5 DESC, 1 DESC",
+        filter.sql(),
+        filter.sql_arriving()
+    )
+}
+
+/// The buckets Snoozed lists, in its order: `boxes` (in that order already, [`Store::scope`])
+/// and the ones `arrivals` are going into that aren't among them (not made yet), each where its
+/// wake time puts it, as the scope's query orders them.
+fn snoozed_buckets(boxes: &[(String, String)], arrivals: &[Arrival]) -> Vec<(String, String)> {
+    let mut out = boxes.to_vec();
+    for a in arrivals {
+        if !out.iter().any(|(acc, b)| *acc == a.account && *b == a.dest) {
+            out.push((a.account.clone(), a.dest.clone()));
+        }
+    }
+    if out.len() > boxes.len() {
+        // A stamp first (they sort as their times do), then the name's last 14 characters,
+        // the account and the name.
+        out.sort_by_cached_key(|(account, name)| {
+            let tail = name.get(name.len().saturating_sub(14)..).unwrap_or(name).to_owned();
+            (crate::snooze::parse_stamp(&tail).is_none(), tail, account.clone(), name.clone())
+        });
+    }
+    out
+}
+
 /// The scope as a condition on `m`, its arguments appended to `args`: one, however many
 /// mailboxes.
 fn scope_sql(scope: &Scope, args: &mut Vec<SqlValue>) -> String {
@@ -591,7 +742,7 @@ mod tests {
         let filter = Filter::new(&Query::default());
         for boxes in [vec![("a".to_owned(), "INBOX".to_owned())], vec![("a".to_owned(), "INBOX".to_owned()), ("b".to_owned(), "INBOX".to_owned())]] {
             let n = boxes.len();
-            let (sql, args) = scan_sql(&Scope::Boxes(boxes), &filter, None);
+            let (sql, args) = scan_sql(&Scope::Boxes(boxes), &filter, None, None);
             let mut stmt = st.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
             let plan: Vec<String> = stmt.query_map(params_from_iter(args.iter()), |r| r.get::<_, String>(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
             assert!(plan.iter().any(|p| p.contains("COVERING INDEX messages_by_date")), "{n} mailboxes: {plan:?}");
@@ -618,7 +769,7 @@ mod tests {
             (vec![("a".to_owned(), "INBOX".to_owned())], "category:n is:unread"),
         ] {
             let filter = Filter::new(&Query::parse(q));
-            let (sql, args) = scan_sql(&Scope::Boxes(boxes.clone()), &filter, None);
+            let (sql, args) = scan_sql(&Scope::Boxes(boxes.clone()), &filter, None, None);
             let plan = plan(&st, &sql, &args);
             assert!(plan.iter().any(|p| p.contains("COVERING INDEX messages_by_category")), "{q}: {plan:?}");
             assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE") || p.contains("messages_by_date")), "{q}: {plan:?}");
@@ -645,14 +796,28 @@ mod tests {
         assert!(one.iter().any(|p| p.contains("COVERING INDEX messages_by_date (account=? AND mailbox=?)")) && !one.iter().any(|p| p.contains("TEMP B-TREE")), "{one:?}");
         let boxes: Vec<(String, String)> = (0..600).map(|i| ("a".to_owned(), format!("Snoozed/{i}"))).collect();
         let scope = Scope::Boxes(boxes);
-        let (sql, args) = scan_sql(&scope, &filter, None);
+        let (sql, args) = scan_sql(&scope, &filter, None, None);
         assert_eq!(args.len(), 1, "one scope parameter");
         assert!(!sql.contains("UNION"), "{sql}");
         assert!(!plan(&st, &sql, &args).is_empty());
         let hits = Hits::new((1..100).collect());
-        let (sql, args) = scan_sql(&scope, &filter, Some(&hits));
+        let (sql, args) = scan_sql(&scope, &filter, Some(&hits), None);
         assert_eq!(args.len(), 2);
         assert!(!plan(&st, &sql, &args).is_empty());
+    }
+
+    /// What's on its way into a view is found by the hidden messages' index and the held ops',
+    /// on every list: never by reading the cache, or the whole queue (a send's op carries its
+    /// whole message).
+    #[test]
+    fn arrivals_are_found_by_their_indexes() {
+        let st = Store::memory();
+        let moving = plan(&st, MOVING, &[]);
+        assert!(moving.iter().any(|p| p.contains("INDEX messages_held")) && !moving.iter().any(|p| p.starts_with("SCAN m") && !p.contains("INDEX")), "{moving:?}");
+        let held = plan(&st, HELD_OPS, &[]);
+        assert!(held.iter().any(|p| p.contains("INDEX ops_batch")), "{held:?}");
+        let there = plan(&st, ALREADY_THERE, &[1i64.into(), "INBOX".to_owned().into()]);
+        assert!(there.iter().any(|p| p.contains("INDEX messages_thread")) && !there.iter().any(|p| p.starts_with("SCAN")), "{there:?}");
     }
 
     /// The inbox's woken messages are found by their own small index, not by reading the inbox:

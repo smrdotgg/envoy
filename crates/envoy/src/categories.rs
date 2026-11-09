@@ -104,6 +104,10 @@ impl App {
         if ids.is_empty() || !self.split_applies() {
             return false;
         }
+        let ids = self.settled(ids);
+        if ids.is_empty() {
+            return true;
+        }
         let rows: Vec<Summary> = self.rows_of(&ids).into_iter().cloned().collect();
         let mine: Vec<String> = self.accounts.iter().map(|a| a.email.trim().to_lowercase()).collect();
         let mut senders: Vec<String> = Vec::new();
