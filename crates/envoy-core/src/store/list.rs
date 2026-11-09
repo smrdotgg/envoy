@@ -128,6 +128,15 @@ fn text<'a>(r: &'a Row<'_>, i: usize) -> rusqlite::Result<&'a str> {
     }
 }
 
+/// A list being read in pages: the whole list's limit, the first page's rows once handed out
+/// (and how many of the grouper's they came from), and who they're handed to.
+struct Pages<'a> {
+    limit: usize,
+    shown: Vec<Summary>,
+    done: usize,
+    first: &'a mut dyn FnMut(Vec<Summary>),
+}
+
 /// One conversation (or message) in the output, until it's read in full.
 struct Row1 {
     id: i64,
@@ -291,42 +300,27 @@ impl Store {
         let (sql, args) = scan_sql(&scope, &filter, few);
         // One snapshot for the scan, the thread pass and the full reads, while sync writes.
         let _read = self.conn.unchecked_transaction()?;
-        // Rows handed out already, and how many of `g.out` they came from.
-        let mut shown: Vec<Summary> = Vec::new();
-        let mut done = 0;
-        let mut stopped = false;
+        let mut pages = Pages { limit, shown: Vec::new(), done: 0, first };
+        // Every pinned row before any other: they're the list's top, first page or not.
+        let mut passes = Vec::new();
         if !pinned.is_empty() {
-            let (sql, args) = pinned_sql(&pinned, &filter);
-            let mut stmt = self.conn.prepare(&sql)?;
-            let mut rows = stmt.query(params_from_iter(args.iter()))?;
-            while let Some(r) = rows.next()? {
-                if let Took::Full = g.take(r, true)? {
-                    break;
-                }
-            }
+            passes.push(pinned_sql(&pinned, &filter));
         }
-        {
+        passes.push((sql, args));
+        let mut stopped = false;
+        'passes: for (sql, args) in passes {
             let mut stmt = self.conn.prepare(&sql)?;
             let mut rows = stmt.query(params_from_iter(args.iter()))?;
             while let Some(r) = rows.next()? {
-                let mut took = g.take(r, true)?;
-                if matches!(took, Took::Full) && g.limit < limit {
-                    // The first page is full: complete it, hand it out, then read on.
-                    self.complete(&mut g, 0, &scope, &filter)?;
-                    shown = self.read_full(&g.out)?;
-                    done = g.out.len();
-                    first(shown.clone());
-                    g.limit = limit;
-                    took = g.take(r, true)?;
-                }
-                if let Took::Full = took {
+                if self.take_paged(&mut g, r, &mut pages, &scope, &filter)? {
                     stopped = true;
-                    break;
+                    break 'passes;
                 }
             }
         }
         // The conversations shown, completed with their older messages: only needed when the
         // scan stopped early (otherwise it read every match).
+        let Pages { mut shown, done, .. } = pages;
         if conversations && stopped {
             self.complete(&mut g, done, &scope, &filter)?;
         }
@@ -342,6 +336,21 @@ impl Store {
             shown = keys.into_iter().filter_map(|(.., i)| rows[i].take()).collect();
         }
         Ok(shown)
+    }
+
+    /// Takes row `r` into the list: once the first page fills, it's completed and handed out,
+    /// and reading goes on to the whole list's limit. True when the whole list is full.
+    fn take_paged(&self, g: &mut Grouper, r: &Row, pages: &mut Pages, scope: &Scope, filter: &Filter) -> Result<bool> {
+        let mut took = g.take(r, true)?;
+        if matches!(took, Took::Full) && g.limit < pages.limit {
+            self.complete(g, 0, scope, filter)?;
+            pages.shown = self.read_full(&g.out)?;
+            pages.done = g.out.len();
+            (pages.first)(pages.shown.clone());
+            g.limit = pages.limit;
+            took = g.take(r, true)?;
+        }
+        Ok(matches!(took, Took::Full))
     }
 
     /// The mailboxes of `view` whose woken messages ([`flags::WOKEN`]) come first: the inbox's.

@@ -5442,6 +5442,22 @@ mod tests {
     }
 
     #[test]
+    fn every_pinned_message_comes_before_other_mail_whatever_the_first_page() {
+        // Three back from a snooze (older), three not (newer); the first page holds two rows.
+        let st = snooze_setup(&[]);
+        let pinned: Vec<MessageId> = (1..=3).map(|uid| message(&st, "INBOX", uid, &format!("<{uid}@x>"), "", flags::WOKEN)).collect();
+        let other: Vec<MessageId> = (7..=9).map(|uid| message(&st, "INBOX", uid, &format!("<{uid}@x>"), "", 0)).collect();
+        let inbox = View::Role { account: None, role: Role::Inbox };
+        let mut first = Vec::new();
+        let rows = st.list_paged(&inbox, &Query::default(), false, 100, &HashSet::new(), 2, &mut |page| first = page).unwrap();
+        let ids = |rows: &[Summary]| rows.iter().map(|s| s.id).collect::<Vec<_>>();
+        let mut want: Vec<MessageId> = pinned.iter().rev().copied().collect();
+        want.extend(other.iter().rev());
+        assert_eq!(ids(&rows), want, "all three pinned first");
+        assert_eq!(ids(&first), want[..2], "the first page is the list's top");
+    }
+
+    #[test]
     fn two_copies_of_a_woken_message_in_the_inbox_list_once() {
         // Two Envoys without MOVE copied the same message back at once: both copies stay on the
         // server (nothing is deleted on a guess), and the list shows one.
