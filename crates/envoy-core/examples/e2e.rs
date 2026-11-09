@@ -480,6 +480,9 @@ fn scenario(pass: Pass) {
     watch_holds(&mut d, vec![Hold { what: "the delete", deadline: due, on_server: Box::new(|| !probe.live("Trash").is_empty() || !probe.live("INBOX").contains(&digest.subject)) }]);
     d.until("in Trash on the server", 10, |_| (probe.live("Trash") == [digest.subject.clone()] && !probe.live("INBOX").contains(&digest.subject)).then_some(()));
     println!("✓ deleted to Trash, after the window and not before");
+    // The foreground connection has sat idle about 30 s here, GreenMail's limit, so it's often
+    // gone: that must cost a fresh connection, not this wait (before, a SELECT on the closed
+    // connection read as an empty Trash, and nothing synced it again for the 300 s interval).
     let trash = View::Role { account: Some(ACCOUNT.into()), role: Role::Trash };
     d.send(Command::Watch { view: trash.clone() });
     let trashed = d.until("the message in Trash here", 20, |d| d.list(&trash, "", false).into_iter().find(|s| s.subject == digest.subject));

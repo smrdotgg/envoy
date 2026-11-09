@@ -444,6 +444,17 @@ enum Job {
     Sync,
 }
 
+impl Job {
+    /// What it does, for the log.
+    fn what(&self) -> String {
+        match self {
+            Job::Bodies { mailbox, uids, .. } => format!("download {} message(s) in {mailbox}", uids.len()),
+            Job::SyncMailbox(mailbox) => format!("sync {mailbox}"),
+            Job::Sync => "check for mail".to_owned(),
+        }
+    }
+}
+
 /// What to send the UI once [`Job::Bodies`] has the messages.
 #[derive(Debug)]
 enum Reply {
@@ -1587,10 +1598,16 @@ async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedRece
             },
         };
         let Some(account) = shared.account(&id) else { return };
-        if let Err(e) = on_foreground(&mut ImapForeground { shared: &shared, account: &account }, &mut session, &job).await {
-            log::warn!("{}: foreground: {e:#}", account.email);
-            let _ = fallback.send(job);
-            notify.notify_one();
+        // Said as it starts and as it ends: a job that stalls shows, not only one that fails.
+        let (what, started) = (job.what(), Instant::now());
+        log::debug!("{}: foreground: {what}", account.email);
+        match on_foreground(&mut ImapForeground { shared: &shared, account: &account }, &mut session, &job).await {
+            Ok(()) => log::debug!("{}: foreground: {what}: done in {:?}", account.email, started.elapsed()),
+            Err(e) => {
+                log::warn!("{}: foreground: {what}: {e:#} (after {:?}; left to the background connection)", account.email, started.elapsed());
+                let _ = fallback.send(job);
+                notify.notify_one();
+            }
         }
     }
 }
