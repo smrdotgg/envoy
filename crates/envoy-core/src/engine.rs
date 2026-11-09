@@ -970,10 +970,12 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             // The view is what's watched, not the mailboxes it has now: workers read those again
             // every round (Snoozed's buckets wake, go and come while it's open).
             let accts: Vec<String> = shared.accounts.read().map(|a| a.iter().map(|a| a.id.clone()).collect()).unwrap_or_default();
+            // Synced at once: a few of each account's (Snoozed's soonest to wake); the worker
+            // gets to the rest a few a round.
             let targets: Vec<(String, String)> = shared.with_writer(|st| {
                 let mut targets = Vec::new();
                 for a in &accts {
-                    targets.extend(st.watched_boxes(&view, a)?.into_iter().map(|m| (a.clone(), m)));
+                    targets.extend(st.watched_boxes(&view, a)?.into_iter().take(LOOK_BATCH).map(|m| (a.clone(), m)));
                 }
                 Ok(targets)
             })?;
@@ -1988,12 +1990,37 @@ async fn sync_one(shared: &Arc<Shared>, account: &Account, session: &mut imap::C
 /// STATUS each ([`changed_since_synced`]), while one is watched.
 const LOOK_EVERY: Duration = Duration::from_secs(30);
 
+/// How many of a view's mailboxes IDLE doesn't cover a round looks at, or syncs with the
+/// inbox ([`look_batch`]): Snoozed may have hundreds of buckets. The soonest to wake are in
+/// every batch; the rest take turns. A look stops starting STATUSes after `LOOK_BUDGET`.
+const LOOK_BATCH: usize = 8;
+const LOOK_SOONEST: usize = 2;
+const LOOK_BUDGET: Duration = Duration::from_secs(5);
+
+/// This round's share of `boxes`, in the view's order (Snoozed's soonest to wake first): all of
+/// them if they're few, else the first [`LOOK_SOONEST`] and the next of the rest from `turn`,
+/// which moves on. Wakes don't wait on it: they go by the buckets' times.
+fn look_batch(boxes: &[String], turn: &mut usize) -> Vec<String> {
+    if boxes.len() <= LOOK_BATCH {
+        return boxes.to_vec();
+    }
+    let (soonest, rest) = boxes.split_at(LOOK_SOONEST);
+    let (from, n) = (*turn % rest.len(), LOOK_BATCH - LOOK_SOONEST);
+    *turn = from + n;
+    soonest.iter().chain(rest.iter().cycle().skip(from).take(n)).cloned().collect()
+}
+
 /// Which of `mailboxes` changed since their last sync ([`Shared::synced`]), by a STATUS each
-/// ([`imap::contents`]); one with no sync on record counts as changed. One the server won't
-/// tell of (deleted meanwhile, say) doesn't; a lost connection ends it.
-async fn changed_since_synced(shared: &Shared, account: &str, session: &mut imap::Connection<impl imap::Io>, mailboxes: &[String]) -> Result<Vec<String>> {
-    let mut changed = Vec::new();
-    for m in mailboxes {
+/// ([`imap::contents`]), started while less than `budget` has passed (the first always); one
+/// with no sync on record counts as changed. One the server won't tell of (deleted meanwhile,
+/// say) doesn't; a lost connection ends it.
+async fn changed_since_synced(shared: &Shared, account: &str, session: &mut imap::Connection<impl imap::Io>, mailboxes: &[String], budget: Duration) -> Result<Vec<String>> {
+    let (mut changed, started) = (Vec::new(), Instant::now());
+    for (i, m) in mailboxes.iter().enumerate() {
+        if i > 0 && started.elapsed() >= budget {
+            log::debug!("{account}: looked at {i} of {} mailboxes in {:?}: the rest next time", mailboxes.len(), started.elapsed());
+            break;
+        }
         match imap::contents(session, m).await {
             Ok(now) => {
                 let synced = shared.synced.lock().ok().and_then(|s| s.get(&(account.to_owned(), m.clone())).copied());
@@ -2088,8 +2115,9 @@ async fn session_loop<T: imap::Io>(
     let mut inbox_dirty = true;
     // The inbox as its last sync found it: mail that came after is checked for before IDLE.
     let mut inbox_synced: Option<imap::Contents> = None;
-    // The watched mailboxes IDLE doesn't cover, and when they were last synced or looked at.
-    let (mut looked, mut last_look) = (Vec::<String>::new(), Instant::now());
+    // The watched mailboxes IDLE doesn't cover, when they were last synced or looked at, and
+    // whose turn it is ([`look_batch`]).
+    let (mut looked, mut last_look, mut turn) = (Vec::<String>::new(), Instant::now(), 0);
     loop {
         while let Ok(j) = jobs.try_recv() {
             pending.push(j);
@@ -2161,6 +2189,8 @@ async fn session_loop<T: imap::Io>(
         // The view on screen's mailboxes as they are now: after the folder list, wakes and cleanup.
         let view = shared.watched.lock().ok().and_then(|w| w.clone());
         let (mailboxes, watched) = shared.with_writer(|st| Ok((st.mailboxes(&id)?, view.map_or(Ok(Vec::new()), |v| st.watched_boxes(&v, &id))?)))?;
+        // Watched mailboxes IDLE doesn't cover (any but the inbox), in the view's order.
+        let beyond_idle: Vec<String> = watched.iter().filter(|w| mailboxes.iter().all(|m| m.role != Role::Inbox || m.name != w.as_str())).cloned().collect();
         // Which mailboxes to sync this round.
         let mut targets: Vec<String> = Vec::new();
         let mut push = |name: &str| {
@@ -2175,8 +2205,9 @@ async fn session_loop<T: imap::Io>(
             if let Some(inbox) = mailboxes.iter().find(|m| m.role == Role::Inbox) {
                 push(&inbox.name);
             }
-            for w in &watched {
-                push(w);
+            // With the inbox, the view's other mailboxes: a folder, or a few of Snoozed's buckets.
+            for w in look_batch(&beyond_idle, &mut turn) {
+                push(&w);
             }
         }
         if full_due {
@@ -2184,18 +2215,16 @@ async fn session_loop<T: imap::Io>(
                 push(&m.name);
             }
         }
-        // Watched mailboxes IDLE doesn't cover (any but the inbox), between their syncs with the
-        // inbox: looked at every LOOK_EVERY, and as soon as ops replayed (one may have moved mail
-        // in), and synced if they changed. Mail filed into the one on screen, by another client
-        // or from another folder, shows in seconds rather than at the next full sync. One just
-        // opened is being synced by the foreground connection: its first look comes later.
-        let mut beyond_idle: Vec<String> = watched.iter().filter(|w| mailboxes.iter().all(|m| m.role != Role::Inbox || m.name != w.as_str())).cloned().collect();
-        beyond_idle.sort();
+        // Between their syncs with the inbox, they're looked at every LOOK_EVERY, and as soon as
+        // ops replayed (one may have moved mail in), a batch at a time, and synced if they
+        // changed. Mail filed into the one on screen, by another client or from another folder,
+        // shows in seconds rather than at the next full sync. One just opened is being synced by
+        // the foreground connection: its first look comes later.
         if inbox_dirty || full_due || beyond_idle != looked {
             looked.clone_from(&beyond_idle);
             last_look = Instant::now();
         } else if !beyond_idle.is_empty() && (ran_ops || last_look.elapsed() >= LOOK_EVERY) {
-            for m in changed_since_synced(shared, &id, &mut session, &beyond_idle).await? {
+            for m in changed_since_synced(shared, &id, &mut session, &look_batch(&beyond_idle, &mut turn), LOOK_BUDGET).await? {
                 push(&m);
             }
             last_look = Instant::now();
@@ -2234,9 +2263,8 @@ async fn session_loop<T: imap::Io>(
         }
         inbox_dirty = false;
         if full_due {
-            // Buckets done with are empty and left alone: not counted.
-            let done = shared.with_writer(|st| st.done_buckets(&id))?;
-            for m in mailboxes.iter().filter(|m| m.selectable && !done.contains(&m.name)) {
+            // Buckets aren't counted (the sidebar shows none of theirs): there may be hundreds.
+            for m in mailboxes.iter().filter(|m| m.selectable && m.role != Role::Snoozed) {
                 match imap::status(&mut session, &m.name).await {
                     Ok((unread, total)) => shared.with_writer(|st| st.set_counts(&id, &m.name, unread, total))?,
                     Err(e) if imap::is_lost(&e) => return Err(e),
@@ -3900,6 +3928,26 @@ mod tests {
         assert!(session.is_some(), "the new connection is kept for the next job");
     }
 
+    #[test]
+    fn a_look_takes_a_few_the_soonest_always_the_rest_in_turns() {
+        let few: Vec<String> = (0..LOOK_BATCH).map(|i| i.to_string()).collect();
+        let mut turn = 0;
+        assert_eq!(look_batch(&few, &mut turn), few, "a folder, or a few buckets: all");
+        let many: Vec<String> = (0..20).map(|i| i.to_string()).collect();
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            let batch = look_batch(&many, &mut turn);
+            assert_eq!((batch.len(), &batch[..LOOK_SOONEST]), (LOOK_BATCH, &many[..LOOK_SOONEST]), "{batch:?}");
+            seen.extend(batch);
+        }
+        assert_eq!(seen.len(), many.len(), "every one within three turns: {seen:?}");
+        // The list changing under it (buckets woken, made): still a batch, still the soonest first.
+        let fewer = &many[..12];
+        let batch = look_batch(fewer, &mut turn);
+        assert_eq!((batch.len(), &batch[..LOOK_SOONEST]), (LOOK_BATCH, &fewer[..LOOK_SOONEST]));
+        assert!(batch.iter().all(|b| fewer.contains(b)));
+    }
+
     #[tokio::test]
     async fn a_watched_mailbox_is_synced_when_its_status_moved_on_since_its_sync() {
         let (shared, _rx) = engine_with(setup());
@@ -3921,16 +3969,20 @@ mod tests {
         .await;
         let watched = ["Junk", "Archive", "Remade", "Gone", "Receipts"].map(String::from);
         // Receipts has no sync on record: it's synced too.
-        assert_eq!(changed_since_synced(&shared, "a", &mut session, &watched).await.unwrap(), ["Junk", "Remade", "Receipts"]);
+        assert_eq!(changed_since_synced(&shared, "a", &mut session, &watched, LOOK_BUDGET).await.unwrap(), ["Junk", "Remade", "Receipts"]);
         assert_eq!(log.lock().unwrap().len(), 1 + watched.len(), "one STATUS each, after the LOGIN");
         // Synced since: nothing to do.
         synced("Junk", 4, 11);
         shared.synced("a", "Remade", imap::Contents { exists: 3, uid_next: Some(10), uid_validity: Some(8) });
         shared.synced("a", "Receipts", imap::Contents { exists: 0, uid_next: Some(1), uid_validity: Some(7) });
-        assert!(changed_since_synced(&shared, "a", &mut session, &watched).await.unwrap().is_empty());
+        assert!(changed_since_synced(&shared, "a", &mut session, &watched, LOOK_BUDGET).await.unwrap().is_empty());
+        // Its time spent, a look starts no more (but always one).
+        let before = log.lock().unwrap().len();
+        changed_since_synced(&shared, "a", &mut session, &watched, Duration::ZERO).await.unwrap();
+        assert_eq!(log.lock().unwrap().len(), before + 1, "one STATUS");
         // A connection lost while looking ends the round, as any lost command does.
         let (mut session, _) = imap::fake::session(|_| Some(imap::fake::HANG_UP.to_owned())).await;
-        assert!(changed_since_synced(&shared, "a", &mut session, &watched).await.is_err_and(|e| imap::is_lost(&e)));
+        assert!(changed_since_synced(&shared, "a", &mut session, &watched, LOOK_BUDGET).await.is_err_and(|e| imap::is_lost(&e)));
     }
 
     // ── drafts ──
@@ -5470,6 +5522,23 @@ mod tests {
         assert_eq!(restarted.next(&buckets, true, t + 4000), None);
     }
 
+    /// Waits for a [`session_loop`] in `task` to finish a round (it says it's idle, waiting), or
+    /// to end.
+    async fn round_done(events: &std::sync::mpsc::Receiver<Event>, task: &tokio::task::JoinHandle<Result<()>>) {
+        for _ in 0..1000 {
+            while let Ok(e) = events.try_recv() {
+                if matches!(e, Event::Sync { state: SyncState::Idle, .. }) {
+                    return;
+                }
+            }
+            if task.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no round finished");
+    }
+
     /// A server for whole rounds of [`session_loop`]: an empty INBOX, the Snoozed parent, and
     /// the buckets in `buckets` (the test changes them as it goes), each empty; MOVE, no IDLE.
     /// A mailbox it hasn't got is NONEXISTENT to SELECT and STATUS, and missing from LIST.
@@ -5510,7 +5579,7 @@ mod tests {
         let (a, b, d, c) = (bucket_of(t - 2 * 3600), bucket_of(t + 3 * 3600), bucket_of(t + 4 * 3600), bucket_of(t + 5 * 3600));
         // From the last run: a's time came while Envoy wasn't running.
         let st = snooze_setup(&[t - 2 * 3600, t + 3 * 3600, t + 4 * 3600]);
-        let (shared, _rx) = engine_with(st);
+        let (shared, events) = engine_with(st);
         shared.accounts.write().unwrap().push(account("a"));
         handle(&shared, &mut HashMap::new(), Command::Watch { view: View::Role { account: Some("a".into()), role: Role::Snoozed } }).await.unwrap();
         let on_server = Arc::new(Mutex::new(vec![a.clone(), b.clone(), d.clone()]));
@@ -5523,38 +5592,89 @@ mod tests {
         });
         let selects = |m: &str| log.lock().unwrap().iter().filter(|c| **c == format!("SELECT \"{m}\"")).count();
         let listed = |m: &str| log.lock().unwrap().iter().any(|c| *c == format!("LIST \"\" \"{m}\""));
-        let until = async |what: &str, done: &dyn Fn() -> bool| {
-            for _ in 0..1000 {
-                if done() || task.is_finished() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        let round = |more: Vec<Job>| {
+            for job in more {
+                jobs.send(job).unwrap();
             }
-            panic!("{what}: {:?}", log.lock().unwrap());
-        };
-        let round = |job: Job| {
-            jobs.send(job).unwrap();
             notify.notify_one();
         };
         // The first round wakes a (empty, and past its stragglers' hour: done with) and syncs
         // the view's other buckets, not a.
-        until("the first round", &|| selects(&b) > 0 && selects(&d) > 0).await;
-        assert!(!task.is_finished());
-        assert_eq!(selects(&a), 1, "a: woken, not synced as a bucket on screen");
+        round_done(&events, &task).await;
+        assert!(!task.is_finished(), "{:?}", log.lock().unwrap());
+        assert_eq!((selects(&a), selects(&b), selects(&d)), (1, 1, 1), "a: woken, not synced as a bucket on screen");
         // d deleted elsewhere: forgotten once it can't be selected, and the session goes on.
         on_server.lock().unwrap().retain(|m| *m != d);
-        round(Job::Sync);
-        until("the round after d went", &|| listed(&d)).await;
+        round(vec![Job::Sync]);
+        round_done(&events, &task).await;
         assert!(!task.is_finished(), "a mailbox gone doesn't end the session: {:?}", log.lock().unwrap());
+        assert!(listed(&d) && selects(&d) == 2, "{:?}", log.lock().unwrap());
         assert!(!shared.with_writer(|st| Ok(st.mailboxes("a")?.iter().any(|m| m.name == d))).unwrap(), "d forgotten");
         // c made elsewhere: synced once the folder list names it. A job for d, from before, is
         // dropped: d is gone.
         on_server.lock().unwrap().push(c.clone());
-        round(Job::SyncMailbox(d.clone()));
-        round(Job::Folders);
-        until("the round after c came", &|| selects(&c) > 0).await;
+        round(vec![Job::SyncMailbox(d.clone()), Job::Folders]);
+        round_done(&events, &task).await;
         assert!(!task.is_finished(), "{:?}", log.lock().unwrap());
-        assert_eq!((selects(&a), selects(&d)), (1, 2), "neither again");
+        assert_eq!((selects(&a), selects(&c), selects(&d)), (1, 1, 2), "c synced; neither a nor d again");
+        task.abort();
+    }
+
+    /// Snoozed open with many buckets: opening it syncs the soonest few at once; every round
+    /// after (the first, news in the inbox, a look) syncs or looks at a few, the soonest to wake
+    /// always among them, the rest in turns; the full round's counts leave buckets out.
+    #[tokio::test]
+    async fn many_buckets_are_synced_and_looked_at_a_few_at_a_time() {
+        let t = now() / 60 * 60;
+        let wakes: Vec<i64> = (0..30).map(|i| t + 3 * 3600 + i * 60).collect();
+        let buckets: Vec<String> = wakes.iter().map(|w| bucket_of(*w)).collect();
+        let (shared, events) = engine_with(snooze_setup(&wakes));
+        shared.accounts.write().unwrap().push(account("a"));
+        // Opening it: the foreground connection gets the soonest few.
+        let (fg, mut fg_jobs) = mpsc::unbounded_channel();
+        let (bg, _bg_jobs) = mpsc::unbounded_channel();
+        let worker = Worker { jobs: bg, now: fg, notify: Arc::new(Notify::new()), task: tokio::spawn(async {}), fg_task: tokio::spawn(async {}) };
+        let mut workers = HashMap::from([("a".to_owned(), worker)]);
+        handle(&shared, &mut workers, Command::Watch { view: View::Role { account: Some("a".into()), role: Role::Snoozed } }).await.unwrap();
+        let opened: Vec<String> = std::iter::from_fn(|| fg_jobs.try_recv().ok()).filter_map(|j| if let Job::SyncMailbox(m) = j { Some(m) } else { None }).collect();
+        assert_eq!(opened, buckets[..8], "the soonest eight, soonest first");
+        let (session, log) = imap::fake::session(loop_server(Arc::new(Mutex::new(buckets.clone())))).await;
+        let (jobs, mut rx) = mpsc::unbounded_channel();
+        let notify = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let (shared, notify) = (shared.clone(), notify.clone());
+            async move { session_loop(&shared, &account("a"), session, &mut rx, &mut Vec::new(), &notify, &mut SnoozeClock::default()).await }
+        });
+        // Each round's commands, once the loop is waiting again.
+        let mut seen = 0;
+        let mut next_round = async || {
+            round_done(&events, &task).await;
+            assert!(!task.is_finished(), "{:?}", log.lock().unwrap());
+            let all = log.lock().unwrap().clone();
+            let round = all[seen..].to_vec();
+            seen = all.len();
+            round
+        };
+        let touched = |round: &[String], verb: &str| -> Vec<String> { buckets.iter().filter(|b| round.iter().any(|c| c.starts_with(&format!("{verb} \"{b}\"")))).cloned().collect() };
+        let first = next_round().await;
+        let synced = touched(&first, "SELECT");
+        assert!(synced.len() <= 8 && synced[..2] == buckets[..2], "{synced:?}");
+        assert!(touched(&first, "STATUS").is_empty(), "no bucket counted: {first:?}");
+        // News in the inbox: a few synced with it, the soonest again, then the next in turn.
+        jobs.send(Job::Sync).unwrap();
+        notify.notify_one();
+        let second = touched(&next_round().await, "SELECT");
+        assert!(second.len() <= 8 && second[..2] == buckets[..2], "{second:?}");
+        assert!(second[2..].iter().all(|b| !synced.contains(b)), "others' turn: {synced:?} then {second:?}");
+        // A look (after ops replayed): a STATUS for a few, and those never synced are synced.
+        let id = shared.with_writer(|st| Ok(message(st, "INBOX", 1, "<1@x>", "", 0))).unwrap();
+        set_flags(&shared, vec![id], flags::SEEN, 0, false).unwrap();
+        notify.notify_one();
+        let look = next_round().await;
+        assert!(look.iter().any(|c| c.starts_with("UID STORE 1")), "{look:?}");
+        let looked = touched(&look, "STATUS");
+        assert!(!looked.is_empty() && looked.len() <= 8 && looked[..2] == buckets[..2], "{looked:?}");
+        assert!(touched(&look, "SELECT").iter().all(|b| looked.contains(b)), "{look:?}");
         task.abort();
     }
 
