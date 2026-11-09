@@ -888,6 +888,43 @@ const BORDER_STYLE: [&str; 4] = ["border-top-style", "border-right-style", "bord
 const BORDER_WIDTH: [&str; 4] = ["border-top-width", "border-right-width", "border-bottom-width", "border-left-width"];
 const BORDER_COLOR: [&str; 4] = ["border-top-color", "border-right-color", "border-bottom-color", "border-left-color"];
 
+/// Whether a picture here (`<img>`, or a box's background) is a tracking pixel or a spacer:
+/// at most 3 px wide or tall as browsers size it ([`picture_side`]).
+fn tiny(h: &Handle, st: &[(Rc<str>, Rc<str>)], size: f32) -> bool {
+    picture_side(h, st, size, "width").is_some_and(|w| w <= 3.0) || picture_side(h, st, size, "height").is_some_and(|v| v <= 3.0)
+}
+
+/// An element's effective width or height in px, where it can be told without layout: the CSS
+/// size over the attribute (`width="1"`), capped by `max-width`/`max-height` and raised by
+/// `min-width`/`min-height`. CSS `auto`, and values browsers reject (negative ones), leave the
+/// attribute in charge; percentages and other keywords make the size unknown (None) unless a
+/// cap says otherwise.
+fn picture_side(h: &Handle, st: &[(Rc<str>, Rc<str>)], size: f32, side: &str) -> Option<f32> {
+    // Some(px), Some(None) for unknown, None to fall back to the attribute.
+    let css = |k: &str| -> Option<Option<f32>> {
+        let v = style(st, k)?.trim();
+        if v == "auto" || v == "none" {
+            return None;
+        }
+        match length(v, size) {
+            Some(n) if n >= 0.0 && !v.ends_with('%') => Some(Some(n)),
+            Some(n) if n < 0.0 => None,
+            _ => Some(None),
+        }
+    };
+    let declared = match css(side) {
+        Some(px) => px,
+        None => attr(h, side).and_then(|v| v.trim().trim_end_matches("px").trim().parse::<f32>().ok()).filter(|n| n.is_finite() && *n >= 0.0),
+    };
+    let max = css(&format!("max-{side}")).flatten();
+    let min = css(&format!("min-{side}")).flatten().unwrap_or(0.0);
+    let upper = match (declared, max) {
+        (Some(d), Some(m)) => Some(d.min(m)),
+        (d, m) => d.or(m),
+    };
+    upper.map(|u| u.max(min))
+}
+
 fn box_style(h: &Handle, t: &str, st: &[(Rc<str>, Rc<str>)], ctx: &mut Ctx, cellpadding: f32) -> BoxStyle {
     let mut b = BoxStyle { align: ctx.align, ..BoxStyle::default() };
     // `<table align>` places the table; it doesn't align what's inside.
@@ -922,11 +959,8 @@ fn box_style(h: &Handle, t: &str, st: &[(Rc<str>, Rc<str>)], ctx: &mut Ctx, cell
         b.bg_image = Some(u);
     }
     // A picture behind a box a few pixels across is a tracking pixel, as for `<img>`.
-    if b.bg_image.is_some() {
-        let side = |a: &str, k: &str| style(st, k).and_then(|v| length(v, size)).or_else(|| attr(h, a).and_then(|v| v.trim().trim_end_matches("px").trim().parse::<f32>().ok()));
-        if side("width", "width").is_some_and(|w| w <= 3.0) || side("height", "height").is_some_and(|v| v <= 3.0) {
-            b.bg_image = None;
-        }
+    if b.bg_image.is_some() && tiny(h, st, size) {
+        b.bg_image = None;
     }
     for (i, k) in PADDING.iter().enumerate() {
         b.pad[i] = style(st, k).and_then(|v| length(v, size)).unwrap_or(cellpadding).clamp(0.0, 80.0);
@@ -1513,12 +1547,11 @@ impl Builder {
             Some(Len::Px(w)) => Some(w),
             _ => None,
         };
-        let zero_attr = |a: &str| attr(h, a).is_some_and(|v| v.trim().trim_end_matches("px").trim() == "0");
         let max = style(st, "max-width").and_then(px);
         let width = attr(h, "width").as_deref().and_then(px).or_else(|| style(st, "width").and_then(px)).map(|w| max.map_or(w, |m| w.min(m))).or(max);
         let height = attr(h, "height").as_deref().and_then(px).or_else(|| style(st, "height").and_then(px));
         // Tracking pixels and spacers.
-        if width.is_some_and(|w| w <= 3.0) || height.is_some_and(|h| h <= 3.0) || zero_attr("width") || zero_attr("height") {
+        if tiny(h, st, ctx.size()) {
             return;
         }
         if !usable_src(&src) {
@@ -2246,6 +2279,24 @@ mod tests {
                <img src="https://tracker.example/pixel.gif" width="1" height="1">"#,
         );
         assert!(doc.images.iter().all(|u| !u.contains("tracker.example") && !u.contains("empty")), "{:?}", doc.images);
+    }
+
+    #[test]
+    fn tiny_by_max_width_or_height_is_tiny() {
+        // A box or picture capped at a few pixels by `max-width`/`max-height` is as small as
+        // one sized so, whatever its width says; `min-*` can make it larger again.
+        let doc = parse(
+            r#"<div style="width:600px;max-width:1px;background:url(https://tracker.example/max-width)">x</div>
+               <table><tr><td style="max-height:2px" background="https://tracker.example/max-height">y</td></tr></table>
+               <table><tr><td width="600" style="max-width:0" background="https://tracker.example/zero">z</td></tr></table>
+               <img src="https://tracker.example/img-max-height.gif" style="max-height:1px">
+               <img src="https://tracker.example/img-css.gif" width="600" style="width:1px">
+               <img src="https://tracker.example/img-auto.gif" width="1" height="1" style="width:auto;height:auto">
+               <div style="max-width:2px;min-width:300px;background:url(https://img.example/min.jpg)">kept</div>
+               <img src="https://img.example/wide.png" width="1" style="width:100%">
+               <img src="https://img.example/hero.png" width="600" style="max-width:100%;height:auto">"#,
+        );
+        assert_eq!(doc.images, ["https://img.example/min.jpg", "https://img.example/wide.png", "https://img.example/hero.png"]);
     }
 
     #[test]
