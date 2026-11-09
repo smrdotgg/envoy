@@ -88,14 +88,17 @@ A feasibility study of live child web views concluded against them:
   scheme-less paths, which a `file://` page resolves to local files); remote pictures stay only
   when they'd load in Envoy, tracking pixels excluded. CSS `url()`s follow the same rule, and
   `<` in sheets is escaped. A strict CSP, no referrer and no DNS prefetching come first in
-  `<head>`; a UTF-8 byte-order mark first in the file. The result is parsed back and checked
-  against the same allowlist; if it fails, the file holds the message's text instead.
+  `<head>`; a UTF-8 byte-order mark and `<!DOCTYPE html>` first in the file. The result is
+  parsed back and checked against the same allowlist; if it fails, the file holds the message's
+  text instead.
 - **"Open original" opens the message as received**, as an `.eml` file for the system's mail
   viewer, not as an `.html` file in a browser that would ignore the image setting.
 - **Exported files are private.** Both go to a folder only the user can open (Envoy's cache
   folder on Linux, not the shared `/tmp`; the per-user temporary folder on macOS and Windows),
   created 0700, each file 0600, created exclusively under a random name, and removed after a
-  day.
+  day. When the default app for the file's type on Linux is a Snap, which can't read hidden
+  folders in home, the folder is `Downloads/Envoy` instead, with the same protections and a
+  `.trackerignore` so desktop search doesn't index mail.
 - **Families map to generic faces.** Sans → the app's sans, mono → its mono, serif → a system
   serif by name (Georgia; DejaVu Serif on Linux). Rune only registers its bundled faces and a
   few system families (symbols, CJK, mono), so the serif request falls back to the sans face
