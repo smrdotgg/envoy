@@ -48,15 +48,15 @@ const SAMPLES: &[Sample] = &[
 const SNOOZED_TOMORROW: &str = "snoozed:tomorrow";
 const SNOOZED_NEXT_WEEK: &str = "snoozed:nextweek";
 
-/// A sample's mailbox: a snooze bucket for its preset's time, from now, or as it says.
+/// When a sample snoozed until a preset wakes, from now.
+fn wake_of(sample: &str) -> Option<i64> {
+    let preset = sample.strip_prefix("snoozed:")?;
+    Some(envoy_core::snooze::presets(&chrono::Local::now()).into_iter().find(|p| p.id == preset).map_or(now() + 86_400, |p| p.at))
+}
+
+/// A sample's mailbox: a snooze bucket for its preset's time, or as it says.
 fn mailbox_of(sample: &str) -> String {
-    match sample.strip_prefix("snoozed:") {
-        Some(preset) => {
-            let at = envoy_core::snooze::presets(&chrono::Local::now()).into_iter().find(|p| p.id == preset).map_or(now() + 86_400, |p| p.at);
-            envoy_core::snooze::bucket("Snoozed", "/", at)
-        }
-        None => sample.to_owned(),
-    }
+    wake_of(sample).map_or_else(|| sample.to_owned(), |at| envoy_core::snooze::bucket("Snoozed", "/", at))
 }
 
 const DRAFTS: &str = "[Gmail]/Drafts";
@@ -83,7 +83,7 @@ pub fn account() -> Account {
 }
 
 fn mailbox(name: &str, display: &str, role: Role, unread: u32) -> Mailbox {
-    Mailbox { account: ACCOUNT.into(), name: name.into(), display: display.into(), role, unread, total: 100, depth: 0, selectable: true }
+    Mailbox { account: ACCOUNT.into(), name: name.into(), display: display.into(), role, unread, total: 100, depth: 0, selectable: true, wake: None }
 }
 
 fn now() -> i64 {
@@ -141,7 +141,7 @@ pub fn list_for(view: &View) -> Vec<Summary> {
             View::Role { role: Role::Inbox, .. } => m.mailbox == "INBOX",
             View::Role { role: Role::Sent, .. } => m.mailbox.contains("Sent"),
             View::Role { role: Role::Drafts, .. } => m.mailbox == DRAFTS,
-            View::Role { role: Role::Snoozed, .. } => envoy_core::snooze::wake_of(&m.mailbox).is_some(),
+            View::Role { role: Role::Snoozed, .. } => m.mailbox.starts_with("Snoozed/"),
             View::Role { role: Role::Flagged, .. } | View::Starred { .. } => m.flagged(),
             View::Mailbox { mailbox, .. } => &m.mailbox == mailbox,
             _ => false,
@@ -340,8 +340,8 @@ pub fn populate(app: &mut App) {
             mailbox("[Gmail]/Spam", "Spam", Role::Junk, 0),
             mailbox("[Gmail]/Trash", "Trash", Role::Trash, 0),
             mailbox("Snoozed", "Snoozed", Role::Snoozed, 0),
-            mailbox(&mailbox_of(SNOOZED_TOMORROW), "Snoozed", Role::Snoozed, 0),
-            mailbox(&mailbox_of(SNOOZED_NEXT_WEEK), "Snoozed", Role::Snoozed, 0),
+            Mailbox { wake: wake_of(SNOOZED_TOMORROW), ..mailbox(&mailbox_of(SNOOZED_TOMORROW), "Snoozed", Role::Snoozed, 0) },
+            Mailbox { wake: wake_of(SNOOZED_NEXT_WEEK), ..mailbox(&mailbox_of(SNOOZED_NEXT_WEEK), "Snoozed", Role::Snoozed, 0) },
             Mailbox { depth: 0, ..mailbox("Receipts", "Receipts", Role::Other, 0) },
             Mailbox { depth: 0, ..mailbox("Travel", "Travel", Role::Other, 1) },
             Mailbox { depth: 0, ..mailbox("Work", "Work", Role::Other, 0) },

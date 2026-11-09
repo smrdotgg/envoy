@@ -2332,7 +2332,7 @@ fn store_listing(st: &Store, account: &str, listed: &[imap::ListedMailbox]) -> R
     }
     // Where snoozes go, decided from the whole list, as every Envoy decides it.
     let parent = imap::snooze_parent(listed);
-    st.set_snooze_parent(account, &parent.name, &parent.delimiter)?;
+    st.set_snooze_parent(account, &parent.name, &parent.delimiter, parent.native.as_deref().unwrap_or(""))?;
     st.retain_mailboxes(account, &listed.iter().map(|m| m.name.clone()).collect::<Vec<_>>())
 }
 
@@ -2661,13 +2661,17 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
     Ok(any)
 }
 
-/// Runs an op that acts on a message by UID: a snooze through [`snooze_move`], the rest as
-/// they are.
+/// Runs an op that acts on a message by UID: a move into one of the account's buckets
+/// ([`Store::bucket_of`]) through [`snooze_move`], the rest as they are.
 async fn run_located(shared: &Shared, account: &Account, runner: &mut impl OpRunner, q: &mut QueuedOp) -> Result<()> {
-    if matches!(&q.op, Op::Move { dest, .. } if snooze::wake_of(dest).is_some()) {
-        return snooze_move(shared, account, runner, q).await;
+    let bucket = match &q.op {
+        Op::Move { dest, .. } => shared.with_writer(|st| st.bucket_of(&account.id, dest))?,
+        _ => None,
+    };
+    match bucket {
+        Some((parent, wake)) => snooze_move(shared, account, runner, q, parent, wake).await,
+        None => runner.run(&q.op, &q.at).await,
     }
-    runner.run(&q.op, &q.at).await
 }
 
 /// Replays a snooze: a move into a bucket ([`crate::snooze`]). Its time too close, or past, it
@@ -2675,12 +2679,11 @@ async fn run_located(shared: &Shared, account: &Account, runner: &mut impl OpRun
 /// inbox, or back in it from elsewhere. Otherwise the bucket is made (once a pass), under
 /// `Envoy Snoozed` if the server won't have `Snoozed` (the op, and the account's choice, follow),
 /// and known here at once, for its wake and the Snoozed view; then the message moves in.
-async fn snooze_move(shared: &Shared, account: &Account, runner: &mut impl OpRunner, q: &mut QueuedOp) -> Result<()> {
+async fn snooze_move(shared: &Shared, account: &Account, runner: &mut impl OpRunner, q: &mut QueuedOp, parent: String, wake: i64) -> Result<()> {
     let (mailbox, uid, dest) = match &q.op {
         Op::Move { mailbox, uid, dest } => (mailbox.clone(), *uid, dest.clone()),
         _ => return runner.run(&q.op, &q.at).await,
     };
-    let (Some(wake), Some(parent)) = (snooze::wake_of(&dest), snooze::parent_of(&dest).map(str::to_owned)) else { return runner.run(&q.op, &q.at).await };
     if snooze::wakes_instead(wake, now()) {
         log::info!("{}: a snooze reached the server at its time ({dest}): woken instead", account.email);
         runner.run(&Op::SetFlags { mailbox: mailbox.clone(), uid, add: flags::WOKEN, remove: flags::SEEN }, &q.at).await?;
@@ -2698,7 +2701,8 @@ async fn snooze_move(shared: &Shared, account: &Account, runner: &mut impl OpRun
         }
         return Ok(());
     }
-    let delimiter = dest[parent.len()..].chars().next().map(String::from).unwrap_or_else(|| "/".to_owned());
+    // What's between the parent and the stamp.
+    let delimiter = dest.get(parent.len()..dest.len().saturating_sub(14)).filter(|d| !d.is_empty()).unwrap_or("/").to_owned();
     match runner.create_bucket(&parent, &dest).await {
         Ok(()) => {}
         Err(e) if e.downcast_ref::<imap::CantCreate>().is_some() && snooze::fallback_of(&parent).is_some() => {
@@ -2709,7 +2713,7 @@ async fn snooze_move(shared: &Shared, account: &Account, runner: &mut impl OpRun
             let op = Op::Move { mailbox, uid, dest: moved };
             shared.with_writer(|st| {
                 st.transaction(|st| {
-                    st.set_snooze_parent(&account.id, &fallback, &delimiter)?;
+                    st.move_snooze_parent(&account.id, &fallback, &delimiter)?;
                     st.rewrite_op(q.id, &op)
                 })
             })?;
@@ -5035,7 +5039,7 @@ mod tests {
     /// [`setup`], with snoozes going to `Snoozed` and a bucket for each time in `buckets`.
     fn snooze_setup(buckets: &[i64]) -> Store {
         let st = setup();
-        st.set_snooze_parent("a", "Snoozed", "/").unwrap();
+        st.set_snooze_parent("a", "Snoozed", "/", "").unwrap();
         for wake in buckets {
             st.upsert_mailbox("a", &snooze::bucket("Snoozed", "/", *wake), "Snoozed", Role::Snoozed, "/", true).unwrap();
         }
@@ -5082,7 +5086,7 @@ mod tests {
     #[test]
     fn a_conversation_snoozes_whole_and_each_account_to_its_own_bucket() {
         let st = snooze_setup(&[]);
-        st.set_snooze_parent("b", "INBOX.Snoozed", ".").unwrap();
+        st.set_snooze_parent("b", "INBOX.Snoozed", ".", "").unwrap();
         let first = message(&st, "INBOX", 1, "<1@x>", "", flags::SEEN);
         let reply = message(&st, "INBOX", 2, "<2@x>", "<1@x>", 0);
         let theirs = message_in(&st, "b", "INBOX", 1, "<3@x>", "", 0);
@@ -5207,6 +5211,22 @@ mod tests {
         // Before any listing: Snoozed, with the inbox's delimiter.
         st.upsert_mailbox("c", "INBOX", "Inbox", Role::Inbox, ".", true).unwrap();
         assert_eq!(st.snooze_bucket("c", 1_794_297_600).unwrap(), "Snoozed.20261110T0800Z");
+    }
+
+    #[test]
+    fn only_envoys_buckets_wake_and_the_servers_own_snoozed_mailbox_never() {
+        let st = setup();
+        // The server's own snoozed mailbox happens to be named like a bucket; a decoy under
+        // another parent and with another delimiter is listed as Snoozed by mistake.
+        let native = "Snoozed/20261110T0800Z";
+        store_listing(&st, "a", &[listed("INBOX", Role::Inbox), imap::ListedMailbox { native_snoozed: true, ..listed(native, Role::Snoozed) }]).unwrap();
+        st.upsert_mailbox("a", "Snoozed/20261111T0800Z", "Snoozed", Role::Snoozed, "/", true).unwrap();
+        st.upsert_mailbox("a", "Snoozed.20261112T0800Z", "Snoozed", Role::Snoozed, "/", true).unwrap();
+        assert_eq!(st.snooze_parent("a").unwrap().0, "Snoozed", "a native mailbox by another name leaves the parent be");
+        let wakes: Vec<(String, Option<i64>)> = st.mailboxes("a").unwrap().into_iter().filter(|m| m.role == Role::Snoozed).map(|m| (m.name, m.wake)).collect();
+        assert_eq!(wakes, [("Snoozed.20261112T0800Z".to_owned(), None), (native.to_owned(), None), ("Snoozed/20261111T0800Z".to_owned(), Some(1_794_384_000))]);
+        assert_eq!(st.buckets("a").unwrap(), [("Snoozed/20261111T0800Z".to_owned(), 1_794_384_000)]);
+        assert_eq!(st.bucket_of("a", native).unwrap(), None, "never moved into, never woken");
     }
 
     /// The server's side of snoozes for [`snooze_cycle`]: what's in each bucket (Message-IDs),

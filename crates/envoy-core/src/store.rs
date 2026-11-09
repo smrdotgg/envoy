@@ -189,11 +189,13 @@ CREATE TABLE IF NOT EXISTS unfiled_sent (
     error TEXT NOT NULL,
     at INTEGER NOT NULL
 );
--- Where each account's snooze buckets go, as its last mailbox list decided (snooze.rs).
+-- Where each account's snooze buckets go, as its last mailbox list decided, and the server's own
+-- snoozed mailbox, if it has one (snooze.rs).
 CREATE TABLE IF NOT EXISTS snooze_parents (
     account TEXT PRIMARY KEY,
     parent TEXT NOT NULL,
-    delimiter TEXT NOT NULL
+    delimiter TEXT NOT NULL,
+    native TEXT NOT NULL DEFAULT ''
 );
 -- Messages this Envoy woke from a snooze, by Message-ID: pinned when they land in the inbox,
 -- for servers that can't keep `$new` (snooze.rs). Forgotten once dealt with, or after a while.
@@ -242,6 +244,8 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     // How many of `recipients` (To, then Cc) were in To, -1 where not known: whether mail is to
     // you, whatever your addresses are by then.
     ("messages", "to_count", "ALTER TABLE messages ADD COLUMN to_count INTEGER NOT NULL DEFAULT -1"),
+    // The server's own snoozed mailbox, for caches made by this branch before it was recorded.
+    ("snooze_parents", "native", "ALTER TABLE snooze_parents ADD COLUMN native TEXT NOT NULL DEFAULT ''"),
 ];
 
 /// [`MIGRATIONS`]'s step that gives queued ops a generation ([`At`]): unknown for the ones
@@ -497,6 +501,23 @@ fn migrate(conn: &Connection) -> Result<()> {
 
 fn has_table(conn: &Connection, name: &str) -> Result<bool> {
     Ok(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", params![name], |r| r.get::<_, i64>(0))? > 0)
+}
+
+/// What counts as an account's snooze bucket: a stamp under either parent, by its delimiter,
+/// never the server's own snoozed mailbox ([`crate::snooze::bucket_wake`]).
+struct BucketLayout {
+    parents: [String; 2],
+    delimiter: String,
+    native: String,
+}
+
+impl BucketLayout {
+    fn wake(&self, name: &str) -> Option<(&str, i64)> {
+        if name == self.native {
+            return None;
+        }
+        crate::snooze::bucket_wake(name, &self.parents, &self.delimiter)
+    }
 }
 
 /// A change queued for the server.
@@ -896,6 +917,7 @@ impl Store {
     }
 
     pub fn mailboxes(&self, account: &str) -> Result<Vec<Mailbox>> {
+        let layout = self.bucket_layout(account)?;
         let mut stmt =
             self.conn.prepare("SELECT account, name, display, role, delimiter, selectable, unread, total FROM mailboxes WHERE account = ?1")?;
         let mut out: Vec<Mailbox> = stmt
@@ -903,16 +925,9 @@ impl Store {
                 let name: String = r.get(1)?;
                 let delim: String = r.get(4)?;
                 let depth = if delim.is_empty() { 0 } else { name.matches(delim.as_str()).count() as u8 };
-                Ok(Mailbox {
-                    account: r.get(0)?,
-                    name,
-                    display: r.get(2)?,
-                    role: Role::parse(&r.get::<_, String>(3)?),
-                    selectable: r.get::<_, i64>(5)? != 0,
-                    unread: r.get(6)?,
-                    total: r.get(7)?,
-                    depth,
-                })
+                let role = Role::parse(&r.get::<_, String>(3)?);
+                let wake = if role == Role::Snoozed { layout.wake(&name).map(|(_, at)| at) } else { None };
+                Ok(Mailbox { account: r.get(0)?, display: r.get(2)?, role, selectable: r.get::<_, i64>(5)? != 0, unread: r.get(6)?, total: r.get(7)?, depth, wake, name })
             })?
             .collect::<rusqlite::Result<_>>()?;
         out.sort_by(|a, b| a.role.rank().cmp(&b.role.rank()).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
@@ -1858,10 +1873,36 @@ impl Store {
 
     // ── snoozes (snooze.rs) ──
 
-    /// Records where the account's snooze buckets go, as its mailbox list decided.
-    pub fn set_snooze_parent(&self, account: &str, parent: &str, delimiter: &str) -> Result<()> {
-        self.conn.execute("INSERT OR REPLACE INTO snooze_parents (account, parent, delimiter) VALUES (?1, ?2, ?3)", params![account, parent, delimiter])?;
+    /// Records where the account's snooze buckets go, as its mailbox list decided, and the
+    /// server's own snoozed mailbox (`native`, or empty).
+    pub fn set_snooze_parent(&self, account: &str, parent: &str, delimiter: &str, native: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO snooze_parents (account, parent, delimiter, native) VALUES (?1, ?2, ?3, ?4)",
+            params![account, parent, delimiter, native],
+        )?;
         Ok(())
+    }
+
+    /// Snoozes go under `parent` from now on (the old one couldn't be made); what's known of
+    /// the server's own snoozed mailbox stays.
+    pub fn move_snooze_parent(&self, account: &str, parent: &str, delimiter: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO snooze_parents (account, parent, delimiter) VALUES (?1, ?2, ?3) ON CONFLICT (account) DO UPDATE SET parent = ?2, delimiter = ?3",
+            params![account, parent, delimiter],
+        )?;
+        Ok(())
+    }
+
+    /// What counts as the account's buckets ([`BucketLayout`]).
+    fn bucket_layout(&self, account: &str) -> Result<BucketLayout> {
+        let native: Option<String> = self.conn.query_row("SELECT native FROM snooze_parents WHERE account = ?1", params![account], |r| r.get(0)).optional()?;
+        let (parent, delimiter) = self.snooze_parent(account)?;
+        Ok(BucketLayout { parents: crate::snooze::parents(crate::snooze::prefix_of(&parent)), delimiter, native: native.unwrap_or_default() })
+    }
+
+    /// If `name` is one of the account's buckets: the parent it's under, and its wake time.
+    pub fn bucket_of(&self, account: &str, name: &str) -> Result<Option<(String, i64)>> {
+        Ok(self.bucket_layout(account)?.wake(name).map(|(p, at)| (p.to_owned(), at)))
     }
 
     /// Where the account's snooze buckets go, `(parent, delimiter)`: as recorded, else
@@ -1886,9 +1927,10 @@ impl Store {
     /// The account's snooze buckets known here, `(name, wake time)`, by name: soonest first
     /// under each parent.
     pub fn buckets(&self, account: &str) -> Result<Vec<(String, i64)>> {
+        let layout = self.bucket_layout(account)?;
         let mut stmt = self.conn.prepare_cached("SELECT name FROM mailboxes WHERE account = ?1 AND role = 'snoozed' ORDER BY name")?;
         let names = stmt.query_map(params![account], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(names.into_iter().filter_map(|n| crate::snooze::wake_of(&n).map(|w| (n, w))).collect())
+        Ok(names.into_iter().filter_map(|n| layout.wake(&n).map(|(_, w)| (n.clone(), w))).collect())
     }
 
     /// A bucket just made on the server: known here at once, for its wake and the Snoozed view.

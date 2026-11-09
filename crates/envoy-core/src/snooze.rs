@@ -67,31 +67,25 @@ pub fn bucket(parent: &str, delimiter: &str, wake: i64) -> String {
     format!("{parent}{delimiter}{}", stamp(wake))
 }
 
-/// The wake time of mailbox `name`, if it's a bucket: a [`stamp`] under a parent whose last part
-/// is [`PARENT`] or [`FALLBACK_PARENT`], whatever the delimiter and namespace.
-pub fn wake_of(name: &str) -> Option<i64> {
-    let (parent, at) = split_bucket(name)?;
-    let delimiter = name[parent.len()..].chars().next()?;
-    let leaf = parent.rsplit(delimiter).next()?;
-    (leaf == PARENT || leaf == FALLBACK_PARENT).then_some(at)
+/// The two parents buckets may be under, in the personal namespace `prefix`: `Snoozed` and
+/// `Envoy Snoozed`.
+pub fn parents(prefix: &str) -> [String; 2] {
+    [format!("{prefix}{PARENT}"), format!("{prefix}{FALLBACK_PARENT}")]
 }
 
-/// A bucket's parent and time, by its shape alone.
-fn split_bucket(name: &str) -> Option<(&str, i64)> {
-    let cut = name.len().checked_sub(14)?;
-    let (head, leaf) = (name.get(..cut)?, name.get(cut..)?);
-    let at = parse_stamp(leaf)?;
-    let delimiter = head.chars().next_back()?;
-    if delimiter.is_alphanumeric() || head.len() == delimiter.len_utf8() {
+/// The personal namespace's prefix in a parent's name (`INBOX.` of `INBOX.Snoozed`).
+pub fn prefix_of(parent: &str) -> &str {
+    parent.strip_suffix(FALLBACK_PARENT).or_else(|| parent.strip_suffix(PARENT)).unwrap_or("")
+}
+
+/// If mailbox `name` is a bucket, the parent it's under and its wake time: exactly one of
+/// `parents`, then the server's `delimiter`, then a [`stamp`]. Nothing else is one, however it
+/// looks (`Snoozed-20261110T0800Z`, or `Work/Snoozed/…`).
+pub fn bucket_wake<'a>(name: &str, parents: &'a [String; 2], delimiter: &str) -> Option<(&'a str, i64)> {
+    if delimiter.is_empty() {
         return None;
     }
-    Some((&head[..head.len() - delimiter.len_utf8()], at))
-}
-
-/// The parent a bucket is under.
-pub fn parent_of(bucket: &str) -> Option<&str> {
-    wake_of(bucket)?;
-    split_bucket(bucket).map(|(parent, _)| parent)
+    parents.iter().find_map(|p| Some((p.as_str(), parse_stamp(name.strip_prefix(p.as_str())?.strip_prefix(delimiter)?)?)))
 }
 
 /// A mailbox as LIST named it, for [`choose_parent`].
@@ -612,17 +606,30 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn buckets_are_known_by_name_under_either_parent() {
+    fn a_bucket_is_a_stamp_under_a_parent_by_the_servers_delimiter() {
         let at = utc(2026, 11, 10, 8, 0);
-        for name in ["Snoozed/20261110T0800Z", "INBOX.Snoozed.20261110T0800Z", "Envoy Snoozed/20261110T0800Z", "INBOX/Envoy Snoozed/20261110T0800Z"] {
-            assert_eq!(wake_of(name), Some(at), "{name}");
+        let root = parents("");
+        assert_eq!(bucket_wake("Snoozed/20261110T0800Z", &root, "/"), Some(("Snoozed", at)));
+        assert_eq!(bucket_wake("Envoy Snoozed/20261110T0800Z", &root, "/"), Some(("Envoy Snoozed", at)));
+        assert_eq!(bucket_wake("Snoozed.20261110T0800Z", &root, "."), Some(("Snoozed", at)));
+        let inside = parents(prefix_of("INBOX.Snoozed"));
+        assert_eq!(bucket_wake("INBOX.Envoy Snoozed.20261110T0800Z", &inside, "."), Some(("INBOX.Envoy Snoozed", at)));
+        for (name, delimiter) in [
+            ("Snoozed-20261110T0800Z", "/"),
+            ("Snoozed.20261110T0800Z", "/"),
+            ("Snoozed/20261110T0800Z", "."),
+            ("Work/Snoozed/20261110T0800Z", "/"),
+            ("MySnoozed/20261110T0800Z", "/"),
+            ("Snoozed/20261110T0800Z/x", "/"),
+            ("Snoozed/", "/"),
+            ("Snoozed", "/"),
+            ("Snoozed20261110T0800Z", ""),
+        ] {
+            assert_eq!(bucket_wake(name, &root, delimiter), None, "{name:?} on a {delimiter:?} server");
         }
-        for name in ["Snoozed", "Snoozed/", "Work/20261110T0800Z", "MySnoozed/20261110T0800Z", "Snoozed/20261110T0800Z/x", "Snoozed20261110T0800Z", "/20261110T0800Z", "20261110T0800Z"] {
-            assert_eq!(wake_of(name), None, "{name}");
-        }
-        assert_eq!(parent_of("INBOX.Snoozed.20261110T0800Z"), Some("INBOX.Snoozed"));
-        assert_eq!(parent_of("Envoy Snoozed/20261110T0800Z"), Some("Envoy Snoozed"));
-        assert_eq!(parent_of("Work/20261110T0800Z"), None);
+        assert_eq!(bucket_wake("INBOX.Snoozed.20261110T0800Z", &root, "."), None, "not in this namespace");
+        assert_eq!(bucket_wake("Snoozed.20261110T0800Z", &inside, "."), None);
+        assert_eq!((prefix_of("INBOX.Snoozed"), prefix_of("INBOX/Envoy Snoozed"), prefix_of("Snoozed")), ("INBOX.", "INBOX/", ""));
     }
 
     fn listed<'a>(names: &[(&'a str, bool)], delimiter: &'a str) -> Vec<Listed<'a>> {
