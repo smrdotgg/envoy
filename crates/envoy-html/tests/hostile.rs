@@ -12,8 +12,8 @@ const STACK: usize = 2 << 20;
 /// minutes, overflowed the stack or panicked.
 const BOUND: Duration = Duration::from_secs(8);
 
-/// Parses, reads back and sanitizes `html` within [`BOUND`]; `remote` sanitizes it a second
-/// time with remote images allowed.
+/// Parses, reads back and sanitizes `html` within [`BOUND`], asserting the copy passed its
+/// check (no text fallback); `remote` sanitizes it a second time with remote images allowed.
 fn parse_bounded(name: &str, html: String, remote: bool) -> Duration {
     let len = html.len();
     if std::env::var_os("HOSTILE_VERBOSE").is_some() {
@@ -26,14 +26,13 @@ fn parse_bounded(name: &str, html: String, remote: bool) -> Duration {
             let doc = envoy_html::parse(&html);
             // The tree is usable afterwards too.
             let _ = envoy_html::plain(&doc);
-            let safe = envoy_html::export(&html, false, &mut |_| None);
-            if let Some(active) = active_content(&safe, false) {
-                panic!("{active} survived sanitizing:\n{safe}");
-            }
-            if remote {
-                let safe = envoy_html::export(&html, true, &mut |_| None);
-                if let Some(active) = active_content(&safe, true) {
-                    panic!("{active} survived sanitizing with images allowed:\n{safe}");
+            for images in if remote { &[false, true][..] } else { &[false][..] } {
+                // The copy passed its own check: the text fallback was never taken.
+                let report = envoy_html::export_report(&html, *images, &mut |_| None);
+                assert!(!report.fell_back, "the browser copy fell back to text (images {images}):\n{html}");
+                let safe = report.html;
+                if let Some(active) = active_content(&safe, *images) {
+                    panic!("{active} survived sanitizing (images {images}):\n{safe}");
                 }
             }
             t.elapsed()

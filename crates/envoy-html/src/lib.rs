@@ -24,7 +24,7 @@ use std::rc::Rc;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 
-pub use export::export;
+pub use export::{Exported, export, export_report};
 pub use fidelity::{Fidelity, Issue, Verdict};
 
 use css::{Elem, NONE, Sheet, Styles, get as style};
