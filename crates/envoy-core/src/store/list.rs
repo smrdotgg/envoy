@@ -335,7 +335,8 @@ impl Store {
         if snoozed {
             // Soonest to wake first (then newest first); the server's own snoozes (no time in
             // their name) last. Sorted by small keys, then the rows put in their order.
-            let mut keys: Vec<(i64, i64, i64, usize)> = shown.iter().enumerate().map(|(i, s)| (crate::snooze::wake_of(&s.mailbox).unwrap_or(i64::MAX), -s.date, -s.id, i)).collect();
+            let wake = |s: &Summary| self.bucket_of(&s.account, &s.mailbox).ok().flatten().map_or(i64::MAX, |(_, w)| w);
+            let mut keys: Vec<(i64, i64, i64, usize)> = shown.iter().enumerate().map(|(i, s)| (wake(s), -s.date, -s.id, i)).collect();
             keys.sort_unstable();
             let mut rows: Vec<Option<Summary>> = shown.into_iter().map(Some).collect();
             shown = keys.into_iter().filter_map(|(.., i)| rows[i].take()).collect();

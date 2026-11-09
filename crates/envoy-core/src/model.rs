@@ -188,6 +188,9 @@ pub struct Mailbox {
     pub depth: u8,
     /// Mailboxes that can't be selected (`\Noselect` parents).
     pub selectable: bool,
+    /// Envoy's snooze bucket: when its messages wake (Unix seconds). None for every other
+    /// mailbox, the server's own snoozed one too ([`crate::snooze`]).
+    pub wake: Option<i64>,
 }
 
 /// Which messages a list shows.

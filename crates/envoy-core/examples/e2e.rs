@@ -637,8 +637,9 @@ fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) 
     let later = rows.iter().find(|s| s.subject == "Snooze me").unwrap().clone();
     let soon = rows.iter().find(|s| s.subject == "Snooze me back").unwrap().clone();
     let until = (epoch() as i64 + 3 * 3600) / 60 * 60;
-    // Buckets for a time (to the minute): this run's, whatever earlier runs left.
-    let bucket_for = |at: i64| probe.buckets().into_iter().find(|b| snooze::wake_of(b) == Some(at / 60 * 60));
+    // The bucket for a time, if it's on the server: this run's, whatever earlier runs left.
+    let delimiter = probe.delimiter();
+    let bucket_for = |at: i64| Some(snooze::bucket("Snoozed", &delimiter, at)).filter(|b| probe.names().contains(b));
 
     // Undone inside the window: back here, and the server never hears of it.
     let (mark, before) = (d.mark(), epoch());
@@ -663,8 +664,7 @@ fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) 
         let bucket = bucket_for(until)?;
         (probe.live(&bucket) == ["Snooze me"] && !probe.live("INBOX").iter().any(|s| s == "Snooze me")).then_some(bucket)
     });
-    let parent = snooze::parent_of(&bucket).unwrap().to_owned();
-    assert_eq!(parent, "Snoozed", "named as every client will find it");
+    let parent = "Snoozed".to_owned();
     let subscribed = probe.subscribed();
     assert!(subscribed.contains(&parent) && subscribed.contains(&bucket), "subscribed, for clients that show only those: {subscribed:?}");
     println!("✓ snoozed: in {bucket} on the server after the window and not before, subscribed, gone from the inbox");
@@ -685,7 +685,6 @@ fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) 
     // A bucket another Envoy left past its time wakes on the next check (Check mail reads the
     // folders again): back in the inbox, unread, pinned atop it here. One a day old and empty
     // goes; one younger stays.
-    let delimiter = probe.delimiter();
     let past = snooze::bucket("Snoozed", &delimiter, (epoch() as i64 - 2 * 3600) / 60 * 60);
     let old = snooze::bucket("Snoozed", &delimiter, (epoch() as i64 - 3 * 86_400) / 60 * 60);
     probe.create(&past);
@@ -715,7 +714,7 @@ fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) 
     let snoozed = View::Role { account: Some(ACCOUNT.into()), role: Role::Snoozed };
     d.send(Command::Watch { view: snoozed.clone() });
     let row = d.until("the snoozed message in Snoozed", 20, |d| d.list(&snoozed, "", false).into_iter().find(|s| s.subject == "Snooze me"));
-    assert_eq!(snooze::wake_of(&row.mailbox), Some(until), "listed with its wake time");
+    assert_eq!(row.mailbox, bucket, "listed in its bucket");
     d.send(Command::Move { ids: vec![row.id], to: MoveTarget::Inbox, thread: false, undo: None });
     d.until("unsnoozed: back in the inbox on the server", 15, |_| (probe.live("INBOX").iter().any(|s| s == "Snooze me") && probe.live(&bucket).is_empty()).then_some(()));
     println!("✓ unsnoozed from Snoozed: back in the inbox");
@@ -1083,11 +1082,6 @@ impl Probe {
     /// Every mailbox's name.
     fn names(&self) -> Vec<String> {
         self.run(async move |s| s.list(Some(""), Some("*")).await.unwrap().map_ok(|n| n.name().to_owned()).try_collect().await.unwrap())
-    }
-
-    /// The snooze buckets there are (by name).
-    fn buckets(&self) -> Vec<String> {
-        self.names().into_iter().filter(|n| snooze::wake_of(n).is_some()).collect()
     }
 
     /// The subscribed mailboxes.

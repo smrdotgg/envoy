@@ -427,7 +427,7 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
     let name_row = name_row_base().grow(1.0);
     // In Snoozed, when it wakes, not when it came.
     let when = if role == Some(Role::Snoozed) {
-        envoy_core::snooze::wake_of(&m.mailbox).map_or_else(|| "Snoozed".to_owned(), fmt::snooze_until)
+        s.wake_of(&m.account, &m.mailbox).map_or_else(|| "Snoozed".to_owned(), fmt::snooze_until)
     } else {
         fmt::list_date(m.date, &s.settings.str("inbox.dateFormat"))
     };

@@ -1668,10 +1668,15 @@ impl App {
 
     // ── snoozes ──
 
-    /// Row `id` is in the server's own snoozed mailbox (no wake time in its name): shown, never
-    /// moved (envoy_core::snooze).
+    /// When the messages of `mailbox` wake, if it's one of Envoy's snooze buckets.
+    pub fn wake_of(&self, account: &str, mailbox: &str) -> Option<i64> {
+        self.mailboxes.get(account)?.iter().find(|m| m.name == mailbox)?.wake
+    }
+
+    /// Row `id` is in the server's own snoozed mailbox (Snoozed, but not one of Envoy's buckets):
+    /// shown, never moved (envoy_core::snooze).
     pub fn snoozed_by_server(&self, id: MessageId) -> bool {
-        self.list.iter().find(|s| s.id == id).is_some_and(|s| self.role_of(&s.account, &s.mailbox) == Role::Snoozed && envoy_core::snooze::wake_of(&s.mailbox).is_none())
+        self.list.iter().find(|s| s.id == id).is_some_and(|s| self.role_of(&s.account, &s.mailbox) == Role::Snoozed && self.wake_of(&s.account, &s.mailbox).is_none())
     }
 
     /// Opens the snooze picker for the targets (not drafts), its field ready for a typed time.
@@ -4467,7 +4472,7 @@ mod tests {
         let boxes = [("INBOX", Role::Inbox), ("Archive", Role::Archive), ("Junk", Role::Junk), ("Trash", Role::Trash), ("Work", Role::Other), ("Clients", Role::Other)];
         app.mailboxes.insert(
             "fm".into(),
-            boxes.iter().map(|(n, r)| Mailbox { account: "fm".into(), name: (*n).into(), display: (*n).into(), role: *r, unread: 0, total: 0, depth: 0, selectable: true }).collect(),
+            boxes.iter().map(|(n, r)| Mailbox { account: "fm".into(), name: (*n).into(), display: (*n).into(), role: *r, unread: 0, total: 0, depth: 0, selectable: true, wake: None }).collect(),
         );
         let mine = app.list[0].id;
         app.list.push(Summary { id: 500, account: "fm".into(), mailbox: "INBOX".into(), ..app.list[0].clone() });
@@ -4510,7 +4515,7 @@ mod tests {
         crate::demo::populate(&mut app);
         // 40 000 selected rows, 300 folders.
         app.list = long_list(&app, 40_000);
-        let folder = |i: usize| Mailbox { account: "demo".into(), name: format!("Folder {i}"), display: format!("Folder {i}"), role: Role::Other, unread: 0, total: 0, depth: 0, selectable: true };
+        let folder = |i: usize| Mailbox { account: "demo".into(), name: format!("Folder {i}"), display: format!("Folder {i}"), role: Role::Other, unread: 0, total: 0, depth: 0, selectable: true, wake: None };
         app.mailboxes.get_mut("demo").unwrap().extend((0..300).map(folder));
         let ids = ids(&app.list);
         let started = std::time::Instant::now();
@@ -4660,7 +4665,7 @@ mod tests {
         assert!(app.has_snoozed(Some("demo")));
         app.go(View::Role { account: Some("demo".into()), role: Role::Snoozed });
         assert_eq!(app.view_title(), "Snoozed");
-        let wakes: Vec<i64> = app.list.iter().map(|s| envoy_core::snooze::wake_of(&s.mailbox).unwrap()).collect();
+        let wakes: Vec<i64> = app.list.iter().map(|s| app.wake_of(&s.account, &s.mailbox).unwrap()).collect();
         assert!(wakes.len() == 2 && wakes[0] <= wakes[1], "soonest first: {wakes:?}");
         let from = app.sent.borrow().len();
         let first = app.list[0].id;
@@ -4674,7 +4679,7 @@ mod tests {
         let mut app = App::new(true);
         crate::demo::populate(&mut app);
         let mut tx = Tx::default();
-        app.mailboxes.get_mut("demo").unwrap().push(Mailbox { account: "demo".into(), name: "Snoozed by server".into(), display: "Snoozed".into(), role: Role::Snoozed, unread: 0, total: 1, depth: 0, selectable: true });
+        app.mailboxes.get_mut("demo").unwrap().push(Mailbox { account: "demo".into(), name: "Snoozed by server".into(), display: "Snoozed".into(), role: Role::Snoozed, unread: 0, total: 1, depth: 0, selectable: true, wake: None });
         let id = app.list[0].id;
         app.list[0].mailbox = "Snoozed by server".into();
         let from = app.sent.borrow().len();

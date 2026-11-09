@@ -402,16 +402,15 @@ pub fn snooze_parent(listed: &[ListedMailbox]) -> snooze::Parent {
     snooze::choose_parent(&names)
 }
 
-/// Gives the snooze buckets, their parents (either name, in the personal namespace) and the
-/// server's own snoozed mailbox their role, whatever they'd have had: they're shown together
-/// as Snoozed, not as folders.
+/// Gives the snooze buckets (a stamp under either parent in the personal namespace, by the
+/// server's delimiter: [`snooze::bucket_wake`]), the parents, and the server's own snoozed
+/// mailbox (by its `\Snoozed` attribute) their role, whatever they'd have had: they're shown
+/// together as Snoozed, not as folders.
 fn mark_snoozed(out: &mut [ListedMailbox]) {
-    let names: Vec<snooze::Listed> = out.iter().map(|m| snooze::Listed { name: &m.name, delimiter: &m.delimiter, native: m.native_snoozed }).collect();
-    let prefix = snooze::personal_prefix(&names);
-    let mut parents: HashSet<String> = [format!("{prefix}{}", snooze::PARENT), format!("{prefix}{}", snooze::FALLBACK_PARENT)].into();
-    parents.extend(out.iter().filter_map(|m| snooze::parent_of(&m.name)).map(str::to_owned));
+    let parent = snooze_parent(out);
+    let parents = snooze::parents(snooze::prefix_of(&parent.name));
     for m in out.iter_mut() {
-        if m.native_snoozed || snooze::wake_of(&m.name).is_some() || parents.contains(&m.name) {
+        if m.native_snoozed || parents.contains(&m.name) || snooze::bucket_wake(&m.name, &parents, &parent.delimiter).is_some() {
             m.role = Role::Snoozed;
             m.display = Role::Snoozed.label().to_owned();
         }
@@ -2229,6 +2228,41 @@ mod tests {
         let listed = list_mailboxes(&mut s).await.unwrap();
         assert!(listed[1].native_snoozed && listed[1].role == Role::Snoozed);
         assert_eq!(snooze_parent(&listed).name, "Envoy Snoozed");
+    }
+
+    /// What a LIST of `names` (with `delimiter`; `(name, attributes)`) gives the Snoozed role.
+    async fn snoozed_of(delimiter: &str, names: &[(&str, &str)]) -> Vec<String> {
+        let mut listing: String = names.iter().map(|(n, attrs)| format!("* LIST ({attrs}) \"{delimiter}\" \"{n}\"\r\n")).collect();
+        listing.push_str("TAG OK done\r\n");
+        let (mut s, _log) = fake::session(move |c: &str| c.starts_with("LIST").then(|| listing.clone())).await;
+        list_mailboxes(&mut s).await.unwrap().into_iter().filter(|m| m.role == Role::Snoozed).map(|m| m.name).collect()
+    }
+
+    #[tokio::test]
+    async fn a_bucket_is_its_parents_child_by_the_servers_own_delimiter() {
+        // On a `/` server: only `Snoozed/<stamp>` (and `Envoy Snoozed/<stamp>`) are buckets.
+        let found = snoozed_of(
+            "/",
+            &[
+                ("INBOX", "\\HasNoChildren"),
+                ("Snoozed", "\\HasChildren"),
+                ("Snoozed/20261110T0800Z", ""),
+                ("Envoy Snoozed/20261111T0800Z", ""),
+                ("Snoozed-20261110T0800Z", ""),
+                ("Snoozed.20261110T0800Z", ""),
+                ("Work/Snoozed/20261110T0800Z", ""),
+                ("Archive/Envoy Snoozed", ""),
+            ],
+        )
+        .await;
+        assert_eq!(found, ["Snoozed", "Snoozed/20261110T0800Z", "Envoy Snoozed/20261111T0800Z"]);
+        // On a `.` server with folders inside INBOX: under `INBOX.Snoozed`, by `.`.
+        let found = snoozed_of(".", &[("INBOX", ""), ("INBOX.Sent", ""), ("INBOX.Snoozed.20261110T0800Z", ""), ("INBOX.Snoozed/20261110T0800Z", ""), ("INBOX.Work.Snoozed.20261110T0800Z", "")]).await;
+        assert_eq!(found, ["INBOX.Snoozed.20261110T0800Z"]);
+        // The server's own snoozed mailbox is known by its attribute, whatever its name; a
+        // `Snoozed` without it is Envoy's parent, nothing more.
+        let found = snoozed_of("/", &[("INBOX", ""), ("Later", "\\Snoozed"), ("Work", "")]).await;
+        assert_eq!(found, ["Later"]);
     }
 
     #[test]
