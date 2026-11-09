@@ -51,10 +51,20 @@ A feasibility study of live child web views concluded against them:
 
 - **Media queries are evaluated for a 760-point desktop pane** (the default reading width), not
   the live pane. The layout tree is built once per message off the UI thread and cached; making
-  it depend on the pane width would mean re-parsing on resize. Narrow panes are handled by the
-  layout itself instead: fluid columns wrap, table columns are shares of the table. So
-  `max-width: 600px` mobile rules don't apply, and `min-width: 480px` desktop rules (MJML's
-  column widths) do.
+  it depend on the pane width would mean building it again, parsing included, as the divider
+  moves, or building one tree per breakpoint on the open path. So `max-width: 600px` mobile
+  rules don't apply, and `min-width: 480px` desktop rules (MJML's column widths) do.
+- **Narrow panes are fitted when the tree is drawn** (`html_view`), at the width the reader
+  has, read from its layout in 8-point steps: dragging the divider rebuilds the message's
+  elements when a step is crossed, never its tree. Nothing reaches past the reader. Fixed widths,
+  minimums, pictures and padding are capped at the room each box gets, as `max-width: 100%`
+  does in mail clients. A word longer than its line (a link) breaks. Table columns keep their
+  longest word while there's room for every column's. Fluid columns stack below 480 points (two
+  240-point columns, where MJML and Cerberus templates switch to one column), or when one would
+  be under 120. One thing is read from the phone rules: which table cells they make full-width
+  blocks (Cerberus's `.stack-column`, Foundation's `.columns`). Rows of those stack below the
+  same 480 points. `envoy`'s `html_view` tests lay every fixture out at 320, 520 and 900 points
+  and fail if any box or line of text reaches past the width or out of its box.
 - **`prefers-color-scheme: dark` rules are not applied.** "Original" (`reading.htmlColors`)
   draws mail as designed on a light page, where the light rules are the consistent ones. "Adapt"
   recolours mail to the theme by its own rules, the same way for every message; mixing in an
@@ -147,7 +157,7 @@ the reading pane draws natively, so nothing sits over the window and nothing tak
 - Mail that needs a browser gets one only on request, in the user's own browser, sanitized:
   nothing in it runs, and it loads only the remote pictures Envoy itself would load.
 - What the renderer still doesn't do (and how the score treats it): absolute/fixed positioning,
-  flex and grid layout, floats that aren't columns, inline SVG, forms, embedded media, transforms
+  flex and grid layout (their items stand one under another), floats that aren't columns, inline SVG, forms, embedded media, transforms
   and filters, multi-column text, `::before`/`::after` content, `rowspan` away from the table's
   edges (each noted, weighted and capped per kind); gradients (first colour), `display: block`
   on some but not all of a row's cells, `dir="rtl"` beyond column order, `@supports`, web fonts
