@@ -2288,7 +2288,7 @@ async fn session_loop(
             wait = wait.min(LOOK_EVERY.saturating_sub(last_look.elapsed()));
         }
         // The next snooze to wake.
-        if let Some(at) = snoozes.next(&shared.with_writer(|st| st.buckets(&id))?, caps.moves) {
+        if let Some(at) = snoozes.next(&shared.with_writer(|st| st.buckets(&id))?, caps.moves, now()) {
             wait = wait.min(Duration::from_secs((at - now()).max(0) as u64));
         }
         if wait.is_zero() {
@@ -2773,27 +2773,28 @@ const WAKE_RETRY: i64 = 60;
 /// Woken messages are pinned as they land for this long at most.
 const KEEP_WOKEN: i64 = 30 * 24 * 3600;
 
-/// A worker's snooze timing, kept across reconnects: this Envoy's jitter for each bucket (on a
-/// server without MOVE), when a bucket may be woken again (one just woken, or one whose wake
-/// failed), and when old buckets were last looked for.
+/// A worker's snooze timing, kept across reconnects: on a server without MOVE, when this Envoy
+/// wakes each bucket (its time, or when it first saw it if that's later, plus a random while),
+/// when a bucket may be woken again (one just woken, or one whose wake failed), and when old
+/// buckets were last looked for.
 #[derive(Default)]
 struct SnoozeClock {
-    jitter: HashMap<String, i64>,
+    jittered: HashMap<String, i64>,
     not_before: HashMap<String, i64>,
     last_cleanup: Option<i64>,
 }
 
 impl SnoozeClock {
-    /// When `bucket`, waking at `wake`, is due here.
-    fn due_at(&mut self, bucket: &str, wake: i64, moves: bool) -> i64 {
-        let jitter = if moves { 0 } else { *self.jitter.entry(bucket.to_owned()).or_insert_with(snooze::jitter) };
-        let at = wake + jitter;
+    /// When `bucket`, waking at `wake`, is due here, as of `now`.
+    fn due_at(&mut self, bucket: &str, wake: i64, moves: bool, now: i64) -> i64 {
+        // Every Envoy catching up on an overdue bucket at once waits its own while from now.
+        let at = if moves { wake } else { *self.jittered.entry(bucket.to_owned()).or_insert_with(|| wake.max(now) + snooze::jitter()) };
         self.not_before.get(bucket).map_or(at, |t| at.max(*t))
     }
 
-    /// The first time any of `buckets` (not done with) is due here.
-    fn next(&mut self, buckets: &[Bucket], moves: bool) -> Option<i64> {
-        buckets.iter().filter(|b| !b.done).map(|b| self.due_at(&b.name, b.wake, moves)).min()
+    /// The first time any of `buckets` (not done with) is due here, as of `now`.
+    fn next(&mut self, buckets: &[Bucket], moves: bool, now: i64) -> Option<i64> {
+        buckets.iter().filter(|b| !b.done).map(|b| self.due_at(&b.name, b.wake, moves, now)).min()
     }
 }
 
@@ -2823,7 +2824,7 @@ async fn snooze_cycle(shared: &Shared, account: &Account, server: &mut impl Snoo
                     log::info!("{}: deleted the empty snooze bucket {bucket}", account.email);
                     shared.with_writer(|st| st.forget_mailbox(&account.id, bucket))?;
                     clock.not_before.remove(bucket);
-                    clock.jitter.remove(bucket);
+                    clock.jittered.remove(bucket);
                     done.deleted.push(bucket.clone());
                 }
                 // A message came after all: woken next round.
@@ -2835,7 +2836,7 @@ async fn snooze_cycle(shared: &Shared, account: &Account, server: &mut impl Snoo
         shared.with_writer(|st| st.prune_woken(now - KEEP_WOKEN))?;
     }
     for Bucket { name: bucket, wake, .. } in buckets.iter().filter(|b| !b.done && !done.deleted.contains(&b.name)) {
-        if now < clock.due_at(bucket, *wake, moves) {
+        if now < clock.due_at(bucket, *wake, moves, now) {
             continue;
         }
         match server.wake(bucket, &inbox).await {
@@ -5298,7 +5299,7 @@ mod tests {
         let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t + 1).await.unwrap();
         assert!(done.woke.is_empty() && server.woken.len() == 1, "{:?}", server.woken);
         let buckets = shared.with_writer(|st| st.buckets("a")).unwrap();
-        assert_eq!(clock.next(&buckets, true), Some(soon), "the worker waits until then");
+        assert_eq!(clock.next(&buckets, true, t + 1), Some(soon), "the worker waits until then");
         snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, soon - 1).await.unwrap();
         assert!(!server.woken.contains(&bucket_of(soon)), "a second early");
         let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, soon).await.unwrap();
@@ -5312,10 +5313,10 @@ mod tests {
         let (shared, _rx) = engine_with(snooze_setup(&[t]));
         let mut clock = SnoozeClock::default();
         let buckets = shared.with_writer(|st| st.buckets("a")).unwrap();
-        let at = clock.next(&buckets, false).unwrap();
+        let at = clock.next(&buckets, false, t - 60).unwrap();
         assert!((t..=t + snooze::MAX_JITTER).contains(&at), "{}", at - t);
-        assert_eq!(clock.next(&buckets, false), Some(at), "the same wait each time it's asked");
-        assert_eq!(clock.next(&buckets, true), Some(t), "with MOVE, no wait");
+        assert_eq!(clock.next(&buckets, false, t - 60), Some(at), "the same wait each time it's asked");
+        assert_eq!(clock.next(&buckets, true, t - 60), Some(t), "with MOVE, no wait");
         let mut server = Buckets::default();
         server.boxes.insert(bucket_of(t), vec!["<1@x>"]);
         if at > t {
@@ -5327,6 +5328,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn without_move_an_overdue_bucket_waits_its_jitter_from_when_its_first_seen() {
+        // Every Envoy catching up on the same overdue bucket (they all started at once, after
+        // a holiday) waits its own random while from now, not from a time long past.
+        let t = 1_800_000_000;
+        let (shared, _rx) = engine_with(snooze_setup(&[t - 3 * 3600]));
+        let buckets = shared.with_writer(|st| st.buckets("a")).unwrap();
+        let waits: Vec<i64> = (0..50).map(|_| SnoozeClock::default().next(&buckets, false, t).unwrap() - t).collect();
+        assert!(waits.iter().all(|w| (0..=snooze::MAX_JITTER).contains(w)), "{waits:?}");
+        assert!(waits.iter().any(|w| *w > 0), "{waits:?}");
+    }
+
+    #[tokio::test]
     async fn a_refused_wake_waits_a_minute_and_a_lost_connection_ends_the_round() {
         let t = 1_800_000_000;
         let (shared, _rx) = engine_with(snooze_setup(&[t - 60]));
@@ -5335,7 +5348,7 @@ mod tests {
         let mut clock = SnoozeClock::default();
         snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t).await.unwrap();
         let buckets = shared.with_writer(|st| st.buckets("a")).unwrap();
-        assert_eq!(clock.next(&buckets, true), Some(t + WAKE_RETRY), "no busy loop on a refusal");
+        assert_eq!(clock.next(&buckets, true, t), Some(t + WAKE_RETRY), "no busy loop on a refusal");
         server.lost = true;
         assert!(snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t + WAKE_RETRY).await.is_err());
     }
@@ -5404,7 +5417,7 @@ mod tests {
         assert_eq!(server.woken.len(), 4, "{:?}", server.woken);
         let buckets = shared.with_writer(|st| st.buckets("a")).unwrap();
         assert!(buckets.iter().all(|b| b.done));
-        assert_eq!(restarted.next(&buckets, true), None);
+        assert_eq!(restarted.next(&buckets, true, t + 4000), None);
     }
 
     #[test]
