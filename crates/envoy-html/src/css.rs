@@ -19,17 +19,14 @@ use std::rc::Rc;
 
 /// Width, in points, `@media` width queries are evaluated against: a desktop reading pane.
 /// Mobile rules (`max-width: 600px`) don't apply; narrow panes are fitted when the tree is
-/// drawn, at the reader's width, not by the email (only which table cells its phone rules
-/// stack is read, [`Sheet::narrow`]).
+/// drawn, at the reader's width, not by the email (only which table cells it stacks on phones
+/// is read, [`Sheet::cascade_phone`]).
 pub const VIEWPORT: f32 = 760.0;
 
 /// Width a phone's `@media` rules are read at, to learn which table cells the email stacks on
-/// phones ([`Sheet::narrow`]): the rules for widths up to 600, 480 or 414 px, not those for
+/// phones ([`Sheet::cascade_phone`]): the rules for widths up to 600, 480 or 414 px, not those for
 /// the smallest phones.
 pub const NARROW: f32 = 400.0;
-
-/// Phone-only `@media` blocks kept for [`Sheet::narrow`]; the rest are dropped.
-const MAX_NARROW_BLOCKS: usize = 64;
 
 /// Compound-selector checks one message may spend matching its sheets.
 pub const MATCH_BUDGET: u32 = 400_000;
@@ -145,6 +142,29 @@ struct Rule {
     order: u32,
     block: u32,
     ua: bool,
+    screen: Screen,
+}
+
+/// Where a rule applies, by the `@media` it's in: everywhere, or only on the desktop pane
+/// ([`VIEWPORT`]) or a phone ([`NARROW`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Screen {
+    #[default]
+    Both,
+    Desktop,
+    Phone,
+}
+
+impl Screen {
+    /// For rules under media that hold on the desktop pane (`desk`) and on a phone (`phone`).
+    fn of(desk: bool, phone: bool) -> Option<Screen> {
+        match (desk, phone) {
+            (true, true) => Some(Screen::Both),
+            (true, false) => Some(Screen::Desktop),
+            (false, true) => Some(Screen::Phone),
+            (false, false) => None,
+        }
+    }
 }
 
 /// A 512-bit Bloom filter of class and id names.
@@ -238,54 +258,52 @@ pub struct Sheet {
     order: u32,
     budget: u32,
     candidates: u32,
+    /// The budgets of [`Sheet::cascade_phone`]: a quarter of the main ones.
+    phone_budget: u32,
+    phone_candidates: u32,
     /// Rules `0..ua_rules` are the built-in sheet's.
     ua_rules: u32,
-    /// The text of `@media` blocks that apply on a phone ([`NARROW`]) but not on the desktop
-    /// pane: only which table cells they stack is read from them ([`Sheet::narrow`]).
-    narrow: Vec<String>,
+    /// It holds rules for phones only.
+    phone_rules: bool,
     pub stats: SheetStats,
 }
 
 impl Sheet {
     /// The built-in sheet and nothing else yet.
     pub fn new() -> Sheet {
-        let mut s = Sheet { budget: MATCH_BUDGET, candidates: CANDIDATE_BUDGET, ..Sheet::default() };
-        s.parse(UA, true);
+        let mut s = Sheet {
+            budget: MATCH_BUDGET,
+            candidates: CANDIDATE_BUDGET,
+            phone_budget: MATCH_BUDGET / 4,
+            phone_candidates: CANDIDATE_BUDGET / 4,
+            ..Sheet::default()
+        };
+        s.parse(UA, true, (true, true));
         s.ua_rules = s.rules.len() as u32;
         s
     }
 
+    /// Whether the email has rules for phones only (`@media (max-width: 600px)`), which
+    /// [`Sheet::cascade`] leaves out and [`Sheet::cascade_phone`] reads.
+    pub fn has_phone_rules(&self) -> bool {
+        self.phone_rules
+    }
+
     /// Adds one `<style>` element's text; `media` is its `media` attribute, if any.
     pub fn add(&mut self, css: &str, media: Option<&str>) {
-        if let Some(m) = media.filter(|m| !media_matches(m)) {
-            if media_matches_at(m, NARROW) && self.narrow.len() < MAX_NARROW_BLOCKS {
-                self.narrow.push(strip_comments(css));
-            }
-            return;
+        let on = media.map_or((true, true), |m| (media_matches_at(m, VIEWPORT), media_matches_at(m, NARROW)));
+        if on.0 || on.1 {
+            self.parse(css, false, on);
         }
-        self.parse(css, false);
     }
 
-    /// A sheet of the email's phone-only rules (`@media (max-width: 600px)`), to read which
-    /// table cells they make full-width blocks; None when it has none. Its matching budget is
-    /// a quarter of the main sheet's, and it's only asked about table cells.
-    pub fn narrow(&mut self) -> Option<Sheet> {
-        if self.narrow.is_empty() {
-            return None;
-        }
-        let mut n = Sheet { budget: MATCH_BUDGET / 4, candidates: CANDIDATE_BUDGET / 4, ..Sheet::default() };
-        for css in std::mem::take(&mut self.narrow) {
-            n.rules_in(&css, false, 0);
-        }
-        Some(n)
-    }
-
-    fn parse(&mut self, css: &str, ua: bool) {
+    fn parse(&mut self, css: &str, ua: bool, on: (bool, bool)) {
         let css = strip_comments(css);
-        self.rules_in(&css, ua, 0);
+        self.rules_in(&css, ua, 0, on);
     }
 
-    fn rules_in(&mut self, s: &str, ua: bool, depth: u32) {
+    /// The rules in `s`, under media that hold on the desktop pane and on a phone (`on`).
+    fn rules_in(&mut self, s: &str, ua: bool, depth: u32, on: (bool, bool)) {
         let b = s.as_bytes();
         let mut i = 0;
         while i < b.len() {
@@ -315,20 +333,23 @@ impl Sheet {
             if let Some(at) = prelude.strip_prefix('@') {
                 let name: String = at.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>().to_ascii_lowercase();
                 let query = &at[name.len()..];
-                if name == "media" && depth < 4 && media_matches(query) {
-                    self.rules_in(block, ua, depth + 1);
-                } else if name == "media" && !ua && depth == 0 && media_matches_at(query, NARROW) && self.narrow.len() < MAX_NARROW_BLOCKS {
-                    self.narrow.push(block.to_owned());
+                let inner = (on.0 && media_matches_at(query, VIEWPORT), on.1 && media_matches_at(query, NARROW));
+                if name == "media" && depth < 4 && (inner.0 || inner.1) {
+                    self.rules_in(block, ua, depth + 1, inner);
                 }
                 // @supports (kinetic email behind feature checks), @font-face, @keyframes,
                 // @page, @document: nothing here draws without them.
                 continue;
             }
-            self.rule(prelude, block, ua);
+            if let Some(screen) = Screen::of(on.0, on.1) {
+                self.rule(prelude, block, ua, screen);
+            }
         }
     }
 
-    fn rule(&mut self, prelude: &str, block: &str, ua: bool) {
+    fn rule(&mut self, prelude: &str, block: &str, ua: bool, screen: Screen) {
+        // Phone rules never draw here: what they hold isn't counted against the score.
+        let counted = screen != Screen::Phone;
         let mut decls = Vec::new();
         parse_decls(block, &mut decls);
         let mut sels = Vec::new();
@@ -341,10 +362,10 @@ impl Sheet {
             match parse_selector(part) {
                 Ok(Some(sel)) => sels.push(sel),
                 Ok(None) => generated |= is_generated(part),
-                Err(()) => self.stats.bad_selectors += 1,
+                Err(()) => self.stats.bad_selectors += u32::from(counted),
             }
         }
-        if generated && decls.iter().any(|d| &*d.name == "content" && !matches!(&*d.value, "none" | "normal" | "\"\"" | "''")) {
+        if counted && generated && decls.iter().any(|d| &*d.name == "content" && !matches!(&*d.value, "none" | "normal" | "\"\"" | "''")) {
             self.stats.generated += 1;
         }
         if decls.is_empty() || sels.is_empty() {
@@ -353,6 +374,7 @@ impl Sheet {
         let block = self.blocks.len() as u32;
         self.blocks.push(decls);
         self.order += 1;
+        self.phone_rules |= screen == Screen::Phone;
         for sel in sels {
             if self.rules.len() >= MAX_RULES {
                 self.stats.dropped_rules += 1;
@@ -371,13 +393,32 @@ impl Sheet {
                 self.universal.push(idx);
             }
             self.need.push(needs(&sel));
-            self.rules.push(Rule { sel, spec, order: self.order, block, ua });
+            self.rules.push(Rule { sel, spec, order: self.order, block, ua, screen });
         }
     }
 
     /// Element `i`'s declarations in cascade order, lowest priority first: look a property up
-    /// from the end ([`get`]).
+    /// from the end ([`get`]). On the desktop pane: rules for phones only are left out.
     pub fn cascade(&mut self, els: &[Elem], i: u32, inline: Option<&str>) -> Styles {
+        self.cascade_on(els, i, inline, Screen::Phone)
+    }
+
+    /// [`Sheet::cascade`] as a phone ([`NARROW`]) would have it: its rules for phones in, those
+    /// for the desktop pane only out, in the same cascade. Its matching has budgets of its own
+    /// (a quarter of the main ones), and running out of them isn't counted against the score.
+    pub fn cascade_phone(&mut self, els: &[Elem], i: u32, inline: Option<&str>) -> Styles {
+        std::mem::swap(&mut self.budget, &mut self.phone_budget);
+        std::mem::swap(&mut self.candidates, &mut self.phone_candidates);
+        let exhausted = self.stats.exhausted;
+        let st = self.cascade_on(els, i, inline, Screen::Desktop);
+        self.stats.exhausted = exhausted;
+        std::mem::swap(&mut self.budget, &mut self.phone_budget);
+        std::mem::swap(&mut self.candidates, &mut self.phone_candidates);
+        st
+    }
+
+    /// The cascade without the rules for `skip` only.
+    fn cascade_on(&mut self, els: &[Elem], i: u32, inline: Option<&str>, skip: Screen) -> Styles {
         let e = &els[i as usize];
         // Each rule sits in one bucket, and an element's classes are distinct: no rule comes
         // up twice. Once a budget runs out only the built-in sheet applies (its rules come
@@ -420,6 +461,9 @@ impl Sheet {
         let mut hits: Vec<(u8, u32, u32, u32)> = Vec::new();
         for r in cands {
             let rule = &self.rules[r as usize];
+            if rule.screen == skip {
+                continue;
+            }
             if !rule.ua && self.budget == 0 {
                 self.stats.exhausted = true;
                 continue;
@@ -854,11 +898,6 @@ fn strip_comments(s: &str) -> String {
 }
 
 // ── media queries ──
-
-/// Whether a media query list applies to a desktop reading pane in light mode.
-pub fn media_matches(list: &str) -> bool {
-    media_matches_at(list, VIEWPORT)
-}
 
 /// Whether a media query list applies to a screen `width` points wide in light mode.
 pub fn media_matches_at(list: &str, width: f32) -> bool {
@@ -1357,24 +1396,28 @@ mod tests {
     }
 
     #[test]
-    fn phone_rules_are_kept_apart() {
-        // Not applied, but kept to read which table cells the email stacks on phones.
+    fn phone_rules_are_kept_out_of_the_desktop_cascade_and_read_in_the_phones() {
         let els = tree();
         let mut s = Sheet::new();
         s.add(
-            "@media screen and (max-width: 600px) { p { display: block; width: 100% } }
+            "@media screen and (max-width: 600px) { p { display: block; width: 100% } p::before { content: 'x' } }
              @media (max-width: 374px) { p { a: tiny } }
              @media (min-width: 480px) { p { b: wide } }
+             @media print { p { e: 1 } }
              p { c: 1 }",
             None,
         );
         s.add("p { d: phone }", Some("(max-width: 480px)"));
-        assert_eq!(value(&mut s, &els, 3, None, "width"), None);
-        let mut n = s.narrow().expect("phone rules");
-        let st = n.cascade(&els, 3, None);
-        assert_eq!((get(&st, "display"), get(&st, "width"), get(&st, "d")), (Some("block"), Some("100%"), Some("phone")));
-        assert_eq!((get(&st, "a"), get(&st, "b"), get(&st, "c")), (None, None, None), "only rules for phones and not the desktop pane");
-        assert!(Sheet::new().narrow().is_none());
+        assert!(s.has_phone_rules());
+        let desk = s.cascade(&els, 3, None);
+        assert_eq!((get(&desk, "width"), get(&desk, "b"), get(&desk, "c"), get(&desk, "d")), (None, Some("wide"), Some("1"), None));
+        let phone = s.cascade_phone(&els, 3, None);
+        assert_eq!((get(&phone, "display"), get(&phone, "width"), get(&phone, "c"), get(&phone, "d")), (Some("block"), Some("100%"), Some("1"), Some("phone")));
+        assert_eq!((get(&phone, "a"), get(&phone, "b"), get(&phone, "e")), (None, None, None), "not the smallest phones', the desktop's or print's");
+        assert_eq!(s.stats.generated, 0, "a phone rule's generated content never draws here");
+        let mut s = Sheet::new();
+        s.add("@media (min-width: 480px) { p { b: wide } } @media print { p { e: 1 } }", None);
+        assert!(!s.has_phone_rules());
     }
 
     #[test]

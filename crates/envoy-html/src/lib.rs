@@ -534,8 +534,6 @@ struct Builder {
     /// Element node address → index in `els`.
     index: HashMap<usize, u32>,
     styles: Vec<Option<Rc<Styles>>>,
-    /// The email's phone-only rules, asked which table cells they stack ([`css::Sheet::narrow`]).
-    narrow: Option<Sheet>,
     /// Counts line breaks and `&nbsp;` met while no text was written: an otherwise empty
     /// block that saw one is a blank line.
     blank_hint: u32,
@@ -562,25 +560,29 @@ fn tag(h: &Handle) -> Option<String> {
 impl Builder {
     /// Indexes the document's elements for selectors and reads its `<style>` sheets.
     fn new(root: &Handle) -> Builder {
-        let mut b = Builder { doc: Doc::default(), depth: 0, sheet: Sheet::new(), els: Vec::new(), index: HashMap::new(), styles: Vec::new(), narrow: None, blank_hint: 0, too_deep: false, stack_top: stack_here() };
+        let mut b = Builder { doc: Doc::default(), depth: 0, sheet: Sheet::new(), els: Vec::new(), index: HashMap::new(), styles: Vec::new(), blank_hint: 0, too_deep: false, stack_top: stack_here() };
         let mut sheets: Vec<(String, Option<String>)> = Vec::new();
         b.index_children(root, NONE, [0; 8], &mut sheets, 0);
         for (css, media) in sheets {
             b.sheet.add(&css, media.as_deref());
         }
-        b.narrow = b.sheet.narrow();
         b.styles = vec![None; b.els.len()];
         b
     }
 
-    /// Whether the email's phone rules make this table cell a block across its row: a width
-    /// of 100%, or a block display with no other width.
+    /// Whether, on a phone, this table cell stands on a line of its own: its display there,
+    /// cascaded from all the email's rules for that width and its `style=""` as a browser
+    /// would, is a block, or an inline block across the row. A cell that's still a table cell
+    /// stays in its row, whatever width it's given.
     fn stacks_on_phones(&mut self, h: &Handle) -> bool {
-        let (Some(n), Some(&i)) = (self.narrow.as_mut(), self.index.get(&key(h))) else { return false };
-        let st = n.cascade(&self.els, i, None);
-        match style(&st, "width").filter(|w| *w != "auto") {
-            Some(w) => matches!(len_attr(w), Some(Len::Pct(p)) if p >= 99.0),
-            None => matches!(style(&st, "display"), Some("block" | "table" | "list-item")),
+        let Some(&i) = self.index.get(&key(h)).filter(|_| self.sheet.has_phone_rules()) else { return false };
+        let inline = self.els[i as usize].attrs.iter().find(|(k, _)| k == "style").map(|(_, v)| v.as_str());
+        let st = self.sheet.cascade_phone(&self.els, i, inline);
+        let across = style(&st, "width").and_then(len_attr).is_some_and(|w| matches!(w, Len::Pct(p) if p >= 99.0));
+        match style(&st, "display") {
+            Some("block" | "flex" | "grid" | "list-item" | "table") => true,
+            Some("inline-block" | "inline-flex" | "inline-grid" | "inline-table") => across,
+            _ => false,
         }
     }
 
@@ -2560,6 +2562,33 @@ mod tests {
         assert_eq!(g.widths(0.0, 4.0), [0.0, 0.0], "no room");
         let g = Grid { shares: vec![0.0, 0.0, 0.0], mins: vec![0.0; 3] };
         assert_eq!(g.widths(90.0, 0.0), [30.0; 3], "no shares: equal");
+    }
+
+    #[test]
+    fn phone_rules_stack_only_cells_they_make_blocks() {
+        // Whether each cell of a two-cell row stacks on phones.
+        let stacks = |css: &str, cells: &str| -> Vec<bool> {
+            let mut r = Vec::new();
+            rows(&parse(&format!("<style>{css}</style><table width='600'><tr>{cells}</tr></table>")).nodes, &mut r);
+            r.first().map(|row| row.iter().map(|s| s.stack).collect()).unwrap_or_default()
+        };
+        let phone = |rules: &str| format!("@media screen and (max-width: 600px) {{ {rules} }}");
+        let two = "<td class='c'>Description</td><td class='c'>$12.00</td>";
+        // A full width alone leaves a data cell in its row: it's still a table cell.
+        assert_eq!(stacks(&phone(".c { width: 100% !important }"), two), [false, false]);
+        assert_eq!(stacks(&phone(".c { display: table-cell; width: 100% }"), two), [false, false]);
+        // A block (Cerberus's .stack-column), or a full-width inline block (Foundation's
+        // .small-12), stands on a line of its own.
+        assert_eq!(stacks(&phone(".c { display: block !important; width: 100% !important }"), two), [true, true]);
+        assert_eq!(stacks(&phone(".c { display: inline-block !important; width: 100% !important }"), two), [true, true]);
+        assert_eq!(stacks(&phone(".c { display: inline-block; width: 50% }"), two), [false, false]);
+        // The phone rule competes with the email's other declarations as in a browser.
+        assert_eq!(stacks(&phone(".c { display: block }"), "<td class='c' style='display: table-cell'>a</td><td class='c'>b</td>"), [false, true], "style=\"\" beats a sheet");
+        assert_eq!(stacks(&phone(".c { display: block !important }"), "<td class='c' style='display: table-cell'>a</td><td class='c'>b</td>"), [true, true], "!important beats style=\"\"");
+        assert_eq!(stacks(&format!("td.c {{ display: table-cell !important }} {}", phone(".c { display: block }")), two), [false, false], "an !important desktop rule holds");
+        assert_eq!(stacks(&format!("{} td.c {{ display: table-cell }}", phone(".c { display: block }")), two), [false, false], "a more specific desktop rule holds");
+        assert_eq!(stacks(&format!("{} .c {{ display: table-cell }}", phone(".c { display: block }")), two), [false, false], "a later desktop rule holds");
+        assert_eq!(stacks(&format!(".c {{ display: table-cell }} {}", phone(".c { display: block }")), two), [true, true], "a later phone rule wins");
     }
 
     #[test]
