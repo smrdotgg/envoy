@@ -415,6 +415,11 @@ impl Store {
     pub fn remove_file(&self, id: i64, file: i64, now: i64) -> Result<bool> {
         self.transaction(|st| {
             let status: Option<i64> = st.conn.query_row("SELECT status FROM draft_attachments WHERE draft = ?1 AND id = ?2", params![id, file], |r| r.get(0)).optional()?;
+            if status.is_none() {
+                // Not listed yet (taken off on close, its attach still queued): its tombstone now,
+                // so the attach, when it comes, finds the id taken.
+                st.conn.execute(&format!("INSERT INTO draft_attachments (draft, id, filename, mime, status) SELECT ?1, ?2, '', '', {REMOVED} WHERE EXISTS (SELECT 1 FROM drafts WHERE id = ?1)"), params![id, file])?;
+            }
             if status.is_none_or(|s| s == REMOVED) {
                 return Ok(false);
             }
@@ -1352,6 +1357,20 @@ mod tests {
         let before = (stored(&s, "draft_files"), stored(&s, "draft_attachments"));
         assert_eq!(s.save_draft_from(3, &draft("gone"), true, at(2), 104, Some(1)).unwrap(), None);
         assert_eq!((stored(&s, "draft_files"), stored(&s, "draft_attachments")), before, "no file without its draft");
+    }
+
+    #[test]
+    fn a_file_taken_off_before_it_was_listed_stays_off() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("x"), true, at(1), 100).unwrap();
+        // Taken off on close before the engine listed it; its attach, still queued, comes after.
+        assert!(!s.remove_file(1, 10, 101).unwrap());
+        let listed = DraftAttachment { status: FileStatus::Attaching, ..file(10, "a.txt", 0) };
+        assert_eq!(s.attaching(1, &[(listed, from_disk("a.txt"))]).unwrap(), Some(vec![false]));
+        assert!(s.files_of(1).unwrap().is_empty());
+        // Nothing kept for a draft that isn't there.
+        assert!(!s.remove_file(2, 11, 102).unwrap());
+        assert_eq!(stored(&s, "draft_attachments"), 1);
     }
 
     #[test]

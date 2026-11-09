@@ -1055,7 +1055,8 @@ fn queue_send(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, draft: &D
     let account = shared.account(&draft.account).ok_or_else(|| anyhow!("Choose an account to send from"))?;
     // The draft's files, as the store has them, read at once with their bytes.
     let (listed, files) = match draft_id {
-        Some(d) => shared.with_writer(|st| Ok((st.files_of(d)?, st.attached_files(d)?)))?,
+        // One transaction: another process can't change them between the two reads.
+        Some(d) => shared.with_writer(|st| st.transaction(|st| Ok((st.files_of(d)?, st.attached_files(d)?))))?,
         None if draft.attachments.is_empty() => (Vec::new(), Vec::new()),
         None => return Err(anyhow!("The attached files aren't saved with this message")),
     };
