@@ -636,7 +636,9 @@ async fn backfill_contacts(shared: Arc<Shared>) {
 
 /// Gives the store the split inbox's rules (`inbox.rules`) and the accounts' addresses: mail
 /// that moves because of it shows at once, and a pass sorting the whole cache again, if one is
-/// needed (or was cut off by a quit), runs in the background ([`recategorize`]).
+/// needed (or was cut off by a quit), runs in the background ([`recategorize`]). Called from a
+/// few places, built once.
+#[inline(never)]
 fn update_classifier(shared: &Arc<Shared>) {
     let Ok(settings) = shared.settings.read().map(|s| s.clone()) else { return };
     let classifier = crate::category::Classifier::from_settings(&settings, shared.me());
@@ -658,43 +660,41 @@ fn update_classifier(shared: &Arc<Shared>) {
 
 fn start_recategorizing(shared: &Arc<Shared>) {
     if !shared.recategorizing.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        tokio::spawn(recategorize(shared.clone()));
+        let shared = shared.clone();
+        tokio::task::spawn_blocking(move || recategorize(&shared));
     }
 }
 
-/// Sorts the whole cache again ([`Store::recategorize`]), a few hundred messages at a time with
-/// the writer free in between (a chunk is a few milliseconds), newest first so what's on screen
-/// is right first; the list follows as it goes, a few times a second at most.
-async fn recategorize(shared: Arc<Shared>) {
-    // The first chunk's changes show at once (a cache from before the split starts all in
-    // Other), then a few times a second.
+/// Sorts the whole cache again ([`Store::recategorize`]), off the engine's loop, a few hundred
+/// messages at a time with the writer free in between (a chunk is a few milliseconds), newest
+/// first so what's on screen is right first. The list follows after the first chunk that moved
+/// anything (a cache from before the split starts all in Other), then a few times a second.
+fn recategorize(shared: &Arc<Shared>) {
     let mut shown: Option<Instant> = None;
     let mut unseen = 0;
-    let finished = loop {
-        let s = shared.clone();
-        match tokio::task::spawn_blocking(move || s.with_writer(|st| st.recategorize(500))).await {
-            Ok(Ok(pass)) => {
-                unseen += pass.changed;
-                if unseen > 0 && (!pass.more || shown.is_none_or(|t| t.elapsed() >= Duration::from_millis(400))) {
-                    shared.emit(Event::Changed { account: String::new() });
-                    (shown, unseen) = (Some(Instant::now()), 0);
-                }
-                if !pass.more {
-                    break true;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            Ok(Err(e)) => {
+    loop {
+        let pass = match shared.with_writer(|st| st.recategorize(500)) {
+            Ok(pass) => pass,
+            Err(e) => {
                 log::warn!("sorting the inbox again: {e:#}");
-                break false;
+                shared.recategorizing.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
             }
-            Err(_) => break false,
+        };
+        unseen += pass.changed;
+        if unseen > 0 && (!pass.more || shown.is_none_or(|t| t.elapsed() >= Duration::from_millis(400))) {
+            shared.emit(Event::Changed { account: String::new() });
+            (shown, unseen) = (Some(Instant::now()), 0);
         }
-    };
-    shared.recategorizing.store(false, std::sync::atomic::Ordering::SeqCst);
-    // Rules that changed again as it ended start another.
-    if finished && shared.with_writer(|st| st.recategorizing()).unwrap_or(false) {
-        start_recategorizing(&shared);
+        if pass.more {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        shared.recategorizing.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Rules that changed again as it ended start another.
+        if !shared.with_writer(|st| st.recategorizing()).unwrap_or(false) || shared.recategorizing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
     }
 }
 

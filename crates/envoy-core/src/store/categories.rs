@@ -17,7 +17,7 @@
 //!   read): the pass reads them from the message itself where it was downloaded, and the rest
 //!   are judged by what the cache has until their body arrives ([`Store::set_body`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
@@ -45,19 +45,27 @@ pub struct Moved {
     pub before: Option<Category>,
 }
 
-/// Mailboxes' roles, by account, read once per batch.
+/// Mailboxes' roles (`(account, mailbox, role)`), read once per batch: a few dozen.
 #[derive(Default)]
-struct Roles(HashMap<String, HashMap<String, Role>>);
+struct Roles(Vec<(String, String, Role)>, Vec<String>);
 
 impl Roles {
-    fn of(&mut self, st: &Store, account: &str) -> Result<&HashMap<String, Role>> {
-        if !self.0.contains_key(account) {
+    fn role(&mut self, st: &Store, account: &str, mailbox: &str) -> Result<Role> {
+        if !self.1.iter().any(|a| a == account) {
             let mut stmt = st.conn.prepare_cached("SELECT name, role FROM mailboxes WHERE account = ?1")?;
-            let roles = stmt.query_map([account], |r| Ok((r.get::<_, String>(0)?, Role::parse(&r.get::<_, String>(1)?))))?.collect::<rusqlite::Result<_>>()?;
-            self.0.insert(account.to_owned(), roles);
+            let mut rows = stmt.query([account])?;
+            while let Some(r) = rows.next()? {
+                self.0.push((account.to_owned(), r.get(0)?, Role::parse(&r.get::<_, String>(1)?)));
+            }
+            self.1.push(account.to_owned());
         }
-        Ok(&self.0[account])
+        Ok(self.0.iter().find(|(a, m, _)| a == account && m == mailbox).map_or(Role::Other, |r| r.2))
     }
+}
+
+/// A conversation's key, as list.rs keys them.
+fn key(account: &str, thread: &str) -> String {
+    format!("{account}\0{thread}")
 }
 
 /// One message of a conversation, as judging it needs.
@@ -126,7 +134,7 @@ impl Store {
                 .prepare_cached("SELECT id, account, thread FROM messages WHERE id < ?1 ORDER BY id DESC LIMIT ?2")?
                 .query_map(params![below, chunk], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?;
-            st.dirty.borrow_mut().extend(rows.iter().map(|(_, a, t)| (a.clone(), t.clone())));
+            st.dirty.borrow_mut().extend(rows.iter().map(|(_, a, t)| key(a, t)));
             let next = if rows.len() == chunk as usize { rows.last().map(|r| r.0) } else { None };
             st.save_category_state(&config, next)?;
             Ok(next.is_some())
@@ -156,7 +164,7 @@ impl Store {
                     "INSERT INTO category_overrides (account, thread, category) VALUES (?1, ?2, ?3) ON CONFLICT (account, thread) DO UPDATE SET category = ?3",
                     params![account, thread, category.code()],
                 )?;
-                st.dirty.borrow_mut().insert((account.clone(), thread.clone()));
+                st.dirty.borrow_mut().insert(key(&account, &thread));
                 moved.push(Moved { account, thread, before });
             }
             Ok(moved)
@@ -174,7 +182,7 @@ impl Store {
                     )?,
                     None => st.conn.execute("DELETE FROM category_overrides WHERE account = ?1 AND thread = ?2", params![m.account, m.thread])?,
                 };
-                st.dirty.borrow_mut().insert((m.account.clone(), m.thread.clone()));
+                st.dirty.borrow_mut().insert(key(&m.account, &m.thread));
             }
             Ok(())
         })
@@ -187,12 +195,12 @@ impl Store {
         let mut counts = [0u32; 4];
         let super::list::Scope::Boxes(boxes) = self.scope(view)? else { return Ok(counts) };
         let mut stmt = self.conn.prepare_cached(COUNT_UNREAD)?;
-        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for (account, mailbox) in &boxes {
             let mut rows = stmt.query(params![account, mailbox])?;
             while let Some(r) = rows.next()? {
                 let category: i64 = r.get(0)?;
-                if conversations && !seen.insert((account.clone(), r.get(1)?)) {
+                if conversations && !seen.insert(key(account, &r.get::<_, String>(1)?)) {
                     continue;
                 }
                 counts[Category::from_code(category).code() as usize] += 1;
@@ -217,7 +225,7 @@ impl Store {
         if from_me && role != Role::Drafts && fl & flags::DRAFT == 0 {
             self.note_written_to(recipients)?;
         }
-        self.dirty.borrow_mut().insert((account.to_owned(), thread.to_owned()));
+        self.dirty.borrow_mut().insert(key(account, thread));
         self.flush_unless_batched()
     }
 
@@ -232,7 +240,7 @@ impl Store {
         }
         let s = category::signals_of(p, &self.classifier.borrow().me);
         self.conn.execute("UPDATE messages SET signals = ?2, list_id = ?3 WHERE id = ?1", params![id, s, p.bulk_headers.list_id])?;
-        self.dirty.borrow_mut().insert((account, thread));
+        self.dirty.borrow_mut().insert(key(&account, &thread));
         self.flush_unless_batched()
     }
 
@@ -244,11 +252,11 @@ impl Store {
     pub(super) fn flush_categories(&self) -> Result<()> {
         let correspondents = std::mem::take(&mut *self.new_correspondents.borrow_mut());
         self.mark_senders(&correspondents)?;
-        let mut dirty: Vec<(String, String)> = std::mem::take(&mut *self.dirty.borrow_mut()).into_iter().collect();
-        dirty.sort_unstable();
+        let dirty = std::mem::take(&mut *self.dirty.borrow_mut());
         let mut roles = Roles::default();
-        for (account, thread) in dirty {
-            if let Some(v) = self.judge(&account, &thread, &mut roles, true)? {
+        for k in &dirty {
+            let Some((account, thread)) = k.split_once('\0') else { continue };
+            if let Some(v) = self.judge(account, thread, &mut roles, true)? {
                 let n = self.conn.prepare_cached(SET_CATEGORY)?.execute(params![account, thread, v.category.code()])?;
                 self.recategorized.set(self.recategorized.get() + n);
             }
@@ -298,23 +306,25 @@ impl Store {
                 }
             }
         }
-        let roles = roles.of(self, account)?;
-        let role = |mailbox: &str| roles.get(mailbox).copied().unwrap_or(Role::Other);
-        let gmail: HashSet<&str> = rows.iter().filter(|r| role(&r.mailbox) == Role::Important && !r.message_id.is_empty()).map(|r| r.message_id.as_str()).collect();
-        let counts = |r: &Row| !matches!(role(&r.mailbox), Role::Drafts | Role::Junk | Role::Trash) && r.flags & (flags::DELETED | flags::DRAFT) == 0;
-        let any = rows.iter().any(counts);
+        let mut row_roles = Vec::with_capacity(rows.len());
+        for r in &rows {
+            row_roles.push(roles.role(self, account, &r.mailbox)?);
+        }
+        let gmail: Vec<&str> = rows.iter().zip(&row_roles).filter(|(r, role)| **role == Role::Important && !r.message_id.is_empty()).map(|(r, _)| r.message_id.as_str()).collect();
+        let counts = |(r, role): &(&Row, &Role)| !matches!(role, Role::Drafts | Role::Junk | Role::Trash) && r.flags & (flags::DELETED | flags::DRAFT) == 0;
+        let any = rows.iter().zip(&row_roles).any(|p| counts(&p));
         let classifier = self.classifier.borrow();
         let mut verdicts = Vec::with_capacity(rows.len());
-        for r in rows.iter().filter(|r| !any || counts(r)) {
+        for (r, role) in rows.iter().zip(&row_roles).filter(|p| !any || counts(p)) {
             let known = r.signals & signals::KNOWN != 0;
             let facts = Facts {
                 from: &r.from,
                 subject: &r.subject,
                 signals: r.signals,
                 list_id: &r.list_id,
-                from_me: classifier.is_me(&r.from) || role(&r.mailbox) == Role::Sent,
+                from_me: classifier.is_me(&r.from) || *role == Role::Sent,
                 written_to: self.is_written_to(&r.from)?,
-                gmail_important: gmail.contains(r.message_id.as_str()),
+                gmail_important: gmail.contains(&r.message_id.as_str()),
                 addressed_to_me: !known && from_json::<Vec<Address>>(&r.recipients).iter().any(|a| classifier.is_me(&a.email)),
             };
             verdicts.push(classifier.verdict(&facts));
@@ -344,10 +354,10 @@ impl Store {
             return Ok(());
         }
         let mut stmt = self.conn.prepare_cached(SENDERS_THREADS)?;
-        let rows = stmt.query_map([json(&senders)], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut rows = stmt.query([json(&senders)])?;
         let mut dirty = self.dirty.borrow_mut();
-        for row in rows {
-            dirty.insert(row?);
+        while let Some(r) = rows.next()? {
+            dirty.insert(key(&r.get::<_, String>(0)?, &r.get::<_, String>(1)?));
         }
         Ok(())
     }

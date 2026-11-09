@@ -23,7 +23,7 @@
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 pub use crate::model::Category;
 
@@ -160,11 +160,9 @@ fn v(category: Category, why: Why) -> Verdict {
 /// A user rule: mail whose sender matches `from` and whose mailing list matches `list` (each
 /// only if given) goes to `category`. In settings.json: `{ "from": "*@github.com", "category":
 /// "notifications" }`; as text (Settings, the README): `from:*@github.com notifications`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub list: String,
     pub category: Category,
 }
@@ -182,6 +180,32 @@ impl Rule {
     /// Exactly one address and nothing else: changing it touches only that sender's mail.
     pub fn sender_only(&self) -> Option<&str> {
         (self.list.is_empty() && !self.from.contains('*') && !self.from.starts_with('@') && self.from.contains('@')).then_some(self.from.as_str())
+    }
+
+    /// As settings.json holds it: no empty fields.
+    pub fn to_json(&self) -> Value {
+        let mut rule = serde_json::Map::new();
+        if !self.from.is_empty() {
+            rule.insert("from".into(), self.from.clone().into());
+        }
+        if !self.list.is_empty() {
+            rule.insert("list".into(), self.list.clone().into());
+        }
+        rule.insert("category".into(), self.category.as_str().into());
+        Value::Object(rule)
+    }
+
+    /// Read from [`Rule::to_json`]'s form, as written (not checked, not lowercased).
+    fn from_json(v: &Value) -> Result<Rule, String> {
+        let o = v.as_object().ok_or("not a rule ({ \"from\": …, \"category\": … })")?;
+        let text = |key: &str| match o.get(key) {
+            None | Some(Value::Null) => Ok(String::new()),
+            Some(Value::String(s)) => Ok(s.clone()),
+            Some(_) => Err(format!("{key} must be text")),
+        };
+        let category = o.get("category").and_then(Value::as_str).ok_or("no category")?;
+        let category = Category::parse(category).ok_or_else(|| format!("unknown category \"{category}\""))?;
+        Ok(Rule { from: text("from")?, list: text("list")?, category })
     }
 
     /// `from:… list:… category`.
@@ -242,7 +266,7 @@ pub fn parse_rules(v: &serde_json::Value) -> (Vec<Rule>, Vec<String>) {
         return (rules, vec!["inbox.rules must be a list of rules".into()]);
     };
     for (i, item) in items.iter().enumerate() {
-        match serde_json::from_value::<Rule>(item.clone()) {
+        match Rule::from_json(item) {
             Ok(mut r) => {
                 r.from = r.from.trim().to_lowercase();
                 r.list = r.list.trim().to_lowercase();
@@ -456,19 +480,19 @@ impl Classifier {
     /// Everything the stored categories depend on, to tell whether they're current: the
     /// heuristics' version, your addresses and the rules.
     pub fn fingerprint(&self) -> String {
-        let mut me: Vec<&String> = self.me.iter().collect();
-        me.sort();
-        serde_json::json!({ "heuristics": HEURISTICS, "me": me, "rules": self.rules }).to_string()
+        let mut me: Vec<&str> = self.me.iter().map(String::as_str).collect();
+        me.sort_unstable();
+        json!({ "heuristics": HEURISTICS, "me": me, "rules": self.rules.iter().map(Rule::to_json).collect::<Vec<_>>() }).to_string()
     }
 
     /// Read back from [`Classifier::fingerprint`]; None for anything else (an old or empty one).
     pub fn from_fingerprint(s: &str) -> Option<Classifier> {
-        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        let v: Value = serde_json::from_str(s).ok()?;
         if v.get("heuristics")?.as_u64()? != u64::from(HEURISTICS) {
             return None;
         }
-        let me: Vec<String> = serde_json::from_value(v.get("me")?.clone()).ok()?;
-        let rules: Vec<Rule> = serde_json::from_value(v.get("rules")?.clone()).ok()?;
+        let me = v.get("me")?.as_array()?.iter().map(|a| a.as_str().map(str::to_owned)).collect::<Option<Vec<String>>>()?;
+        let rules = v.get("rules")?.as_array()?.iter().map(|r| Rule::from_json(r).ok()).collect::<Option<Vec<Rule>>>()?;
         Some(Classifier::new(rules, me))
     }
 
@@ -479,16 +503,16 @@ impl Classifier {
         if self.me != next.me {
             return None;
         }
-        let old: HashSet<&Rule> = self.rules.iter().collect();
-        let new: HashSet<&Rule> = next.rules.iter().collect();
+        // A few rules each: lists, not sets.
+        let (old, new) = (&self.rules, &next.rules);
         let mut senders = Vec::new();
-        for r in old.symmetric_difference(&new) {
+        for r in old.iter().filter(|r| !new.contains(r)).chain(new.iter().filter(|r| !old.contains(r))) {
             senders.push(r.sender_only()?.to_owned());
         }
         // A rule moving up or down only matters against another rule for the same mail; for
         // single-address rules that's the same address, among those already collected or not.
-        let kept_old: Vec<&Rule> = self.rules.iter().filter(|r| new.contains(r)).collect();
-        let kept_new: Vec<&Rule> = next.rules.iter().filter(|r| old.contains(r)).collect();
+        let kept_old: Vec<&Rule> = old.iter().filter(|r| new.contains(r)).collect();
+        let kept_new: Vec<&Rule> = new.iter().filter(|r| old.contains(r)).collect();
         if kept_old != kept_new {
             for r in kept_new {
                 senders.push(r.sender_only()?.to_owned());
@@ -671,7 +695,7 @@ mod tests {
         assert!(Rule::parse_text("important").is_err(), "matches nothing");
         assert!(Rule::parse_text("from:* important").is_err(), "matches everything");
         // Serialized as settings.json holds it: no empty fields.
-        assert_eq!(serde_json::to_value(&rules[0]).unwrap(), serde_json::json!({ "from": "*@github.com", "category": "notifications" }));
+        assert_eq!(rules[0].to_json(), serde_json::json!({ "from": "*@github.com", "category": "notifications" }));
     }
 
     #[test]
