@@ -9,6 +9,7 @@ pub mod oauth;
 pub mod paths;
 pub mod secrets;
 pub mod settings;
+pub mod snooze;
 pub mod store;
 pub mod engine;
 /// The native HTML renderer, in a crate of its own so it can be built for size.
