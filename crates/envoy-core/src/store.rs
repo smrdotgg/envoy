@@ -395,6 +395,9 @@ fn has_table(conn: &Connection, name: &str) -> Result<bool> {
 pub enum Op {
     SetFlags { mailbox: String, uid: u32, add: u32, remove: u32 },
     Move { mailbox: String, uid: u32, dest: String },
+    /// Put a copy in `dest`, leaving the message where it is: a Gmail label (labels are
+    /// mailboxes there, and a message in two of them has both labels).
+    Copy { mailbox: String, uid: u32, dest: String },
     /// Delete for good (expunge), used in Trash.
     Expunge { mailbox: String, uid: u32 },
     Send { raw_b64: String, from: String, to: Vec<String>, sent_mailbox: Option<String>, reply_of: Option<(String, u32)> },
@@ -2016,6 +2019,21 @@ mod tests {
     fn counts(s: &Store) -> (u32, u32) {
         let m = s.mailboxes("a").unwrap().into_iter().find(|m| m.name == "INBOX").unwrap();
         (m.unread, m.total)
+    }
+
+    #[test]
+    fn a_held_copy_leaves_its_message_where_it_is_and_undoes() {
+        let s = Store::memory();
+        s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        let id = s.upsert_header("a", "INBOX", 9, 0, 10, 100, &parsed("Hi", "<9@x>", "", "Ana <ana@x.com>", 1)).unwrap();
+        let op = Op::Copy { mailbox: "INBOX".into(), uid: 9, dest: "Work".into() };
+        s.enqueue_held("a", &op, 100, 8).unwrap();
+        assert_eq!(inbox(&s).len(), 1, "still in the inbox");
+        assert_eq!(s.ops("a", 100).unwrap().iter().map(|q| q.op.clone()).collect::<Vec<_>>(), vec![op], "queued, and reads back");
+        let undone = s.undo_batch(8).unwrap();
+        assert_eq!((undone.released, undone.accounts), (1, vec!["a".to_owned()]));
+        assert!(s.ops("a", 100).unwrap().is_empty(), "never reaches the server");
+        assert_eq!(s.thread(id, false).unwrap().len(), 1, "and the message is untouched");
     }
 
     #[test]

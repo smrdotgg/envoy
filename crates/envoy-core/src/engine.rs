@@ -46,8 +46,12 @@ pub enum Command {
     /// [`Command::UndoMove`]; the move then waits `behavior.undoSeconds` before reaching the
     /// server. `None` sends it at once.
     Move { ids: Vec<MessageId>, to: MoveTarget, thread: bool, undo: Option<i64> },
-    /// Takes back a [`Command::Move`] (or [`Command::DiscardDraft`]) that hasn't reached the
-    /// server yet.
+    /// Copies messages to `mailbox`, leaving them where they are: on Gmail, adds that label.
+    /// `thread` and `undo` as in [`Command::Move`]: with `undo`, the copies wait out the undo
+    /// window (answered with [`Event::Held`]), and [`Command::UndoMove`] takes them back.
+    Copy { ids: Vec<MessageId>, mailbox: String, thread: bool, undo: Option<i64> },
+    /// Takes back a [`Command::Move`] (or [`Command::Copy`], or [`Command::DiscardDraft`]) that
+    /// hasn't reached the server yet.
     UndoMove { undo: i64 },
     /// Sends after `compose.undoSendSeconds`. `draft_id`: the composer's draft, which goes once
     /// the message is out, and comes back in the composer if the send is undone.
@@ -141,8 +145,9 @@ pub enum Event {
     /// The largest message the account's SMTP server takes, as it said (its EHLO `SIZE`), for
     /// the composer to judge a message by ([`crate::attach::Limit`]).
     SendLimit { account: String, size: u64 },
-    /// How many ops an undoable [`Command::Move`] actually held. 0 means it had nothing to do
-    /// (the messages were already moving, or already there), so there's nothing to undo.
+    /// How many ops an undoable [`Command::Move`] (or [`Command::Copy`]) actually held. 0 means
+    /// it had nothing to do (the messages were already moving, or already there), so there's
+    /// nothing to undo.
     Held { undo: i64, ops: usize },
     AccountAdded(Account),
     AccountFailed(String),
@@ -587,6 +592,13 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 shared.emit(Event::Changed { account: a.clone() });
                 // Wakes the worker: it replays at once, or re-plans its wait around the hold.
                 poke(workers, &a, Job::Sync);
+            }
+            shared.emit_pending();
+        }
+        Command::Copy { ids, mailbox, thread, undo } => {
+            // Nothing changes here: the copies show once their mailbox is synced.
+            for a in copy_and_hold(shared, ids, &mailbox, thread, undo, now())? {
+                wake(workers, &a);
             }
             shared.emit_pending();
         }
@@ -1185,6 +1197,53 @@ fn move_and_hold(shared: &Shared, ids: Vec<MessageId>, to: &MoveTarget, thread: 
         shared.emit(Event::Error(p));
     }
     Ok(moved.touched)
+}
+
+/// [`Command::Copy`]'s local part: queues a copy of each message (each conversation's messages
+/// in its mailbox, with `thread`) to `dest`, held for the undo window when `undo` is set, and
+/// remembers the undo key. Messages already in `dest`, or on their way out, are left alone.
+/// Returns the accounts touched.
+fn copy_and_hold(shared: &Shared, ids: Vec<MessageId>, dest: &str, thread: bool, undo: Option<i64>, now: i64) -> Result<HashSet<String>> {
+    let ids = expand(shared, ids, thread, true)?;
+    let window = shared.setting_u32("behavior.undoSeconds");
+    // The second of grace, as for moves (move_and_hold).
+    let hold = undo.filter(|_| window > 0).map(|key| (now + window as i64 + 1, key));
+    let (touched, held) = shared.with_writer(|st| {
+        st.transaction(|st| {
+            let mut touched = HashSet::new();
+            let mut held = 0;
+            for id in &ids {
+                let Some((account, mailbox, uid)) = st.movable(*id)? else { continue };
+                if mailbox == dest {
+                    continue;
+                }
+                let op = Op::Copy { mailbox, uid, dest: dest.to_owned() };
+                match hold {
+                    Some((not_before, key)) => {
+                        st.enqueue_held(&account, &op, not_before, key)?;
+                        held += 1;
+                    }
+                    None => {
+                        st.enqueue(&account, &op)?;
+                    }
+                }
+                touched.insert(account);
+            }
+            Ok((touched, held))
+        })
+    })?;
+    if let Some((_, key)) = hold {
+        shared.emit(Event::Held { undo: key, ops: held });
+        if held > 0
+            && let Ok(mut keys) = shared.undo_keys.lock()
+        {
+            if keys.len() >= 256 {
+                keys.clear();
+            }
+            keys.insert(key, held);
+        }
+    }
+    Ok(touched)
 }
 
 /// [`Command::UndoMove`]: takes back what's still queued of a move and tells the UI how it went.
@@ -1789,6 +1848,7 @@ impl OpRunner for ImapRunner<'_> {
         match op {
             Op::SetFlags { mailbox, uid, add, remove } => imap::store_flags(session, mailbox, *uid, *add, *remove).await,
             Op::Move { mailbox, uid, dest } => imap::move_message(session, self.caps, mailbox, *uid, dest).await,
+            Op::Copy { mailbox, uid, dest } => imap::copy_message(session, mailbox, *uid, dest).await,
             Op::Expunge { mailbox, uid } => imap::expunge(session, self.caps, mailbox, *uid, true).await,
             Op::SaveDraft { .. } | Op::PurgeDraft { .. } => Err(anyhow!("draft ops replay through replay_draft")),
             Op::Send { raw_b64, from, to, sent_mailbox, reply_of } => {
@@ -1831,7 +1891,7 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
     // Claimed: an undo from here on can't cancel these, since the server may be doing them.
     let ops = shared.with_writer(|st| st.claim_due(&account.id, now()))?;
     let mut any = false;
-    // Mailboxes moved out of: their counts get re-read once the pass is done.
+    // Mailboxes moved out of or copied into: their counts get re-read once the pass is done.
     let mut recount: Vec<String> = Vec::new();
     for q in ops {
         let r = match &q.op {
@@ -1842,7 +1902,12 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
             Ok(()) => {
                 shared.with_writer(|st| st.op_done(q.id))?;
                 any = true;
-                if let Op::Move { mailbox, .. } | Op::Expunge { mailbox, .. } = &q.op
+                let changed = match &q.op {
+                    Op::Move { mailbox, .. } | Op::Expunge { mailbox, .. } => Some(mailbox),
+                    Op::Copy { dest, .. } => Some(dest),
+                    _ => None,
+                };
+                if let Some(mailbox) = changed
                     && !recount.contains(mailbox)
                 {
                     recount.push(mailbox.clone());
@@ -2418,6 +2483,36 @@ mod tests {
         assert!(visible(&st, "INBOX").is_empty());
         st.op_done(due[0].id).unwrap();
         assert!(st.summary(a).unwrap().is_none(), "the local copy goes once the server has it");
+    }
+
+    #[tokio::test]
+    async fn a_label_is_a_held_undoable_copy_that_leaves_the_message() {
+        let st = setup();
+        st.upsert_mailbox("a", "Work", "Work", Role::Other, "/", true).unwrap();
+        let first = message(&st, "INBOX", 1, "<1@x>", "", flags::SEEN);
+        let reply = message(&st, "INBOX", 2, "<2@x>", "<1@x>", 0);
+        let other = message(&st, "INBOX", 3, "<3@x>", "", 0);
+        let (shared, rx) = engine_with(st);
+        // A conversation and another message, labeled in one go.
+        copy_and_hold(&shared, vec![reply, other], "Work", true, Some(9), 1000).unwrap();
+        assert!(rx.try_iter().any(|e| matches!(e, Event::Held { undo: 9, ops: 3 })), "every message held under one key");
+        let inbox = shared.with_writer(|st| Ok(visible(st, "INBOX"))).unwrap();
+        assert_eq!(inbox.len(), 3, "nothing leaves the inbox");
+        assert!(shared.with_writer(|st| st.ops("a", 1005)).unwrap().is_empty(), "held for the window and its second of grace");
+        // Undone in the window: the server never sees it.
+        undo_move(&shared, 9).unwrap();
+        assert_eq!(shared.with_writer(|st| st.pending_count()).unwrap(), 0);
+        assert!(toasts(&rx).is_empty(), "no 'too late'");
+        // Labeled again, and left: the copies reach the server, the messages stay put.
+        copy_and_hold(&shared, vec![first], "Work", false, Some(10), now() - 10).unwrap();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        assert!(replay_with(&shared, &account("a"), &mut server).await.unwrap());
+        assert_eq!(server.ran, vec![Op::Copy { mailbox: "INBOX".into(), uid: 1, dest: "Work".into() }]);
+        assert_eq!(shared.with_writer(|st| Ok(visible(st, "INBOX"))).unwrap().len(), 3);
+        // Already in the label's mailbox: nothing to do, nothing to undo.
+        let in_work = message(&shared.writer.lock().unwrap(), "Work", 4, "<4@x>", "", 0);
+        copy_and_hold(&shared, vec![in_work], "Work", false, Some(11), now()).unwrap();
+        assert!(rx.try_iter().any(|e| matches!(e, Event::Held { undo: 11, ops: 0 })));
     }
 
     // ── drafts ──
