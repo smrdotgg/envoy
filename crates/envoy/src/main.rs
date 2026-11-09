@@ -13,12 +13,13 @@ mod html_view;
 mod icons;
 mod reader;
 mod theme;
+mod toast;
 mod view_account;
 mod view_mail;
 mod view_settings;
 
 use rune::{AppSpec, Chrome, Cx, El, KeyEvent, Tx, Waker, row};
-use rune_kit::{Button, ButtonVariant, Dialog, Toast, ToastRegion};
+use rune_kit::{Button, ButtonVariant, Dialog};
 
 use envoy_core::engine::{Command, Engine};
 use envoy_core::model::{Role, View};
@@ -105,34 +106,6 @@ fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     s.on_key(ev, tx)
 }
 
-fn toasts(s: &App, t: &theme::Theme) -> Option<El> {
-    if s.toasts.is_empty() {
-        return None;
-    }
-    let k = &t.k;
-    let mut region = ToastRegion::new();
-    for toast in &s.toasts {
-        let id = toast.id;
-        let mut b = Toast::new(format!("toast-{id}"), toast.text.clone());
-        if toast.error {
-            b = b.icon(k, &icons::ALERT);
-        }
-        if toast.undo.is_some() {
-            b = b.action(k, "Undo", true, move |s: &mut App, tx: &mut Tx| s.undo_toast(id, tx));
-        }
-        if let Some(path) = toast.open_path.clone() {
-            b = b.action(k, "Show", false, move |_: &mut App, _: &mut Tx| {
-                let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone());
-                let _ = open::that_detached(dir);
-            });
-        }
-        b = b.on_close(move |s: &mut App| s.toasts.retain(|t| t.id != id));
-        region = region.toast(b.build(k));
-    }
-    // Bottom-left, clear of the composer at the bottom right.
-    Some(region.build(k).pin(Some(20.0), None, None, Some(20.0)))
-}
-
 fn view(s: &App, cx: &mut Cx<App>) -> El {
     let t = theme::build(&s.settings, cx.system_dark());
     let k = &t.k;
@@ -165,7 +138,7 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
             .on_close(|s: &mut App| s.confirm_delete = None)
             .build(k, &mut layer);
     }
-    if let Some(tl) = toasts(s, &t) {
+    if let Some(tl) = toast::region(s, &t) {
         layer.push(tl);
     }
     rune_kit::root(body.fill(t.page), layer)
@@ -247,6 +220,19 @@ const SCENES: &[Scene] = &[
     ("sent", |s| {
         s.view = View::Role { account: Some("demo".into()), role: Role::Sent };
         s.list = demo::list_for(&s.view);
+    }),
+    ("toast", |s| {
+        // The second conversation archived: its notice, with Undo, under the list and reader.
+        scene_open(s);
+        let id = s.list[1].id;
+        s.archive(vec![id], &mut Tx::default());
+        s.toast("Couldn't reach imap.gmail.com: the network is down", true);
+    }),
+    ("toast-compose", |s| {
+        scene_open(s);
+        s.compose_reply(None, false, false);
+        let id = s.list[1].id;
+        s.archive(vec![id], &mut Tx::default());
     }),
     ("drafts", scene_drafts),
     ("draft", |s| {
