@@ -12,8 +12,12 @@ pub struct Parsed {
     pub from: Address,
     pub to: Vec<Address>,
     pub cc: Vec<Address>,
+    /// Only in a copy of mail you sent, and only from some servers (Gmail keeps it).
+    pub bcc: Vec<Address>,
     pub reply_to: Vec<Address>,
     pub date: Option<i64>,
+    /// A mailing list's or a bulk sender's mail ([`is_bulk`]).
+    pub bulk: bool,
     pub text: Option<String>,
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
@@ -43,6 +47,18 @@ fn angle(id: &str) -> String {
     if id.is_empty() || id.starts_with('<') { id.to_owned() } else { format!("<{id}>") }
 }
 
+/// Mail sent to many, not to you: a mailing list's (`List-Id`), a newsletter's
+/// (`List-Unsubscribe`), one marked `Precedence: bulk` (or `list`, `junk`), or one sent by a
+/// machine (`Auto-Submitted`, other than `no`). Recipient suggestions put its senders last.
+/// `header` reads a header's raw value.
+pub fn is_bulk<'a>(header: impl Fn(&'static str) -> Option<&'a str>) -> bool {
+    let value = |name| header(name).map(|v| v.trim().to_ascii_lowercase());
+    header("List-Id").is_some()
+        || header("List-Unsubscribe").is_some()
+        || value("Precedence").is_some_and(|p| matches!(p.as_str(), "bulk" | "list" | "junk"))
+        || value("Auto-Submitted").is_some_and(|a| !a.is_empty() && a != "no")
+}
+
 /// Parses headers only (or a whole message; extra parts are ignored when `headers_only`).
 pub fn parse(raw: &[u8], headers_only: bool) -> Option<Parsed> {
     let msg = MessageParser::default().parse(raw)?;
@@ -56,8 +72,10 @@ pub fn parse(raw: &[u8], headers_only: bool) -> Option<Parsed> {
         from: msg.from().and_then(|f| f.first()).map(addr).unwrap_or(Address { name: String::new(), email: String::new() }),
         to: addresses(msg.to()),
         cc: addresses(msg.cc()),
+        bcc: addresses(msg.bcc()),
         reply_to: addresses(msg.reply_to()),
         date: msg.date().map(|d| d.to_timestamp()),
+        bulk: is_bulk(|name| msg.header_raw(name)),
         text: None,
         html: None,
         attachments: Vec::new(),
