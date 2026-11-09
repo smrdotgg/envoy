@@ -558,4 +558,19 @@ mod tests {
         assert_eq!(r[0].email.to_string(), "ana@x.com");
         assert!(parse_recipients("not an address").is_err());
     }
+
+    #[test]
+    fn a_suggested_recipient_is_sent_as_it_shows() {
+        // What accepting a suggestion writes into the field (Address::recipient), between others.
+        let names = ["Jordan Lee", "Lee, Jordan", "Dr. Rivera's Office", "Ana (Work)", "Zoë Müller", "ana@x.com", "\"Quoted\" Name", "O'Brien", "a;b", ".dot", "<x>", "Back\\slash", "", "  "];
+        for name in names {
+            let a = crate::model::Address { name: name.into(), email: "a.b@x.com".into() };
+            let field = format!("bo@y.org, {}, cy@z.net", a.recipient());
+            let got = parse_recipients(&field).unwrap_or_else(|e| panic!("{field}: {e}"));
+            assert_eq!(got.iter().map(|m| m.email.to_string()).collect::<Vec<_>>(), vec!["bo@y.org", "a.b@x.com", "cy@z.net"], "{field}");
+            let want: String = name.trim().chars().filter(|c| !matches!(c, '"' | '\\')).collect();
+            assert_eq!(got[1].name.clone().unwrap_or_default(), want, "{field}");
+        }
+        assert_eq!(crate::model::Address { name: "Jordan Lee".into(), email: "j@x.com".into() }.recipient(), "Jordan Lee <j@x.com>", "bare when it can be");
+    }
 }

@@ -131,6 +131,18 @@ impl Address {
     pub fn formatted(&self) -> String {
         if self.name.trim().is_empty() { self.email.clone() } else { format!("{} <{}>", self.name, self.email) }
     }
+
+    /// As written into a recipients field, to be sent as it is: `Name <address>`, the name in
+    /// quotes when it has a character that would split the field or not parse bare (a comma,
+    /// brackets, `@`), or the address alone.
+    pub fn recipient(&self) -> String {
+        let name: String = self.name.trim().chars().filter(|c| !matches!(c, '"' | '\\')).collect();
+        if name.is_empty() {
+            return self.email.clone();
+        }
+        let bare = !name.starts_with('.') && name.chars().all(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || c == ' ' || "!#$%&'*+-/=?^_`{|}~.".contains(c));
+        if bare { format!("{name} <{}>", self.email) } else { format!("\"{name}\" <{}>", self.email) }
+    }
 }
 
 /// One row of the message list.
