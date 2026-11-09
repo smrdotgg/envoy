@@ -17,6 +17,8 @@ pub struct Parsed {
     pub text: Option<String>,
     pub html: Option<String>,
     pub attachments: Vec<Attachment>,
+    /// Pictures shown inside the message (`cid:`), not listed as files.
+    pub inline: Vec<Attachment>,
 }
 
 fn addr(a: &Addr) -> Address {
@@ -59,6 +61,7 @@ pub fn parse(raw: &[u8], headers_only: bool) -> Option<Parsed> {
         text: None,
         html: None,
         attachments: Vec::new(),
+        inline: Vec::new(),
     };
     if headers_only {
         return Some(p);
@@ -77,19 +80,29 @@ pub fn parse(raw: &[u8], headers_only: bool) -> Option<Parsed> {
         p.text = msg.body_text(0).map(|t| t.into_owned());
     }
     for (index, part) in msg.attachments().enumerate() {
-        let filename = part.attachment_name().map(str::to_owned).unwrap_or_else(|| format!("attachment-{}", index + 1));
         let mime = part
             .content_type()
             .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("octet-stream")))
             .unwrap_or_else(|| "application/octet-stream".into());
-        // Inline images referenced from HTML aren't listed as files.
+        // Inline images referenced from HTML aren't listed as files, but kept apart: a forward
+        // takes them along.
         let inline = part.content_disposition().is_some_and(|d| d.is_inline()) && mime.starts_with("image/") && part.content_id().is_some();
-        if inline {
-            continue;
-        }
-        p.attachments.push(Attachment { index, filename, mime, size: part.contents().len() });
+        let filename = file_name(part, index);
+        let a = Attachment { index, filename, mime, size: part.contents().len() };
+        if inline { p.inline.push(a) } else { p.attachments.push(a) }
     }
     Some(p)
+}
+
+/// A part's file name; one without gets one (`image-2.png` for a picture, `attachment-3`).
+fn file_name(p: &mail_parser::MessagePart, index: usize) -> String {
+    if let Some(name) = p.attachment_name().filter(|n| !n.trim().is_empty()) {
+        return name.to_owned();
+    }
+    match p.content_type().filter(|c| c.ctype().eq_ignore_ascii_case("image")).and_then(|c| c.subtype()) {
+        Some(ext) => format!("image-{}.{}", index + 1, ext.to_ascii_lowercase()),
+        None => format!("attachment-{}", index + 1),
+    }
 }
 
 /// A draft from the server (one Envoy saved, or another client's), as the composer edits it.
@@ -168,13 +181,8 @@ pub fn server_draft(raw: &[u8]) -> Option<ServerDraft> {
     }
     let mut files = Vec::new();
     for (i, p) in msg.attachments().enumerate() {
-        let data = p.contents().to_vec();
-        draft.attachments.push(DraftAttachment {
-            id: i as u32,
-            filename: p.attachment_name().map(str::to_owned).unwrap_or_else(|| format!("attachment-{}", i + 1)),
-            mime: part_type(p),
-            size: data.len(),
-        });
+        let data = part_bytes(&msg, p);
+        draft.attachments.push(DraftAttachment { id: i as i64, filename: file_name(p, i), mime: file_type(p), size: data.len(), ..DraftAttachment::default() });
         files.push(data);
     }
     Some(ServerDraft { draft, files, notice: has_html.then_some(DraftNotice::PlainText) })
@@ -185,28 +193,38 @@ fn part_type(p: &mail_parser::MessagePart) -> String {
     p.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")).to_ascii_lowercase()).unwrap_or_else(|| "application/octet-stream".into())
 }
 
+/// A file part's type as it goes on with its bytes ([`part_bytes`]): `type/subtype`, and the
+/// charset text names, so the bytes keep saying what they are.
+fn file_type(p: &mail_parser::MessagePart) -> String {
+    let charset = p.content_type().filter(|c| c.ctype().eq_ignore_ascii_case("text")).and_then(|c| c.attribute("charset")).filter(|c| c.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_.:".contains(ch)));
+    match charset {
+        Some(charset) => format!("{}; charset={}", part_type(p), charset.to_ascii_lowercase()),
+        None => part_type(p),
+    }
+}
+
 /// The attachments of a raw message a forward takes along: `(id, index)` pairs, each the
 /// attachment's id in the draft and its index among the message's attachments (as
-/// [`Attachment::index`] numbers them). Each comes back with its bytes, or why it can't.
-pub fn forwarded_files(raw: &[u8], files: &[(u32, usize)]) -> Vec<Result<(crate::model::DraftAttachment, Vec<u8>), String>> {
+/// [`Attachment::index`] numbers them, pictures shown inline included). Each comes back with its
+/// bytes, as sent, or why it can't.
+pub fn forwarded_files(raw: &[u8], files: &[(i64, usize)]) -> Vec<Result<(crate::model::DraftAttachment, Vec<u8>), String>> {
     let Some(msg) = MessageParser::default().parse(raw) else { return files.iter().map(|_| Err("The original message can't be read".to_owned())).collect() };
     files
         .iter()
         .map(|&(id, index)| {
             let p = msg.attachments().nth(index).ok_or_else(|| "The original message doesn't have this file any more".to_owned())?;
             let data = part_bytes(&msg, p);
-            let filename = p.attachment_name().map(str::to_owned).unwrap_or_else(|| format!("attachment-{}", index + 1));
-            Ok((crate::model::DraftAttachment { id, filename, mime: part_type(p), size: data.len() }, data))
+            Ok((crate::model::DraftAttachment { id, filename: file_name(p, index), mime: file_type(p), size: data.len(), ..Default::default() }, data))
         })
         .collect()
 }
 
-/// A part's bytes as they were sent, transfer encoding undone. Text that doesn't name its
-/// charset isn't read as UTF-8 on the way (which mangles what isn't): a file goes on as it came.
+/// A part's bytes as they were sent, transfer encoding undone. Text isn't read into UTF-8 on
+/// the way (which changes the bytes of any other charset, and mangles text that names none):
+/// a file goes on as it came, its charset said by [`file_type`].
 fn part_bytes(msg: &mail_parser::Message, p: &mail_parser::MessagePart) -> Vec<u8> {
     use mail_parser::{Encoding, PartType};
-    let text = matches!(p.body, PartType::Text(_) | PartType::Html(_));
-    if !text || p.content_type().and_then(|c| c.attribute("charset")).is_some() {
+    if !matches!(p.body, PartType::Text(_) | PartType::Html(_)) {
         return p.contents().to_vec();
     }
     let raw = msg.raw_message.get(p.offset_body as usize..p.offset_end as usize).unwrap_or_default();
@@ -510,6 +528,22 @@ mod tests {
         // Signed inline (PGP in the text itself): editing would break it too.
         let inline = b"From: a@x.com\r\nSubject: Hi\r\nContent-Type: text/plain\r\n\r\n-----BEGIN PGP SIGNED MESSAGE-----\r\nHash: SHA256\r\n\r\nHello\r\n-----BEGIN PGP SIGNATURE-----\r\nxyz\r\n-----END PGP SIGNATURE-----\r\n";
         assert!(copy(inline));
+    }
+
+    #[test]
+    fn a_forwarded_text_file_keeps_its_bytes_and_its_charset() {
+        let latin1 = b"caf\xe9 cr\xe8me\n";
+        for (encoding, body) in [("base64", "Y2Fm6SBjcuhtZQo="), ("quoted-printable", "caf=E9 cr=E8me=0A")] {
+            let raw = format!(
+                "From: a@x.com\r\nSubject: Menu\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"m\"\r\n\r\n--m\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--m\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Disposition: attachment; filename=\"menu.txt\"\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n{body}\r\n--m--\r\n"
+            );
+            let got = forwarded_files(raw.as_bytes(), &[(1, 0)]);
+            let (file, data) = got[0].as_ref().unwrap();
+            assert_eq!(data.as_slice(), latin1, "{encoding}: the bytes as sent, not re-encoded");
+            assert_eq!(file.mime, "text/plain; charset=iso-8859-1", "{encoding}: still saying what they are");
+            // A draft opened from the server keeps them the same way.
+            assert_eq!(server_draft(raw.as_bytes()).unwrap().files[0], latin1, "{encoding}");
+        }
     }
 
     #[test]

@@ -105,15 +105,19 @@ Attach files with the paperclip next to Send (or `mod+shift+a`), which opens you
 picker (pick several at once), or drop files from anywhere onto the composer. Each file shows as
 a chip with its name and size, and an × to take it off; while a file is being read it says
 "Attaching…" (reading never holds up typing). Forwarding a message takes its attachments along,
-removable like any other.
+pictures shown inside it too (a forward is plain text), each removable like any other.
 
-A message's attachments can add up to 25 MB, Gmail's limit, which most providers share: over
-it, the composer says so and won't send until some come off, rather than have the server bounce
-it later. A single file over 25 MB isn't attached at all. Files are kept with the draft on your
-computer, so they survive a crash or restart like its text, go to the Drafts folder with it,
-and are sent with it; Envoy never sends a message without a file it shows. A draft carrying big
-files is copied to the Drafts folder less often while you type (every couple of minutes at
-25 MB), since each copy sends them all again.
+A message can be as big as your mail server says it takes (Envoy asks it once; Gmail's limit
+comes to about 25 MB of attachments, as files grow by a third when encoded for sending). Until
+Envoy has asked, 25 MB of attachments is the limit, which most providers share. Over it, the
+composer says so and won't send until some come off, rather than have the server bounce the
+message later; a single file too big for any message isn't attached at all. Files are kept with
+the draft on your computer from the moment you pick them: one still being read when you start
+another message, quit or crash is still there when you open the draft again (read again, or,
+if the file is gone, marked as not attached, never silently dropped). They go to the Drafts
+folder with the draft and are sent with it; Envoy never sends a message without a file it
+shows. A draft carrying big files is copied to the Drafts folder less often while you type
+(every couple of minutes at 25 MB), since each copy sends them all again.
 
 ## How it's built
 

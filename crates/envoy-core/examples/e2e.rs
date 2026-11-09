@@ -513,7 +513,8 @@ fn scenario(pass: Pass) {
     let mut fwd = Draft { account: ACCOUNT.into(), to: format!("Me <{user}>"), subject: "Fwd: With a file".into(), body: "See below.".into(), ..Draft::default() };
     d.send(Command::SaveDraft { id: 4, draft: fwd.clone(), open: true, rev: 1, lifecycle: 0 });
     let mark = d.mark();
-    d.send(Command::AttachForwarded { draft: 4, message: received.id, files: vec![(0, 0)] });
+    let listed = envoy_core::model::DraftAttachment { id: 1, filename: name.into(), mime: "application/pdf".into(), size: pdf.len(), ..Default::default() };
+    d.send(Command::AttachForwarded { draft: 4, message: received.id, files: vec![(listed, 0)] });
     let forwarded = d.wait(mark, "the original's file attached", 30, |e| match e {
         Event::FileAttached { draft: 4, file } => Some(file.clone()),
         Event::AttachFailed { error, .. } => panic!("not attached: {error}"),

@@ -33,7 +33,7 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 
 use super::{Op, Store, json};
-use crate::model::{Draft, DraftAttachment, MessageId};
+use crate::model::{Draft, DraftAttachment, FileSource, FileStatus, MessageId};
 
 /// Where a write to a draft stands: the draft's lifecycle it was made in, and the writer's
 /// stamp, which orders saves within it ([`Store::save_draft`]).
@@ -77,6 +77,28 @@ pub struct DraftUpload {
 
 const COLS: &str = "d.id, d.account, d.content, d.message_id, d.updated, d.sending = 0 AND d.purge_op = 0, d.lifecycle, d.rev";
 
+/// A draft's files: their columns in draft_attachments, and what `status` holds.
+const FILE_COLS: &str = "id, filename, mime, size, status, error";
+const ATTACHED: i64 = 0;
+const ATTACHING: i64 = 1;
+const FAILED: i64 = 2;
+/// Taken off: kept only so its id is never given again.
+const REMOVED: i64 = 3;
+
+fn file_row(r: &rusqlite::Row) -> rusqlite::Result<DraftAttachment> {
+    let status = match r.get::<_, i64>(4)? {
+        ATTACHING => FileStatus::Attaching,
+        FAILED => FileStatus::Failed(r.get(5)?),
+        _ => FileStatus::Attached,
+    };
+    Ok(DraftAttachment { id: r.get(0)?, filename: r.get(1)?, mime: r.get(2)?, size: r.get::<_, i64>(3)? as usize, status })
+}
+
+/// What's kept of a draft's content: its text, not its files, which are the store's.
+fn text_of(draft: &Draft) -> String {
+    if draft.attachments.is_empty() { json(draft) } else { json(&Draft { attachments: Vec::new(), ..draft.clone() }) }
+}
+
 /// Runs for every Drafts list: it must read only the Drafts mailboxes, never a whole account
 /// (messages has no index on message_id). CROSS JOIN fixes the order: Drafts mailboxes, then
 /// their messages by (account, mailbox), then the few drafts.
@@ -116,17 +138,17 @@ impl Store {
     }
 
     /// [`Store::save_draft`] for a draft that carries on another's text (`files_from`: a save
-    /// refused under its own id, kept as a new draft): the files it lists are copied from that
-    /// draft first, if it still has them.
+    /// refused under its own id, kept as a new draft): it gets that draft's files, those still
+    /// being attached too (whose bytes, once read, go to both).
     pub fn save_draft_from(&self, id: i64, draft: &Draft, open: bool, at: DraftRev, now: i64, files_from: Option<i64>) -> Result<Option<bool>> {
         self.transaction(|st| {
             if let Some(from) = files_from.filter(|f| *f != id) {
-                st.copy_draft_files(from, id, &draft.attachments)?;
+                st.copy_draft_files(from, id)?;
             }
             let saved = st.put_draft(id, draft, open, Some(at.lifecycle), Some(at.rev), now)?;
             if saved.is_none() {
                 // Refused: what was copied for it goes too.
-                st.conn.execute("DELETE FROM draft_files WHERE draft = ?1 AND NOT EXISTS (SELECT 1 FROM drafts WHERE id = ?1)", params![id])?;
+                st.drop_files_without_draft(id)?;
             }
             Ok(saved)
         })
@@ -134,10 +156,9 @@ impl Store {
 
     /// [`Store::save_draft`]. `lifecycle: None` writes in whatever lifecycle: the send itself,
     /// which comes after everything (it starts a draft gone for good again). `rev: None` writes
-    /// whatever the stored rev. A stored draft never lists a file it doesn't have the bytes of
-    /// (one written to a draft that's since gone, say): such a file is left off, and saving and
-    /// sending go on without what can't be had, rather than fail every time. Call inside a
-    /// transaction.
+    /// whatever the stored rev. The draft's files are the store's (`draft_attachments`): a
+    /// write's list is ignored, so no save, however late, adds or takes off a file. Call inside
+    /// a transaction.
     fn put_draft(&self, id: i64, draft: &Draft, open: bool, lifecycle: Option<i64>, rev: Option<i64>, now: i64) -> Result<Option<bool>> {
         // Gone for good: no write from its life brings it back.
         let ended: Option<i64> = self.conn.query_row("SELECT lifecycle FROM draft_ends WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
@@ -147,15 +168,7 @@ impl Store {
             }
             self.conn.execute("DELETE FROM draft_ends WHERE id = ?1", params![id])?;
         }
-        let missing = self.missing_files(id, &draft.attachments)?;
-        let present;
-        let draft = if missing.is_empty() {
-            draft
-        } else {
-            present = Draft { attachments: draft.attachments.iter().filter(|a| !missing.contains(&a.id)).cloned().collect(), ..draft.clone() };
-            &present
-        };
-        let content = json(draft);
+        let content = text_of(draft);
         type Row = (String, String, String, i64, bool, Option<(String, u32, u32)>, bool, bool, i64, i64);
         let old: Option<Row> = self
             .conn
@@ -209,23 +222,31 @@ impl Store {
         Ok(Some(changed))
     }
 
+    /// A draft as read, with its files.
+    fn with_files(&self, mut d: LocalDraft) -> Result<LocalDraft> {
+        d.draft.attachments = self.files_of(d.id)?;
+        Ok(d)
+    }
+
     /// Any draft, shown or not.
     pub fn draft(&self, id: i64) -> Result<Option<LocalDraft>> {
-        Ok(self.conn.query_row(&format!("SELECT {COLS} FROM drafts d WHERE d.id = ?1"), params![id], row).optional()?)
+        let d = self.conn.query_row(&format!("SELECT {COLS} FROM drafts d WHERE d.id = ?1"), params![id], row).optional()?;
+        d.map(|d| self.with_files(d)).transpose()
     }
 
     /// Every draft, of one account or all, newest first, shown or not: what the Drafts list is
     /// merged with.
     pub fn drafts(&self, account: Option<&str>) -> Result<Vec<LocalDraft>> {
         let mut stmt = self.conn.prepare_cached(&format!("SELECT {COLS} FROM drafts d WHERE ?1 IS NULL OR d.account = ?1 ORDER BY d.updated DESC, d.id DESC"))?;
-        let rows = stmt.query_map(params![account], row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let rows: Vec<LocalDraft> = stmt.query_map(params![account], row)?.collect::<rusqlite::Result<_>>()?;
+        rows.into_iter().map(|d| self.with_files(d)).collect()
     }
 
     /// The draft that was in the composer when the app last closed, to open again.
     pub fn draft_to_restore(&self) -> Result<Option<LocalDraft>> {
         let sql = format!("SELECT {COLS} FROM drafts d WHERE d.open = 1 AND d.sending = 0 AND d.purge_op = 0 ORDER BY d.updated DESC, d.id DESC LIMIT 1");
-        Ok(self.conn.query_row(&sql, [], row).optional()?)
+        let d = self.conn.query_row(&sql, [], row).optional()?;
+        d.map(|d| self.with_files(d)).transpose()
     }
 
     pub fn set_draft_open(&self, id: i64, open: bool) -> Result<()> {
@@ -246,7 +267,8 @@ impl Store {
         let sql = format!(
             "SELECT {COLS} FROM drafts d JOIN messages m ON m.account = d.account AND m.message_id = d.message_id WHERE m.id = ?1 AND m.message_id != ''"
         );
-        Ok(self.conn.query_row(&sql, params![id], row).optional()?)
+        let d = self.conn.query_row(&sql, params![id], row).optional()?;
+        d.map(|d| self.with_files(d)).transpose()
     }
 
     /// Makes a draft found on the server (written elsewhere, or by Envoy on another computer) a
@@ -264,10 +286,11 @@ impl Store {
             let message_id = if fresh { new_message_id(id) } else { message_id };
             st.conn.execute(
                 "INSERT INTO drafts (id, account, content, message_id, updated, version, server_version, appended, open) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, 1)",
-                params![id, account, json(&draft), message_id, now, if fresh { 0 } else { 1 }],
+                params![id, account, text_of(&draft), message_id, now, if fresh { 0 } else { 1 }],
             )?;
             for (a, data) in draft.attachments.iter().zip(files) {
-                st.conn.execute("INSERT OR REPLACE INTO draft_files (draft, id, data) VALUES (?1, ?2, ?3)", params![id, a.id, data])?;
+                st.conn.execute("INSERT INTO draft_attachments (draft, id, filename, mime, size) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, a.id, a.filename, a.mime, data.len()])?;
+                st.conn.execute("INSERT INTO draft_files (draft, id, data) VALUES (?1, ?2, ?3)", params![id, a.id, data])?;
             }
             if fresh {
                 let op = st.enqueue(&account, &Op::Expunge { mailbox, uid })?;
@@ -296,17 +319,25 @@ impl Store {
             "INSERT INTO drafts (id, account, content, message_id, rev, updated, version, open)
              SELECT n, ?1, ?2, '<' || n || '.' || ?3 || '.draft@envoy>', ?4, ?5, 1, ?6
              FROM (SELECT MAX(COALESCE((SELECT MAX(id) FROM drafts), 0) + 1, COALESCE((SELECT MAX(id) FROM draft_ends), 0) + 1, ?7) AS n)",
-            params![draft.account, json(draft), format!("{:08x}", rand::random::<u32>()), rev, now, open, now.saturating_mul(1_000_000)],
+            params![draft.account, text_of(draft), format!("{:08x}", rand::random::<u32>()), rev, now, open, now.saturating_mul(1_000_000)],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// The bytes of a draft's attachments, with them. An error if any is missing: a draft is
-    /// never sent or saved without a file it lists.
-    pub fn draft_files(&self, id: i64, attachments: &[DraftAttachment]) -> Result<Vec<(DraftAttachment, Vec<u8>)>> {
+    /// The draft's files, in the order they were added (their ids), each with where it stands.
+    pub fn files_of(&self, id: i64) -> Result<Vec<DraftAttachment>> {
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT {FILE_COLS} FROM draft_attachments WHERE draft = ?1 AND status != {REMOVED} ORDER BY id"))?;
+        let rows = stmt.query_map(params![id], file_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The draft's attached files with their bytes, in order: what's uploaded and sent with it.
+    /// An error if one's bytes are missing: a draft never goes without a file it lists.
+    pub fn attached_files(&self, id: i64) -> Result<Vec<(DraftAttachment, Vec<u8>)>> {
         let mut stmt = self.conn.prepare_cached("SELECT data FROM draft_files WHERE draft = ?1 AND id = ?2")?;
-        attachments
-            .iter()
+        self.files_of(id)?
+            .into_iter()
+            .filter(|a| a.status == FileStatus::Attached)
             .map(|a| {
                 let data: Option<Vec<u8>> = stmt.query_row(params![id, a.id], |r| r.get(0)).optional()?;
                 data.map(|d| (a.clone(), d)).ok_or_else(|| anyhow::anyhow!("The attached file {} is missing from this draft", a.filename))
@@ -314,57 +345,144 @@ impl Store {
             .collect()
     }
 
-    /// Puts file `file`'s bytes with draft `id`, written once: the draft's saves list it from
-    /// then on, and never write it again. Only for a draft the store has (a composer saves
-    /// before it attaches): false, and nothing written, when it's gone, so no file outlives its
-    /// draft. Its bytes go with the draft (sent, discarded); a file taken off the draft stays
-    /// with it until then, so no save made before can list a file that's gone.
-    pub fn add_draft_file(&self, id: i64, file: u32, data: &[u8]) -> Result<bool> {
-        Ok(self.conn.execute(
-            "INSERT OR REPLACE INTO draft_files (draft, id, data) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM drafts WHERE id = ?1)",
-            params![id, file, data],
-        )? > 0)
-    }
-
-    /// Copies the `files` draft `from` has to draft `id`, leaving any `id` has. Call inside a
-    /// transaction that saves draft `id`.
-    fn copy_draft_files(&self, from: i64, id: i64, files: &[DraftAttachment]) -> Result<()> {
-        let mut stmt = self.conn.prepare_cached("INSERT OR IGNORE INTO draft_files (draft, id, data) SELECT ?2, id, data FROM draft_files WHERE draft = ?1 AND id = ?3")?;
-        for f in files {
-            stmt.execute(params![from, id, f.id])?;
-        }
-        Ok(())
-    }
-
-    /// The `files` draft `id` doesn't have the bytes of (their ids).
-    pub fn missing_files(&self, id: i64, files: &[DraftAttachment]) -> Result<Vec<u32>> {
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut stmt = self.conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM draft_files WHERE draft = ?1 AND id = ?2)")?;
-        let mut missing = Vec::new();
-        for f in files {
-            if !stmt.query_row(params![id, f.id], |r| r.get::<_, bool>(0))? {
-                missing.push(f.id);
+    /// Starts attaching `files` to draft `id`: each is listed from now on, as being attached,
+    /// with where it comes from, until its bytes are in ([`Store::file_in`]) or it can't be
+    /// ([`Store::file_failed`]), whoever is (or isn't) looking at the draft meanwhile. Only for
+    /// a draft the store has (a composer saves before it attaches): None, and nothing listed,
+    /// when it's gone, so no file outlives its draft. An id the draft already has, or had, is
+    /// refused, never taken over: false for that file.
+    pub fn attaching(&self, id: i64, files: &[(DraftAttachment, FileSource)]) -> Result<Option<Vec<bool>>> {
+        self.transaction(|st| {
+            if st.conn.query_row("SELECT NOT EXISTS (SELECT 1 FROM drafts WHERE id = ?1)", params![id], |r| r.get::<_, bool>(0))? {
+                return Ok(None);
             }
-        }
-        Ok(missing)
+            let mut stmt = st.conn.prepare_cached(&format!(
+                "INSERT OR IGNORE INTO draft_attachments (draft, id, filename, mime, size, status, source) VALUES (?1, ?2, ?3, ?4, ?5, {ATTACHING}, ?6)"
+            ))?;
+            let taken = files.iter().map(|(a, from)| Ok(stmt.execute(params![id, a.id, a.filename, a.mime, a.size, json(from)])? > 0)).collect::<Result<_>>()?;
+            Ok(Some(taken))
+        })
     }
 
-    /// A new draft that carries on another's text ([`Store::insert_new_draft`]) gets its files
-    /// from draft `from`, those it still has; the rest are left off it. Call inside a
-    /// transaction.
-    pub fn take_files_from(&self, from: Option<i64>, id: i64) -> Result<()> {
-        let Some(d) = self.draft(id)? else { return Ok(()) };
-        if let Some(from) = from.filter(|f| *f != id) {
-            self.copy_draft_files(from, id, &d.draft.attachments)?;
-        }
-        let missing = self.missing_files(id, &d.draft.attachments)?;
-        if !missing.is_empty() {
-            let draft = Draft { attachments: d.draft.attachments.into_iter().filter(|a| !missing.contains(&a.id)).collect(), ..d.draft };
-            self.conn.execute("UPDATE drafts SET content = ?2 WHERE id = ?1", params![id, json(&draft)])?;
+    /// File `file` is read: its bytes go with every draft attaching it (a draft carrying on
+    /// another's text attaches the same file), written once, and each draft gets an upload.
+    /// Returns those drafts, with the file as it now is. A file no longer being attached (taken
+    /// off, or its draft gone) is left alone: an answer that comes late changes nothing.
+    pub fn file_in(&self, file: i64, data: &[u8], mime: &str, now: i64) -> Result<Vec<(i64, DraftAttachment)>> {
+        self.transaction(|st| {
+            let drafts: Vec<i64> = st
+                .conn
+                .prepare_cached(&format!("SELECT draft FROM draft_attachments WHERE id = ?1 AND status = {ATTACHING}"))?
+                .query_map(params![file], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut done = Vec::new();
+            for draft in drafts {
+                // Bytes are never replaced: a draft's file id names one file, ever.
+                if st.conn.execute("INSERT OR IGNORE INTO draft_files (draft, id, data) VALUES (?1, ?2, ?3)", params![draft, file, data])? == 0 {
+                    st.conn.execute(&format!("UPDATE draft_attachments SET status = {FAILED}, error = 'Couldn''t attach it: try again' WHERE draft = ?1 AND id = ?2"), params![draft, file])?;
+                    continue;
+                }
+                st.conn.execute(
+                    &format!("UPDATE draft_attachments SET status = {ATTACHED}, size = ?3, mime = CASE WHEN ?4 = '' THEN mime ELSE ?4 END, error = '' WHERE draft = ?1 AND id = ?2"),
+                    params![draft, file, data.len(), mime],
+                )?;
+                st.files_changed(draft, now)?;
+                if let Some(a) = st.files_of(draft)?.into_iter().find(|a| a.id == file) {
+                    done.push((draft, a));
+                }
+            }
+            Ok(done)
+        })
+    }
+
+    /// File `file` couldn't be attached (`error`, to show): it stays listed, saying so, for the
+    /// user to take off or attach again. Returns the drafts that were attaching it.
+    pub fn file_failed(&self, file: i64, error: &str) -> Result<Vec<i64>> {
+        self.transaction(|st| {
+            let drafts: Vec<i64> = st
+                .conn
+                .prepare_cached(&format!("SELECT draft FROM draft_attachments WHERE id = ?1 AND status = {ATTACHING}"))?
+                .query_map(params![file], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            st.conn.execute(&format!("UPDATE draft_attachments SET status = {FAILED}, error = ?2 WHERE id = ?1 AND status = {ATTACHING}"), params![file, error])?;
+            Ok(drafts)
+        })
+    }
+
+    /// Takes file `file` off draft `id`, its bytes too. Its id stays the draft's, never given
+    /// to another file, so an answer still on its way for it changes nothing. True if it was
+    /// attached (the draft changed, and gets an upload).
+    pub fn remove_file(&self, id: i64, file: i64, now: i64) -> Result<bool> {
+        self.transaction(|st| {
+            let status: Option<i64> = st.conn.query_row("SELECT status FROM draft_attachments WHERE draft = ?1 AND id = ?2", params![id, file], |r| r.get(0)).optional()?;
+            if status.is_none_or(|s| s == REMOVED) {
+                return Ok(false);
+            }
+            st.conn.execute(&format!("UPDATE draft_attachments SET status = {REMOVED}, error = '' WHERE draft = ?1 AND id = ?2"), params![id, file])?;
+            st.conn.execute("DELETE FROM draft_files WHERE draft = ?1 AND id = ?2", params![id, file])?;
+            let attached = status == Some(ATTACHED);
+            if attached {
+                st.files_changed(id, now)?;
+            }
+            Ok(attached)
+        })
+    }
+
+    /// Files still being attached, as a restart finds them: `(draft, file, where it comes
+    /// from)`, once per file (with one of the drafts attaching it).
+    pub fn attaching_files(&self) -> Result<Vec<(i64, i64, FileSource)>> {
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT MIN(draft), id, MIN(source) FROM draft_attachments WHERE status = {ATTACHING} GROUP BY id ORDER BY id"))?;
+        let rows: Vec<(i64, i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows.into_iter().filter_map(|(draft, id, source)| serde_json::from_str(&source).ok().map(|s| (draft, id, s))).collect())
+    }
+
+    /// How much the draft's attached files weigh.
+    pub fn attached_size(&self, id: i64) -> Result<usize> {
+        Ok(self.conn.query_row(&format!("SELECT COALESCE(SUM(size), 0) FROM draft_attachments WHERE draft = ?1 AND status = {ATTACHED}"), params![id], |r| r.get::<_, i64>(0))? as usize)
+    }
+
+    /// The draft's files changed: its server copy is behind, and gets an upload (in a while if
+    /// the draft is being written, and longer the more its files weigh; now if it's put away).
+    /// Nothing for a draft on its way out. Call inside a transaction.
+    fn files_changed(&self, id: i64, now: i64) -> Result<()> {
+        let found: Option<(String, bool)> = self
+            .conn
+            .query_row("SELECT account, open != 0 FROM drafts WHERE id = ?1 AND sending = 0 AND purge_op = 0", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((account, open)) = found else { return Ok(()) };
+        self.conn.execute("UPDATE drafts SET version = version + 1, updated = ?2 WHERE id = ?1", params![id, now])?;
+        let at = if open { now + crate::drafts::upload_delay(self.attached_size(id)?) } else { now };
+        self.queue_draft_upload(&account, id, at)?;
+        Ok(())
+    }
+
+    /// Copies draft `from`'s files to draft `id`, leaving any `id` has. Call inside a
+    /// transaction that saves draft `id`.
+    fn copy_draft_files(&self, from: i64, id: i64) -> Result<()> {
+        self.conn.execute(
+            &format!("INSERT OR IGNORE INTO draft_attachments (draft, id, filename, mime, size, status, error, source) SELECT ?2, id, filename, mime, size, status, error, source FROM draft_attachments WHERE draft = ?1 AND status != {REMOVED}"),
+            params![from, id],
+        )?;
+        self.conn.execute("INSERT OR IGNORE INTO draft_files (draft, id, data) SELECT ?2, id, data FROM draft_files WHERE draft = ?1", params![from, id])?;
+        Ok(())
+    }
+
+    /// Files copied for draft `id` that never got their draft (its save was refused). Call
+    /// inside a transaction.
+    fn drop_files_without_draft(&self, id: i64) -> Result<()> {
+        for table in ["draft_files", "draft_attachments"] {
+            self.conn.execute(&format!("DELETE FROM {table} WHERE draft = ?1 AND NOT EXISTS (SELECT 1 FROM drafts WHERE id = ?1)"), params![id])?;
         }
         Ok(())
+    }
+
+    /// A new draft that carries on another's text ([`Store::insert_new_draft`]) gets the files
+    /// of draft `from`. Call inside a transaction.
+    pub fn take_files_from(&self, from: Option<i64>, id: i64) -> Result<()> {
+        match from.filter(|f| *f != id) {
+            Some(from) => self.copy_draft_files(from, id),
+            None => Ok(()),
+        }
     }
 
     /// Whether the draft has changes the server's copy lacks, and should get them (it isn't on
@@ -448,6 +566,7 @@ impl Store {
         self.conn.execute("UPDATE drafts SET appended = 1, unconfirmed = 1 WHERE id = ?1", params![id])?;
         let mut draft: Draft = serde_json::from_str(&content).unwrap_or_default();
         draft.account = account.to_owned();
+        draft.attachments = self.files_of(id)?.into_iter().filter(|a| a.status == FileStatus::Attached).collect();
         Ok(Some(DraftUpload { account: account.to_owned(), draft, message_id, version, generation, previous, maybe_strays }))
     }
 
@@ -1086,91 +1205,142 @@ mod tests {
         assert!(s.draft_upload("b", 1).unwrap().unwrap().previous.is_none(), "b's upload replaces nothing");
     }
 
-    fn file(id: u32, name: &str, size: usize) -> DraftAttachment {
-        DraftAttachment { id, filename: name.into(), mime: crate::attach::type_for(name).into(), size }
+    fn file(id: i64, name: &str, size: usize) -> DraftAttachment {
+        DraftAttachment { id, filename: name.into(), mime: crate::attach::type_for(name).into(), size, status: FileStatus::Attached }
     }
 
-    fn with_files(subject: &str, files: &[DraftAttachment]) -> Draft {
-        Draft { attachments: files.to_vec(), ..draft(subject) }
+    fn from_disk(path: &str) -> FileSource {
+        FileSource::Path(path.into())
     }
 
-    fn stored_files(s: &Store) -> i64 {
-        s.conn.query_row("SELECT COUNT(*) FROM draft_files", [], |r| r.get(0)).unwrap()
+    /// Attaches `name` to draft `id` as file `file`, its bytes `data`, as the engine does.
+    fn attach(s: &Store, id: i64, file: i64, name: &str, data: &[u8]) {
+        let listed = DraftAttachment { status: FileStatus::Attaching, ..self::file(file, name, 0) };
+        assert_eq!(s.attaching(id, &[(listed, from_disk(name))]).unwrap(), Some(vec![true]));
+        assert_eq!(s.file_in(file, data, "", 100).unwrap().len(), 1);
+    }
+
+    fn stored(s: &Store, table: &str) -> i64 {
+        s.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
     }
 
     #[test]
-    fn attached_files_survive_a_restart_and_go_with_their_draft() {
+    fn a_file_being_attached_is_kept_with_its_draft_until_its_bytes_are_in() {
         let (dir, db) = temp_db("files");
-        let pdf = file(0, "plan.pdf", 4);
+        let pdf = file(7, "plan.pdf", 4);
         {
             let s = Store::open(&db).unwrap();
-            assert!(!s.add_draft_file(1, 0, b"%PDF").unwrap(), "no draft, nothing kept: a file never outlives its draft");
-            assert_eq!(stored_files(&s), 0);
+            let listed = DraftAttachment { status: FileStatus::Attaching, ..file(7, "plan.pdf", 0) };
+            assert_eq!(s.attaching(1, &[(listed.clone(), from_disk("/x/plan.pdf"))]).unwrap(), None, "no draft, nothing kept: a file never outlives its draft");
             s.save_draft(1, &draft("plan"), true, at(1), 100).unwrap();
-            assert!(s.add_draft_file(1, 0, b"%PDF").unwrap());
-            s.save_draft(1, &with_files("plan", std::slice::from_ref(&pdf)), true, at(2), 101).unwrap();
-            // The app dies here.
+            assert_eq!(s.attaching(1, &[(listed.clone(), from_disk("/x/plan.pdf"))]).unwrap(), Some(vec![true]));
+            assert_eq!(s.draft(1).unwrap().unwrap().draft.attachments, vec![listed], "listed at once, as being attached");
+            // The app dies here, the file half read.
         }
         let s = Store::open(&db).unwrap();
+        assert_eq!(s.attaching_files().unwrap(), vec![(1, 7, from_disk("/x/plan.pdf"))], "a restart finds it, and where it comes from");
+        assert_eq!(s.file_in(7, b"%PDF", "", 200).unwrap(), vec![(1, pdf.clone())]);
         let back = s.draft_to_restore().unwrap().unwrap();
-        assert_eq!(back.draft.attachments, vec![pdf.clone()], "listed with the draft");
-        assert_eq!(s.draft_files(1, &back.draft.attachments).unwrap(), vec![(pdf, b"%PDF".to_vec())], "and the bytes with it");
-        // Typing on rewrites the text, never the file.
-        s.save_draft(1, &with_files("plan, v2", &back.draft.attachments), true, at(3), 102).unwrap();
-        assert_eq!(stored_files(&s), 1);
+        assert_eq!(back.draft.attachments, vec![pdf.clone()], "attached");
+        assert_eq!(s.attached_files(1).unwrap(), vec![(pdf, b"%PDF".to_vec())], "with its bytes");
+        assert!(s.draft_needs_upload(1).unwrap() && s.attaching_files().unwrap().is_empty());
+        // Typing on rewrites the text, never the file; saves don't list files at all.
+        s.save_draft(1, &draft("plan, v2"), true, at(3), 202).unwrap();
+        assert_eq!(s.draft(1).unwrap().unwrap().draft.attachments.len(), 1);
         s.discard_draft(1, None).unwrap();
-        assert_eq!(stored_files(&s), 0, "gone with the draft");
+        assert_eq!((stored(&s, "draft_files"), stored(&s, "draft_attachments")), (0, 0), "gone with the draft");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_file_taken_off_leaves_the_draft_but_not_a_save_made_before() {
+    fn a_save_never_adds_or_takes_off_a_file() {
         let s = Store::memory();
-        let (a, b) = (file(0, "a.txt", 1), file(1, "b.txt", 1));
         s.save_draft(1, &draft("x"), true, at(1), 100).unwrap();
-        s.add_draft_file(1, 0, b"a").unwrap();
-        s.add_draft_file(1, 1, b"b").unwrap();
-        s.save_draft(1, &with_files("x", &[a.clone(), b.clone()]), true, at(2), 101).unwrap();
-        s.save_draft(1, &with_files("x", std::slice::from_ref(&a)), true, at(4), 102).unwrap();
-        let d = s.draft(1).unwrap().unwrap();
-        assert_eq!(d.draft.attachments, vec![a.clone()], "off the draft: not saved or sent with it");
-        assert_eq!(s.draft_upload("a", 1).unwrap().unwrap().draft.attachments, vec![a]);
-        // A retry of an older save, still listing b, can't win; and if it could, b is still there.
-        assert_eq!(s.save_draft(1, &with_files("x", &[file(0, "a.txt", 1), b.clone()]), true, at(3), 103).unwrap(), Some(false));
-        assert!(s.missing_files(1, &[b]).unwrap().is_empty());
+        attach(&s, 1, 10, "a.txt", b"a");
+        // A save listing another file, or none, made before or after: the store's files stand.
+        s.save_draft(1, &Draft { attachments: vec![file(11, "b.txt", 1)], ..draft("x") }, true, at(2), 101).unwrap();
+        s.save_draft(1, &draft("x, later"), true, at(3), 102).unwrap();
+        assert_eq!(s.draft(1).unwrap().unwrap().draft.attachments, vec![file(10, "a.txt", 1)]);
+        assert_eq!(s.draft_upload("a", 1).unwrap().unwrap().draft.attachments, vec![file(10, "a.txt", 1)], "uploaded with it");
     }
 
     #[test]
-    fn a_draft_never_lists_a_file_it_doesnt_have() {
+    fn a_file_id_is_never_taken_twice_and_bytes_never_replaced() {
         let s = Store::memory();
-        let (kept, lost) = (file(0, "kept.png", 3), file(1, "lost.png", 3));
         s.save_draft(1, &draft("x"), true, at(1), 100).unwrap();
-        s.add_draft_file(1, 0, b"png").unwrap();
-        assert_eq!(s.missing_files(1, &[kept.clone(), lost.clone()]).unwrap(), vec![1]);
-        s.save_draft(1, &with_files("x", &[kept.clone(), lost]), true, at(2), 101).unwrap();
-        let d = s.draft(1).unwrap().unwrap();
-        assert_eq!(d.draft.attachments, vec![kept.clone()], "the one it has the bytes of");
-        assert!(s.draft_files(1, &d.draft.attachments).is_ok(), "so it can always be uploaded and sent");
+        attach(&s, 1, 5, "a.pdf", b"AAAA");
+        let again = DraftAttachment { status: FileStatus::Attaching, ..file(5, "b.png", 0) };
+        assert_eq!(s.attaching(1, &[(again, from_disk("b.png"))]).unwrap(), Some(vec![false]), "refused");
+        assert!(s.file_in(5, b"BBBB", "", 101).unwrap().is_empty(), "a late answer for id 5 changes nothing");
+        assert_eq!(s.attached_files(1).unwrap(), vec![(file(5, "a.pdf", 4), b"AAAA".to_vec())]);
+        // Taken off, its id still isn't given again, and an answer still on its way for it is
+        // dropped.
+        let pending = DraftAttachment { status: FileStatus::Attaching, ..file(6, "slow.mov", 0) };
+        s.attaching(1, &[(pending.clone(), from_disk("slow.mov"))]).unwrap();
+        assert!(!s.remove_file(1, 6, 102).unwrap(), "it wasn't attached yet");
+        assert!(s.file_in(6, b"late", "", 103).unwrap().is_empty());
+        assert_eq!(s.attaching(1, &[(pending, from_disk("other.mov"))]).unwrap(), Some(vec![false]));
+        assert_eq!(s.files_of(1).unwrap(), vec![file(5, "a.pdf", 4)]);
     }
 
     #[test]
-    fn a_draft_carrying_on_anothers_text_takes_its_files() {
+    fn a_file_taken_off_goes_with_its_bytes_and_the_draft_gets_an_upload() {
         let s = Store::memory();
-        let pdf = file(0, "plan.pdf", 4);
+        s.save_draft(1, &draft("x"), true, at(1), 100).unwrap();
+        attach(&s, 1, 10, "a.txt", b"a");
+        attach(&s, 1, 11, "b.txt", b"b");
+        let up = s.draft_upload("a", 1).unwrap().unwrap();
+        s.draft_uploaded(1, &up, "Drafts", Some((1, 1)), true).unwrap();
+        assert!(s.remove_file(1, 11, 101).unwrap());
+        assert_eq!(s.files_of(1).unwrap(), vec![file(10, "a.txt", 1)]);
+        assert_eq!(stored(&s, "draft_files"), 1, "its bytes gone");
+        assert!(s.draft_needs_upload(1).unwrap(), "the server's copy still has it");
+        assert!(!s.remove_file(1, 11, 102).unwrap(), "once");
+    }
+
+    #[test]
+    fn a_file_that_cant_be_read_says_why_and_stays_listed() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("x"), true, at(1), 100).unwrap();
+        let listed = DraftAttachment { status: FileStatus::Attaching, ..file(3, "gone.pdf", 0) };
+        s.attaching(1, &[(listed, from_disk("/gone.pdf"))]).unwrap();
+        assert_eq!(s.file_failed(3, "Couldn't read gone.pdf: not found").unwrap(), vec![1]);
+        assert_eq!(s.files_of(1).unwrap()[0].status, FileStatus::Failed("Couldn't read gone.pdf: not found".into()));
+        assert!(s.attaching_files().unwrap().is_empty() && s.attached_files(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_draft_carrying_on_anothers_text_takes_its_files_even_those_on_their_way() {
+        let s = Store::memory();
         s.save_draft(1, &draft("plan"), true, at(1), 100).unwrap();
-        s.add_draft_file(1, 0, b"%PDF").unwrap();
-        s.save_draft(1, &with_files("plan", std::slice::from_ref(&pdf)), true, at(2), 101).unwrap();
-        // A save refused under id 1 carries on as draft 2, listing 1's file.
-        assert_eq!(s.save_draft_from(2, &with_files("plan", std::slice::from_ref(&pdf)), true, at(1), 102, Some(1)).unwrap(), Some(true));
-        let d = s.draft(2).unwrap().unwrap();
-        assert_eq!(s.draft_files(2, &d.draft.attachments).unwrap()[0].1, b"%PDF".to_vec());
+        attach(&s, 1, 10, "plan.pdf", b"%PDF");
+        let slow = DraftAttachment { status: FileStatus::Attaching, ..file(11, "slow.mov", 0) };
+        s.attaching(1, &[(slow, from_disk("slow.mov"))]).unwrap();
+        // A save refused under id 1 carries on as draft 2.
+        assert_eq!(s.save_draft_from(2, &draft("plan"), true, at(1), 102, Some(1)).unwrap(), Some(true));
+        assert_eq!(s.attached_files(2).unwrap()[0].1, b"%PDF".to_vec());
+        // The slow one's bytes go to both.
+        let done: Vec<i64> = s.file_in(11, b"MOV", "", 103).unwrap().into_iter().map(|(d, _)| d).collect();
+        assert_eq!(done, vec![1, 2]);
+        assert_eq!(s.attached_files(2).unwrap().len(), 2);
         // One refused itself leaves nothing behind.
-        s.discard_draft(3, None).unwrap();
         s.save_draft(3, &draft("gone"), true, at(1), 100).unwrap();
         s.discard_draft(3, None).unwrap();
-        let before = stored_files(&s);
-        assert_eq!(s.save_draft_from(3, &with_files("gone", std::slice::from_ref(&pdf)), true, at(2), 103, Some(1)).unwrap(), None);
-        assert_eq!(stored_files(&s), before, "no file without its draft");
+        let before = (stored(&s, "draft_files"), stored(&s, "draft_attachments"));
+        assert_eq!(s.save_draft_from(3, &draft("gone"), true, at(2), 104, Some(1)).unwrap(), None);
+        assert_eq!((stored(&s, "draft_files"), stored(&s, "draft_attachments")), before, "no file without its draft");
+    }
+
+    #[test]
+    fn files_of_drafts_from_an_earlier_build_are_listed() {
+        let s = Store::memory();
+        s.save_draft(1, &draft("old"), true, at(1), 100).unwrap();
+        // As the build before kept them: listed in the content, bytes in draft_files.
+        let old = Draft { attachments: vec![DraftAttachment { id: 0, filename: "plan.pdf".into(), mime: "application/pdf".into(), size: 4, ..Default::default() }], ..draft("old") };
+        s.conn.execute("UPDATE drafts SET content = ?2 WHERE id = ?1", params![1, json(&old)]).unwrap();
+        s.conn.execute("INSERT INTO draft_files (draft, id, data) VALUES (1, 0, x'25504446')", []).unwrap();
+        crate::store::migrate(&s.conn).unwrap();
+        assert_eq!(s.attached_files(1).unwrap(), vec![(file(0, "plan.pdf", 4), b"%PDF".to_vec())]);
     }
 
     #[test]
