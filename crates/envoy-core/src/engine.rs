@@ -3388,27 +3388,30 @@ mod tests {
     #[tokio::test]
     async fn a_watched_mailbox_is_synced_when_its_status_moved_on_since_its_sync() {
         let (shared, _rx) = engine_with(setup());
-        let synced = |m: &str, exists, uid_next| shared.synced("a", m, imap::Contents { exists, uid_next: Some(uid_next) });
-        synced("Junk", 3, 10);
-        synced("Archive", 3, 10);
-        synced("Gone", 3, 10);
+        let synced = |m: &str, exists, uid_next| shared.synced("a", m, imap::Contents { exists, uid_next: Some(uid_next), uid_validity: Some(7) });
+        for m in ["Junk", "Archive", "Gone", "Remade"] {
+            synced(m, 3, 10);
+        }
         let (mut session, log) = imap::fake::session(|c| {
             Some(match c {
                 // Filed into elsewhere, then nothing else.
-                "STATUS \"Junk\" (MESSAGES UNSEEN UIDNEXT)" => "* STATUS \"Junk\" (MESSAGES 4 UNSEEN 1 UIDNEXT 11)\r\nTAG OK done\r\n".into(),
-                "STATUS \"Archive\" (MESSAGES UNSEEN UIDNEXT)" => "* STATUS \"Archive\" (MESSAGES 3 UNSEEN 0 UIDNEXT 10)\r\nTAG OK done\r\n".into(),
-                "STATUS \"Gone\" (MESSAGES UNSEEN UIDNEXT)" => "TAG NO no such mailbox\r\n".into(),
-                _ => "* STATUS \"Receipts\" (MESSAGES 0 UNSEEN 0 UIDNEXT 1)\r\nTAG OK done\r\n".into(),
+                "STATUS \"Junk\" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)" => "* STATUS \"Junk\" (MESSAGES 4 UNSEEN 1 UIDNEXT 11 UIDVALIDITY 7)\r\nTAG OK done\r\n".into(),
+                "STATUS \"Archive\" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)" => "* STATUS \"Archive\" (MESSAGES 3 UNSEEN 0 UIDNEXT 10 UIDVALIDITY 7)\r\nTAG OK done\r\n".into(),
+                // Deleted and made again elsewhere, as full and with as many UIDs used.
+                "STATUS \"Remade\" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)" => "* STATUS \"Remade\" (MESSAGES 3 UNSEEN 0 UIDNEXT 10 UIDVALIDITY 8)\r\nTAG OK done\r\n".into(),
+                "STATUS \"Gone\" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)" => "TAG NO no such mailbox\r\n".into(),
+                _ => "* STATUS \"Receipts\" (MESSAGES 0 UNSEEN 0 UIDNEXT 1 UIDVALIDITY 7)\r\nTAG OK done\r\n".into(),
             })
         })
         .await;
-        let watched = ["Junk", "Archive", "Gone", "Receipts"].map(String::from);
+        let watched = ["Junk", "Archive", "Remade", "Gone", "Receipts"].map(String::from);
         // Receipts has no sync on record: it's synced too.
-        assert_eq!(changed_since_synced(&shared, "a", &mut session, &watched).await.unwrap(), ["Junk", "Receipts"]);
+        assert_eq!(changed_since_synced(&shared, "a", &mut session, &watched).await.unwrap(), ["Junk", "Remade", "Receipts"]);
         assert_eq!(log.lock().unwrap().len(), 1 + watched.len(), "one STATUS each, after the LOGIN");
         // Synced since: nothing to do.
         synced("Junk", 4, 11);
-        synced("Receipts", 0, 1);
+        shared.synced("a", "Remade", imap::Contents { exists: 3, uid_next: Some(10), uid_validity: Some(8) });
+        shared.synced("a", "Receipts", imap::Contents { exists: 0, uid_next: Some(1), uid_validity: Some(7) });
         assert!(changed_since_synced(&shared, "a", &mut session, &watched).await.unwrap().is_empty());
         // A connection lost while looking ends the round, as any lost command does.
         let (mut session, _) = imap::fake::session(|_| Some(imap::fake::HANG_UP.to_owned())).await;

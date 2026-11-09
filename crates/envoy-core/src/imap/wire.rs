@@ -125,15 +125,16 @@ pub(super) async fn select(session: &mut Connection<impl Io>, mailbox: &str) -> 
 pub(super) struct Told {
     pub unseen: u32,
     pub messages: u32,
-    /// Asked for, but a server may leave it out.
+    /// Asked for, but a server may leave them out.
     pub uid_next: Option<u32>,
+    pub uid_validity: Option<u32>,
 }
 
 /// STATUS of `mailbox`: its counts, each as the server said it (an answer missing either isn't
-/// read as zero), and its UIDNEXT.
+/// read as zero), its UIDNEXT and UIDVALIDITY.
 pub(super) async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Told> {
-    let (mut unseen, mut messages, mut uid_next) = (None, None, None);
-    run(session, &format!("STATUS {} (MESSAGES UNSEEN UIDNEXT)", quoted(mailbox)), "STATUS", COMMAND_TIMEOUT, |r| {
+    let (mut unseen, mut messages, mut uid_next, mut uid_validity) = (None, None, None, None);
+    run(session, &format!("STATUS {} (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)", quoted(mailbox)), "STATUS", COMMAND_TIMEOUT, |r| {
         if let Response::MailboxData(MailboxDatum::Status { mailbox: m, status }) = r
             && (m.as_ref() == mailbox || (m.eq_ignore_ascii_case("INBOX") && mailbox.eq_ignore_ascii_case("INBOX")))
         {
@@ -142,6 +143,7 @@ pub(super) async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> 
                     StatusAttribute::Unseen(n) => unseen = Some(*n),
                     StatusAttribute::Messages(n) => messages = Some(*n),
                     StatusAttribute::UidNext(n) => uid_next = Some(*n),
+                    StatusAttribute::UidValidity(n) => uid_validity = Some(*n),
                     _ => {}
                 }
             }
@@ -149,7 +151,7 @@ pub(super) async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> 
     })
     .await?;
     match (unseen, messages) {
-        (Some(unseen), Some(messages)) => Ok(Told { unseen, messages, uid_next }),
+        (Some(unseen), Some(messages)) => Ok(Told { unseen, messages, uid_next, uid_validity }),
         _ => Err(anyhow!("STATUS {mailbox}: the server's answer didn't say {}", if unseen.is_none() && messages.is_none() { "MESSAGES, UNSEEN" } else if unseen.is_none() { "UNSEEN" } else { "MESSAGES" })),
     }
 }

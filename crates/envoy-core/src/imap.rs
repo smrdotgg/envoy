@@ -449,18 +449,21 @@ pub struct SyncOutcome {
 pub struct Contents {
     pub exists: u32,
     pub uid_next: Option<u32>,
+    /// The mailbox's generation: another, and it was recreated (or reset), whatever the rest.
+    pub uid_validity: Option<u32>,
 }
 
 impl Contents {
     fn of(mb: &wire::Selected) -> Contents {
-        Contents { exists: mb.exists, uid_next: mb.uid_next }
+        Contents { exists: mb.exists, uid_next: mb.uid_next, uid_validity: Some(mb.uid_validity) }
     }
 
     /// Whether `now` tells of mail come or gone since these: a message in (from anywhere)
-    /// moves UIDNEXT on, one out changes the count. Without UIDNEXT on either side, by the
-    /// count alone.
+    /// moves UIDNEXT on, one out changes the count, and a mailbox made again has another
+    /// UIDVALIDITY. UIDNEXT or UIDVALIDITY missing on either side isn't compared.
     pub fn moved_on(self, now: Contents) -> bool {
-        self.exists != now.exists || matches!((self.uid_next, now.uid_next), (Some(a), Some(b)) if a != b)
+        let differ = |a: Option<u32>, b: Option<u32>| matches!((a, b), (Some(a), Some(b)) if a != b);
+        self.exists != now.exists || differ(self.uid_next, now.uid_next) || differ(self.uid_validity, now.uid_validity)
     }
 }
 
@@ -468,7 +471,7 @@ impl Contents {
 /// [`Contents::moved_on`] against what its last sync found.
 pub async fn contents(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Contents> {
     let told = wire::status(session, mailbox).await?;
-    Ok(Contents { exists: told.messages, uid_next: told.uid_next })
+    Ok(Contents { exists: told.messages, uid_next: told.uid_next, uid_validity: told.uid_validity })
 }
 
 /// Selects `mailbox` and says whether its contents changed since `synced` (what its last sync
@@ -1305,29 +1308,31 @@ mod tests {
 
     #[test]
     fn contents_move_on_with_mail_in_or_out() {
-        let was = Contents { exists: 3, uid_next: Some(10) };
+        let was = Contents { exists: 3, uid_next: Some(10), uid_validity: Some(7) };
         assert!(!was.moved_on(was));
         // One moved in and another out: the same count, a new UID.
-        assert!(was.moved_on(Contents { exists: 3, uid_next: Some(11) }));
-        assert!(was.moved_on(Contents { exists: 2, uid_next: Some(10) }));
-        // Without UIDNEXT on one side, by the count.
-        assert!(!was.moved_on(Contents { exists: 3, uid_next: None }));
-        assert!(Contents { exists: 3, uid_next: None }.moved_on(Contents { exists: 4, uid_next: Some(11) }));
+        assert!(was.moved_on(Contents { uid_next: Some(11), ..was }));
+        assert!(was.moved_on(Contents { exists: 2, ..was }));
+        // Deleted and made again with as many messages, and as many UIDs used: a new generation.
+        assert!(was.moved_on(Contents { uid_validity: Some(8), ..was }));
+        // Without UIDNEXT or UIDVALIDITY on one side, by the rest.
+        assert!(!was.moved_on(Contents { uid_next: None, uid_validity: None, ..was }));
+        assert!(Contents { uid_next: None, ..was }.moved_on(Contents { exists: 4, uid_next: Some(11), ..was }));
     }
 
     #[tokio::test]
     async fn a_status_tells_contents_with_or_without_uidnext() {
         let (mut s, log) = fake::session(|c| match c {
-            "STATUS \"Old Projects\" (MESSAGES UNSEEN UIDNEXT)" => Some("* STATUS \"Old Projects\" (MESSAGES 4 UNSEEN 1 UIDNEXT 12)\r\nTAG OK done\r\n".into()),
-            "STATUS \"Junk\" (MESSAGES UNSEEN UIDNEXT)" => Some("* STATUS \"Junk\" (MESSAGES 4 UNSEEN 0)\r\nTAG OK done\r\n".into()),
+            "STATUS \"Old Projects\" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)" => Some("* STATUS \"Old Projects\" (MESSAGES 4 UNSEEN 1 UIDNEXT 12 UIDVALIDITY 7)\r\nTAG OK done\r\n".into()),
+            "STATUS \"Junk\" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)" => Some("* STATUS \"Junk\" (MESSAGES 4 UNSEEN 0)\r\nTAG OK done\r\n".into()),
             _ => Some("* STATUS \"Other\" (MESSAGES 9 UNSEEN 0 UIDNEXT 99)\r\n* STATUS \"Trash\" (UNSEEN 0 UIDNEXT 12)\r\nTAG OK done\r\n".into()),
         })
         .await;
-        assert_eq!(contents(&mut s, "Old Projects").await.unwrap(), Contents { exists: 4, uid_next: Some(12) });
-        assert_eq!(contents(&mut s, "Junk").await.unwrap(), Contents { exists: 4, uid_next: None });
+        assert_eq!(contents(&mut s, "Old Projects").await.unwrap(), Contents { exists: 4, uid_next: Some(12), uid_validity: Some(7) });
+        assert_eq!(contents(&mut s, "Junk").await.unwrap(), Contents { exists: 4, uid_next: None, uid_validity: None });
         // Another mailbox's count isn't this one's.
         assert!(contents(&mut s, "Trash").await.is_err());
-        assert_eq!(log.lock().unwrap().last().unwrap(), "STATUS \"Trash\" (MESSAGES UNSEEN UIDNEXT)");
+        assert_eq!(log.lock().unwrap().last().unwrap(), "STATUS \"Trash\" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)");
     }
 
     #[tokio::test]
@@ -1511,7 +1516,7 @@ mod tests {
         }
     }
 
-    const SYNCED: Contents = Contents { exists: 3, uid_next: Some(11) };
+    const SYNCED: Contents = Contents { exists: 3, uid_next: Some(11), uid_validity: Some(7) };
 
     #[tokio::test]
     async fn mail_told_before_idles_go_ahead_is_noticed() {
