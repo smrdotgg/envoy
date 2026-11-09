@@ -69,6 +69,11 @@ fn header(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
             }
         }));
     let targets: Vec<MessageId> = open.into_iter().collect();
+    // Not for a draft, nor what the server snoozed itself.
+    let in_drafts = s.mailboxes.get(&last.account).and_then(|m| m.iter().find(|m| m.name == last.mailbox)).is_some_and(|m| m.role == Role::Drafts);
+    if !in_drafts && !open.is_some_and(|id| s.snoozed_by_server(id)) {
+        tools = tools.child(crate::triage::snooze_picker(s, t, layer));
+    }
     tools = tools.child(crate::triage::picker(s, t, Picker::Move, &targets, layer));
     if s.all_gmail(&targets) {
         tools = tools.child(crate::triage::picker(s, t, Picker::Label, &targets, layer));

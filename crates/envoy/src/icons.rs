@@ -61,5 +61,6 @@ icon!(FILE_CODE, "file-code", r#"<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2
 icon!(KEYBOARD, "keyboard", r#"<rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/>"#);
 icon!(PALETTE, "palette", r#"<path d="M12 3a9 9 0 0 0 0 18c1.1 0 1.8-.8 1.8-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .8-1.8 1.8-1.8H17a4 4 0 0 0 4-4c0-4.4-4-8-9-8z"/><circle cx="7.5" cy="11" r="1"/><circle cx="10.5" cy="7" r="1"/><circle cx="15" cy="7.5" r="1"/>"#);
 icon!(BOOK, "book", r#"<path d="M4 19.5V5a2 2 0 0 1 2-2h14v15H6a2 2 0 0 0-2 2z"/><path d="M4 19.5A1.5 1.5 0 0 0 5.5 21H20"/>"#);
+icon!(CLOCK, "clock", r#"<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>"#);
 icon!(BOLT, "bolt", r#"<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>"#);
 icon!(SLIDERS, "sliders", r#"<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>"#);

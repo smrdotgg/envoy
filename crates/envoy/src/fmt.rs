@@ -40,6 +40,30 @@ fn full_date_at(ts: i64, now: chrono::DateTime<Local>) -> String {
     if rel.is_empty() { base } else { format!("{base} ({rel})") }
 }
 
+/// When a snooze ends, as its picker, toast and the Snoozed list say it: `18:00 today`,
+/// `Tue 08:00` (in the week ahead), `Sat 21 Nov, 08:00`, `Mon 4 Jan 2027, 08:00`.
+pub fn snooze_until(ts: i64) -> String {
+    snooze_until_at(ts, &Local::now())
+}
+
+/// [`snooze_until`] as of `now`, in `now`'s zone.
+fn snooze_until_at<Tz: TimeZone>(ts: i64, now: &chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let Some(d) = now.timezone().timestamp_opt(ts, 0).single() else { return String::new() };
+    let days = (d.date_naive() - now.date_naive()).num_days();
+    if days == 0 {
+        d.format("%H:%M today").to_string()
+    } else if (1..7).contains(&days) {
+        d.format("%a %H:%M").to_string()
+    } else if d.year() == now.year() {
+        d.format("%a %-d %b, %H:%M").to_string()
+    } else {
+        d.format("%a %-d %b %Y, %H:%M").to_string()
+    }
+}
+
 /// How long ago, for the last week: `just now`, `5 min ago`, `1 hour ago`, `3 days ago`.
 /// Empty for longer ago, or for a date in the future (a sender's clock ahead of ours).
 fn ago(d: chrono::TimeDelta) -> String {
@@ -154,6 +178,18 @@ pub fn quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snooze_times_say_the_day_as_near_as_it_is() {
+        let tz = chrono::FixedOffset::east_opt(3600).unwrap();
+        let now = tz.with_ymd_and_hms(2026, 11, 9, 10, 17, 0).unwrap(); // a Monday
+        let at = |d: u32, h: u32| tz.with_ymd_and_hms(2026, 11, d, h, 0, 0).unwrap().timestamp();
+        assert_eq!(snooze_until_at(at(9, 18), &now), "18:00 today");
+        assert_eq!(snooze_until_at(at(10, 8), &now), "Tue 08:00");
+        assert_eq!(snooze_until_at(at(15, 8), &now), "Sun 08:00");
+        assert_eq!(snooze_until_at(at(16, 8), &now), "Mon 16 Nov, 08:00", "a week on says its date");
+        assert_eq!(snooze_until_at(tz.with_ymd_and_hms(2027, 1, 4, 8, 0, 0).unwrap().timestamp(), &now), "Mon 4 Jan 2027, 08:00");
+    }
 
     #[test]
     fn subjects() {

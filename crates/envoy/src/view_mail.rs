@@ -7,7 +7,7 @@ use rune_kit::shell::{PaneMotion, Sidebar, SidebarRow, SidebarSection, SidebarTo
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Spinner, TextInput};
 
 use envoy_core::engine::Command;
-use envoy_core::model::{Category, Mailbox, MessageId, Role, Summary, SyncState, View};
+use envoy_core::model::{Category, Mailbox, MessageId, Role, Summary, SyncState, View, flags};
 
 use crate::app::{App, Screen, row_key, unread_count};
 use crate::theme::{Theme, avatar_color};
@@ -24,6 +24,7 @@ pub fn role_icon(role: Role) -> &'static rune::Icon {
         Role::Junk => &icons::SPAM,
         Role::Trash => &icons::TRASH,
         Role::Important => &icons::IMPORTANT,
+        Role::Snoozed => &icons::CLOCK,
         Role::Other => &icons::LABEL,
     }
 }
@@ -81,6 +82,20 @@ fn mailbox_row(s: &App, t: &Theme, m: &Mailbox, label: Option<String>) -> El {
     }
     let v = view.clone();
     r.on_select(move |s: &mut App, _| s.go(v.clone())).build(&t.k).key(format!("mb:{}:{}", m.account, m.name))
+}
+
+/// Snoozed: every bucket of `account` (every account's, with None) as one row.
+fn snoozed_row(s: &App, t: &Theme, account: Option<String>) -> El {
+    let view = View::Role { account: account.clone(), role: Role::Snoozed };
+    let label = if account.is_none() { "All snoozed" } else { "Snoozed" };
+    let selected = s.screen == Screen::Mail && s.view == view;
+    SidebarRow::new(label)
+        .icon(&icons::CLOCK)
+        .height(32.0)
+        .selected(selected)
+        .on_select(move |s: &mut App, _| s.go(view.clone()))
+        .build(&t.k)
+        .key(format!("snoozed:{}", account.unwrap_or_default()))
 }
 
 fn view_matches(view: &View, m: &Mailbox) -> bool {
@@ -166,6 +181,9 @@ pub fn sidebar(s: &App, t: &Theme) -> El {
                 .build(k)
                 .key("unified-starred"),
         );
+        if s.has_snoozed(None) {
+            sb = sb.header(snoozed_row(s, t, None));
+        }
     }
     for a in &s.accounts {
         let boxes = s.mailboxes.get(&a.id).cloned().unwrap_or_default();
@@ -184,7 +202,16 @@ pub fn sidebar(s: &App, t: &Theme) -> El {
                     .key(format!("loading:{}", a.id)),
             );
         }
+        // The buckets (and the server's own snoozed mailbox) are one row, where Snoozed ranks.
+        let mut snoozed = false;
         for m in roles {
+            if m.role == Role::Snoozed {
+                if !snoozed {
+                    rows.push(snoozed_row(s, t, Some(a.id.clone())));
+                    snoozed = true;
+                }
+                continue;
+            }
             rows.push(mailbox_row(s, t, m, None));
         }
         let labels_key = format!("labels:{}", a.id);
@@ -387,10 +414,26 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
         }
         r
     };
+    // Back from a snooze: says so, pinned atop the inbox until it's dealt with.
+    let woken = m.flags & flags::WOKEN != 0 && role != Some(Role::Snoozed);
+    let name_row_base = || {
+        let r = name_row_base();
+        if woken {
+            r.child(row().gap(3.0).center_y().child(icon(&icons::CLOCK, 12.0).color(t.accent)).child(text("Snoozed").font(k.ty.text_xsmall_medium).color(t.accent)).help("Back from a snooze"))
+        } else {
+            r
+        }
+    };
     let name_row = name_row_base().grow(1.0);
-    let date = text(fmt::list_date(m.date, &s.settings.str("inbox.dateFormat")))
+    // In Snoozed, when it wakes, not when it came.
+    let when = if role == Some(Role::Snoozed) {
+        envoy_core::snooze::wake_of(&m.mailbox).map_or_else(|| "Snoozed".to_owned(), fmt::snooze_until)
+    } else {
+        fmt::list_date(m.date, &s.settings.str("inbox.dateFormat"))
+    };
+    let date = text(when)
         .font(if unread { rune::TextStyle { weight: 600.0, ..k.ty.text_xsmall } } else { k.ty.text_xsmall })
-        .color(if unread { t.accent } else { k.c.text_faint })
+        .color(if unread || role == Some(Role::Snoozed) { t.accent } else { k.c.text_faint })
         .group_opacity(1.0, 0.0);
     let subject = if m.subject.is_empty() { "(no subject)".to_owned() } else { m.subject.clone() };
     let subject_style = if unread { rune::TextStyle { weight: 600.0, ..k.ty.text_small } } else { k.ty.text_small };
@@ -417,6 +460,14 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
     // A draft is only discarded (with Undo): it isn't archived, and it's never unread.
     let actions = if role == Some(Role::Drafts) || id < 0 {
         actions.child(act(&icons::TRASH, "Discard draft", "d", |s, id, tx| s.delete(vec![id], tx)))
+    } else if role == Some(Role::Snoozed) && s.snoozed_by_server(id) {
+        // The server's own snooze: shown, not moved from here.
+        actions
+    } else if role == Some(Role::Snoozed) {
+        actions
+            .child(act(&icons::INBOX, "Unsnooze: back to the inbox now", "u", |s, id, tx| s.unsnooze(vec![id], tx)))
+            .child(act(&icons::ARCHIVE, "Archive", "a", |s, id, tx| s.archive(vec![id], tx)))
+            .child(act(&icons::TRASH, "Delete", "d", |s, id, tx| s.delete(vec![id], tx)))
     } else {
         actions
             .child(act(&icons::ARCHIVE, "Archive", "a", |s, id, tx| s.archive(vec![id], tx)))
@@ -486,7 +537,7 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
     let mut r = row()
         .key(row_key(id))
         .role("row")
-        .label(format!("{}{}{}, {}", if marks.checked { "Selected, " } else { "" }, if unread { "Unread, " } else { "" }, m.from.display(), m.subject))
+        .label(format!("{}{}{}{}, {}", if marks.checked { "Selected, " } else { "" }, if woken { "Back from a snooze, " } else { "" }, if unread { "Unread, " } else { "" }, m.from.display(), m.subject))
         .w_full()
         .gap(10.0)
         .px(if compact { 10.0 } else { 12.0 })
@@ -549,6 +600,10 @@ fn empty_list(s: &App, t: &Theme) -> El {
         ("All caught up".into(), sub)
     } else if matches!(&s.view, View::Role { role: Role::Inbox, .. }) {
         ("All caught up".into(), "Nothing in your inbox.".into())
+    } else if matches!(&s.view, View::Role { role: Role::Snoozed, .. }) {
+        let key = crate::app::key_label(&s.settings, "keys.snooze");
+        let how = if key.is_empty() { "Snooze a message".to_owned() } else { format!("Press {key} on a message") };
+        ("Nothing snoozed".into(), format!("{how} to put it away until later. It comes back to the top of your inbox then."))
     } else {
         ("Nothing here".into(), String::new())
     };
@@ -659,7 +714,7 @@ fn rows_env(s: &App, t: &Theme) -> u64 {
     // A Sent or Drafts list (a role view or the mailbox itself) shows recipients, and a draft
     // only Discard: list_row reads the view's role.
     let role = s.view_role();
-    (role == Some(Role::Sent), role == Some(Role::Drafts), s.settings.str("inbox.dateFormat"), chrono::Local::now().date_naive()).hash(&mut h);
+    (role == Some(Role::Sent), role == Some(Role::Drafts), role == Some(Role::Snoozed), s.settings.str("inbox.dateFormat"), chrono::Local::now().date_naive()).hash(&mut h);
     h.finish()
 }
 

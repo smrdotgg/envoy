@@ -40,7 +40,24 @@ const SAMPLES: &[Sample] = &[
     Sample { from: ("Jordan Lee", "jordan@northwind.dev"), subject: "Offsite agenda", preview: "Draft agenda for the offsite. Day one is planning, day two is hack day. Let me know what's missing.", hours_ago: 260, unread: false, starred: false, count: 2, attach: true, mailbox: "INBOX", category: Category::Other },
     Sample { from: ("You", "you@gmail.com"), subject: "Re: Design review moved to Thursday", preview: "Thursday works. I'll bring the prototype on my laptop.", hours_ago: 0, unread: false, starred: false, count: 1, attach: false, mailbox: "[Gmail]/Sent Mail", category: Category::Important },
     Sample { from: ("You", "you@gmail.com"), subject: "Offsite travel plan", preview: "Thinking we take the 8:10 train on Thursday and share a car from the station. Could you check whether the hotel does early check-in?", hours_ago: 3, unread: false, starred: false, count: 1, attach: true, mailbox: DRAFTS, category: Category::Important },
+    Sample { from: ("City Library", "notices@library.example"), subject: "Your hold is ready for pickup", preview: "The book you reserved is waiting at the front desk until Friday.", hours_ago: 20, unread: false, starred: false, count: 1, attach: false, mailbox: SNOOZED_TOMORROW, category: Category::Notifications },
+    Sample { from: ("Nora Blake", "nora@blake.studio"), subject: "Invoice #118 — due next month", preview: "Attached is the invoice for March. No rush, it's due on the 30th.", hours_ago: 48, unread: false, starred: false, count: 1, attach: true, mailbox: SNOOZED_NEXT_WEEK, category: Category::Important },
 ];
+
+/// Stand-ins for snooze buckets, whose names hold their (moving) wake times ([`mailbox_of`]).
+const SNOOZED_TOMORROW: &str = "snoozed:tomorrow";
+const SNOOZED_NEXT_WEEK: &str = "snoozed:nextweek";
+
+/// A sample's mailbox: a snooze bucket for its preset's time, from now, or as it says.
+fn mailbox_of(sample: &str) -> String {
+    match sample.strip_prefix("snoozed:") {
+        Some(preset) => {
+            let at = envoy_core::snooze::presets(&chrono::Local::now()).into_iter().find(|p| p.id == preset).map_or(now() + 86_400, |p| p.at);
+            envoy_core::snooze::bucket("Snoozed", "/", at)
+        }
+        None => sample.to_owned(),
+    }
+}
 
 const DRAFTS: &str = "[Gmail]/Drafts";
 /// Senders whose mail is bulk (lists, newsletters, notifications): suggested last.
@@ -93,7 +110,7 @@ fn summary(i: usize, s: &Sample) -> Summary {
     Summary {
         id: i as MessageId + 1,
         account: ACCOUNT.into(),
-        mailbox: s.mailbox.into(),
+        mailbox: mailbox_of(s.mailbox),
         uid: i as u32 + 1,
         thread: format!("t{i}"),
         subject: s.subject.into(),
@@ -115,7 +132,7 @@ fn first(name: &str) -> &str {
 }
 
 pub fn list_for(view: &View) -> Vec<Summary> {
-    SAMPLES
+    let mut rows: Vec<Summary> = SAMPLES
         .iter()
         .enumerate()
         .map(|(i, s)| summary(i, s))
@@ -123,11 +140,16 @@ pub fn list_for(view: &View) -> Vec<Summary> {
             View::Role { role: Role::Inbox, .. } => m.mailbox == "INBOX",
             View::Role { role: Role::Sent, .. } => m.mailbox.contains("Sent"),
             View::Role { role: Role::Drafts, .. } => m.mailbox == DRAFTS,
+            View::Role { role: Role::Snoozed, .. } => envoy_core::snooze::wake_of(&m.mailbox).is_some(),
             View::Role { role: Role::Flagged, .. } | View::Starred { .. } => m.flagged(),
             View::Mailbox { mailbox, .. } => &m.mailbox == mailbox,
             _ => false,
         })
-        .collect()
+        .collect();
+    if matches!(view, View::Role { role: Role::Snoozed, .. }) {
+        rows.sort_by_key(|m| envoy_core::snooze::wake_of(&m.mailbox));
+    }
+    rows
 }
 
 /// The drafts written in demo mode, which has no store: kept for the session, so Drafts lists
@@ -320,6 +342,9 @@ pub fn populate(app: &mut App) {
             mailbox("[Gmail]/All Mail", "All Mail", Role::All, 0),
             mailbox("[Gmail]/Spam", "Spam", Role::Junk, 0),
             mailbox("[Gmail]/Trash", "Trash", Role::Trash, 0),
+            mailbox("Snoozed", "Snoozed", Role::Snoozed, 0),
+            mailbox(&mailbox_of(SNOOZED_TOMORROW), "Snoozed", Role::Snoozed, 0),
+            mailbox(&mailbox_of(SNOOZED_NEXT_WEEK), "Snoozed", Role::Snoozed, 0),
             Mailbox { depth: 0, ..mailbox("Receipts", "Receipts", Role::Other, 0) },
             Mailbox { depth: 0, ..mailbox("Travel", "Travel", Role::Other, 1) },
             Mailbox { depth: 0, ..mailbox("Work", "Work", Role::Other, 0) },
