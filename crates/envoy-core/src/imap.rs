@@ -396,7 +396,7 @@ impl Contents {
 /// once it's full, so [`idle`] would never hear of mail that arrives as it starts.
 pub async fn changed_since(session: &mut async_imap::Session<impl Io>, mailbox: &str, synced: Option<Contents>) -> Result<bool> {
     news(session);
-    let mb = timed("SELECT", session.select(mailbox)).await??;
+    let mb = selected(session, mailbox).await?;
     // Anything told unasked during the SELECT may be newer than its counts.
     let told = news(session);
     Ok(synced != Some(Contents::of(&mb)) || told)
@@ -442,7 +442,7 @@ fn store_fetched(store: &Mutex<Store>, account: &str, mailbox: &str, fetched: &[
 /// Brings one mailbox's local copy up to date (see the module docs). `progress` runs after
 /// each chunk of a first download lands, so the UI can show it.
 pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, window: u32, progress: &(dyn Fn() + Send + Sync)) -> Result<SyncOutcome> {
-    let mb = timed("SELECT", session.select(mailbox)).await??;
+    let mb = selected(session, mailbox).await?;
     let contents = Contents::of(&mb);
     let uidvalidity = mb.uid_validity.unwrap_or(0);
     let mut changed = false;
@@ -514,9 +514,11 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
 }
 
 /// Unread and total counts for the sidebar.
-pub async fn status(session: &mut Session, mailbox: &str) -> Result<(u32, u32)> {
+pub async fn status(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<(u32, u32)> {
     let mb = timed("STATUS", session.status(mailbox, "(MESSAGES UNSEEN)")).await??;
-    Ok((mb.unseen.unwrap_or(0), mb.exists))
+    // Nothing back (a closed connection reads as an empty answer, see `selected`): not zero.
+    let Some(unseen) = mb.unseen else { bail!("STATUS {mailbox} got no answer (connection lost?)") };
+    Ok((unseen, mb.exists))
 }
 
 /// Downloads whole messages by UID into the store. The mailbox must be selected.
@@ -550,8 +552,21 @@ pub trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::D
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send> Io for T {}
 
 pub async fn select(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<()> {
-    timed("SELECT", session.select(mailbox)).await??;
+    selected(session, mailbox).await?;
     Ok(())
+}
+
+/// SELECT, and what it said. async-imap reads a connection the server has closed (left idle
+/// too long: servers and NATs drop idle connections early, GreenMail after 30 s) as a SELECT
+/// answered with nothing at all, which would pass for an empty mailbox with a new UIDVALIDITY
+/// and empty its local copy: that's a lost connection. A real SELECT always says FLAGS and
+/// UIDVALIDITY (RFC 3501 requires both).
+async fn selected(session: &mut async_imap::Session<impl Io>, mailbox: &str) -> Result<async_imap::types::Mailbox> {
+    let mb = timed("SELECT", session.select(mailbox)).await??;
+    if mb.flags.is_empty() && mb.permanent_flags.is_empty() && mb.uid_validity.is_none() && mb.uid_next.is_none() {
+        bail!("SELECT {mailbox} got no answer (connection lost?)");
+    }
+    Ok(mb)
 }
 
 pub async fn store_flags(session: &mut Session, mailbox: &str, uid: u32, add: u32, remove: u32) -> Result<()> {
@@ -642,7 +657,7 @@ pub async fn replace_draft(
     previous: Option<(u32, u32)>,
     maybe_strays: bool,
 ) -> Result<Replaced> {
-    let before = timed("SELECT", session.select(mailbox)).await??;
+    let before = selected(session, mailbox).await?;
     let validity = before.uid_validity.unwrap_or(0);
     let appended = timed("APPEND", append_uid(session, mailbox, "(\\Draft \\Seen)", raw)).await??;
     let appended = appended.filter(|(v, _)| *v == validity || validity == 0);
@@ -741,8 +756,7 @@ pub async fn purge_message_id(
     known: Option<(u32, u32)>,
     search: bool,
 ) -> Result<Vec<u32>> {
-    let selected = timed("SELECT", session.select(mailbox)).await??;
-    let validity = selected.uid_validity.unwrap_or(0);
+    let validity = selected(session, mailbox).await?.uid_validity.unwrap_or(0);
     let mut uids = if search { uids_with_message_id(session, message_id).await? } else { Vec::new() };
     uids.extend(known.filter(|(v, _)| *v == validity && validity != 0).map(|(_, uid)| uid));
     uids.sort_unstable();
@@ -833,7 +847,8 @@ pub(crate) mod fake {
 
     /// A logged-in session with a server that answers each command with `answer(command)`:
     /// the response lines, where `TAG` stands for the command's tag. `None` answers
-    /// `TAG OK done`.
+    /// `TAG OK done`; [`HANG_UP`] closes the connection instead, as a server does with one
+    /// left idle too long.
     pub async fn session(answer: impl Fn(&str) -> Option<String> + Send + 'static) -> (async_imap::Session<DuplexStream>, Log) {
         let (client, server) = tokio::io::duplex(1 << 20);
         let log: Log = Arc::default();
@@ -866,6 +881,9 @@ pub(crate) mod fake {
                 }
                 seen.lock().unwrap().push(command.clone());
                 let reply = if command.starts_with("LOGIN") { None } else { answer(&command) };
+                if reply.as_deref() == Some(HANG_UP) {
+                    return;
+                }
                 let reply = reply.unwrap_or_else(|| "TAG OK done\r\n".into()).replace("TAG", &tag);
                 w.write_all(reply.as_bytes()).await.unwrap();
             }
@@ -874,6 +892,9 @@ pub(crate) mod fake {
         c.read_response().await.unwrap().unwrap();
         (c.login("me", "pw").await.map_err(|e| e.0).unwrap(), log)
     }
+
+    /// What `answer` returns to close the connection rather than answer.
+    pub const HANG_UP: &str = "<hang up>";
 
     /// A SELECT's answer.
     pub fn selected(validity: u32, uid_next: u32) -> String {
@@ -917,6 +938,28 @@ mod tests {
             }
             Some(out + "TAG OK done\r\n")
         }
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_server_closed_is_lost_not_an_empty_mailbox() {
+        let store = Mutex::new(Store::memory());
+        store.lock().unwrap().upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        let (mut s, _log) = fake::session(mailbox_server(3, 0..=0)).await;
+        sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await.unwrap();
+        let cached = |store: &Mutex<Store>| store.lock().unwrap().local_uids("a", "INBOX").unwrap().len();
+        assert_eq!(cached(&store), 3);
+        // The server hangs up (the connection sat idle too long). async-imap reads that as a
+        // SELECT answered with nothing: that mustn't empty the local copy, or pass at all.
+        let (mut s, _log) = fake::session(|_| Some(fake::HANG_UP.to_owned())).await;
+        let Err(e) = sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await else { panic!("a closed connection synced") };
+        assert!(connection_trouble(&e), "{e:#}");
+        assert_eq!(cached(&store), 3, "the local copy is kept");
+        let (mut s, _log) = fake::session(|_| Some(fake::HANG_UP.to_owned())).await;
+        assert!(select(&mut s, "INBOX").await.is_err());
+        let (mut s, _log) = fake::session(|_| Some(fake::HANG_UP.to_owned())).await;
+        assert!(changed_since(&mut s, "INBOX", None).await.is_err());
+        let (mut s, _log) = fake::session(|_| Some(fake::HANG_UP.to_owned())).await;
+        assert!(status(&mut s, "INBOX").await.is_err(), "not zero unread of zero");
     }
 
     #[tokio::test]
