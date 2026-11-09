@@ -234,10 +234,13 @@ fn control(s: &App, t: &Theme, d: &'static SettingDef, layer: &mut Vec<El>) -> E
             // One entry per line; saved as a JSON array.
             let current = v.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
             let edit = s.settings_ui.edits.get(key).cloned().unwrap_or_else(|| TextEdit::new(current.clone()));
-            TextArea::new(&edit)
+            // Entries that can't be read are kept as typed but do nothing: say so.
+            let problems = envoy_core::settings::list_problems(key, edit.text.lines());
+            let area = TextArea::new(&edit)
                 .label(d.title)
                 .rows(4)
                 .width(Some(320.0))
+                .invalid(!problems.is_empty())
                 .on_edit(edit_access(key, current))
                 .on_change(move |s: &mut App, _: &mut Tx| {
                     let text = s.settings_ui.edits.get(key).map(|e| e.text.clone()).unwrap_or_default();
@@ -245,7 +248,17 @@ fn control(s: &App, t: &Theme, d: &'static SettingDef, layer: &mut Vec<El>) -> E
                     s.set_setting(key, json!(items));
                 })
                 .build(k)
-                .key(format!("field-{key}"))
+                .key(format!("field-{key}"));
+            if problems.is_empty() {
+                area
+            } else {
+                col()
+                    .key(format!("ctl-{key}"))
+                    .gap(4.0)
+                    .items_end()
+                    .child(area)
+                    .child(text(format!("Ignored, not an address or domain: {}", problems.join(", "))).font(k.ty.text_xsmall).color(k.c.danger.fg).wrap().max_w(320.0))
+            }
         }
         Kind::Keybinding => {
             let current = v.as_str().unwrap_or_default().to_owned();
