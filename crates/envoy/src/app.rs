@@ -744,11 +744,18 @@ impl App {
             Event::Pending(n) => self.pending_ops = n,
             Event::Held { undo, ops: 0 } => {
                 // The move had nothing to do (already moving, or already there): no Undo, and
-                // the rows the UI took away optimistically come back with a reload.
+                // the rows the UI took away optimistically come back with a reload, and with
+                // them what they took off the sidebar's counts.
+                let mut back = Vec::new();
                 for t in &mut self.toasts {
-                    if matches!(&t.undo, Some(Undo::Move(m)) if m.key == undo) {
-                        t.undo = None;
+                    if matches!(&t.undo, Some(Undo::Move(m)) if m.key == undo)
+                        && let Some(Undo::Move(m)) = t.undo.take()
+                    {
+                        back.extend(m.rows);
                     }
+                }
+                for (account, mailbox, unread, total) in self.counted(&back) {
+                    self.bump_counts(&account, &mailbox, unread, total);
                 }
                 reload = true;
             }
@@ -1028,6 +1035,7 @@ impl App {
 
     fn mark_read(&mut self, id: MessageId) {
         self.mark_read_at = None;
+        self.count_read(id, true);
         if let Some(s) = self.list.iter_mut().find(|s| s.id == id) {
             s.flags |= flags::SEEN;
             s.thread_unread = false;
@@ -1038,6 +1046,49 @@ impl App {
                 m.summary.flags |= flags::SEEN;
             }
         }
+    }
+
+    /// Moves the sidebar's counts at once for a change made here. The engine's own counts
+    /// replace them a moment later (in demo mode nothing else would).
+    fn bump_counts(&mut self, account: &str, mailbox: &str, unread: i64, total: i64) {
+        if let Some(m) = self.mailboxes.get_mut(account).and_then(|boxes| boxes.iter_mut().find(|m| m.name == mailbox)) {
+            m.unread = (m.unread as i64 + unread).max(0) as u32;
+            m.total = (m.total as i64 + total).max(0) as u32;
+        }
+    }
+
+    /// Counts row `id` read (or unread) in the sidebar, before the engine does: each unread
+    /// message of the open conversation when it's that row's, else the row.
+    fn count_read(&mut self, id: MessageId, read: bool) {
+        let Some(row) = self.list.iter().find(|s| s.id == id) else { return };
+        if row.thread_unread != read {
+            return;
+        }
+        let (account, mailbox) = (row.account.clone(), row.mailbox.clone());
+        if !read {
+            self.bump_counts(&account, &mailbox, 1, 0);
+            return;
+        }
+        let unread: Vec<(String, String)> = if self.thread_for == Some(id) && self.conversations() {
+            self.thread.iter().filter(|m| !m.summary.seen()).map(|m| (m.summary.account.clone(), m.summary.mailbox.clone())).collect()
+        } else {
+            Vec::new()
+        };
+        if unread.is_empty() {
+            self.bump_counts(&account, &mailbox, -1, 0);
+        }
+        for (account, mailbox) in unread {
+            self.bump_counts(&account, &mailbox, -1, 0);
+        }
+    }
+
+    /// What rows leaving their mailbox take from its counts: (unread, total) as the sidebar
+    /// shows them, for an archive or move and for its undo.
+    fn counted(&self, rows: &[Summary]) -> Vec<(String, String, i64, i64)> {
+        let conversations = self.conversations();
+        rows.iter()
+            .map(|r| (r.account.clone(), r.mailbox.clone(), i64::from(r.thread_unread), if conversations { i64::from(r.thread_count.max(1)) } else { 1 }))
+            .collect()
     }
 
     pub fn close_message(&mut self) {
@@ -1173,6 +1224,10 @@ impl App {
     fn after_remove(&mut self, removed: &[MessageId], tx: &mut Tx) {
         let idx = self.index_of_open();
         let was_open = self.open.is_some_and(|o| removed.contains(&o));
+        let gone: Vec<Summary> = self.list.iter().filter(|s| removed.contains(&s.id)).cloned().collect();
+        for (account, mailbox, unread, total) in self.counted(&gone) {
+            self.bump_counts(&account, &mailbox, -unread, -total);
+        }
         self.list.retain(|s| !removed.contains(&s.id));
         self.selection.retain(&self.list);
         if !was_open {
@@ -1299,6 +1354,9 @@ impl App {
     /// and the reload that follows confirms it.
     fn restore(&mut self, mut m: MovedAway, tx: &mut Tx) {
         self.send(Command::UndoMove { undo: m.key });
+        for (account, mailbox, unread, total) in self.counted(&m.rows) {
+            self.bump_counts(&account, &mailbox, unread, total);
+        }
         if let Some(c) = m.compose.take() {
             self.reopen(*c);
         }
@@ -1646,6 +1704,9 @@ impl App {
     pub fn set_read(&mut self, ids: Vec<MessageId>, read: bool) {
         if ids.is_empty() {
             return;
+        }
+        for id in &ids {
+            self.count_read(*id, read);
         }
         for s in self.list.iter_mut().filter(|s| ids.contains(&s.id)) {
             s.thread_unread = !read;
@@ -3612,6 +3673,11 @@ mod tests {
         app.sent.borrow()[from..].iter().filter(|c| c.starts_with(kind)).cloned().collect()
     }
 
+    fn inbox_counts(app: &App) -> (u32, u32) {
+        let m = app.mailboxes["demo"].iter().find(|m| m.role == Role::Inbox).unwrap();
+        (m.unread, m.total)
+    }
+
     #[test]
     fn the_keyboard_selects_rows_and_one_undo_takes_the_whole_batch_back() {
         let mut app = App::new(true);
@@ -3670,10 +3736,12 @@ mod tests {
         for id in &all[..3] {
             app.toggle_selected(*id);
         }
+        assert_eq!(inbox_counts(&app).0, 3);
         let from = app.sent.borrow().len();
         assert!(key(&mut app, "u"), "any unread: all read");
         assert!(app.list[..3].iter().all(|s| !s.thread_unread));
         assert!(sent_since(&app, from, "SetFlags")[0].contains(&format!("ids: {:?}, add: 1, remove: 0", &all[..3])));
+        assert_eq!(inbox_counts(&app).0, 1, "the sidebar counts the two read");
         assert!(key(&mut app, "u"), "all read: all unread");
         assert!(app.list[..3].iter().all(|s| s.thread_unread));
         assert!(key(&mut app, "s"), "any unstarred: all starred");
@@ -3749,6 +3817,32 @@ mod tests {
         app.press_row(all[6], Mods::default(), &mut tx);
         assert!(app.selection.is_empty());
         assert_eq!(app.open, Some(all[6]));
+    }
+
+    #[test]
+    fn the_sidebar_counts_follow_reads_moves_and_undo() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let (unread, total) = inbox_counts(&app);
+        // Opening an unread conversation marks it read (demo: at once).
+        let first = app.list.iter().find(|s| s.thread_unread).unwrap().id;
+        app.open_message(first);
+        assert_eq!(inbox_counts(&app), (unread - 1, total), "as the list header says");
+        // Archiving an unread conversation takes it, and its messages, off the inbox.
+        let row = app.list.iter().find(|s| s.thread_unread).unwrap().clone();
+        app.archive(vec![row.id], &mut tx);
+        assert_eq!(inbox_counts(&app), (unread - 2, total - row.thread_count));
+        assert!(app.undo_last(&mut tx));
+        assert_eq!(inbox_counts(&app), (unread - 1, total), "undo puts them back");
+        // A move the engine found nothing to do for gives its counts back too.
+        app.archive(vec![row.id], &mut tx);
+        let key = move_key(&app);
+        app.apply(Event::Held { undo: key, ops: 0 }, &mut tx);
+        assert_eq!(inbox_counts(&app), (unread - 1, total));
+        // Marked unread again: counted again.
+        app.toggle_read(first);
+        assert_eq!(inbox_counts(&app), (unread, total));
     }
 
     /// The demo account, and a second, non-Gmail one with a Work folder too; a row in each

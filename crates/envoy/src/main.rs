@@ -253,6 +253,13 @@ const SCENES: &[Scene] = &[
         let id = s.list[1].id;
         s.archive(vec![id], &mut Tx::default());
     }),
+    ("counts", |s| {
+        // Two unread conversations opened (and so read): the sidebar's Inbox count follows.
+        let unread: Vec<_> = s.list.iter().filter(|m| m.thread_unread).map(|m| m.id).take(2).collect();
+        for id in unread {
+            s.open_message(id);
+        }
+    }),
     ("drafts", scene_drafts),
     ("draft", |s| {
         scene_drafts(s);
