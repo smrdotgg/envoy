@@ -32,6 +32,7 @@ use envoy_core::accounts::{Account, AuthKind};
 use envoy_core::engine::{Command, Engine, Event, MoveTarget};
 use envoy_core::model::{Draft, Role, Summary, View, flags};
 use envoy_core::settings::Settings;
+use envoy_core::snooze;
 use futures::TryStreamExt;
 use lettre::message::{Attachment, MultiPart, header::ContentType};
 use lettre::{Message, SmtpTransport, Transport};
@@ -589,6 +590,9 @@ fn scenario(pass: Pass) {
     println!("✓ forwarded with the original's file");
     d.until("an empty queue", 30, |d| d.events.iter().rev().find_map(|e| if let Event::Pending(n) = e { Some(*n) } else { None }).filter(|n| *n == 0));
 
+    // ── Snoozes: kept on the server, in mailboxes named for when they wake ──
+    snoozes(&mut d, &probe, pass, user, &inbox);
+
     // ── What Envoy must never have touched ──
     for (mailbox, flags, subject) in BYSTANDERS {
         let found = probe.messages(mailbox).into_iter().find(|m| m.subject == *subject);
@@ -616,6 +620,105 @@ fn scenario(pass: Pass) {
     println!("\nALL GOOD ({} pass)", pass.name());
     drop(d);
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Snoozing and waking against the server: a snooze undone inside its window never reaches it;
+/// one let go lands in its bucket (made and subscribed), gone from the inbox; one whose time
+/// comes before it reaches the server wakes where it is instead; a bucket another Envoy left
+/// past its time wakes on the next check, unread and pinned here; an empty one a day old goes;
+/// and Unsnooze from the Snoozed view brings a message back.
+fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) {
+    deliver(user, "Snooze me", "Fay <fay@localhost>", "Later, please.", |b| b.message_id(Some("<snooze-1@localhost>".into())));
+    deliver(user, "Snooze me back", "Fay <fay@localhost>", "Too soon to snooze.", |b| b.message_id(Some("<snooze-2@localhost>".into())));
+    let rows = d.until("the two to snooze", 20, |d| {
+        let rows: Vec<Summary> = d.list(inbox, "", false).into_iter().filter(|s| s.subject.starts_with("Snooze me")).collect();
+        (rows.len() == 2).then_some(rows)
+    });
+    let later = rows.iter().find(|s| s.subject == "Snooze me").unwrap().clone();
+    let soon = rows.iter().find(|s| s.subject == "Snooze me back").unwrap().clone();
+    let until = (epoch() as i64 + 3 * 3600) / 60 * 60;
+    // Buckets for a time (to the minute): this run's, whatever earlier runs left.
+    let bucket_for = |at: i64| probe.buckets().into_iter().find(|b| snooze::wake_of(b) == Some(at / 60 * 60));
+
+    // Undone inside the window: back here, and the server never hears of it.
+    let (mark, before) = (d.mark(), epoch());
+    d.send(Command::Snooze { ids: vec![later.id], until, thread: false, undo: Some(40) });
+    d.wait(mark, "the snooze held", 5, |e| matches!(e, Event::Held { undo: 40, ops: 1 }).then_some(()));
+    let undone = deadline("batch = 40");
+    assert_hold("the snooze", undone, before, epoch(), MOVE_HOLD);
+    assert!(!d.list(inbox, "", false).iter().any(|s| s.id == later.id), "gone from the inbox at once");
+    d.send(Command::UndoMove { undo: 40 });
+    assert!(d.list(inbox, "", false).iter().any(|s| s.id == later.id), "back after undo");
+    untouched_until(d, "the undone snooze reached the server", undone as f64 + 3.0, || bucket_for(until).is_none() && probe.live("INBOX").iter().any(|s| s == "Snooze me"));
+    println!("✓ snooze undone: back here, no bucket made, the server untouched past the window");
+
+    // Let go: after the window, in its bucket (made, and subscribed), gone from the inbox.
+    let (mark, before) = (d.mark(), epoch());
+    d.send(Command::Snooze { ids: vec![later.id], until, thread: false, undo: Some(41) });
+    d.wait(mark, "the snooze held", 5, |e| matches!(e, Event::Held { undo: 41, ops: 1 }).then_some(()));
+    let due = deadline("batch = 41");
+    assert_hold("the snooze", due, before, epoch(), MOVE_HOLD);
+    watch_holds(d, vec![Hold { what: "the snooze", deadline: due, on_server: Box::new(|| bucket_for(until).is_some() || !probe.live("INBOX").iter().any(|s| s == "Snooze me")) }]);
+    let bucket = d.until("in its bucket on the server, gone from the inbox", 15, |_| {
+        let bucket = bucket_for(until)?;
+        (probe.live(&bucket) == ["Snooze me"] && !probe.live("INBOX").iter().any(|s| s == "Snooze me")).then_some(bucket)
+    });
+    let parent = snooze::parent_of(&bucket).unwrap().to_owned();
+    assert_eq!(parent, "Snoozed", "named as every client will find it");
+    let subscribed = probe.subscribed();
+    assert!(subscribed.contains(&parent) && subscribed.contains(&bucket), "subscribed, for clients that show only those: {subscribed:?}");
+    println!("✓ snoozed: in {bucket} on the server after the window and not before, subscribed, gone from the inbox");
+
+    // Its time comes before it reaches the server: it never goes into a bucket, and wakes where
+    // it is, unread.
+    d.send(Command::SetFlags { ids: vec![soon.id], add: flags::SEEN, remove: 0, thread: false });
+    d.until("read on the server", 15, |_| probe.flags("INBOX", &soon.subject).filter(|f| f & flags::SEEN != 0));
+    let (mark, too_soon) = (d.mark(), epoch() as i64 + 30);
+    d.send(Command::Snooze { ids: vec![soon.id], until: too_soon, thread: false, undo: Some(42) });
+    d.wait(mark, "the snooze held", 5, |e| matches!(e, Event::Held { undo: 42, ops: 1 }).then_some(()));
+    d.until("woken in place: unread on the server", 30, |_| probe.flags("INBOX", &soon.subject).filter(|f| f & flags::SEEN == 0));
+    let row = d.until("pinned here", 15, |d| d.list(inbox, "", false).into_iter().find(|s| s.id == soon.id && s.flags & flags::WOKEN != 0));
+    assert!(!row.seen());
+    assert!(bucket_for(too_soon).is_none(), "no bucket for a time that came");
+    println!("✓ a snooze whose time came first: left in the inbox, unread and pinned, no bucket made");
+
+    // A bucket another Envoy left past its time wakes on the next check (Check mail reads the
+    // folders again): back in the inbox, unread, pinned atop it here. One a day old and empty
+    // goes; one younger stays.
+    let delimiter = probe.delimiter();
+    let past = snooze::bucket("Snoozed", &delimiter, (epoch() as i64 - 2 * 3600) / 60 * 60);
+    let old = snooze::bucket("Snoozed", &delimiter, (epoch() as i64 - 3 * 86_400) / 60 * 60);
+    probe.create(&past);
+    probe.create(&old);
+    probe.append(&past, "(\\Seen)", &raw(user, "Back from a snooze", "<woke@elsewhere>"));
+    d.send(Command::SyncNow);
+    // Without MOVE each Envoy waits up to 30 s first.
+    d.until("the due bucket woken into the inbox, unread", 60, |_| probe.flags("INBOX", "Back from a snooze").filter(|f| f & flags::SEEN == 0));
+    // Pinned among the woken ("Snooze me back" is too), above the rest.
+    let woke = d.until("pinned atop the inbox here", 20, |d| {
+        let rows = d.list(inbox, "", false);
+        let at = rows.iter().position(|s| s.subject == "Back from a snooze")?;
+        rows[..=at].iter().all(|s| s.flags & flags::WOKEN != 0).then(|| rows[at].clone())
+    });
+    assert!(!woke.seen());
+    match pass {
+        // MOVE: nothing left behind.
+        Pass::Full => assert_eq!(probe.count(&past), 0),
+        // COPY, then flagged \Deleted, never expunged without UIDPLUS.
+        Pass::Plain => assert_eq!(probe.deleted(&past), ["Back from a snooze"]),
+    }
+    d.until("the old empty bucket deleted", 20, |_| (!probe.names().contains(&old)).then_some(()));
+    assert!(probe.names().contains(&past), "a bucket not a day past its time stays");
+    println!("✓ a bucket past its time woke on the next check, pinned here; an old empty one was deleted");
+
+    // Unsnooze from Snoozed: back in the inbox now.
+    let snoozed = View::Role { account: Some(ACCOUNT.into()), role: Role::Snoozed };
+    d.send(Command::Watch { view: snoozed.clone() });
+    let row = d.until("the snoozed message in Snoozed", 20, |d| d.list(&snoozed, "", false).into_iter().find(|s| s.subject == "Snooze me"));
+    assert_eq!(snooze::wake_of(&row.mailbox), Some(until), "listed with its wake time");
+    d.send(Command::Move { ids: vec![row.id], to: MoveTarget::Inbox, thread: false, undo: None });
+    d.until("unsnoozed: back in the inbox on the server", 15, |_| (probe.live("INBOX").iter().any(|s| s == "Snooze me") && probe.live(&bucket).is_empty()).then_some(()));
+    println!("✓ unsnoozed from Snoozed: back in the inbox");
 }
 
 /// The Envoy that's killed mid-hold, in a process of its own: archives "Sent from Envoy" and
@@ -975,6 +1078,33 @@ impl Probe {
         let Some(m) = self.messages(mailbox).into_iter().find(|m| m.subject == subject && m.flags & flags::DELETED == 0) else { return vec![] };
         let d = envoy_core::mime::server_draft(&m.raw).expect("a message");
         d.draft.attachments.into_iter().map(|a| a.filename).zip(d.files).collect()
+    }
+
+    /// Every mailbox's name.
+    fn names(&self) -> Vec<String> {
+        self.run(async move |s| s.list(Some(""), Some("*")).await.unwrap().map_ok(|n| n.name().to_owned()).try_collect().await.unwrap())
+    }
+
+    /// The snooze buckets there are (by name).
+    fn buckets(&self) -> Vec<String> {
+        self.names().into_iter().filter(|n| snooze::wake_of(n).is_some()).collect()
+    }
+
+    /// The subscribed mailboxes.
+    fn subscribed(&self) -> Vec<String> {
+        self.run(async move |s| s.lsub(Some(""), Some("*")).await.unwrap().map_ok(|n| n.name().to_owned()).try_collect().await.unwrap())
+    }
+
+    /// The server's hierarchy delimiter.
+    fn delimiter(&self) -> String {
+        self.run(async move |s| {
+            let names: Vec<_> = s.list(Some(""), Some("INBOX")).await.unwrap().try_collect().await.unwrap();
+            names.first().and_then(|n| n.delimiter().map(str::to_owned)).unwrap_or_else(|| "/".to_owned())
+        })
+    }
+
+    fn create(&self, mailbox: &str) {
+        self.run(async move |s| s.create(mailbox).await.unwrap())
     }
 
     /// Envoy's drafts in Drafts (subject, text): not flagged \Deleted, other devices' left out.

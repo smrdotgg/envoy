@@ -481,7 +481,8 @@ enum Job {
     Bodies { mailbox: String, validity: u32, uids: Vec<u32>, reply: Option<Reply> },
     SyncMailbox(String),
     Sync,
-    /// [`Job::Sync`], with the mailbox list read again (new snooze buckets, folders made elsewhere).
+    /// [`Job::Sync`], with the mailbox list read again (new snooze buckets, folders made
+    /// elsewhere) and old buckets looked for: Check mail.
     Folders,
 }
 
@@ -2116,6 +2117,7 @@ async fn session_loop(
                 Job::Folders => {
                     inbox_dirty = true;
                     last_list = None;
+                    snoozes.last_cleanup = None;
                 }
                 Job::Bodies { .. } => {}
             }
