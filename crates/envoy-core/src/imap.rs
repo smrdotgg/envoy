@@ -576,15 +576,30 @@ pub async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> Result<
     wire::status(session, mailbox).await
 }
 
-/// Downloads whole messages by UID into the store. The mailbox must be selected.
-pub async fn fetch_bodies(session: &mut Connection<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, uids: &[u32]) -> Result<Vec<i64>> {
+/// Downloads the bodies of `uids` in `mailbox`, UIDs from generation `validity` (UIDVALIDITY)
+/// of it as cached, and stores each against the cached message its UID names. Only when the
+/// server, the cache and the request all have that generation: in another, a UID may name
+/// another message, so nothing is stored (nothing is fetched, if the server has moved on), and
+/// the error is [`NewGeneration`]: the mailbox wants syncing again. Returns the messages that
+/// got their bodies.
+pub async fn fetch_bodies(session: &mut Connection<impl Io>, store: &Mutex<Store>, account: &str, mailbox: &str, validity: u32, uids: &[u32]) -> Result<Vec<i64>> {
     if uids.is_empty() {
         return Ok(vec![]);
+    }
+    let new_generation = |now: u32| anyhow::Error::new(NewGeneration { mailbox: mailbox.to_owned(), validity: now, found: None });
+    let selected = wire::select(session, mailbox).await?;
+    if validity == 0 || selected.uid_validity != validity {
+        return Err(new_generation(selected.uid_validity));
     }
     let set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     let fetched = wire::fetch(session, true, &set, "(UID BODY.PEEK[])", "FETCH bodies").await?;
     let mut ids = Vec::new();
     let st = store.lock().map_err(|_| anyhow!("store poisoned"))?;
+    // The cache may have moved on while they came (another connection saw a reset).
+    let cached = st.uidvalidity(account, mailbox)?;
+    if cached != validity {
+        return Err(new_generation(cached));
+    }
     for f in &fetched {
         let (Some(uid), Some(raw)) = (f.uid, f.body.as_deref()) else { continue };
         let Some(id) = st.id_for_uid(account, mailbox, uid)? else { continue };
@@ -619,9 +634,9 @@ pub struct Target<'a> {
     pub message_id: &'a str,
 }
 
-/// A queued op's UID is from another generation of its mailbox than the server has now (its
-/// UIDVALIDITY changed: the mailbox was recreated, or reset), so it may name a different
-/// message, or none: the op didn't run. `found`: the message's UID in this generation, when its
+/// A queued op's UID (or a download's) is from another generation of its mailbox than the
+/// server has now (its UIDVALIDITY changed: the mailbox was recreated, or reset), so it may name
+/// a different message, or none: the op didn't run. `found`: the message's UID in this generation, when its
 /// Message-ID finds exactly one.
 #[derive(Debug, PartialEq)]
 pub struct NewGeneration {
@@ -1230,13 +1245,37 @@ mod tests {
             let store = synced_store().await;
             let partial = "* 1 FETCH (UID 101 BODY[] {12}\r\nSubject: x\r\n)\r\n";
             let (mut s, _log) = fake::session(breaking("UID FETCH 101 (UID BODY.PEEK[])", partial, how)).await;
-            select(&mut s, "INBOX").await.unwrap();
-            assert!(fetch_bodies(&mut s, &store, "a", "INBOX", &[101]).await.is_err(), "{how:?}");
+            assert!(fetch_bodies(&mut s, &store, "a", "INBOX", 7, &[101]).await.is_err(), "{how:?}");
         }
         let store = synced_store().await;
         let (mut s, _log) = fake::session(inbox_server).await;
-        select(&mut s, "INBOX").await.unwrap();
-        assert_eq!(fetch_bodies(&mut s, &store, "a", "INBOX", &[101]).await.unwrap().len(), 1);
+        assert_eq!(fetch_bodies(&mut s, &store, "a", "INBOX", 7, &[101]).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bodies_are_stored_only_in_the_generation_they_were_asked_for_in() {
+        // Cached in generation 7; the server reset INBOX since, and UID 101 is another message
+        // in generation 8.
+        let store = synced_store().await;
+        let row = store.lock().unwrap().id_for_uid("a", "INBOX", 101).unwrap().unwrap();
+        let reset = |c: &str| match c {
+            c if c.starts_with("SELECT") => Some(SELECT_INBOX.replace("UIDVALIDITY 7", "UIDVALIDITY 8")),
+            c if c.starts_with("UID FETCH 101 (UID BODY.PEEK[])") => {
+                let body = "From: b@x.com\r\nSubject: someone else's\r\nMessage-ID: <other@x>\r\n\r\nnot yours\r\n";
+                Some(format!("* 1 FETCH (UID 101 BODY[] {{{}}}\r\n{body})\r\nTAG OK done\r\n", body.len()))
+            }
+            c => inbox_server(c),
+        };
+        let (mut s, log) = fake::session(reset).await;
+        let e = fetch_bodies(&mut s, &store, "a", "INBOX", 7, &[101]).await.unwrap_err();
+        assert_eq!(e.downcast_ref::<NewGeneration>(), Some(&NewGeneration { mailbox: "INBOX".into(), validity: 8, found: None }), "{e:#}");
+        assert!(!store.lock().unwrap().has_body(row), "the other message's body isn't stored as this one's");
+        assert!(!commands(&log).iter().any(|c| c.starts_with("UID FETCH 101 (UID BODY")), "{:?}", commands(&log));
+        // Asked for in 7, and the server still in 7, but the cache moved on meanwhile: nothing.
+        store.lock().unwrap().set_uidvalidity("a", "INBOX", 9).unwrap();
+        let (mut s, _log) = fake::session(inbox_server).await;
+        assert!(fetch_bodies(&mut s, &store, "a", "INBOX", 7, &[101]).await.unwrap_err().downcast_ref::<NewGeneration>().is_some());
+        assert!(!store.lock().unwrap().has_body(row));
     }
 
     #[tokio::test]
@@ -1281,8 +1320,7 @@ mod tests {
         // reports that as an I/O error ("bytes remaining in stream"), not a closed connection.
         let store = synced_store().await;
         let (mut s, _log) = fake::session(breaking("UID FETCH 101 (UID BODY.PEEK[])", "* 1 FETCH (UID 101 BODY[] {100}\r\nSubject: x\r\n", Breaks::Eof)).await;
-        select(&mut s, "INBOX").await.unwrap();
-        let e = fetch_bodies(&mut s, &store, "a", "INBOX", &[101]).await.unwrap_err();
+        let e = fetch_bodies(&mut s, &store, "a", "INBOX", 7, &[101]).await.unwrap_err();
         assert!(e.downcast_ref::<Lost>().is_some(), "{e:#}: not taken for a lost connection");
     }
 

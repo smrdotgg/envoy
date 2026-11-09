@@ -413,8 +413,10 @@ struct Worker {
 
 #[derive(Debug)]
 enum Job {
-    /// Download these messages now (someone opened them), then answer.
-    Bodies { mailbox: String, uids: Vec<u32>, reply: Option<Reply> },
+    /// Download these messages now (someone opened them), then answer. `validity`: the
+    /// generation of the mailbox (UIDVALIDITY) the UIDs are from, as cached when asked for;
+    /// in another, nothing is stored and the mailbox is synced again ([`download_bodies`]).
+    Bodies { mailbox: String, validity: u32, uids: Vec<u32>, reply: Option<Reply> },
     SyncMailbox(String),
     Sync,
 }
@@ -571,18 +573,21 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             });
         }
         Command::Open { req, id, conversations } => {
-            let messages = {
+            let (messages, missing) = {
                 let st = shared.reader.lock().map_err(|_| anyhow!("store poisoned"))?;
-                st.thread(id, conversations)?
+                let messages = st.thread(id, conversations)?;
+                // Ask for any bodies we don't have, grouped by mailbox, each with the generation
+                // its UIDs are from: they're stored only while the cache is still in it.
+                let mut missing: HashMap<(String, String), Vec<u32>> = HashMap::new();
+                for m in messages.iter().filter(|m| m.body.is_none()) {
+                    missing.entry((m.summary.account.clone(), m.summary.mailbox.clone())).or_default().push(m.summary.uid);
+                }
+                let missing = missing.into_iter().map(|((account, mailbox), uids)| Ok((st.uidvalidity(&account, &mailbox)?, account, mailbox, uids))).collect::<Result<Vec<_>>>()?;
+                (messages, missing)
             };
-            // Ask for any bodies we don't have, grouped by mailbox.
-            let mut missing: HashMap<(String, String), Vec<u32>> = HashMap::new();
-            for m in messages.iter().filter(|m| m.body.is_none()) {
-                missing.entry((m.summary.account.clone(), m.summary.mailbox.clone())).or_default().push(m.summary.uid);
-            }
             shared.emit(Event::Thread { req, id, messages });
-            for ((account, mailbox), uids) in missing {
-                poke(workers, &account, Job::Bodies { mailbox, uids, reply: Some(Reply::Thread(req, id, conversations)) });
+            for (validity, account, mailbox, uids) in missing {
+                poke(workers, &account, Job::Bodies { mailbox, validity, uids, reply: Some(Reply::Thread(req, id, conversations)) });
             }
         }
         Command::Prefetch { id, conversations } => {
@@ -702,7 +707,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
         Command::OpenDraft { id } => match open_draft(shared, id, now())? {
             // Sent by open_draft.
             Opening::Ready(..) | Opening::Copy(..) => {}
-            Opening::Download { account, mailbox, uid } => poke(workers, &account, Job::Bodies { mailbox, uids: vec![uid], reply: Some(Reply::Draft(id)) }),
+            Opening::Download { account, mailbox, validity, uid } => poke(workers, &account, Job::Bodies { mailbox, validity, uids: vec![uid], reply: Some(Reply::Draft(id)) }),
             // Sent or discarded meanwhile: the list catches up.
             Opening::Gone => shared.emit(Event::Changed { account: String::new() }),
         },
@@ -994,14 +999,21 @@ fn forward_files(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, messag
     if files.is_empty() {
         return Ok(());
     }
-    let (summary, here) = shared.with_writer(|st| Ok((st.summary(message)?, st.has_raw(message)?)))?;
+    // With the generation of its mailbox its UID is from: the body is stored only in it.
+    let (summary, here) = shared.with_writer(|st| {
+        let summary = match st.summary(message)? {
+            Some(s) => Some((st.uidvalidity(&s.account, &s.mailbox)?, s)),
+            None => None,
+        };
+        Ok((summary, st.has_raw(message)?))
+    })?;
     match summary {
         _ if here => {
             let shared = shared.clone();
             tokio::task::spawn_blocking(move || attach_forwarded(&shared, message, &files));
         }
-        Some(s) if workers.contains_key(&s.account) => {
-            poke(workers, &s.account, Job::Bodies { mailbox: s.mailbox, uids: vec![s.uid], reply: Some(Reply::Attach { message, files }) });
+        Some((validity, s)) if workers.contains_key(&s.account) => {
+            poke(workers, &s.account, Job::Bodies { mailbox: s.mailbox, validity, uids: vec![s.uid], reply: Some(Reply::Attach { message, files }) });
         }
         _ => {
             for (file, _) in files {
@@ -1303,8 +1315,9 @@ enum Opening {
     Ready(Box<LocalDraft>, Option<DraftNotice>),
     /// A server draft that can't be edited in place (`why`): an unsaved copy to start from.
     Copy(Box<Draft>, String),
-    /// A server draft not downloaded yet: fetch it, then try again.
-    Download { account: String, mailbox: String, uid: u32 },
+    /// A server draft not downloaded yet: fetch it (UID `uid` in generation `validity` of
+    /// `mailbox`), then try again.
+    Download { account: String, mailbox: String, validity: u32, uid: u32 },
     /// Nothing to open (sent, discarded, or deleted meanwhile).
     Gone,
 }
@@ -1324,7 +1337,7 @@ fn open_draft(shared: &Shared, id: MessageId, now: i64) -> Result<Opening> {
             None if id < 0 => Opening::Gone,
             None => match (st.summary(id)?, st.raw(id)?) {
                 (None, _) => Opening::Gone,
-                (Some(s), None) => Opening::Download { account: s.account, mailbox: s.mailbox, uid: s.uid },
+                (Some(s), None) => Opening::Download { validity: st.uidvalidity(&s.account, &s.mailbox)?, account: s.account, mailbox: s.mailbox, uid: s.uid },
                 (Some(s), Some(raw)) => match crate::mime::server_draft(&raw) {
                     // Left as it is on the server: the copy becomes a draft of its own if edited.
                     Some(crate::mime::ServerDraft { draft, notice: Some(DraftNotice::Copy(why)), .. }) => Opening::Copy(Box::new(Draft { account: s.account, ..draft }), why),
@@ -1584,44 +1597,66 @@ async fn on_foreground<F: Foreground>(fg: &mut F, session: &mut Option<F::Sessio
 async fn foreground_job(shared: &Arc<Shared>, account: &Account, session: &mut Session, job: &Job) -> Result<()> {
     let id = &account.id;
     match job {
-        Job::Bodies { mailbox, uids, reply: then } => {
-            imap::select(session, mailbox).await?;
-            imap::fetch_bodies(session, &shared.writer, id, mailbox, uids).await?;
+        Job::Bodies { mailbox, validity, uids, reply: then } => {
+            download_bodies(shared, account, session, mailbox, *validity, uids).await?;
             if let Some(then) = then {
                 reply(shared, then)?;
             }
             shared.emit(Event::Changed { account: id.clone() });
         }
         Job::SyncMailbox(mailbox) => {
-            let window = shared.setting_u32("sync.initialMessages").max(50);
-            let progress = {
-                let shared = shared.clone();
-                let id = id.clone();
-                move || shared.emit(Event::Changed { account: id.clone() })
-            };
-            let out = imap::sync_mailbox(session, &shared.writer, id, mailbox, window, &progress).await?;
-            // Counts are a nicety; a lost connection isn't, and ends the job here.
-            match imap::status(session, mailbox).await {
-                Ok((unread, total)) => shared.with_writer(|st| st.set_counts(id, mailbox, unread, total))?,
-                Err(e) if imap::is_lost(&e) => return Err(e),
-                Err(e) => log::debug!("{}: no counts for {mailbox}: {e:#}", account.email),
-            }
-            shared.emit_mailboxes(id);
-            if out.changed {
-                shared.emit(Event::Changed { account: id.clone() });
-            }
+            sync_one(shared, account, session, mailbox).await?;
             // Bodies for the top of the list, so the first messages opened are instant.
             let max_size = shared.setting_u32("sync.maxPrefetchSizeKb").saturating_mul(1024);
-            let missing = shared.with_writer(|st| st.missing_bodies(id, mailbox, 25, max_size))?;
+            let (validity, missing) = shared.with_writer(|st| Ok((st.uidvalidity(id, mailbox)?, st.missing_bodies(id, mailbox, 25, max_size)?)))?;
             if !missing.is_empty() {
-                imap::select(session, mailbox).await?;
-                imap::fetch_bodies(session, &shared.writer, id, mailbox, &missing).await?;
+                download_bodies(shared, account, session, mailbox, validity, &missing).await?;
                 shared.emit(Event::Changed { account: id.clone() });
             }
         }
         Job::Sync => {}
     }
     Ok(())
+}
+
+/// Syncs one mailbox now (someone is looking at it), and its counts.
+async fn sync_one(shared: &Arc<Shared>, account: &Account, session: &mut Session, mailbox: &str) -> Result<()> {
+    let id = &account.id;
+    let window = shared.setting_u32("sync.initialMessages").max(50);
+    let progress = {
+        let shared = shared.clone();
+        let id = id.clone();
+        move || shared.emit(Event::Changed { account: id.clone() })
+    };
+    let out = imap::sync_mailbox(session, &shared.writer, id, mailbox, window, &progress).await?;
+    // Counts are a nicety; a lost connection isn't, and ends the job here.
+    match imap::status(session, mailbox).await {
+        Ok((unread, total)) => shared.with_writer(|st| st.set_counts(id, mailbox, unread, total))?,
+        Err(e) if imap::is_lost(&e) => return Err(e),
+        Err(e) => log::debug!("{}: no counts for {mailbox}: {e:#}", account.email),
+    }
+    shared.emit_mailboxes(id);
+    if out.changed {
+        shared.emit(Event::Changed { account: id.clone() });
+    }
+    Ok(())
+}
+
+/// Downloads bodies whose UIDs are from generation `validity` of `mailbox`
+/// ([`imap::fetch_bodies`]). When the mailbox is in another generation now, a UID may name
+/// another message: nothing is stored, and the mailbox is synced again instead, so its cache
+/// starts over in the new one (the messages come back as new rows, to download when opened).
+/// Returns whether the bodies were downloaded.
+async fn download_bodies(shared: &Arc<Shared>, account: &Account, session: &mut Session, mailbox: &str, validity: u32, uids: &[u32]) -> Result<bool> {
+    match imap::fetch_bodies(session, &shared.writer, &account.id, mailbox, validity, uids).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.downcast_ref::<imap::NewGeneration>().is_some() => {
+            log::info!("{}: {e:#}: syncing it again instead of downloading", account.email);
+            sync_one(shared, account, session, mailbox).await?;
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// One account's sync loop: connect, catch up, replay queued changes, download ahead, then
@@ -1691,9 +1726,8 @@ async fn session_loop(
         // Opened messages first: someone is waiting.
         let (bodies, rest): (Vec<Job>, Vec<Job>) = pending.drain(..).partition(|j| matches!(j, Job::Bodies { .. }));
         for job in bodies {
-            if let Job::Bodies { mailbox, uids, reply: then } = job {
-                imap::select(&mut session, &mailbox).await?;
-                imap::fetch_bodies(&mut session, &shared.writer, &id, &mailbox, &uids).await?;
+            if let Job::Bodies { mailbox, validity, uids, reply: then } = job {
+                download_bodies(shared, account, &mut session, &mailbox, validity, &uids).await?;
                 if let Some(then) = &then {
                     reply(shared, then)?;
                 }
@@ -1792,16 +1826,16 @@ async fn session_loop(
                 Ok(st.mailboxes(&id)?.into_iter().filter(|m| m.selectable && (targets.contains(&m.name) || m.role == Role::Inbox || watched.contains(&m.name))).map(|m| m.name).collect())
             })?;
             for name in synced {
-                let missing = shared.with_writer(|st| st.missing_bodies(&id, &name, prefetch, max_size))?;
+                let (validity, missing) = shared.with_writer(|st| Ok((st.uidvalidity(&id, &name)?, st.missing_bodies(&id, &name, prefetch, max_size)?)))?;
                 if missing.is_empty() {
                     continue;
                 }
                 shared.emit(Event::Sync { account: id.clone(), state: SyncState::Syncing(format!("Downloading {}", missing.len())) });
-                imap::select(&mut session, &name).await?;
                 let batch: Vec<u32> = missing.iter().take(20).copied().collect();
-                imap::fetch_bodies(&mut session, &shared.writer, &id, &name, &batch).await?;
+                // Reset since: synced again instead, and the next round downloads ahead in it.
+                let downloaded = download_bodies(shared, account, &mut session, &name, validity, &batch).await?;
                 shared.emit(Event::Changed { account: id.clone() });
-                more_to_fetch = missing.len() > batch.len();
+                more_to_fetch = downloaded && missing.len() > batch.len();
                 break;
             }
         }
