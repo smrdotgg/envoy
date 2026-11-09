@@ -57,6 +57,9 @@ fn boxed(s: &BoxStyle) -> String {
     if s.tight {
         parts.push("tight".into());
     }
+    if s.stack {
+        parts.push("stacks on phones".into());
+    }
     parts.join(", ")
 }
 

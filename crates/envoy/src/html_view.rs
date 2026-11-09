@@ -419,6 +419,15 @@ fn block_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
 }
 
 fn cells(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], gap: f32, l: Local) -> El {
+    // A row the email stacks on phones, in a narrow pane: its cells one under another.
+    let filled = || cells.iter().filter(|(_, kids)| !kids.is_empty());
+    if cx.content_width() < STACK_BELOW && filled().count() > 1 && filled().all(|(s, _)| s.stack) {
+        let mut c = col().w_full().gap(gap);
+        for (s, kids) in filled() {
+            c = c.child(styled_box(cx, s, kids, Local { tight: false, ..l }).w_full());
+        }
+        return c;
+    }
     // The room the cells share, and their minimums (small fixed columns, longest words):
     // as given while they all fit, so a cell may take more than its share at the expense of
     // the others; scaled down together when they don't.

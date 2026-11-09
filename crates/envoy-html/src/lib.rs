@@ -143,6 +143,10 @@ pub struct BoxStyle {
     pub valign: VAlign,
     /// Size to content instead of sharing the row (`nowrap`, small fixed cells, buttons).
     pub tight: bool,
+    /// A table cell the email's phone rules make a block across its row (`.stack-column {
+    /// display: block; width: 100% }` under `@media (max-width: 600px)`): in a narrow pane,
+    /// a row of such cells stacks, one under another.
+    pub stack: bool,
 }
 
 impl BoxStyle {
@@ -481,6 +485,8 @@ struct Builder {
     /// Element node address → index in `els`.
     index: HashMap<usize, u32>,
     styles: Vec<Option<Rc<Styles>>>,
+    /// The email's phone-only rules, asked which table cells they stack ([`css::Sheet::narrow`]).
+    narrow: Option<Sheet>,
     /// Counts line breaks and `&nbsp;` met while no text was written: an otherwise empty
     /// block that saw one is a blank line.
     blank_hint: u32,
@@ -507,16 +513,27 @@ fn tag(h: &Handle) -> Option<String> {
 impl Builder {
     /// Indexes the document's elements for selectors and reads its `<style>` sheets.
     fn new(root: &Handle) -> Builder {
-        let mut b = Builder { doc: Doc::default(), depth: 0, sheet: Sheet::new(), els: Vec::new(), index: HashMap::new(), styles: Vec::new(), blank_hint: 0, too_deep: false, stack_top: stack_here() };
+        let mut b = Builder { doc: Doc::default(), depth: 0, sheet: Sheet::new(), els: Vec::new(), index: HashMap::new(), styles: Vec::new(), narrow: None, blank_hint: 0, too_deep: false, stack_top: stack_here() };
         let mut sheets: Vec<(String, Option<String>)> = Vec::new();
         b.index_children(root, NONE, [0; 8], &mut sheets, 0);
         for (css, media) in sheets {
             b.sheet.add(&css, media.as_deref());
         }
+        b.narrow = b.sheet.narrow();
         b.styles = vec![None; b.els.len()];
         b
     }
 
+    /// Whether the email's phone rules make this table cell a block across its row: a width
+    /// of 100%, or a block display with no other width.
+    fn stacks_on_phones(&mut self, h: &Handle) -> bool {
+        let (Some(n), Some(&i)) = (self.narrow.as_mut(), self.index.get(&key(h))) else { return false };
+        let st = n.cascade(&self.els, i, None);
+        match style(&st, "width").filter(|w| *w != "auto") {
+            Some(w) => matches!(len_attr(w), Some(Len::Pct(p)) if p >= 99.0),
+            None => matches!(style(&st, "display"), Some("block" | "table" | "list-item")),
+        }
+    }
 
     fn index_children(&mut self, h: &Handle, parent: u32, ancestors: css::Bloom, sheets: &mut Vec<(String, Option<String>)>, depth: usize) {
         let mut prev = NONE;
@@ -1694,6 +1711,7 @@ impl Builder {
                 let mut cctx = rctx.clone();
                 text_style(c, &ct, &cst, &mut cctx);
                 let mut bs = box_style(c, &ct, &cst, &mut cctx, cellpadding);
+                bs.stack = self.stacks_on_phones(c);
                 if border_attr && bs.border.is_none() {
                     bs.border = Some(Border { widths: [1.0; 4], color: [160, 160, 160, 255], dashed: false });
                 }

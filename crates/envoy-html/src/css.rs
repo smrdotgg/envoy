@@ -18,9 +18,18 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Width, in points, `@media` width queries are evaluated against: a desktop reading pane.
-/// Mobile rules (`max-width: 600px`) don't apply; narrow panes are the layout's business
-/// (columns wrap), not the email's.
+/// Mobile rules (`max-width: 600px`) don't apply; narrow panes are fitted when the tree is
+/// drawn, at the reader's width, not by the email (only which table cells its phone rules
+/// stack is read, [`Sheet::narrow`]).
 pub const VIEWPORT: f32 = 760.0;
+
+/// Width a phone's `@media` rules are read at, to learn which table cells the email stacks on
+/// phones ([`Sheet::narrow`]): the rules for widths up to 600, 480 or 414 px, not those for
+/// the smallest phones.
+pub const NARROW: f32 = 400.0;
+
+/// Phone-only `@media` blocks kept for [`Sheet::narrow`]; the rest are dropped.
+const MAX_NARROW_BLOCKS: usize = 64;
 
 /// Compound-selector checks one message may spend matching its sheets.
 pub const MATCH_BUDGET: u32 = 400_000;
@@ -231,6 +240,9 @@ pub struct Sheet {
     candidates: u32,
     /// Rules `0..ua_rules` are the built-in sheet's.
     ua_rules: u32,
+    /// The text of `@media` blocks that apply on a phone ([`NARROW`]) but not on the desktop
+    /// pane: only which table cells they stack is read from them ([`Sheet::narrow`]).
+    narrow: Vec<String>,
     pub stats: SheetStats,
 }
 
@@ -245,10 +257,27 @@ impl Sheet {
 
     /// Adds one `<style>` element's text; `media` is its `media` attribute, if any.
     pub fn add(&mut self, css: &str, media: Option<&str>) {
-        if media.is_some_and(|m| !media_matches(m)) {
+        if let Some(m) = media.filter(|m| !media_matches(m)) {
+            if media_matches_at(m, NARROW) && self.narrow.len() < MAX_NARROW_BLOCKS {
+                self.narrow.push(strip_comments(css));
+            }
             return;
         }
         self.parse(css, false);
+    }
+
+    /// A sheet of the email's phone-only rules (`@media (max-width: 600px)`), to read which
+    /// table cells they make full-width blocks; None when it has none. Its matching budget is
+    /// a quarter of the main sheet's, and it's only asked about table cells.
+    pub fn narrow(&mut self) -> Option<Sheet> {
+        if self.narrow.is_empty() {
+            return None;
+        }
+        let mut n = Sheet { budget: MATCH_BUDGET / 4, candidates: CANDIDATE_BUDGET / 4, ..Sheet::default() };
+        for css in std::mem::take(&mut self.narrow) {
+            n.rules_in(&css, false, 0);
+        }
+        Some(n)
     }
 
     fn parse(&mut self, css: &str, ua: bool) {
@@ -285,8 +314,11 @@ impl Sheet {
             i = close + 1;
             if let Some(at) = prelude.strip_prefix('@') {
                 let name: String = at.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>().to_ascii_lowercase();
-                if name == "media" && depth < 4 && media_matches(&at[name.len()..]) {
+                let query = &at[name.len()..];
+                if name == "media" && depth < 4 && media_matches(query) {
                     self.rules_in(block, ua, depth + 1);
+                } else if name == "media" && !ua && depth == 0 && media_matches_at(query, NARROW) && self.narrow.len() < MAX_NARROW_BLOCKS {
+                    self.narrow.push(block.to_owned());
                 }
                 // @supports (kinetic email behind feature checks), @font-face, @keyframes,
                 // @page, @document: nothing here draws without them.
@@ -825,11 +857,16 @@ fn strip_comments(s: &str) -> String {
 
 /// Whether a media query list applies to a desktop reading pane in light mode.
 pub fn media_matches(list: &str) -> bool {
-    let list = list.trim();
-    list.is_empty() || split_top(list, b',').iter().any(|q| query_matches(q))
+    media_matches_at(list, VIEWPORT)
 }
 
-fn query_matches(q: &str) -> bool {
+/// Whether a media query list applies to a screen `width` points wide in light mode.
+pub fn media_matches_at(list: &str, width: f32) -> bool {
+    let list = list.trim();
+    list.is_empty() || split_top(list, b',').iter().any(|q| query_matches(q, width))
+}
+
+fn query_matches(q: &str, width: f32) -> bool {
     let q = q.trim().to_ascii_lowercase();
     let (negate, q) = match q.strip_prefix("not ") {
         Some(r) => (true, r.trim().to_owned()),
@@ -842,7 +879,7 @@ fn query_matches(q: &str) -> bool {
             continue;
         }
         let this = if let Some(f) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
-            feature_matches(f)
+            feature_matches(f, width)
         } else {
             matches!(part, "all" | "screen")
         };
@@ -851,16 +888,16 @@ fn query_matches(q: &str) -> bool {
     ok != negate
 }
 
-fn feature_matches(f: &str) -> bool {
+fn feature_matches(f: &str, width: f32) -> bool {
     let (name, value) = match f.split_once(':') {
         Some((n, v)) => (n.trim(), v.trim()),
         None => (f.trim(), ""),
     };
     let px = || super::length(value, 16.0);
     match name {
-        "min-width" | "min-device-width" => px().is_some_and(|w| VIEWPORT >= w),
-        "max-width" | "max-device-width" => px().is_some_and(|w| VIEWPORT <= w),
-        "width" | "device-width" => px().is_some_and(|w| (VIEWPORT - w).abs() < 0.5),
+        "min-width" | "min-device-width" => px().is_some_and(|w| width >= w),
+        "max-width" | "max-device-width" => px().is_some_and(|w| width <= w),
+        "width" | "device-width" => px().is_some_and(|w| (width - w).abs() < 0.5),
         "prefers-color-scheme" => value == "light",
         "orientation" => value == "landscape",
         "hover" => value == "hover" || value.is_empty(),
@@ -1317,6 +1354,27 @@ mod tests {
         let mut s = Sheet::new();
         s.add("p { a: 1 }", Some("print"));
         assert_eq!(value(&mut s, &els, 3, None, "a"), None, "<style media=print>");
+    }
+
+    #[test]
+    fn phone_rules_are_kept_apart() {
+        // Not applied, but kept to read which table cells the email stacks on phones.
+        let els = tree();
+        let mut s = Sheet::new();
+        s.add(
+            "@media screen and (max-width: 600px) { p { display: block; width: 100% } }
+             @media (max-width: 374px) { p { a: tiny } }
+             @media (min-width: 480px) { p { b: wide } }
+             p { c: 1 }",
+            None,
+        );
+        s.add("p { d: phone }", Some("(max-width: 480px)"));
+        assert_eq!(value(&mut s, &els, 3, None, "width"), None);
+        let mut n = s.narrow().expect("phone rules");
+        let st = n.cascade(&els, 3, None);
+        assert_eq!((get(&st, "display"), get(&st, "width"), get(&st, "d")), (Some("block"), Some("100%"), Some("phone")));
+        assert_eq!((get(&st, "a"), get(&st, "b"), get(&st, "c")), (None, None, None), "only rules for phones and not the desktop pane");
+        assert!(Sheet::new().narrow().is_none());
     }
 
     #[test]

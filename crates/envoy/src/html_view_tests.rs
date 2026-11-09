@@ -173,8 +173,8 @@ fn no_fixture_overflows_the_reader() {
     assert!(failures.is_empty(), "content reaches past the reader:\n{}", failures.join("\n"));
 }
 
-/// Every paragraph's text in tree order, and per row of columns the paragraph each column
-/// with text starts with.
+/// Every paragraph's text in tree order, and per row of columns (fluid columns, and table
+/// rows the email stacks on phones) the paragraph each column with text starts with.
 fn paragraphs(nodes: &[Node], paras: &mut Vec<String>, rows: &mut Vec<Vec<usize>>) {
     for n in nodes {
         match n {
@@ -193,6 +193,20 @@ fn paragraphs(nodes: &[Node], paras: &mut Vec<String>, rows: &mut Vec<Vec<usize>
                 }
             }
             Node::Box { children, .. } | Node::Quote(children) => paragraphs(children, paras, rows),
+            // A table row the email stacks on phones counts as a row of columns.
+            Node::Row { cells, .. } if cells.iter().filter(|(_, k)| !k.is_empty()).count() > 1 && cells.iter().all(|(s, k)| k.is_empty() || s.stack) => {
+                let mut row = Vec::new();
+                for (_, kids) in cells {
+                    let before = paras.len();
+                    paragraphs(kids, paras, rows);
+                    if paras.len() > before {
+                        row.push(before);
+                    }
+                }
+                if row.len() > 1 {
+                    rows.push(row);
+                }
+            }
             Node::Row { cells, .. } => cells.iter().for_each(|(_, k)| paragraphs(k, paras, rows)),
             Node::List { items, .. } => items.iter().for_each(|k| paragraphs(k, paras, rows)),
             _ => {}
@@ -244,7 +258,7 @@ fn fluid_columns_stack_when_narrow_and_stand_side_by_side_when_wide() {
         // shares of the row above its 480 px breakpoint; Cerberus's hybrid columns are up to
         // 330 px each, so two need its whole 680 px container, as in a browser.
         let wide: &[f32] = match name.as_str() {
-            "mjml-newsletter" => &[520.0, 900.0],
+            "mjml-newsletter" | "cerberus-responsive" | "foundation-hero" => &[520.0, 900.0],
             "cerberus-hybrid" => &[900.0],
             _ => &[],
         };
@@ -258,5 +272,5 @@ fn fluid_columns_stack_when_narrow_and_stand_side_by_side_when_wide() {
             }
         }
     }
-    assert!(seen >= 4, "rows of columns checked: {seen}");
+    assert!(seen >= 7, "rows of columns checked: {seen}");
 }
