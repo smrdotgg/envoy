@@ -107,6 +107,16 @@ Search understands `from:`, `to:`, `subject:`, `is:unread`, `is:read`, `is:starr
 `has:attachment`, plus free text over subject, people and body (SQLite FTS5, instant,
 offline).
 
+## Recipients
+
+Typing in To, Cc or Bcc suggests people from your own mail: ↑ and ↓ to choose, Return or Tab to
+take one (it goes in as `Name <address>`, with a comma for the next), Esc to hide them; a click
+works too. They come from the mail Envoy keeps on your computer, never from a server: the people
+you write to first (writing to someone counts five times what hearing from them does), and the
+ones you've been in touch with lately (a month ago counts half). Newsletters, lists and other
+bulk senders you've never written to come last, no-reply addresses not at all, and your own
+addresses never.
+
 ## Attachments
 
 Attach files with the paperclip next to Send (or `mod+shift+a`), which opens your system's file
@@ -180,7 +190,10 @@ cargo run -p envoy-core --example e2e           # engine against a local GreenMa
 ENVOY_DEMO=1 target/debug/envoy --snap out.png --scene open     # headless screenshot
 ENVOY_DEMO=1 ENVOY_DEMO_HTML=mail.html target/debug/envoy --snap out.png --scene html --size 1300x3000   # a whole HTML email
 cargo run -p envoy-core --example html_dump -- mail.html            # its layout tree (TREE=1) and fidelity score
-ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/flow.json --snap out.png --at 3.6
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/flow.json --snap out.png --at 4.8
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/suggest.json --snap out.png --at 0.7 # "l" in To: suggestions, bulk senders last
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/suggest.json --snap out.png --at 1.6 # one taken with Return, "s", and ↓
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/suggest.json --snap out.png --at 3.2 # Esc, "a", Tab takes Sam; Tab again to Subject
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 1.0   # archive: toast with Undo
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/undo.json --snap out.png --at 2.0   # after z: message back, open
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/drafts.json --snap out.png --at 2.8 # draft opened, edited, discarded: toast with Undo
@@ -194,7 +207,7 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png -
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png --at 2.6 # z: all three back
 ```
 
-Run from the repository root (the attach script picks files in it). Scenes: `open light dark compact bottom compose forward light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label toast toast-compose counts`.
+Run from the repository root (the attach script picks files in it). Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label toast toast-compose counts`.
 
 HTML rendering is tested against the mail in `crates/envoy-core/tests/fixtures/html` (sources and
 licenses in its `LICENSES.md`).

@@ -1,9 +1,9 @@
 //! The composer: a floating window at the bottom right, as in Gmail.
 
 use rune::{Cursor, El, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Select, Spinner, TextInput};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Placement, PopupItem, PopupList, Select, Spinner, TextInput};
 
-use crate::app::{App, Compose, key_label};
+use crate::app::{App, Compose, Recipients, key_label};
 use envoy_core::model::{DraftAttachment, FileStatus};
 use crate::{fmt, icons};
 use crate::theme::Theme;
@@ -38,6 +38,46 @@ fn plain_input(edit: &rune::TextEdit, placeholder: &str, key: &str, access: fn(&
 
 fn c(s: &mut App) -> &mut Compose {
     s.compose.as_mut().expect("composer is open while its fields exist")
+}
+
+/// A To, Cc or Bcc field, as wide as its row (several recipients fit): typing in it suggests
+/// people (app/suggest.rs), in a list under it that takes no focus, so the caret and every key
+/// stay in the field.
+fn recipients_input(cm: &Compose, f: Recipients, placeholder: &str, k: &rune_kit::Kit, layer: &mut Vec<El>) -> El {
+    let key = format!("field-compose-{}", f.key());
+    let shown = cm.suggestions(f);
+    let mut input = TextInput::new(cm.recipients(f))
+        .plain()
+        .width(None)
+        .placeholder(placeholder)
+        .label(placeholder)
+        .on_edit(move |s: &mut App| c(s).recipients_mut(f))
+        .on_change(move |s: &mut App, _: &mut Tx| s.recipients_edited(f))
+        .on_key(move |s: &mut App, ev, tx| s.suggestion_key(f, ev, tx));
+    if let Some((items, active)) = shown {
+        input = input.active_descendant(Some(format!("compose-suggest-option-{active}")));
+        let emails: Vec<String> = items.iter().map(|a| a.email.clone()).collect();
+        let rows = items.iter().enumerate().map(|(i, a)| {
+            let name = a.name.trim();
+            let row = PopupItem::new(i.to_string(), if name.is_empty() { a.email.as_str() } else { name });
+            if name.is_empty() { row } else { row.description(&a.email) }
+        });
+        PopupList::new("compose-suggest", key.clone())
+            .placement(Placement::BottomStart)
+            .offset(6.0)
+            .width(380.0)
+            .label("Suggested recipients")
+            .items(rows)
+            .active(Some(active))
+            .on_active(|s: &mut App, i| s.hover_suggestion(i))
+            .on_choose(move |s: &mut App, id: &str, _: &mut Tx| {
+                if let Some(email) = id.parse::<usize>().ok().and_then(|i| emails.get(i)) {
+                    s.accept_suggestion(f, email);
+                }
+            })
+            .build(k, layer);
+    }
+    input.build(k).key(key)
 }
 
 pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
@@ -138,11 +178,11 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
                 .child(text("Cc Bcc").font(k.ty.text_xsmall_medium).color(k.c.text_muted)),
         )
     };
-    fields = fields.child(field_row(t, "To", plain_input(&cm.to, "Recipients", "field-compose-to", |s| &mut c(s).to, k), cc_toggle));
+    fields = fields.child(field_row(t, "To", recipients_input(cm, Recipients::To, "Recipients", k, layer), cc_toggle));
     if cm.show_cc {
         fields = fields
-            .child(field_row(t, "Cc", plain_input(&cm.cc, "Cc", "field-compose-cc", |s| &mut c(s).cc, k), None))
-            .child(field_row(t, "Bcc", plain_input(&cm.bcc, "Bcc", "field-compose-bcc", |s| &mut c(s).bcc, k), None));
+            .child(field_row(t, "Cc", recipients_input(cm, Recipients::Cc, "Cc", k, layer), None))
+            .child(field_row(t, "Bcc", recipients_input(cm, Recipients::Bcc, "Bcc", k, layer), None));
     }
     fields = fields.child(field_row(t, "Subject", plain_input(&cm.subject, "Subject", "field-compose-subject", |s| &mut c(s).subject, k), None));
     if let Some(notice) = &cm.notice {

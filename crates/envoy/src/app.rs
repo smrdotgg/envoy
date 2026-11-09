@@ -17,6 +17,9 @@ use envoy_core::store::DraftRev;
 use crate::fmt;
 use crate::selection::Selection;
 
+mod suggest;
+pub use suggest::{Recipients, Suggest};
+
 pub enum ImageState {
     Loading,
     Ready(rune::Image),
@@ -79,6 +82,8 @@ pub struct Compose {
     /// When (app clock) the first unsaved edit and the latest one were seen.
     pub dirty_since: Option<f64>,
     pub edited_at: f64,
+    /// Recipient suggestions for the To, Cc or Bcc entry being typed (app/suggest.rs).
+    pub suggest: Suggest,
 }
 
 /// Seconds after the last keystroke that the composer saves its draft, and the longest it
@@ -118,6 +123,7 @@ impl Compose {
             timed: 0,
             dirty_since: None,
             edited_at: 0.0,
+            suggest: Suggest::default(),
         }
     }
 
@@ -796,6 +802,7 @@ impl App {
             Event::AttachFailed { draft, file, error } => self.attach_failed(draft, file, error),
             Event::SendFailed { draft_id, error } => self.send_failed(draft_id, error),
             Event::DraftFiles { draft, files } => self.draft_files(draft, files),
+            Event::Contacts { req, contacts } => self.contacts_arrived(req, contacts),
         }
         reload
     }

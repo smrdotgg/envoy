@@ -5,8 +5,9 @@
   {"t": 1.2, "type": "key", "name": "e"},
   {"t": 1.6, "type": "key", "name": "c"},
   {"t": 1.9, "type": "type", "text": "maya@northwind.dev"},
-  {"t": 2.2, "type": "tap", "key": "field-compose-subject"},
-  {"t": 2.4, "type": "type", "text": "Hello from a script"},
-  {"t": 2.7, "type": "tap", "key": "field-compose-body"},
-  {"t": 2.9, "type": "type", "text": "Typing into the body."}
+  {"t": 2.6, "type": "key", "name": "Escape"},
+  {"t": 2.7, "type": "tap", "key": "field-compose-subject"},
+  {"t": 2.9, "type": "type", "text": "Hello from a script"},
+  {"t": 3.7, "type": "tap", "key": "field-compose-body"},
+  {"t": 3.9, "type": "type", "text": "Typing into the body."}
 ]}

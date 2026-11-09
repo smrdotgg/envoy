@@ -41,6 +41,8 @@ const SAMPLES: &[Sample] = &[
 ];
 
 const DRAFTS: &str = "[Gmail]/Drafts";
+/// Senders whose mail is bulk (lists, newsletters, notifications): suggested last.
+const BULK: &[&str] = &["notifications@github.com", "updates@linear.app", "receipts@stripe.com", "booking@lufthansa.com", "hello@thebrowser.company", "kale@hackernewsletter.com"];
 const DRAFT_TO: (&str, &str) = ("Jordan Lee", "jordan@northwind.dev");
 
 pub fn account() -> Account {
@@ -304,4 +306,27 @@ pub fn populate(app: &mut App) {
     app.view = View::Role { account: Some(ACCOUNT.into()), role: Role::Inbox };
     app.list = list_for(&app.view);
     app.list_loaded = true;
+}
+
+/// Recipient suggestions from the sample mail, ranked as the store ranks a real cache's
+/// (`envoy_core::contacts`): you've written in each conversation you replied to (every other
+/// message of its thread), and Jordan is copied on the longer ones.
+pub fn suggest(typed: &str) -> Vec<Address> {
+    use envoy_core::contacts::{self, Candidate, Stats, source};
+    let now = now();
+    let words = contacts::query_words(typed);
+    let mut candidates = Vec::new();
+    for s in SAMPLES.iter().filter(|s| s.mailbox == "INBOX") {
+        let at = now - s.hours_ago * 3600 - 600;
+        let bulk = BULK.contains(&s.from.1);
+        let yours = if bulk { 0 } else { s.count / 2 };
+        let stats = Stats { sent: yours, sent_at: at, got: if bulk { 0 } else { s.count - yours }, cc: 0, bulk: bulk as u32, seen_at: at };
+        candidates.push(Candidate { email: s.from.1.into(), name: s.from.0.into(), name_rank: (source::THEIRS, at), stats });
+        if s.count > 2 {
+            candidates.push(Candidate { email: DRAFT_TO.1.into(), name: DRAFT_TO.0.into(), name_rank: (source::COPIED, at), stats: Stats { cc: 1, seen_at: at, ..Stats::default() } });
+        }
+    }
+    candidates.retain(|c| contacts::matches(&words, &contacts::terms(&c.name, &c.email)));
+    let me = [account().email].into();
+    contacts::rank(candidates, &words, &me, now, envoy_core::engine::SUGGESTIONS)
 }

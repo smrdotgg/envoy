@@ -115,10 +115,14 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
     let k = &t.k;
     let mut layer: Vec<El> = Vec::new();
     let body = view_mail::mail_screen(s, &t, cx, &mut layer);
-    if s.screen == Screen::Mail
-        && let Some(c) = compose::composer(s, &t, &mut layer)
-    {
-        layer.push(c);
+    if s.screen == Screen::Mail {
+        // What the composer opens over itself (suggestions, the From list) goes after it: an
+        // overlay follows the element it's anchored to.
+        let mut over = Vec::new();
+        if let Some(c) = compose::composer(s, &t, &mut over) {
+            layer.push(c);
+        }
+        layer.extend(over);
     }
     if let Some(ids) = &s.confirm_delete {
         let ids = ids.clone();
@@ -203,6 +207,15 @@ const SCENES: &[Scene] = &[
     ("forward", |s| {
         scene_open(s);
         s.compose_reply(None, false, true);
+    }),
+    ("compose-suggest", |s| {
+        // Recipient suggestions for "l" in a new message's To field.
+        scene_open(s);
+        s.compose_new();
+        if let Some(c) = &mut s.compose {
+            c.to.insert("l");
+        }
+        s.recipients_edited(app::Recipients::To);
     }),
     ("settings", |s| s.screen = Screen::Settings),
     ("settings-keys", |s| {
