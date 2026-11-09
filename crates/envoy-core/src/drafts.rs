@@ -121,13 +121,10 @@ fn write_recovered(dir: &Path, r: &Recovered) -> Result<()> {
 /// isn't a draft is set aside (renamed), never removed. Stops at the first store error, leaving
 /// the rest for the next start. Returns how many were imported.
 ///
-/// Each import is on disk before its file goes ([`Store::durably`]): a power cut can't take
-/// back the text and keep the file's deletion.
+/// Each file goes only once what holds its text is on disk ([`Store::sync_to_disk`]), whether
+/// this import wrote it or it was in already: a power cut can't take back the text and keep the
+/// file's deletion.
 pub fn import_recovery(dir: &Path, st: &Store, now: i64) -> Result<usize> {
-    st.durably(|st| import_files(dir, st, now))
-}
-
-fn import_files(dir: &Path, st: &Store, now: i64) -> Result<usize> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -156,7 +153,8 @@ fn import_files(dir: &Path, st: &Store, now: i64) -> Result<usize> {
             Err(e) => return Err(e.into()),
         };
         import_one(st, &r, now)?;
-        // It's in the store now: its file can go.
+        // It's in the store now, and on disk once this returns: its file can go.
+        st.sync_to_disk()?;
         match std::fs::remove_file(&file) {
             Ok(()) => imported += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -481,6 +479,31 @@ mod tests {
         let mut want: Vec<String> = (0..importers).flat_map(|i| (0..each).map(move |j| format!("text {i}-{j}"))).collect();
         want.sort();
         assert_eq!(subjects, want, "each snapshot's text kept, once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recovery_file_goes_only_after_a_sync_to_disk_even_when_nothing_was_written() {
+        let dir = temp("synced");
+        let folder = dir.join("drafts-recovery");
+        let st = Store::memory();
+        let draft = |subject: &str| Draft { account: "a".into(), subject: subject.into(), ..Draft::default() };
+        // Already in, from earlier commits at NORMAL: the same text at a newer stamp, and a
+        // send already queued. Importing their files writes nothing.
+        st.save_draft(1, &draft("same"), true, DraftRev { lifecycle: 0, rev: 50 }, 100).unwrap();
+        let send = st.enqueue_at("a", &crate::store::Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: None }, 100).unwrap();
+        st.transaction(|s| s.draft_sending(2, &draft("on its way"), send, 100)).unwrap();
+        save_recovery(&folder, &[recovered(1, "same", 40, false), recovered(2, "on its way", 7, true)]).unwrap();
+        let before = st.syncs_to_disk();
+        assert_eq!(import_recovery(&folder, &st, 101).unwrap(), 2);
+        assert_eq!(st.syncs_to_disk() - before, 2, "one sync to disk before each file went");
+        assert!(files(&folder).is_empty());
+        assert_eq!(st.drafts(None).unwrap().len(), 2, "and nothing was added");
+        // A sync that fails keeps the file.
+        save_recovery(&folder, &[recovered(1, "same", 40, false)]).unwrap();
+        st.conn_for_tests().execute_batch("DROP TABLE durable_mark").unwrap();
+        assert!(import_recovery(&folder, &st, 102).is_err());
+        assert_eq!(files(&folder).len(), 1, "kept for the next start");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
