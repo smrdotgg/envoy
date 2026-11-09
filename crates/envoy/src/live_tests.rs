@@ -294,3 +294,47 @@ fn a_moved_or_labeled_conversation_is_at_its_destination_at_once() {
         assert_eq!(ids(&app), want, "{view:?} after the undos");
     }
 }
+/// Finding: a conversation snoozed didn't show in Snoozed. With the engine too: it waited out
+/// the undo window in the inbox, hidden, and Snoozed lists the snooze folders on the server,
+/// the new one made only once it went. It's in Snoozed at once now, among the others by when it
+/// comes back, saying when; an Undo takes it back out.
+#[test]
+fn a_snoozed_conversation_is_in_snoozed_at_once() {
+    let now = chrono::Utc::now().timestamp() / 60 * 60;
+    let (soon, later, mine) = (now + 86_400, now + 7 * 86_400, now + 3 * 86_400);
+    let mut seeded = None;
+    let mut app = live("snoozed", |st| {
+        seeded = Some(inbox_seed(st));
+        for (wake, uid, from, subject) in [(soon, 1, "City Library <library@city.example>", "Your hold is ready"), (later, 2, "Nora <nora@x.example>", "Photos")] {
+            let bucket = envoy_core::snooze::bucket(envoy_core::snooze::PARENT, "/", wake);
+            st.upsert_mailbox(ACCOUNT, &bucket, "Snoozed", Role::Snoozed, "/", true).unwrap();
+            put(st, &bucket, uid, from, subject, flags::SEEN);
+        }
+    });
+    let (maya, ..) = seeded.unwrap();
+    let mut tx = Tx::default();
+    let snoozed = View::Role { account: None, role: Role::Snoozed };
+    app.go(snoozed.clone());
+    settle(&mut app);
+    let before = ids(&app);
+    assert_eq!(before.len(), 2);
+    app.go_role(Role::Inbox);
+    settle(&mut app);
+    app.open_message(maya);
+    settle(&mut app);
+    app.snooze(app.targets(), mine, &mut tx);
+    settle(&mut app);
+    assert!(row(&app, maya).is_none(), "gone from the inbox");
+    app.go(snoozed.clone());
+    settle(&mut app);
+    assert_eq!(ids(&app), [before[0], maya, before[1]], "in Snoozed, by when each comes back");
+    let r = row(&app, maya).unwrap().clone();
+    assert_eq!(app.wake_of(&r.account, &r.mailbox), Some(mine), "saying when it comes back");
+    assert!(!app.snoozed_by_server(maya), "Envoy's snooze, not the server's");
+    assert!(app.undo_last(&mut tx));
+    settle(&mut app);
+    assert_eq!(ids(&app), before, "undone: out of Snoozed");
+    app.go_role(Role::Inbox);
+    settle(&mut app);
+    assert!(row(&app, maya).is_some(), "and back in the inbox");
+}

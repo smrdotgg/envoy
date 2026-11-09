@@ -953,6 +953,26 @@ impl Store {
         Ok(out)
     }
 
+    /// [`Store::mailboxes`] as the app shows them: with the buckets snoozes are on their way
+    /// into that the server doesn't have yet (each is made as its first snooze goes), so
+    /// Snoozed lists those snoozes meanwhile saying when they come back. Not selectable: there's
+    /// nothing in them to sync yet.
+    pub fn shown_mailboxes(&self, account: &str) -> Result<Vec<Mailbox>> {
+        let mut out = self.mailboxes(account)?;
+        let (_, delimiter) = self.snooze_parent(account)?;
+        for a in self.arrivals()?.into_iter().filter(|a| a.account == account) {
+            if out.iter().any(|m| m.name == a.dest) {
+                continue;
+            }
+            if let Some((_, wake)) = self.bucket_of(account, &a.dest)? {
+                let depth = if delimiter.is_empty() { 0 } else { a.dest.matches(delimiter.as_str()).count() as u8 };
+                out.push(Mailbox { account: account.to_owned(), display: Role::Snoozed.label().to_owned(), role: Role::Snoozed, unread: 0, total: 0, depth, selectable: false, wake: Some(wake), name: a.dest });
+            }
+        }
+        out.sort_by(|a, b| a.role.rank().cmp(&b.role.rank()).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        Ok(out)
+    }
+
     pub fn mailbox_for_role(&self, account: &str, role: Role) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -2841,6 +2861,56 @@ mod tests {
         assert_eq!((inbox_box().unread, inbox_box().total), (0, 0), "the held message isn't counted");
         s.undo_batch(7).unwrap();
         assert_eq!(unread(&s), 1, "one unread message, one unread");
+    }
+
+    /// A snooze not on the server yet is in Snoozed at once, among the others by when it comes
+    /// back, the very first one too (no bucket made yet: one is made as the snooze goes). The
+    /// app is told of its bucket, saying when, until the server has it; the worker isn't.
+    #[test]
+    fn a_snooze_on_its_way_is_in_snoozed_by_when_it_comes_back() {
+        let s = Store::memory();
+        for account in ["a", "b"] {
+            s.upsert_mailbox(account, "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        }
+        let wake = 1_794_297_600; // 2026-11-10 08:00Z
+        let day = 86_400;
+        let put = |account: &str, mailbox: &str, uid: u32| s.upsert_header(account, mailbox, uid, 0, 10, 0, &parsed("Later", &format!("<{account}{uid}@x>"), "", "Ana <ana@x.com>", uid)).unwrap();
+        let snooze = |account: &str, id: MessageId, uid: u32, at: i64| {
+            let bucket = s.snooze_bucket(account, at).unwrap();
+            let op = s.enqueue_held(account, &Op::Move { mailbox: "INBOX".into(), uid, dest: bucket.clone() }, i64::MAX, 7).unwrap();
+            assert!(s.hide_local(id, op).unwrap());
+            (bucket, op)
+        };
+        let snoozed = |account: Option<&str>| {
+            let rows = s.list(&View::Role { account: account.map(Into::into), role: Role::Snoozed }, &Query::default(), true, 100, &HashSet::new()).unwrap();
+            rows.iter().map(|m| m.id).collect::<Vec<_>>()
+        };
+        // The first snooze ever: no bucket anywhere yet.
+        let first = put("a", "INBOX", 1);
+        let (bucket, op) = snooze("a", first, 1, wake + 2 * day);
+        assert_eq!(snoozed(None), [first]);
+        let row = s.list(&View::Role { account: None, role: Role::Snoozed }, &Query::default(), true, 100, &HashSet::new()).unwrap().remove(0);
+        assert_eq!((row.mailbox.as_str(), row.flags & flags::ARRIVING != 0), (bucket.as_str(), true));
+        let shown = s.shown_mailboxes("a").unwrap();
+        let b = shown.iter().find(|m| m.name == bucket).expect("its bucket, for the app");
+        assert_eq!((b.role, b.wake, b.selectable), (Role::Snoozed, Some(wake + 2 * day), false));
+        assert!(s.mailboxes("a").unwrap().iter().all(|m| m.name != bucket), "not among the mailboxes a worker syncs");
+        assert!(s.watched_boxes(&View::Role { account: None, role: Role::Snoozed }, "a").unwrap().is_empty());
+        // Buckets made already, waking sooner and later, and another account's snooze between.
+        let (sooner, later) = (crate::snooze::bucket("Snoozed", "/", wake + day), crate::snooze::bucket("Snoozed", "/", wake + 5 * day));
+        for b in [&sooner, &later] {
+            s.upsert_mailbox("a", b, "Snoozed", Role::Snoozed, "/", true).unwrap();
+        }
+        let (in_sooner, in_later) = (put("a", &sooner, 2), put("a", &later, 3));
+        let theirs = put("b", "INBOX", 4);
+        snooze("b", theirs, 4, wake + 3 * day);
+        assert_eq!(snoozed(None), [in_sooner, first, theirs, in_later], "by when each comes back");
+        assert_eq!(snoozed(Some("b")), [theirs], "one account's");
+        assert_eq!(snoozed(Some("a")), [in_sooner, first, in_later]);
+        // Gone to the server: out of Snoozed here until its bucket, made and synced, has it.
+        s.op_done(op).unwrap();
+        assert_eq!(snoozed(Some("a")), [in_sooner, in_later]);
+        assert!(s.shown_mailboxes("a").unwrap().iter().all(|m| m.name != bucket), "nothing on its way into it");
     }
 
     /// A message hidden for a move opens only as what it is now: on its way into another

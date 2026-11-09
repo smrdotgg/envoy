@@ -211,8 +211,8 @@ impl Store {
         // On their way in (back to the inbox, say, and not on the server yet): counted where the
         // list shows them.
         let mut arriving = self.conn.prepare_cached("SELECT account, category, thread FROM messages WHERE id = ?1 AND flags & 1 = 0 AND flags & 16 = 0")?;
-        for id in self.arriving_in(&boxes)?.into_keys() {
-            let Some((account, category, thread)) = arriving.query_row([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))).optional()? else { continue };
+        for a in self.arrivals_into(&boxes)? {
+            let Some((account, category, thread)) = arriving.query_row([a.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))).optional()? else { continue };
             if conversations && !seen.insert(key(&account, &thread)) {
                 continue;
             }

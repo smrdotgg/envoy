@@ -404,7 +404,7 @@ impl Shared {
     }
 
     fn emit_mailboxes(&self, account: &str) {
-        if let Ok(mailboxes) = self.with_writer(|st| st.mailboxes(account)) {
+        if let Ok(mailboxes) = self.with_writer(|st| st.shown_mailboxes(account)) {
             self.emit(Event::Mailboxes { account: account.to_owned(), mailboxes });
         }
     }

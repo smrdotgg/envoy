@@ -327,9 +327,21 @@ impl Store {
         Ok(out)
     }
 
-    /// The messages on their way into `boxes`, `(account, name)`s, each with where it's going.
-    pub(super) fn arriving_in(&self, boxes: &[(String, String)]) -> Result<HashMap<i64, String>> {
-        Ok(self.arrivals()?.into_iter().filter(|a| boxes.iter().any(|(acc, b)| *acc == a.account && *b == a.dest)).map(|a| (a.id, a.dest)).collect())
+    /// The messages on their way into `boxes`, `(account, name)`s.
+    pub(super) fn arrivals_into(&self, boxes: &[(String, String)]) -> Result<Vec<Arrival>> {
+        Ok(self.arrivals()?.into_iter().filter(|a| boxes.iter().any(|(acc, b)| *acc == a.account && *b == a.dest)).collect())
+    }
+
+    /// The messages on their way into `account`'s snooze buckets (every account's: None),
+    /// whether the bucket is made yet or not (it's made as the snooze goes): Snoozed's.
+    fn snoozing(&self, account: Option<&str>) -> Result<Vec<Arrival>> {
+        let mut out = Vec::new();
+        for a in self.arrivals()? {
+            if account.is_none_or(|x| x == a.account) && self.bucket_of(&a.account, &a.dest)?.is_some() {
+                out.push(a);
+            }
+        }
+        Ok(out)
     }
 
     fn fts_hits(&self, query: &Query) -> Result<Hits> {
@@ -353,7 +365,17 @@ impl Store {
         first: &mut dyn FnMut(Vec<Summary>),
     ) -> Result<Vec<Summary>> {
         let scope = self.scope(view)?;
-        if limit == 0 || matches!(&scope, Scope::Boxes(b) if b.is_empty()) {
+        // One snapshot for what's on its way, the scan, the thread pass and the full reads,
+        // while sync writes.
+        let _read = self.conn.unchecked_transaction()?;
+        // Moved, labeled or snoozed here, and not on the server yet: here already, by date (in
+        // Snoozed, by when it comes back, its bucket made or not).
+        let arrivals = match (&scope, view) {
+            (Scope::Boxes(_), View::Role { account, role: Role::Snoozed }) => self.snoozing(account.as_deref())?,
+            (Scope::Boxes(boxes), _) => self.arrivals_into(boxes)?,
+            (Scope::Starred(_), _) => Vec::new(),
+        };
+        if limit == 0 || (matches!(&scope, Scope::Boxes(b) if b.is_empty()) && arrivals.is_empty()) {
             return Ok(Vec::new());
         }
         let filter = Filter::new(query);
@@ -367,11 +389,7 @@ impl Store {
         // Messages back from a snooze come first in the inbox, and in their own tab of the split
         // inbox (the filter keeps its category), until they're dealt with; a search goes by date.
         let pinned = if query.is_search() { Vec::new() } else { self.pinned_boxes(view, &scope) };
-        // Moved or labeled here, and not on the server yet: here already, by date.
-        let arriving = match &scope {
-            Scope::Boxes(boxes) => self.arriving_in(boxes)?,
-            Scope::Starred(_) => HashMap::new(),
-        };
+        let arriving: HashMap<i64, String> = arrivals.iter().map(|a| (a.id, a.dest.clone())).collect();
         let (limit, page) = (limit as usize, page as usize);
         let mut g = Grouper {
             conversations,
@@ -391,8 +409,6 @@ impl Store {
         let few = hits.as_ref().filter(|h| h.ids.len() <= FEW_HITS);
         let arriving_ids: Vec<i64> = arriving.keys().copied().collect();
         let (sql, args) = scan_sql(&scope, &filter, few, (!arriving_ids.is_empty()).then_some(arriving_ids.as_slice()));
-        // One snapshot for the scan, the thread pass and the full reads, while sync writes.
-        let _read = self.conn.unchecked_transaction()?;
         let mut pages = Pages { limit, shown: Vec::new(), done: 0, first };
         // Every pinned row before any other: they're the list's top, first page or not.
         let mut passes = Vec::new();
@@ -402,11 +418,21 @@ impl Store {
         passes.push((sql, args));
         let mut stopped = false;
         if let (true, Scope::Boxes(boxes)) = (snoozed, &scope) {
-            // One statement, run for each bucket in turn: its shape doesn't grow with them.
+            // One statement, run for each bucket in turn: its shape doesn't grow with them. A
+            // bucket with snoozes on their way in has them merged in by a second.
             let mut stmt = self.conn.prepare(&box_sql(&filter))?;
-            'boxes: for (a, b) in boxes {
-                let args: Vec<SqlValue> = [SqlValue::from(a.clone()), SqlValue::from(b.clone())].into_iter().chain(filter.args.iter().cloned()).collect();
-                let mut rows = stmt.query(params_from_iter(args.iter()))?;
+            let mut with_arriving = if arrivals.is_empty() { None } else { Some(self.conn.prepare(&box_arriving_sql(&filter))?) };
+            'boxes: for (a, b) in snoozed_buckets(boxes, &arrivals) {
+                let here: Vec<i64> = arrivals.iter().filter(|x| x.account == a && x.dest == b).map(|x| x.id).collect();
+                let mut args: Vec<SqlValue> = [SqlValue::from(a), SqlValue::from(b)].into_iter().chain(filter.args.iter().cloned()).collect();
+                let mut rows = match &mut with_arriving {
+                    Some(merged) if !here.is_empty() => {
+                        args.push(SqlValue::from(ids_json(&here)));
+                        args.extend(filter.args.iter().cloned());
+                        merged.query(params_from_iter(args.iter()))?
+                    }
+                    _ => stmt.query(params_from_iter(args.iter()))?,
+                };
                 while let Some(r) = rows.next()? {
                     if self.take_paged(&mut g, r, &mut pages, &scope, &filter)? {
                         stopped = true;
@@ -634,6 +660,38 @@ fn ids_json(ids: &[i64]) -> String {
 /// filter's arguments.
 fn box_sql(filter: &Filter) -> String {
     format!("SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_by_date WHERE m.account = ? AND m.mailbox = ? AND {} ORDER BY {ORDER}", filter.sql())
+}
+
+/// [`box_sql`] with the messages on their way into the bucket merged in ([`Arrival`]): its
+/// arguments, then their ids (`[1,2]`) and the filter's again.
+fn box_arriving_sql(filter: &Filter) -> String {
+    format!(
+        "SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_by_date WHERE m.account = ? AND m.mailbox = ? AND {}
+         UNION ALL SELECT {LIGHT_COLS} FROM messages m WHERE m.id IN (SELECT value FROM json_each(?)) AND {} ORDER BY 5 DESC, 1 DESC",
+        filter.sql(),
+        filter.sql_arriving()
+    )
+}
+
+/// The buckets Snoozed lists, in its order: `boxes` (in that order already, [`Store::scope`])
+/// and the ones `arrivals` are going into that aren't among them (not made yet), each where its
+/// wake time puts it, as the scope's query orders them.
+fn snoozed_buckets(boxes: &[(String, String)], arrivals: &[Arrival]) -> Vec<(String, String)> {
+    let mut out = boxes.to_vec();
+    for a in arrivals {
+        if !out.iter().any(|(acc, b)| *acc == a.account && *b == a.dest) {
+            out.push((a.account.clone(), a.dest.clone()));
+        }
+    }
+    if out.len() > boxes.len() {
+        // A stamp first (they sort as their times do), then the name's last 14 characters,
+        // the account and the name.
+        out.sort_by_cached_key(|(account, name)| {
+            let tail = name.get(name.len().saturating_sub(14)..).unwrap_or(name).to_owned();
+            (crate::snooze::parse_stamp(&tail).is_none(), tail, account.clone(), name.clone())
+        });
+    }
+    out
 }
 
 /// The scope as a condition on `m`, its arguments appended to `args`: one, however many

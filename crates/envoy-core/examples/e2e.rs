@@ -671,6 +671,10 @@ fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) 
     d.wait(mark, "the snooze held", 5, |e| matches!(e, Event::Held { undo: 41, ops: 1 }).then_some(()));
     let due = deadline("batch = 41");
     assert_hold("the snooze", due, before, epoch(), MOVE_HOLD);
+    // In Snoozed here at once, in the bucket it's going to (not made yet), saying when.
+    let snoozed = View::Role { account: Some(ACCOUNT.into()), role: Role::Snoozed };
+    let on_its_way = d.list(&snoozed, "", false).into_iter().find(|s| s.id == later.id).expect("in Snoozed at once");
+    assert_eq!((on_its_way.mailbox, on_its_way.flags & flags::ARRIVING != 0), (snooze::bucket("Snoozed", &delimiter, until), true));
     watch_holds(d, vec![Hold { what: "the snooze", deadline: due, on_server: Box::new(|| bucket_for(until).is_some() || !probe.live("INBOX").iter().any(|s| s == "Snooze me")) }]);
     let bucket = d.until("in its bucket on the server, gone from the inbox", 15, |_| {
         let bucket = bucket_for(until)?;
