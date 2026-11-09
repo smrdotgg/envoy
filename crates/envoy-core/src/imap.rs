@@ -574,6 +574,13 @@ pub async fn move_message(session: &mut async_imap::Session<impl Io>, caps: Caps
     Ok(())
 }
 
+/// Copies a message to `dest`, leaving it where it is: on Gmail, adds the label `dest`.
+pub async fn copy_message(session: &mut async_imap::Session<impl Io>, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
+    select(session, mailbox).await?;
+    timed("COPY", session.uid_copy(uid.to_string(), quoted(dest))).await??;
+    Ok(())
+}
+
 pub async fn expunge(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, uid: u32, select_first: bool) -> Result<()> {
     if select_first {
         select(session, mailbox).await?;
