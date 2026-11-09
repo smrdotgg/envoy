@@ -174,24 +174,6 @@ pub(super) async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> 
     }
 }
 
-/// `mailbox`'s UIDNEXT, if a finished STATUS said it.
-pub(super) async fn uid_next(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Option<u32>> {
-    let mut next = None;
-    run(session, &format!("STATUS {} (UIDNEXT)", quoted(mailbox)), "STATUS", COMMAND_TIMEOUT, &mut |r: &Response<'_>| {
-        if let Response::MailboxData(MailboxDatum::Status { mailbox: m, status }) = r
-            && (m.as_ref() == mailbox || (m.eq_ignore_ascii_case("INBOX") && mailbox.eq_ignore_ascii_case("INBOX")))
-        {
-            for item in status {
-                if let StatusAttribute::UidNext(n) = item {
-                    next = Some(*n);
-                }
-            }
-        }
-    })
-    .await?;
-    Ok(next)
-}
-
 /// Whether the server lists a mailbox of exactly this name (`LIST "" "name"`), one that doesn't
 /// exist (`\NonExistent`) aside. For names without LIST's wildcards (`*`, `%`).
 pub(super) async fn listed(session: &mut Connection<impl Io>, name: &str) -> Result<bool> {

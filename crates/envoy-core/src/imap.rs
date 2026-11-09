@@ -864,9 +864,10 @@ pub struct Woken {
 /// Wakes snooze bucket `bucket`: every message in it not flagged \Deleted goes back to `inbox`,
 /// unread, with `$new` where the server keeps keywords. With MOVE, one UID MOVE; without, a
 /// COPY, then the originals deleted (expunged only with UIDPLUS: Envoy never sends a plain
-/// EXPUNGE), and copies another Envoy made of the same messages at the same time put down to
-/// one. The same call on an emptied bucket (by another Envoy, or this one) sends nothing more
-/// than a SELECT. The messages are named by the UIDs a search just found, never `1:*`.
+/// EXPUNGE). Nothing in the inbox is ever deleted: should two Envoys copy the same messages at
+/// once (each waits at random first, so it's rare), the inbox has two copies, and the list shows
+/// them as one. The same call on an emptied bucket (by another Envoy, or this one) sends nothing
+/// more than a SELECT. The messages are named by the UIDs a search just found, never `1:*`.
 pub async fn wake_bucket(session: &mut Connection<impl Io>, caps: Caps, bucket: &str, inbox: &str) -> Result<Woken> {
     let selected = wire::select(session, bucket).await?;
     if selected.exists == 0 {
@@ -886,41 +887,10 @@ pub async fn wake_bucket(session: &mut Connection<impl Io>, caps: Caps, bucket: 
     if caps.moves {
         wire::ok(session, &format!("UID MOVE {set} {}", quoted(inbox)), "MOVE").await?;
     } else {
-        // Copies from here on are this wake's (or another Envoy's at the same moment).
-        let before = wire::uid_next(session, inbox).await?;
         wire::ok(session, &format!("UID COPY {set} {}", quoted(inbox)), "COPY").await?;
         delete_uids(session, caps, &uids).await?;
-        if let Some(before) = before {
-            dedupe_copies(session, caps, inbox, before, &message_ids).await?;
-        }
     }
     Ok(Woken { moved: uids.len(), message_ids })
-}
-
-/// After a wake by COPY: each of `message_ids` found more than once in `inbox` keeps its first
-/// copy, and the others made since `before` (UIDNEXT before the copy) are deleted.
-async fn dedupe_copies(session: &mut Connection<impl Io>, caps: Caps, inbox: &str, before: u32, message_ids: &[String]) -> Result<()> {
-    let mut wanted: Vec<&str> = Vec::new();
-    for m in message_ids.iter().filter(|m| !m.is_empty()) {
-        if !wanted.contains(&m.as_str()) {
-            wanted.push(m);
-        }
-    }
-    if wanted.is_empty() {
-        return Ok(());
-    }
-    wire::select(session, inbox).await?;
-    let mut extra = Vec::new();
-    for message_id in wanted {
-        let found = uids_with_message_id(session, message_id).await?;
-        // The first copy stays, wherever it came from.
-        let first = found.iter().copied().min().unwrap_or(0);
-        extra.extend(found.into_iter().filter(|u| *u != first && *u >= before));
-    }
-    if !extra.is_empty() {
-        log::info!("{} woken message(s) were copied to {inbox} twice (another Envoy woke them at the same time): the extra copies go", extra.len());
-    }
-    delete_uids(session, caps, &extra).await
 }
 
 /// The Message-IDs of the selected mailbox's messages `set`, as their headers say.
@@ -2066,8 +2036,7 @@ mod tests {
 
     /// A server whose snooze bucket holds UIDs 5 and 6 (`<a@x>`, `<b@x>`; `exists` messages in
     /// all, some maybe flagged \Deleted: the search finds `undeleted`), keeping keywords if
-    /// `keywords`. INBOX is at UIDNEXT 40; after a COPY, `<a@x>` is there twice (12, from before,
-    /// and 40) and `<b@x>` once (41).
+    /// `keywords`.
     fn bucket_server(exists: u32, undeleted: &'static str, keywords: bool) -> impl Fn(&str) -> Option<String> + Send + 'static {
         move |c: &str| {
             let permanent = if keywords { "\\Seen \\Deleted \\*" } else { "\\Seen \\Deleted" };
@@ -2078,11 +2047,6 @@ mod tests {
                 "SELECT \"INBOX\"" => fake::selected(7, 42),
                 "UID SEARCH UNDELETED" => format!("* SEARCH {undeleted}\r\nTAG OK done\r\n"),
                 c if c.starts_with("UID FETCH 5:6 ") => fake::message_ids(&[(5, "<a@x>"), (6, "<b@x>")]),
-                "STATUS \"INBOX\" (UIDNEXT)" => "* STATUS INBOX (UIDNEXT 40)\r\nTAG OK done\r\n".into(),
-                "UID SEARCH UNDELETED HEADER Message-ID \"<a@x>\"" => "* SEARCH 12 40\r\nTAG OK done\r\n".into(),
-                "UID SEARCH UNDELETED HEADER Message-ID \"<b@x>\"" => "* SEARCH 41\r\nTAG OK done\r\n".into(),
-                c if c.starts_with("UID FETCH 12,40 ") || c.starts_with("UID FETCH 40,12 ") => fake::message_ids(&[(12, "<a@x>"), (40, "<a@x>")]),
-                c if c.starts_with("UID FETCH 41 ") => fake::message_ids(&[(41, "<b@x>")]),
                 _ => return None,
             })
         }
@@ -2130,38 +2094,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_move_a_wake_copies_deletes_exactly_and_puts_down_double_copies() {
+    async fn without_move_a_wake_copies_then_deletes_exactly_its_originals() {
+        // INBOX already has a message with <a@x>'s Message-ID (a copy another Envoy made at
+        // the same moment, or a distinct message that shares the ID): it's never touched.
         let (mut s, log) = fake::session(bucket_server(2, "5 6", true)).await;
         let woken = wake_bucket(&mut s, caps(true), BUCKET, "INBOX").await.unwrap();
         assert_eq!(woken.moved, 2);
-        let cmds = commands(&log);
-        assert!(!cmds.iter().any(|c| c.starts_with("UID MOVE")) && !expunges_everything(&cmds), "{cmds:?}");
-        let after_fetch: Vec<&str> = cmds.iter().skip(3).map(String::as_str).filter(|c| !c.starts_with("UID SEARCH UNDELETED HEADER") && !c.starts_with("UID FETCH")).collect();
         assert_eq!(
-            after_fetch,
+            commands(&log)[3..],
             [
                 "UID STORE 5:6 -FLAGS.SILENT (\\Seen)",
                 "UID STORE 5:6 +FLAGS.SILENT ($new)",
-                "STATUS \"INBOX\" (UIDNEXT)",
                 "UID COPY 5:6 \"INBOX\"",
                 "UID STORE 5,6 +FLAGS.SILENT (\\Deleted)",
                 "UID EXPUNGE 5,6",
-                "SELECT \"INBOX\"",
-                // <a@x> came twice: the copy made now (40) goes, the first (12) stays.
-                "UID STORE 40 +FLAGS.SILENT (\\Deleted)",
-                "UID EXPUNGE 40",
-            ]
+            ],
+            "nothing in the inbox is deleted, whatever its Message-ID"
         );
     }
 
     #[tokio::test]
-    async fn without_move_or_uidplus_a_wake_never_expunges() {
+    async fn without_move_or_uidplus_a_wake_never_expunges_nor_touches_the_inbox() {
         let (mut s, log) = fake::session(bucket_server(2, "5 6", true)).await;
         wake_bucket(&mut s, caps(false), BUCKET, "INBOX").await.unwrap();
-        let cmds = commands(&log);
-        assert!(!cmds.iter().any(|c| c.contains("EXPUNGE") || c.starts_with("UID MOVE")), "{cmds:?}");
-        assert!(cmds.contains(&"UID COPY 5:6 \"INBOX\"".to_owned()) && cmds.contains(&"UID STORE 5,6 +FLAGS.SILENT (\\Deleted)".to_owned()), "{cmds:?}");
-        assert!(cmds.contains(&"UID STORE 40 +FLAGS.SILENT (\\Deleted)".to_owned()), "the double copy is flagged: {cmds:?}");
+        assert_eq!(commands(&log)[3..], ["UID STORE 5:6 -FLAGS.SILENT (\\Seen)", "UID STORE 5:6 +FLAGS.SILENT ($new)", "UID COPY 5:6 \"INBOX\"", "UID STORE 5,6 +FLAGS.SILENT (\\Deleted)"]);
     }
 
     #[tokio::test]

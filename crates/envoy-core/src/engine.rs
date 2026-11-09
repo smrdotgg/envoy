@@ -5352,6 +5352,16 @@ mod tests {
     }
 
     #[test]
+    fn two_copies_of_a_woken_message_in_the_inbox_list_once() {
+        // Two Envoys without MOVE copied the same message back at once: both copies stay on the
+        // server (nothing is deleted on a guess), and the list shows one.
+        let st = snooze_setup(&[]);
+        message(&st, "INBOX", 1, "<1@x>", "", flags::WOKEN);
+        let newer = message(&st, "INBOX", 2, "<1@x>", "", flags::WOKEN);
+        assert_eq!(visible(&st, "INBOX"), vec![newer]);
+    }
+
+    #[test]
     fn moving_a_woken_message_away_unpins_it_first() {
         let st = snooze_setup(&[]);
         let woken = message(&st, "INBOX", 1, "<1@x>", "", flags::WOKEN);
