@@ -16,7 +16,8 @@
 //!   the inbox, its messages marked unread (and `$new`, where the server keeps keywords), with
 //!   UID MOVE; the same moves by two Envoys at once just find the messages gone. A server without
 //!   MOVE gets COPY and \Deleted (expunged only with UIDPLUS), each Envoy waiting up to
-//!   [`MAX_JITTER`] at random first, and copies two of them made at once are put down to one.
+//!   [`MAX_JITTER`] at random first, so two rarely copy the same messages; when they do, the
+//!   inbox keeps both copies (nothing there is deleted on a guess), and the list shows one.
 //! - **Cleanup**: a bucket is deleted only a day after its time ([`KEEP_EMPTY`]), and only when
 //!   the server says it's empty right before.
 //! - If the server already has a `Snoozed` mailbox of its own (`\Snoozed`, RFC 9979's
