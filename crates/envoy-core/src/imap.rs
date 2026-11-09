@@ -945,17 +945,25 @@ pub async fn idle<T: Io>(session: Connection<T>, wait: Duration, interrupt: Arc<
     // server's go-ahead: async-imap files that away rather than ending the wait, so it's looked
     // for here, and the wait skipped.
     let changed = news_in(|| unsolicited.try_recv().ok()) || {
+        // async-imap's own limit starts again at every response, keepalives (`* OK Still
+        // here`) included, so a server sending them more often than `wait` would hold the wait
+        // open for ever: `wait` is kept here, from the start.
         let (fut, stop) = handle.wait_with_timeout(wait);
         tokio::pin!(fut);
-        let mut stop = Some(stop);
-        tokio::select! {
-            r = &mut fut => matches!(r.map_err(lost_if_transport)?, async_imap::extensions::idle::IdleResponse::NewData(_)),
-            _ = interrupt.notified() => {
-                // Ask the wait to stop, and let it finish reading cleanly.
-                stop.take();
-                matches!(timed("IDLE stop", &mut fut).await?.map_err(lost_if_transport)?, async_imap::extensions::idle::IdleResponse::NewData(_))
+        let ended = tokio::select! {
+            r = &mut fut => Some(r),
+            _ = interrupt.notified() => None,
+            _ = tokio::time::sleep(wait) => None,
+        };
+        let r = match ended {
+            Some(r) => r,
+            // Ask the wait to stop, and let it finish reading cleanly.
+            None => {
+                drop(stop);
+                timed("IDLE stop", &mut fut).await?
             }
-        }
+        };
+        matches!(r.map_err(lost_if_transport)?, async_imap::extensions::idle::IdleResponse::NewData(_))
     };
     // Told as the IDLE ended, before its OK: filed away too.
     let mut session = Connection::new(timed("DONE", handle.done()).await?.map_err(lost_if_transport)?);
@@ -985,20 +993,27 @@ pub(crate) mod fake {
     /// the response lines, where `TAG` stands for the command's tag. `None` answers
     /// `TAG OK done`. An answer ending in [`HANG_UP`] closes the connection after what comes
     /// before it, as a server does with one left idle too long (or going away mid-answer);
-    /// [`SILENT`] answers nothing.
+    /// [`SILENT`] answers nothing. One ending in [`every`]'s line goes on sending that line
+    /// until the client's next command (an IDLE's keepalives).
     pub async fn session(answer: impl Fn(&str) -> Option<String> + Send + 'static) -> (super::Connection<DuplexStream>, Log) {
         let (client, server) = tokio::io::duplex(1 << 20);
         let log: Log = Arc::default();
         let seen = log.clone();
         tokio::spawn(async move {
-            let (r, mut w) = tokio::io::split(server);
+            let (r, w) = tokio::io::split(server);
             let mut r = BufReader::new(r);
-            w.write_all(b"* OK fake ready\r\n").await.unwrap();
+            let w = Arc::new(tokio::sync::Mutex::new(w));
+            w.lock().await.write_all(b"* OK fake ready\r\n").await.unwrap();
             let mut line = String::new();
             let mut last_tag = String::new();
+            let mut repeating: Option<tokio::task::JoinHandle<()>> = None;
             loop {
                 line.clear();
-                if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                let read = r.read_line(&mut line).await.unwrap_or(0);
+                if let Some(task) = repeating.take() {
+                    task.abort();
+                }
+                if read == 0 {
                     return;
                 }
                 // IDLE's DONE has no tag: it ends the command before it.
@@ -1012,7 +1027,7 @@ pub(crate) mod fake {
                 last_tag = tag.clone();
                 // A literal follows: ask for it and read it (plus the line's end).
                 if let Some(n) = command.strip_suffix('}').and_then(|c| c.rsplit_once('{')).and_then(|(_, n)| n.parse::<usize>().ok()) {
-                    w.write_all(b"+ go ahead\r\n").await.unwrap();
+                    w.lock().await.write_all(b"+ go ahead\r\n").await.unwrap();
                     let mut literal = vec![0; n + 2];
                     r.read_exact(&mut literal).await.unwrap();
                 }
@@ -1025,11 +1040,27 @@ pub(crate) mod fake {
                 }
                 // Some of an answer, then the connection closes.
                 if let Some(before) = reply.strip_suffix(HANG_UP) {
+                    let mut w = w.lock().await;
                     let _ = w.write_all(before.as_bytes()).await;
                     let _ = w.shutdown().await;
                     return;
                 }
-                w.write_all(reply.as_bytes()).await.unwrap();
+                let (reply, again) = match reply.split_once(EVERY) {
+                    Some((reply, again)) => (reply.to_owned(), again.split_once(' ').map(|(ms, l)| (ms.parse().unwrap(), l.to_owned()))),
+                    None => (reply, None),
+                };
+                w.lock().await.write_all(reply.as_bytes()).await.unwrap();
+                if let Some((ms, again)) = again {
+                    let w = w.clone();
+                    repeating = Some(tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                            if w.lock().await.write_all(again.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }));
+                }
             }
         });
         let mut c = async_imap::Client::new(client);
@@ -1042,6 +1073,14 @@ pub(crate) mod fake {
 
     /// An answer that never comes, the connection staying open: one dropped without a word.
     pub const SILENT: &str = "<silent>";
+
+    const EVERY: &str = "<every>";
+
+    /// What an answer ends with to go on sending `line` every `ms` milliseconds after it, until
+    /// the client's next command.
+    pub fn every(ms: u64, line: &str) -> String {
+        format!("{EVERY}{ms} {line}")
+    }
 
     /// A SELECT's answer.
     pub fn selected(validity: u32, uid_next: u32) -> String {
@@ -1494,6 +1533,22 @@ mod tests {
         let started = std::time::Instant::now();
         let (_s, news) = idle(s, Duration::from_millis(300), Arc::new(tokio::sync::Notify::new())).await.unwrap();
         assert!(!news && started.elapsed() >= Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn keepalives_dont_stretch_idle_past_its_wait() {
+        // A server that says it's still there every 50 ms while idling (as many do, every 10 to
+        // 20 s): the wait still ends on time, with no news, and the IDLE is ended cleanly.
+        let keepalives = format!("+ idling\r\n{}", fake::every(50, "* OK Still here\r\n"));
+        let (mut s, log) = fake::session(move |c| if c == "IDLE" { Some(keepalives.clone()) } else { idle_server("")(c) }).await;
+        assert!(!changed_since(&mut s, "INBOX", Some(SYNCED)).await.unwrap());
+        let started = std::time::Instant::now();
+        let waited = tokio::time::timeout(Duration::from_secs(3), idle(s, Duration::from_millis(300), Arc::new(tokio::sync::Notify::new()))).await;
+        let (mut s, news) = waited.expect("the wait ends at its deadline, keepalives or not").unwrap();
+        assert!(!news && started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(commands(&log)[commands(&log).len() - 2..], ["IDLE", "DONE"]);
+        // Done with cleanly: the connection goes on.
+        select(&mut s, "INBOX").await.unwrap();
     }
 
     /// A message by UID in generation 7, the fake servers' UIDVALIDITY.
