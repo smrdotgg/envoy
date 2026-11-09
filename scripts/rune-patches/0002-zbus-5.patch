@@ -1,0 +1,140 @@
+diff --git a/vendor/rune/crates/rune/Cargo.toml b/vendor/rune/crates/rune/Cargo.toml
+index 12e27d3..094a381 100644
+--- a/vendor/rune/crates/rune/Cargo.toml
++++ b/vendor/rune/crates/rune/Cargo.toml
+@@ -163,7 +163,11 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Wind
+ accesskit_unix = { version = "0.24.1", optional = true }
+ libc = "0.2"
+ libloading = "0.8"
+-zbus = { version = "6", default-features = false, features = ["tokio", "proxy", "service"], optional = true }
++# zbus 5, the version AccessKit's AT-SPI bridge (accesskit_unix) uses, so a Linux build carries
++# one D-Bus stack, not two. Since 5.19 its tokio and async-io backends build side by side: each
++# connection takes tokio when made inside a tokio runtime (these services), async-io otherwise
++# (the AT-SPI bridge's own thread).
++zbus = { version = "5.19", default-features = false, features = ["tokio"], optional = true }
+ tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], optional = true }
+ futures-util = { version = "0.3", optional = true }
+ 
+diff --git a/vendor/rune/crates/rune/src/file_dialog/portal.rs b/vendor/rune/crates/rune/src/file_dialog/portal.rs
+index 8dddbf6..4c025a4 100644
+--- a/vendor/rune/crates/rune/src/file_dialog/portal.rs
++++ b/vendor/rune/crates/rune/src/file_dialog/portal.rs
+@@ -7,7 +7,7 @@ use futures_util::StreamExt;
+ use std::{collections::HashMap, path::PathBuf, sync::atomic::{AtomicU32, AtomicU64, Ordering}, time::Duration};
+ use tokio::sync::oneshot;
+ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+-use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant, fdo};
++use zbus::{Connection, Proxy, fdo, zvariant::{OwnedObjectPath, OwnedValue as OwnedVariant, Value as Variant}};
+ 
+ const DEST: &str = "org.freedesktop.portal.Desktop";
+ const PATH: &str = "/org/freedesktop/portal/desktop";
+diff --git a/vendor/rune/crates/rune/src/platform/portal_appearance.rs b/vendor/rune/crates/rune/src/platform/portal_appearance.rs
+index 545f8bf..0b7013f 100644
+--- a/vendor/rune/crates/rune/src/platform/portal_appearance.rs
++++ b/vendor/rune/crates/rune/src/platform/portal_appearance.rs
+@@ -6,7 +6,7 @@
+ use futures_util::StreamExt;
+ use std::{sync::{Arc, Mutex, OnceLock, Weak, atomic::{AtomicU8, Ordering}, mpsc}, time::Duration};
+ use winit::window::Window;
+-use zbus::{Connection, OwnedVariant, Proxy, Variant};
++use zbus::{Connection, Proxy, zvariant::{OwnedValue as OwnedVariant, Value as Variant}};
+ 
+ const DEST: &str = "org.freedesktop.portal.Desktop";
+ const PATH: &str = "/org/freedesktop/portal/desktop";
+@@ -50,7 +50,7 @@ fn scheme_dark(scheme: u32) -> Option<bool> {
+ fn scheme(value: &Variant<'_>) -> Option<u32> {
+     match value {
+         Variant::U32(x) => Some(*x),
+-        Variant::Variant(inner) => scheme(inner),
++        Variant::Value(inner) => scheme(inner),
+         _ => None,
+     }
+ }
+diff --git a/vendor/rune/crates/rune/src/platform/portal_appearance_tests.rs b/vendor/rune/crates/rune/src/platform/portal_appearance_tests.rs
+index ada44b0..138565b 100644
+--- a/vendor/rune/crates/rune/src/platform/portal_appearance_tests.rs
++++ b/vendor/rune/crates/rune/src/platform/portal_appearance_tests.rs
+@@ -11,7 +11,7 @@ fn only_an_explicit_preference_picks_an_appearance() {
+ #[test]
+ fn reads_the_scheme_however_deeply_the_portal_wraps_it() {
+     assert_eq!(scheme(&Variant::U32(2)), Some(2));
+-    assert_eq!(scheme(&Variant::Variant(Box::new(Variant::U32(1)))), Some(1));
+-    assert_eq!(scheme(&Variant::Variant(Box::new(Variant::Variant(Box::new(Variant::U32(2)))))), Some(2));
++    assert_eq!(scheme(&Variant::Value(Box::new(Variant::U32(1)))), Some(1));
++    assert_eq!(scheme(&Variant::Value(Box::new(Variant::Value(Box::new(Variant::U32(2)))))), Some(2));
+     assert_eq!(scheme(&Variant::Str("prefer-dark".into())), None);
+ }
+diff --git a/vendor/rune/crates/rune/src/shortcuts/wayland.rs b/vendor/rune/crates/rune/src/shortcuts/wayland.rs
+index 04725ae..ef87a15 100644
+--- a/vendor/rune/crates/rune/src/shortcuts/wayland.rs
++++ b/vendor/rune/crates/rune/src/shortcuts/wayland.rs
+@@ -4,7 +4,7 @@ use super::{Backend, Shortcut, ShortcutError, ShortcutId, Sink};
+ use futures_util::StreamExt;
+ use std::{collections::HashMap, sync::mpsc, thread::JoinHandle, time::Duration};
+ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+-use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant, fdo};
++use zbus::{Connection, Proxy, fdo, zvariant::{OwnedObjectPath, OwnedValue as OwnedVariant, Value as Variant}};
+ 
+ const DEST: &str = "org.freedesktop.portal.Desktop";
+ const PATH: &str = "/org/freedesktop/portal/desktop";
+@@ -37,7 +37,7 @@ fn response_status(status: u32) -> Result<(), ShortcutError> {
+ }
+ fn timed_out() -> ShortcutError { ShortcutError::Backend("portal request timed out".into()) }
+ 
+-async fn request<B: serde::Serialize + zbus::Type>(conn: &Connection, portal: &Proxy<'_>, token: &str,
++async fn request<B: serde::Serialize + zbus::zvariant::Type>(conn: &Connection, portal: &Proxy<'_>, token: &str,
+     method: &str, body: &B) -> Result<HashMap<String, OwnedVariant>, ShortcutError> {
+     let sender = conn.unique_name().ok_or(ShortcutError::Unsupported)?.trim_start_matches(':').replace('.', "_");
+     let path = format!("{PATH}/request/{sender}/{token}");
+diff --git a/vendor/rune/crates/rune/src/tray/sni.rs b/vendor/rune/crates/rune/src/tray/sni.rs
+index 17668fd..ef0e1af 100644
+--- a/vendor/rune/crates/rune/src/tray/sni.rs
++++ b/vendor/rune/crates/rune/src/tray/sni.rs
+@@ -5,7 +5,7 @@ use super::{Handler, TrayError, TrayEvent, TrayItem, TraySpec};
+ use futures_util::StreamExt;
+ use std::{collections::HashMap, sync::{Arc, Mutex, mpsc}, thread::JoinHandle, time::Duration};
+ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+-use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant, object_server::SignalEmitter};
++use zbus::{Connection, Proxy, object_server::SignalEmitter, zvariant::{OwnedObjectPath, OwnedValue as OwnedVariant, Value as Variant}};
+ 
+ const ITEM_PATH: &str = "/StatusNotifierItem";
+ const MENU_PATH: &str = "/MenuBar";
+@@ -35,13 +35,13 @@ fn pixmaps(spec: &TraySpec) -> Pixmaps {
+ /// Menu ids are the item's position plus one; 0 is the root.
+ fn properties(menu: &[TrayItem], id: i32) -> HashMap<String, OwnedVariant> {
+     let mut map = HashMap::new();
+-    if id == ROOT { map.insert("children-display".into(), OwnedVariant::from(zbus::Str::from_static("submenu"))); return map; }
++    if id == ROOT { map.insert("children-display".into(), OwnedVariant::from(zbus::zvariant::Str::from_static("submenu"))); return map; }
+     match menu.get(id as usize - 1) {
+         Some(TrayItem::Action { label, enabled, .. }) => {
+-            map.insert("label".into(), OwnedVariant::from(zbus::Str::from(label.clone())));
++            map.insert("label".into(), OwnedVariant::from(zbus::zvariant::Str::from(label.clone())));
+             if !enabled { map.insert("enabled".into(), OwnedVariant::from(false)); }
+         }
+-        Some(TrayItem::Separator) => { map.insert("type".into(), OwnedVariant::from(zbus::Str::from_static("separator"))); }
++        Some(TrayItem::Separator) => { map.insert("type".into(), OwnedVariant::from(zbus::zvariant::Str::from_static("separator"))); }
+         None => {}
+     }
+     map
+@@ -163,9 +163,9 @@ impl Native {
+             };
+             runtime.block_on(async move {
+                 let setup = async {
+-                    let conn = zbus::connection::Builder::session()
+-                        .serve_at(ITEM_PATH, Item { model: model.clone(), on_event: on_event.clone() })
+-                        .serve_at(MENU_PATH, Menu { model: model.clone(), on_event })
++                    let conn = zbus::connection::Builder::session()?
++                        .serve_at(ITEM_PATH, Item { model: model.clone(), on_event: on_event.clone() })?
++                        .serve_at(MENU_PATH, Menu { model: model.clone(), on_event })?
+                         .build().await?;
+                     let bus = Proxy::new(&conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus").await?;
+                     let owners = bus.receive_signal_with_args("NameOwnerChanged", &[(0, WATCHER)]).await?;
+@@ -227,7 +227,7 @@ impl Drop for Native {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use zbus::Type;
++    use zbus::zvariant::Type;
+ 
+     fn menu() -> Vec<TrayItem> { vec![TrayItem::action("show", "Show"), TrayItem::Separator, TrayItem::action("quit", "Quit").enabled(false)] }
+ 

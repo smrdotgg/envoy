@@ -163,7 +163,11 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Wind
 accesskit_unix = { version = "0.24.1", optional = true }
 libc = "0.2"
 libloading = "0.8"
-zbus = { version = "6", default-features = false, features = ["tokio", "proxy", "service"], optional = true }
+# zbus 5, the version AccessKit's AT-SPI bridge (accesskit_unix) uses, so a Linux build carries
+# one D-Bus stack, not two. Since 5.19 its tokio and async-io backends build side by side: each
+# connection takes tokio when made inside a tokio runtime (these services), async-io otherwise
+# (the AT-SPI bridge's own thread).
+zbus = { version = "5.19", default-features = false, features = ["tokio"], optional = true }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], optional = true }
 futures-util = { version = "0.3", optional = true }
 
