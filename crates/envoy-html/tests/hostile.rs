@@ -12,7 +12,9 @@ const STACK: usize = 2 << 20;
 /// minutes, overflowed the stack or panicked.
 const BOUND: Duration = Duration::from_secs(8);
 
-fn parse_bounded(name: &str, html: String) -> Duration {
+/// Parses, reads back and sanitizes `html` within [`BOUND`]; `remote` sanitizes it a second
+/// time with remote images allowed.
+fn parse_bounded(name: &str, html: String, remote: bool) -> Duration {
     let len = html.len();
     if std::env::var_os("HOSTILE_VERBOSE").is_some() {
         eprintln!("{name} ({len} bytes)");
@@ -25,8 +27,14 @@ fn parse_bounded(name: &str, html: String) -> Duration {
             // The tree is usable afterwards too.
             let _ = envoy_html::plain(&doc);
             let safe = envoy_html::export(&html, false, &mut |_| None);
-            if let Some(active) = active_content(&safe) {
+            if let Some(active) = active_content(&safe, false) {
                 panic!("{active} survived sanitizing:\n{safe}");
+            }
+            if remote {
+                let safe = envoy_html::export(&html, true, &mut |_| None);
+                if let Some(active) = active_content(&safe, true) {
+                    panic!("{active} survived sanitizing with images allowed:\n{safe}");
+                }
             }
             t.elapsed()
         })
@@ -40,8 +48,9 @@ fn parse_bounded(name: &str, html: String) -> Duration {
     t
 }
 
-/// Anything a browser would run or load in sanitized output, read back as a browser would.
-fn active_content(html: &str) -> Option<String> {
+/// Anything a browser would run or load in sanitized output, read back as a browser would
+/// (with `remote`, `http(s)` pictures may load).
+fn active_content(html: &str, remote: bool) -> Option<String> {
     use html5ever::tendril::TendrilSink;
     use markup5ever_rcdom::{NodeData, RcDom};
     let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(html);
@@ -59,14 +68,15 @@ fn active_content(html: &str) -> Option<String> {
                 if k.starts_with("on") || k == "srcset" || k == "action" || k == "ping" {
                     return Some(format!("{tag} {k}="));
                 }
-                if ["href", "src", "background"].contains(&k.as_str()) && (v.starts_with("javascript:") || v.starts_with("vbscript:") || v.starts_with("http") && k != "href") {
+                if ["href", "src", "background"].contains(&k.as_str()) && (v.starts_with("javascript:") || v.starts_with("vbscript:") || v.starts_with("http") && k != "href" && !remote) {
                     return Some(format!("{tag} {k}={v}"));
                 }
                 if tag == "meta" && k == "http-equiv" {
-                    if v != "content-security-policy" {
-                        return Some(format!("meta http-equiv={v}"));
+                    match v.as_str() {
+                        "content-security-policy" => policy = true,
+                        "x-dns-prefetch-control" => {}
+                        _ => return Some(format!("meta http-equiv={v}")),
                     }
-                    policy = true;
                 }
             }
         }
@@ -118,7 +128,7 @@ fn adversarial_inputs() {
     }
     let mut slowest = (Duration::ZERO, String::new());
     for (name, html) in cases {
-        let t = parse_bounded(&name, html);
+        let t = parse_bounded(&name, html, false);
         if t > slowest.0 {
             slowest = (t, name);
         }
@@ -193,7 +203,7 @@ fn random_documents_never_panic() {
                 }
             }
         }
-        parse_bounded(&format!("random document {round}"), html);
+        parse_bounded(&format!("random document {round}"), html, true);
     }
     assert!(started.elapsed() < Duration::from_secs(60), "250 random documents took {:?}", started.elapsed());
 }
