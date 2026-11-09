@@ -449,6 +449,8 @@ fn reply(shared: &Arc<Shared>, reply: &Reply) -> Result<()> {
 }
 
 async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
+    // Before any worker can replay them.
+    drop_unprovable_ops(&shared);
     let mut workers: HashMap<String, Worker> = HashMap::new();
     let accounts = shared.accounts.read().map(|a| a.clone()).unwrap_or_default();
     shared.emit(Event::Accounts(accounts.clone()));
@@ -485,6 +487,24 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
         if let Err(e) = handle(&shared, &mut workers, cmd).await {
             shared.emit(Event::Error(format!("{e:#}")));
         }
+    }
+}
+
+/// Drops queued changes left by an older Envoy that can't be applied safely
+/// ([`Store::drop_unprovable_ops`]), and says so once, however many.
+fn drop_unprovable_ops(shared: &Shared) {
+    match shared.with_writer(|st| st.drop_unprovable_ops()) {
+        Ok(0) => {}
+        Ok(n) => {
+            log::warn!("dropped {n} queued change(s) from before generations were recorded");
+            shared.emit(Event::Error(format!(
+                "{} from before the update couldn't be applied safely and {} dropped: the messages they were for may have changed on the server since.",
+                if n == 1 { "1 queued change".to_owned() } else { format!("{n} queued changes") },
+                if n == 1 { "was" } else { "were" }
+            )));
+            shared.emit(Event::Changed { account: String::new() });
+        }
+        Err(e) => log::error!("couldn't check the queued changes: {e:#}"),
     }
 }
 
@@ -1959,7 +1979,9 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
         if let Err(e) = &r
             && let Some(g) = e.downcast_ref::<imap::NewGeneration>()
         {
-            match g.found.and_then(|uid| q.op.at_uid(uid)) {
+            // An expunge from an unknown generation never runs: deleting needs proof.
+            let found = g.found.filter(|_| !(q.at.validity == 0 && matches!(q.op, Op::Expunge { .. })));
+            match found.and_then(|uid| q.op.at_uid(uid)) {
                 Some(op) => {
                     log::info!("{}: {} was reset since a change was queued; its message was found again by Message-ID", account.email, g.mailbox);
                     let validity = g.validity;
@@ -2618,6 +2640,60 @@ mod tests {
             })
             .unwrap();
         assert!(rx.try_iter().any(|e| matches!(&e, Event::Error(m) if m.contains("was dropped"))), "and the user is told");
+    }
+
+    /// Puts an op straight in the queue, as an older Envoy left it: no generation, `message_id`
+    /// as given (the old Envoy recorded none).
+    fn legacy_op(shared: &Shared, op: &Op, message_id: &str) -> i64 {
+        shared
+            .with_writer(|st| {
+                let id = st.enqueue("a", op)?;
+                st.conn_for_tests().execute("UPDATE ops SET uidvalidity = 0, message_id = ?2 WHERE id = ?1", rusqlite::params![id, message_id])?;
+                Ok(id)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn changes_from_before_the_update_that_cant_be_proven_go_with_one_notice() {
+        let st = setup();
+        let held = message(&st, "INBOX", 1, "<held@x>", "", 0);
+        st.set_uidvalidity("a", "INBOX", 8).unwrap();
+        let (shared, rx) = engine_with(st);
+        let mv = legacy_op(&shared, &Op::Move { mailbox: "INBOX".into(), uid: 1, dest: "Archive".into() }, "");
+        shared.with_writer(|st| st.hide_local(held, mv)).unwrap();
+        legacy_op(&shared, &Op::SetFlags { mailbox: "INBOX".into(), uid: 2, add: flags::SEEN, remove: 0 }, "");
+        legacy_op(&shared, &Op::Copy { mailbox: "INBOX".into(), uid: 3, dest: "Work".into() }, "");
+        // An expunge goes even with a Message-ID: deleting needs proof.
+        legacy_op(&shared, &Op::Expunge { mailbox: "INBOX".into(), uid: 4 }, "<doomed@x>");
+        // These stay: a move that can be found again, a send, a draft upload.
+        let findable = legacy_op(&shared, &Op::Move { mailbox: "INBOX".into(), uid: 5, dest: "Archive".into() }, "<findable@x>");
+        let send = legacy_op(&shared, &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: Some(("INBOX".into(), 6)) }, "");
+        let draft = legacy_op(&shared, &Op::SaveDraft { draft: 1 }, "");
+        drop_unprovable_ops(&shared);
+        let left: Vec<i64> = shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().into_iter().map(|q| q.id).collect();
+        assert_eq!(left, [findable, send, draft]);
+        assert_eq!(shared.with_writer(|st| Ok(visible(st, "INBOX"))).unwrap(), [held], "what the dropped move hid shows again");
+        let notices: Vec<String> = rx.try_iter().filter_map(|e| if let Event::Error(m) = e { Some(m) } else { None }).collect();
+        assert_eq!(notices.len(), 1, "one notice, not one per change: {notices:?}");
+        assert!(notices[0].starts_with("4 queued changes from before the update couldn't be applied safely"), "{}", notices[0]);
+        // The next start finds nothing more to say.
+        drop_unprovable_ops(&shared);
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_expunge_from_an_unknown_generation_never_runs() {
+        let st = setup();
+        st.set_uidvalidity("a", "INBOX", 8).unwrap();
+        let (shared, _rx) = engine_with(st);
+        // Somehow still queued (the sweep keeps none): even found by its Message-ID, it doesn't run.
+        legacy_op(&shared, &Op::Expunge { mailbox: "INBOX".into(), uid: 1 }, "<doomed@x>");
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        server.generation = Some((8, vec![("<doomed@x>", 5)]));
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert!(server.ran.is_empty(), "{:?}", server.ran);
+        assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty(), "dropped");
     }
 
     fn listed(name: &str, role: Role) -> imap::ListedMailbox {

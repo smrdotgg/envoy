@@ -175,25 +175,18 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     // Bumped by send and Undo send: a write made before can't touch what came after.
     ("drafts", "lifecycle", "ALTER TABLE drafts ADD COLUMN lifecycle INTEGER NOT NULL DEFAULT 0"),
     // Which generation of its mailbox (UIDVALIDITY) a UID-based op's UID is from, and its
-    // message's Message-ID, to find it again in another. Ops queued before take their
-    // mailbox's generation as cached now (the one their UIDs are from: a new one empties the
-    // cache) and the Message-ID of the message their UID names there.
+    // message's Message-ID, to find it again in another. Ops queued before have neither: their
+    // UIDs may be from before a reset the old Envoy didn't guard against, so nothing is
+    // inferred from what the cache has now ([`Store::drop_unprovable_ops`]).
     ("ops", "uidvalidity", OPS_GENERATION),
 ];
 
-/// [`MIGRATIONS`]'s step that records each queued op's generation ([`At`]).
+/// [`MIGRATIONS`]'s step that gives queued ops a generation ([`At`]): unknown for the ones
+/// already queued.
 const OPS_GENERATION: &str = "
 BEGIN;
 ALTER TABLE ops ADD COLUMN uidvalidity INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE ops ADD COLUMN message_id TEXT NOT NULL DEFAULT '';
-UPDATE ops SET
-    uidvalidity = COALESCE((SELECT m.uidvalidity FROM mailboxes m WHERE m.account = ops.account AND m.name = json_extract(ops.op, '$.mailbox')), 0),
-    message_id = COALESCE((SELECT x.message_id FROM messages x WHERE x.account = ops.account AND x.mailbox = json_extract(ops.op, '$.mailbox') AND x.uid = json_extract(ops.op, '$.uid')), '')
-  WHERE json_extract(op, '$.kind') IN ('setFlags', 'move', 'copy', 'expunge');
-UPDATE ops SET
-    uidvalidity = COALESCE((SELECT m.uidvalidity FROM mailboxes m WHERE m.account = ops.account AND m.name = json_extract(ops.op, '$.reply_of[0]')), 0),
-    message_id = COALESCE((SELECT x.message_id FROM messages x WHERE x.account = ops.account AND x.mailbox = json_extract(ops.op, '$.reply_of[0]') AND x.uid = json_extract(ops.op, '$.reply_of[1]')), '')
-  WHERE json_extract(op, '$.kind') = 'send' AND json_extract(op, '$.reply_of') IS NOT NULL;
 COMMIT;
 ";
 
@@ -883,6 +876,12 @@ impl Store {
         Ok(changed || trimmed > 0)
     }
 
+    /// The connection, for tests that set up what an older Envoy left.
+    #[cfg(test)]
+    pub(crate) fn conn_for_tests(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let tx = self.conn.unchecked_transaction()?;
         let out = f(self)?;
@@ -1264,6 +1263,28 @@ impl Store {
             params![account, json(op), not_before, batch, at.validity, at.message_id],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Drops the queued ops that name a message by a UID from an unknown generation and can't
+    /// be proven to act on the right one: the ones queued by an Envoy from before generations
+    /// were recorded. A move, flag change or copy with a recorded Message-ID is found again by
+    /// it on replay; one without, and any expunge (never run without proof), goes, and what it
+    /// hid shows again. A send keeps going (only marking its original answered depends on a
+    /// UID, and that's skipped). Returns how many went.
+    pub fn drop_unprovable_ops(&self) -> Result<usize> {
+        self.transaction(|st| {
+            let ids: Vec<i64> = st
+                .conn
+                .prepare(
+                    "SELECT id FROM ops WHERE uidvalidity = 0 AND (
+                        json_extract(op, '$.kind') = 'expunge'
+                        OR (json_extract(op, '$.kind') IN ('setFlags', 'move', 'copy') AND message_id = ''))",
+                )?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            st.release(&ids)?;
+            Ok(ids.len())
+        })
     }
 
     /// An op's message, found again by its Message-ID in generation `validity` of its mailbox,
@@ -2443,17 +2464,20 @@ mod tests {
     }
 
     #[test]
-    fn ops_queued_before_the_upgrade_learn_their_generation() {
+    fn ops_queued_before_the_upgrade_get_no_generation() {
         let dir = std::env::temp_dir().join(format!("envoy-store-generation-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("mail.sqlite");
         let reply = Op::Send { raw_b64: String::new(), from: "me@x.com".into(), to: vec!["you@x.com".into()], sent_mailbox: None, reply_of: Some(("INBOX".into(), 9)) };
+        // Queued by the old Envoy, maybe before INBOX was reset: generation 8 is what the cache
+        // has now, and UIDs 1 and 9 may be other messages than the ones these ops were for.
         let ops = [
+            Op::Expunge { mailbox: "INBOX".into(), uid: 1 },
             Op::Move { mailbox: "INBOX".into(), uid: 9, dest: "Archive".into() },
             reply,
-            // Its mailbox is gone: no generation to give it.
-            Op::SetFlags { mailbox: "Gone".into(), uid: 1, add: flags::SEEN, remove: 0 },
+            Op::SetFlags { mailbox: "INBOX".into(), uid: 9, add: flags::SEEN, remove: 0 },
+            Op::Copy { mailbox: "INBOX".into(), uid: 9, dest: "Work".into() },
             Op::SaveDraft { draft: 3 },
         ];
         {
@@ -2462,8 +2486,9 @@ mod tests {
             let conn = Connection::open(&db).unwrap();
             conn.execute_batch(&old).unwrap();
             conn.execute_batch(
-                "INSERT INTO mailboxes (account, name, display, role, uidvalidity) VALUES ('a', 'INBOX', 'Inbox', 'inbox', 7);
-                 INSERT INTO messages (account, mailbox, uid, message_id, thread) VALUES ('a', 'INBOX', 9, '<9@x>', '<9@x>');",
+                "INSERT INTO mailboxes (account, name, display, role, uidvalidity) VALUES ('a', 'INBOX', 'Inbox', 'inbox', 8);
+                 INSERT INTO messages (account, mailbox, uid, message_id, thread) VALUES ('a', 'INBOX', 1, '<unrelated@x>', '<unrelated@x>');
+                 INSERT INTO messages (account, mailbox, uid, message_id, thread) VALUES ('a', 'INBOX', 9, '<other@x>', '<other@x>');",
             )
             .unwrap();
             for op in &ops {
@@ -2472,11 +2497,10 @@ mod tests {
         }
         let s = Store::open(&db).unwrap();
         let at: Vec<At> = s.ops("a", 0).unwrap().into_iter().map(|q| q.at).collect();
-        let known = At { validity: 7, message_id: "<9@x>".into() };
-        assert_eq!(at, [known.clone(), known, At::default(), At::default()]);
+        assert_eq!(at, vec![At::default(); 6], "nothing inferred from what the cache has now");
         // Ops queued from now on record theirs.
         let op = s.enqueue("a", &Op::Copy { mailbox: "INBOX".into(), uid: 9, dest: "Work".into() }).unwrap();
-        assert_eq!(s.ops("a", 0).unwrap().into_iter().find(|q| q.id == op).unwrap().at, At { validity: 7, message_id: "<9@x>".into() });
+        assert_eq!(s.ops("a", 0).unwrap().into_iter().find(|q| q.id == op).unwrap().at, At { validity: 8, message_id: "<other@x>".into() });
         drop(s);
         Store::open(&db).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
