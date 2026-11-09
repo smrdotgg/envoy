@@ -89,11 +89,19 @@ All rebindable under Settings → Keyboard (`mod` = ⌘ on macOS, Ctrl elsewhere
 | `j` / `k` | next / previous | `c` | compose |
 | `e` | archive | `r` / `a` / `f` | reply / reply all / forward |
 | `#` | delete | `mod+enter` | send |
-| `z` | undo archive / delete / move / send | `/` | search |
-| `s` | star | `esc` | close |
-| `u` | toggle read | `mod+,` | settings |
-| `mod+1/2/3` | inbox / starred / sent | `mod+shift+b` | toggle sidebar |
+| `!` | report spam (from Spam: not spam) | `/` | search |
+| `v` | move to… | `l` | label… (Gmail) |
+| `z` | undo archive / delete / move / label / send | `esc` | close, or clear the selection |
+| `s` | star | `mod+,` | settings |
+| `u` | toggle read | `mod+shift+b` | toggle sidebar |
+| `x` | select / unselect | `shift+j` / `shift+k` | select the next / previous too |
+| `mod+a` | select all | `mod+1/2/3` | inbox / starred / sent |
 | | | `mod+shift+a` | attach files (in the composer) |
+
+With messages selected (also shift-click for a range, mod-click to add one), every key above
+acts on all of them, `j` and `k` move without opening, and one `z` undoes the whole batch.
+Move to… and Label… search as you type; with messages from several accounts selected they
+offer only what every one of those accounts has.
 
 Search understands `from:`, `to:`, `subject:`, `is:unread`, `is:read`, `is:starred`,
 `has:attachment`, plus free text over subject, people and body (SQLite FTS5, instant,
@@ -142,10 +150,10 @@ shows the files as they are, and waits for you to send again). A draft carrying 
 network. Every action (read, star, archive, delete, send) is applied locally first and
 queued in the database; the worker replays the queue on the server and retries with backoff
 until it succeeds, across restarts and offline periods. Sending waits `compose.undoSendSeconds`
-in that queue so it can be undone; archive, delete, spam and other moves wait
-`behavior.undoSeconds` (5 s) the same way, with the messages hidden rather than deleted
-locally, so **Undo** in the toast (or `z`) puts them back exactly as they were and the server
-never sees the move. Once the toast is gone the move goes through; if the app quits first, it
+in that queue so it can be undone; archive, delete, spam, other moves and labels (on Gmail a
+label is a copy in the label's mailbox) wait `behavior.undoSeconds` (5 s) the same way, with
+the messages hidden rather than deleted locally, so **Undo** in the toast (or `z`) puts them
+back exactly as they were and the server never sees the move. Once the toast is gone the move goes through; if the app quits first, it
 goes through on the next start. Deleting from Trash is permanent and has no undo. The worker
 uses IMAP IDLE for push, reconnects with
 backoff, and times out dead connections in 30 s.
@@ -181,9 +189,12 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/attach.json --snap out.png -
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/attach.json --snap out.png --at 2.0 # attached, and a folder that can't be
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/attach.json --snap out.png --at 2.5 # a file dragged over the composer
 ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/attach.json --snap out.png --at 4.2 # dropped, and the folder taken off
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png --at 1.2 # x, shift+j twice: three selected
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png --at 1.8 # e: all three archived, one toast
+ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png --at 2.6 # z: all three back
 ```
 
-Run from the repository root (the attach script picks files in it). Scenes: `open light dark compact bottom compose forward light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark`.
+Run from the repository root (the attach script picks files in it). Scenes: `open light dark compact bottom compose forward light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label toast toast-compose counts`.
 
 HTML rendering is tested against the mail in `crates/envoy-core/tests/fixtures/html` (sources and
 licenses in its `LICENSES.md`).
@@ -191,7 +202,8 @@ licenses in its `LICENSES.md`).
 **End to end.** CI's `e2e` job runs the engine against a real IMAP/SMTP server,
 [GreenMail](https://greenmail-mail-test.github.io/greenmail/): initial sync, new mail by IDLE,
 flags both ways, archive, spam, trash and moves with the undo window (off the server during it,
-untouched by an undo, there after it), delete forever, sending with undo send, drafts (saved,
+untouched by an undo, there after it), labels (a copy in another mailbox, the message staying
+put) and a two-message move under one undo key, delete forever, sending with undo send, drafts (saved,
 edited, sent, undone, discarded), and moves and a send held across a kill and a restart. It runs
 twice: against GreenMail as it is (UIDPLUS, MOVE, IDLE), then through a proxy that takes UIDPLUS
 and MOVE away, so the fallbacks run too, and fails if Envoy sends a command that server lacks,
