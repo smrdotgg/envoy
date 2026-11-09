@@ -107,7 +107,8 @@ offer only what every one of those accounts has.
 Search understands `from:`, `to:`, `subject:`, `is:unread`, `is:read`, `is:starred`,
 `has:attachment`, `category:` (`category:newsletters`, or just `category:n`), plus free text
 over subject, people and body (SQLite FTS5, instant, offline). Search looks in every inbox tab
-unless you add `category:`; each result says which tab it's in.
+unless you add `category:` (no tab is chosen while a search shows; an opened message says which
+it's in).
 
 ## Split inbox
 
