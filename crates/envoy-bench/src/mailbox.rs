@@ -19,7 +19,7 @@ use envoy_core::store::Store;
 pub const ACCOUNT: &str = "bench";
 pub const ME: &str = "me@envoy-bench.test";
 /// The newest message's date: fixed, so runs are comparable.
-const END: i64 = 1_793_491_200; // 2026-11-01T00:00:00Z
+pub const END: i64 = 1_793_491_200; // 2026-11-01T00:00:00Z
 const SPAN: i64 = 6 * 365 * 86_400;
 
 /// SplitMix64: tiny, fast, and identical on every platform.
@@ -63,13 +63,13 @@ impl Rng {
     }
 }
 
-const FIRST: &[&str] = &[
+pub const FIRST: &[&str] = &[
     "Alice", "Sam", "Maya", "Jonas", "Priya", "Omar", "Lena", "Diego", "Hannah", "Kenji", "Fatima", "Lucas", "Zoë", "Mateo", "Aisha",
     "Noah", "Sofia", "Elias", "Chloé", "Ravi", "Ingrid", "Tomás", "Mei", "Oliver", "Nadia", "Felix", "Amara", "Leo", "Yuki", "Grace",
     "Hugo", "Isabel", "Arjun", "Clara", "Mohammed", "Freya", "José", "Elena", "Marcus", "Søren", "Leila", "Daniel", "Anya", "Theo",
     "Rosa", "Kofi", "Emma", "Ivan", "Nora", "Ahmed", "Julia", "Pablo", "Sara", "Victor", "Hana", "Ben", "Lucía", "Kwame", "Ines", "Max",
 ];
-const LAST: &[&str] = &[
+pub const LAST: &[&str] = &[
     "Chen", "Okafor", "Lindqvist", "Patel", "García", "Novak", "Schmidt", "Kim", "Rossi", "Müller", "Haddad", "Silva", "Tanaka",
     "Johansson", "Nguyen", "Dubois", "Kowalski", "Andersen", "Moreau", "Ivanova", "Costa", "Fischer", "Yilmaz", "Brown", "Wójcik",
     "Okonkwo", "Hernández", "Larsen", "Sato", "Ferreira", "Bauer", "Murphy", "Romano", "Kaur", "Svensson", "O'Brien", "Petrov", "Ali",
