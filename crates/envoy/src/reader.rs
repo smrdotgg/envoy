@@ -111,6 +111,22 @@ fn avatar(name: &str, email: &str, t: &Theme) -> El {
         .child(text(fmt::initial(name)).font(rune::TextStyle::new(16.0, 600.0)).color(Color::WHITE))
 }
 
+/// What a message body's width is short of the cards column's: the column's padding, the
+/// card's, and the avatar's indent (`reader`, `message_card`). Borders take no room.
+const BODY_INSET: f32 = 2.0 * 20.0 + 2.0 * 20.0 + 50.0;
+
+/// The steps, in points, a message's width is read in: dragging the divider re-fits it (its
+/// elements rebuild, never its tree) when a step is crossed, not on every frame.
+const WIDTH_STEP: f32 = 8.0;
+
+/// The width the reader gives message bodies, read from the cards column in steps of
+/// [`WIDTH_STEP`] (rounded down, so what's fitted to it fits); None before it's laid out. The
+/// view re-runs only when a step is crossed. The cards column is there before a message
+/// opens from another, so opening one lays it out once, at the right width.
+fn body_width() -> Option<f32> {
+    rune::memo::layout_with("cards", |r| ((r[2] - BODY_INSET) / WIDTH_STEP).floor() as i32).map(|n| (n as f32 * WIDTH_STEP).max(0.0))
+}
+
 fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
     let k = &t.k;
     let id = m.summary.id;
@@ -137,11 +153,13 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
             load_images: remote,
             copy_links: s.settings.bool("behavior.copyLinks"),
             max_w,
+            width: body_width().unwrap_or(max_w + 32.0),
         };
         let ready = doc.images.iter().filter(|u| matches!(s.images.get(*u), Some(crate::app::ImageState::Ready(_)))).count();
-        let version = (t.dark, cx.adapt, cx.load_images, cx.copy_links, max_w as u32, ready, std::sync::Arc::as_ptr(doc) as usize);
+        let version = (t.dark, cx.adapt, cx.load_images, cx.copy_links, max_w as u32, cx.width as u32, ready, std::sync::Arc::as_ptr(doc) as usize);
         let rendered = rune::memo(format!("html-{id}"), version, || crate::html_view::render(&cx, doc));
-        let mut out = col().key(format!("body-{id}")).w_full().max_w(max_w + 32.0).gap(8.0);
+        // It may shrink below what's in it: what's in it is fitted to the width it gets.
+        let mut out = col().key(format!("body-{id}")).w_full().shrink().max_w(max_w + 32.0).gap(8.0);
         let has_remote = doc.images.iter().any(|u| u.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")));
         if has_remote && !remote && s.settings.str("reading.loadImages") == "ask" {
             out = out.child(images_bar(t, id, &m.summary.from.email));
@@ -452,4 +470,39 @@ pub fn reader(s: &App, t: &Theme, _cx: &mut Cx<App>, layer: &mut Vec<El>) -> El 
     col().key("reader").w_full().h_full().min_h(0.0).child(header(s, t, layer)).child(
         col().key("reader-scroll").scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(12.0).grow(1.0).min_h(0.0).w_full().child(cards),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use rune::{Env, Runtime};
+
+    use crate::app::App;
+
+    #[test]
+    fn message_bodies_are_fitted_to_the_reader_they_are_in() {
+        // The width the reader hands the renderer is the body's own, as laid out, so mail that
+        // asks for 760 points of minimum width in a narrow reader still ends at its edge.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../envoy-core/tests/fixtures/html/foundation-hero.html")).unwrap();
+        for window in [1120.0, 1280.0, 1700.0] {
+            let mut app = App::new(true);
+            crate::demo::populate(&mut app);
+            crate::scene_open(&mut app);
+            let m = app.thread.last_mut().unwrap();
+            m.body.as_mut().unwrap().doc = Some(std::sync::Arc::new(envoy_core::html::parse(&src)));
+            let id = m.summary.id;
+            let mut rt = Runtime::new(app, crate::view, (window, 1000.0), Env::new(false, 1.0));
+            rt.frame(0.0);
+            rt.frame(0.0);
+            let els = rt.elements();
+            let rect = |key: &str| els.iter().find(|e| e.key.as_deref() == Some(key)).unwrap_or_else(|| panic!("{key} at {window}")).rect;
+            let (cards, body) = (rect("cards"), rect(&format!("body-{id}")));
+            let max_w = crate::app::App::new(true).settings.f32("reading.maxWidth");
+            assert!((cards[2] - super::BODY_INSET).min(max_w + 32.0) - body[2] < 0.5 && body[2] <= cards[2] - super::BODY_INSET + 0.5, "at {window}: cards {cards:?}, body {body:?}");
+            let right = body[0] + body[2];
+            let html = format!("html-{id}");
+            for e in els.iter().filter(|e| e.path.split('/').any(|p| p == html)) {
+                assert!(e.rect[0] + e.rect[2] <= right + 0.5, "at {window}: {:?} spans {:?}, past the body's edge {right}", e.text.as_deref().unwrap_or(&e.path), e.rect);
+            }
+        }
+    }
 }

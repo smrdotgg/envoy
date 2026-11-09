@@ -309,10 +309,18 @@ fn cerberus_fluid_columns_and_background() {
     // `<center>` centres; the tables inside start over on the left, as browsers do.
     assert_eq!(para(&doc, "Praesent laoreet").align, Align::Left);
     assert_eq!(para(&doc, "View as a Web Page").align, Align::Center);
-    // `dir="rtl"`: the second thumbnail row puts its picture last.
-    let thumbs: Vec<_> = cols.iter().filter(|c| c.len() == 2 && c.iter().any(|(s, _)| s.max_width == Some(440.0))).collect();
+    // `dir="rtl"`: the second thumbnail row keeps its picture first in source order (as it
+    // stacks), and is marked to stand right to left, picture last, side by side.
+    let thumbs: Vec<_> = all(&doc.nodes)
+        .into_iter()
+        .filter_map(|n| match n {
+            Node::Columns { cells, rtl, .. } if cells.len() == 2 && cells.iter().any(|(s, _)| s.max_width == Some(440.0)) => Some((cells, *rtl)),
+            _ => None,
+        })
+        .collect();
     assert_eq!(thumbs.len(), 2);
-    assert!(matches!(all(&thumbs[0][0].1).first(), Some(Node::Box { .. })) && cell_text(&thumbs[1][0]).starts_with("Class aptent"));
+    assert!(matches!(all(&thumbs[0].0[0].1).first(), Some(Node::Box { .. })) && !thumbs[0].1);
+    assert!(matches!(all(&thumbs[1].0[0].1).first(), Some(Node::Box { .. })) && cell_text(&thumbs[1].0[1]).starts_with("Class aptent") && thumbs[1].1);
     // The floated button stays left of its column; the centred one is centred.
     let (_, b) = buttons(&doc).into_iter().find(|(_, t)| t == "Centered Primary Button").expect("button");
     assert_eq!(b, "Centered Primary Button");
