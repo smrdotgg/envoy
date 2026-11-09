@@ -98,7 +98,7 @@ pub fn composer(s: &App, t: &Theme, layer: &mut Vec<El>) -> Option<El> {
                 c.minimized = !c.minimized;
             }
         })
-        .child(text(if cm.title.is_empty() { "New message".to_owned() } else { cm.title.clone() }).font(k.ty.text_small_medium).color(k.c.text_base).truncate().grow(1.0).min_w(0.0))
+        .child(text(cm.shown_title()).font(k.ty.text_small_medium).color(k.c.text_base).truncate().grow(1.0).min_w(0.0))
         .child(
             IconButton::new(if cm.minimized { &icons::PLUS } else { &icons::MINUS })
                 .variant(IconButtonVariant::GhostMuted)
