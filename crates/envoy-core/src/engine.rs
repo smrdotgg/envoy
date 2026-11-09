@@ -692,15 +692,12 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             // The message as received, for the system's mail viewer: nothing in it is rendered
             // by a browser that ignores Envoy's image setting.
             let raw = shared.with_writer(|st| st.raw(id))?.ok_or_else(|| anyhow!("The message isn't downloaded yet"))?;
-            let path = crate::paths::write_export(&format!("message-{id}"), "eml", &raw)?;
-            shared.emit(Event::Saved(path));
+            export_in_background(shared, format!("message-{id}"), "eml", move || raw);
         }
         Command::OpenInBrowser { id, remote_images } => {
             let (body, raw) = shared.with_writer(|st| Ok((st.body(id)?, st.raw(id)?)))?;
             let html = body.and_then(|b| b.html).ok_or_else(|| anyhow!("This message has no HTML to open"))?;
-            let safe = crate::mime::browser_html(&html, raw.as_deref(), remote_images);
-            let path = crate::paths::write_export(&format!("message-{id}-safe"), "html", safe.as_bytes())?;
-            shared.emit(Event::Saved(path));
+            export_in_background(shared, format!("message-{id}-safe"), "html", move || crate::mime::browser_html(&html, raw.as_deref(), remote_images).into_bytes());
         }
         Command::FetchImage { url, message } => {
             let shared = shared.clone();
@@ -730,6 +727,17 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
         }
     }
     Ok(())
+}
+
+/// Makes an export's bytes and writes them ([`crate::paths::write_export`]) on a blocking
+/// thread: sanitizing parses the message, and on Linux choosing the folder asks `xdg-mime` for
+/// the default app. Emits [`Event::Saved`], or [`Event::Error`].
+fn export_in_background(shared: &Arc<Shared>, stem: String, ext: &'static str, bytes: impl FnOnce() -> Vec<u8> + Send + 'static) {
+    let shared = shared.clone();
+    tokio::task::spawn_blocking(move || match crate::paths::write_export(&stem, ext, &bytes()) {
+        Ok(path) => shared.emit(Event::Saved(path)),
+        Err(e) => shared.emit(Event::Error(format!("Couldn't write the file to open: {e}"))),
+    });
 }
 
 /// [`Command::DiscardDraft`]: hides the draft and queues its purge, held for the undo window
