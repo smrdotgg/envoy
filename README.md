@@ -229,7 +229,9 @@ until it succeeds, across restarts and offline periods. Sending waits `compose.u
 in that queue so it can be undone; archive, delete, spam, other moves and labels (on Gmail a
 label is a copy in the label's mailbox) wait `behavior.undoSeconds` (5 s) the same way, with
 the messages hidden rather than deleted locally, so **Undo** in the toast (or `z`) puts them
-back exactly as they were and the server never sees the move. Once the toast is gone the move goes through; if the app quits first, it
+back exactly as they were and the server never sees the move. Meanwhile they're shown where
+they're going too (the folder, Trash, the label), to read but not to act on until they're
+there (Undo takes them back out). Once the toast is gone the move goes through; if the app quits first, it
 goes through on the next start. Deleting from Trash is permanent and has no undo. The worker
 uses IMAP IDLE for push, reconnects with
 backoff, and times out dead connections in 30 s.

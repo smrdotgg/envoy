@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use envoy_core::accounts::{Account, AuthKind};
 use envoy_core::engine::{Command, Engine, MoveTarget};
-use envoy_core::model::{Category, MessageId, Role, Summary};
+use envoy_core::model::{Category, MessageId, Role, Summary, View, flags};
 use envoy_core::store::Store;
 use rune::Tx;
 
@@ -216,4 +216,81 @@ fn a_conversation_moved_to_a_tab_is_there() {
     app.show_category(Category::Other);
     settle(&mut app);
     assert_eq!(ids(&app), [maya, lee], "in Other, by date");
+}
+
+fn mailbox(name: &str) -> View {
+    View::Mailbox { account: ACCOUNT.into(), mailbox: name.into() }
+}
+
+/// Finding: "Moved to Travel", "Labeled Work", and neither showed the conversation. With the
+/// engine too: a move or a label waits out the undo window on this computer before it goes to
+/// the server, and the mailbox it goes to had nothing until then (and until it synced). It's
+/// there at once now, by date among what's there, and an Undo takes it back out.
+#[test]
+fn a_moved_or_labeled_conversation_is_at_its_destination_at_once() {
+    let mut seeded = None;
+    let mut app = live("destinations", |st| {
+        seeded = Some(inbox_seed(st));
+        put(st, "Travel", 9, "Lufthansa <noreply@lufthansa.example>", "Your booking", flags::SEEN);
+        put(st, "Travel", 1, "Rail <noreply@rail.example>", "Your ticket", flags::SEEN);
+    });
+    let (maya, sam, lee) = seeded.unwrap();
+    let mut tx = Tx::default();
+    let travel: Vec<MessageId> = {
+        app.go(mailbox("Travel"));
+        settle(&mut app);
+        ids(&app)
+    };
+    app.go_role(Role::Inbox);
+    settle(&mut app);
+    app.move_to(vec![maya], MoveTarget::Mailbox("Travel".into()), &mut tx);
+    settle(&mut app);
+    assert!(row(&app, maya).is_none(), "gone from the inbox");
+    app.go(mailbox("Travel"));
+    settle(&mut app);
+    assert_eq!(ids(&app), [travel[0], maya, travel[1]], "in Travel, by date");
+    let r = row(&app, maya).unwrap();
+    assert_eq!((r.mailbox.as_str(), r.thread_unread), ("Travel", true), "as it will be there");
+    // It opens there, and nothing is done to it until it's there: not marked read, not moved.
+    app.open_message(maya);
+    settle(&mut app);
+    assert_eq!(app.thread.iter().map(|m| m.summary.id).collect::<Vec<_>>(), [maya], "it opens");
+    assert!(row(&app, maya).unwrap().thread_unread, "not marked read while on its way");
+    let sent = app.sent.borrow().len();
+    app.archive(vec![maya], &mut tx);
+    app.toggle_star(maya);
+    assert!(app.sent.borrow()[sent..].iter().all(|c| !c.starts_with("Move") && !c.starts_with("SetFlags")), "{:?}", &app.sent.borrow()[sent..]);
+    assert!(row(&app, maya).is_some_and(|m| !m.flagged()), "still there, unstarred");
+    assert!(app.toasts.pop().unwrap().text.starts_with("That's still on the way here"));
+    app.toasts.pop();
+    // Labeled: a copy in Work, the conversation staying in the inbox.
+    app.go_role(Role::Inbox);
+    settle(&mut app);
+    app.label(vec![sam], "Work".into(), &mut tx);
+    settle(&mut app);
+    assert!(row(&app, sam).is_some(), "a label leaves it where it is");
+    app.go(mailbox("Work"));
+    settle(&mut app);
+    assert_eq!(ids(&app), [sam], "and it's in Work");
+    // Archived and deleted: in All Mail and in Trash.
+    app.go_role(Role::Inbox);
+    settle(&mut app);
+    app.show_category(Category::Other);
+    settle(&mut app);
+    app.delete_now(vec![lee], &mut tx);
+    settle(&mut app);
+    app.go_role(Role::Trash);
+    settle(&mut app);
+    assert_eq!(ids(&app), [lee], "in Trash");
+    // Undone, each leaves where it went.
+    for _ in 0..3 {
+        assert!(app.undo_last(&mut tx));
+    }
+    settle(&mut app);
+    assert!(app.list.is_empty(), "Trash: {:?}", ids(&app));
+    for (view, want) in [(mailbox("Work"), vec![]), (mailbox("Travel"), travel.clone())] {
+        app.go(view.clone());
+        settle(&mut app);
+        assert_eq!(ids(&app), want, "{view:?} after the undos");
+    }
 }

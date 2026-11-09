@@ -781,6 +781,8 @@ fn fts_term(t: &str) -> String {
 }
 
 const SUMMARY_COLS: &str = "m.id, m.account, m.mailbox, m.uid, m.thread, m.subject, m.from_name, m.from_email, m.recipients, m.date, m.flags, m.preview, m.has_attachments, m.message_id, m.category";
+/// How many columns [`SUMMARY_COLS`] has: the index of one selected after them.
+const SUMMARY_WIDTH: usize = 15;
 
 fn summary_row(r: &rusqlite::Row) -> rusqlite::Result<(Summary, String)> {
     let recipients: String = r.get(8)?;
@@ -1527,24 +1529,41 @@ impl Store {
     }
 
     /// An opened message, or its whole conversation (oldest first) with `conversations`.
-    /// Empty for a message that's gone, or hidden while its move waits to replay.
+    /// Empty for a message that's gone, or hidden while its move waits to replay, unless it's
+    /// on its way into another mailbox, where a list shows it ([`flags::ARRIVING`]): then it
+    /// opens, with what's on its way there with it, marked so (and still where it is now).
     pub fn thread(&self, id: MessageId, conversations: bool) -> Result<Vec<ThreadMessage>> {
-        let sql = format!("SELECT {SUMMARY_COLS} FROM messages m WHERE m.id = ?1 AND m.held_op = 0");
-        let Some((s, _)) = self.conn.query_row(&sql, params![id], summary_row).optional()? else { return Ok(vec![]) };
+        let sql = format!("SELECT {SUMMARY_COLS}, m.held_op FROM messages m WHERE m.id = ?1");
+        let Some(((mut s, _), held)) = self.conn.query_row(&sql, params![id], |r| Ok((summary_row(r)?, r.get::<_, i64>(SUMMARY_WIDTH)?))).optional()? else {
+            return Ok(vec![]);
+        };
+        // Hidden: only one on its way somewhere opens, with the rest on its way there.
+        let mut arriving: HashSet<MessageId> = HashSet::new();
+        if held != 0 {
+            let arrivals = self.arrivals()?;
+            let Some(dest) = arrivals.iter().find(|a| a.id == id).map(|a| a.dest.clone()) else { return Ok(vec![]) };
+            arriving = arrivals.into_iter().filter(|a| a.account == s.account && a.dest == dest).map(|a| a.id).collect();
+            s.flags |= flags::ARRIVING;
+        }
         let mut items = Vec::new();
         if conversations {
             let sql = format!(
-                "SELECT {SUMMARY_COLS} FROM messages m WHERE m.account = ?1 AND m.thread = ?2 AND m.flags & 16 = 0 AND m.held_op = 0
+                "SELECT {SUMMARY_COLS} FROM messages m WHERE m.account = ?1 AND m.thread = ?2 AND m.flags & 16 = 0
+                 AND (m.held_op = 0 OR m.id IN (SELECT value FROM json_each(?4)))
                  AND ((m.account, m.mailbox) NOT IN (SELECT account, name FROM mailboxes WHERE role IN ('trash', 'junk')) OR m.mailbox = ?3)
                  ORDER BY m.date ASC, m.id DESC"
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![s.account, s.thread, s.mailbox], summary_row)?;
+            let ids = serde_json::to_string(&arriving.iter().collect::<Vec<_>>())?;
+            let rows = stmt.query_map(params![s.account, s.thread, s.mailbox, ids], summary_row)?;
             let mut seen = HashSet::new();
             for row in rows {
-                let (m, mid) = row?;
+                let (mut m, mid) = row?;
                 if !mid.is_empty() && !seen.insert(mid) {
                     continue;
+                }
+                if arriving.contains(&m.id) {
+                    m.flags |= flags::ARRIVING;
                 }
                 items.push(m);
             }
@@ -2116,6 +2135,77 @@ mod tests {
 
     fn inbox(s: &Store) -> Vec<Summary> {
         s.list(&View::Role { account: None, role: Role::Inbox }, &Query::default(), true, 100, &HashSet::new()).unwrap()
+    }
+
+    /// A message moved or labeled, and not on the server yet (held for the undo window, or
+    /// waiting to replay), is listed where it's going at once: marked, in that mailbox, by date
+    /// among what's there, as far as the list's query matches it. It opens there, with what
+    /// went with it; the tabs count it if it's coming back to the inbox. An undo, or its op
+    /// going through, takes it out; nothing hidden for an op that doesn't take it anywhere shows.
+    #[test]
+    fn moves_and_labels_show_where_they_go_before_they_get_there() {
+        let s = Store::memory();
+        for (name, role) in [("INBOX", Role::Inbox), ("Archive", Role::Archive), ("Travel", Role::Other), ("Work", Role::Other), ("Trash", Role::Trash)] {
+            s.upsert_mailbox("a", name, name, role, "/", true).unwrap();
+        }
+        let put = |mailbox: &str, uid: u32, subject: &str, mid: &str, refs: &str, fl: u32| {
+            let p = parsed(subject, mid, refs, "Ana <ana@x.com>", uid);
+            s.upsert_header("a", mailbox, uid, fl, 10, 0, &p).unwrap()
+        };
+        let older = put("Travel", 1, "Ticket", "<t1@x>", "", flags::SEEN);
+        let newer = put("Travel", 9, "Booking", "<t9@x>", "", flags::SEEN);
+        let plans = put("INBOX", 4, "Plans", "<p@x>", "", 0);
+        let reply = put("INBOX", 5, "Re: Plans", "<r@x>", "<p@x>", flags::SEEN);
+        let invoice = put("INBOX", 6, "Invoice", "<i@x>", "", flags::SEEN);
+        let me = HashSet::new();
+        let list = |view: &View, q: &str, conversations: bool| s.list(view, &Query::parse(q), conversations, 100, &me).unwrap();
+        let mailbox = |name: &str| View::Mailbox { account: "a".into(), mailbox: name.into() };
+        let ids = |rows: &[Summary]| rows.iter().map(|m| m.id).collect::<Vec<_>>();
+        // The Plans conversation moved to Travel, held under key 7.
+        for (id, uid) in [(plans, 4), (reply, 5)] {
+            let op = s.enqueue_held("a", &Op::Move { mailbox: "INBOX".into(), uid, dest: "Travel".into() }, i64::MAX, 7).unwrap();
+            assert!(s.hide_local(id, op).unwrap());
+        }
+        let travel = list(&mailbox("Travel"), "", true);
+        assert_eq!(ids(&travel), [newer, reply, older], "one row for the conversation, by date");
+        let row = &travel[1];
+        assert_eq!((row.mailbox.as_str(), row.flags & flags::ARRIVING != 0, row.thread_count, row.thread_unread), ("Travel", true, 2, true));
+        assert_eq!(ids(&list(&mailbox("Travel"), "", false)), [newer, reply, plans, older], "a message a row");
+        assert!(list(&mailbox("Travel"), "", false).iter().filter(|m| m.id == newer || m.id == older).all(|m| m.flags & flags::ARRIVING == 0), "what's there already isn't marked");
+        assert_eq!(ids(&list(&mailbox("Travel"), "plans", false)), [reply, plans], "searched like the rest");
+        assert_eq!(ids(&list(&mailbox("Travel"), "is:unread", false)), [plans]);
+        assert_eq!(ids(&inbox(&s)), [invoice], "gone from the inbox");
+        // It opens there, both messages, marked; one not on its way anywhere doesn't open.
+        let opened = s.thread(reply, true).unwrap();
+        assert_eq!(opened.iter().map(|m| (m.summary.id, m.summary.flags & flags::ARRIVING != 0)).collect::<Vec<_>>(), [(plans, true), (reply, true)]);
+        s.conn.execute("UPDATE messages SET held_op = 999 WHERE id = ?1", params![invoice]).unwrap();
+        assert!(s.thread(invoice, true).unwrap().is_empty(), "hidden for nothing that takes it anywhere");
+        assert!(list(&mailbox("Archive"), "", true).is_empty());
+        s.conn.execute("UPDATE messages SET held_op = 0 WHERE id = ?1", params![invoice]).unwrap();
+        // Labeled Work: listed there too, and still in the inbox.
+        s.enqueue_held("a", &Op::Copy { mailbox: "INBOX".into(), uid: 6, dest: "Work".into() }, i64::MAX, 8).unwrap();
+        assert_eq!(ids(&list(&mailbox("Work"), "", true)), [invoice]);
+        assert_eq!(list(&mailbox("Work"), "", true)[0].mailbox, "Work");
+        assert_eq!(ids(&inbox(&s)), [invoice]);
+        // Back to the inbox from Trash, unread: in its tab and counted there.
+        let trashed = put("Trash", 7, "Lost", "<l@x>", "", 0);
+        let op = s.enqueue_held("a", &Op::Move { mailbox: "Trash".into(), uid: 7, dest: "INBOX".into() }, i64::MAX, 9).unwrap();
+        assert!(s.hide_local(trashed, op).unwrap());
+        let category = s.summary(trashed).unwrap().unwrap().category;
+        assert_eq!(ids(&inbox(&s)), [trashed, invoice]);
+        assert_eq!(ids(&list(&View::Role { account: None, role: Role::Inbox }, &format!("category:{}", category.as_str()), true)), [trashed]);
+        let counts = s.category_counts(&View::Role { account: None, role: Role::Inbox }, true).unwrap();
+        assert_eq!(counts[category.code() as usize], 1, "{counts:?}");
+        // Undone, or gone through: out of where they were going.
+        assert_eq!(s.undo_batch(8).unwrap().released, 1);
+        assert!(list(&mailbox("Work"), "", true).is_empty());
+        for op in s.ops("a", i64::MAX).unwrap().into_iter().filter(|q| matches!(&q.op, Op::Move { dest, .. } if dest == "Travel")) {
+            s.op_done(op.id).unwrap();
+        }
+        assert_eq!(ids(&list(&mailbox("Travel"), "", true)), [newer, older]);
+        s.undo_batch(9).unwrap();
+        assert_eq!(ids(&inbox(&s)), [invoice]);
+        assert_eq!(ids(&list(&mailbox("Trash"), "", true)), [trashed], "back in Trash");
     }
 
     fn unread(s: &Store) -> u32 {
@@ -2753,15 +2843,21 @@ mod tests {
         assert_eq!(unread(&s), 1, "one unread message, one unread");
     }
 
+    /// A message hidden for a move opens only as what it is now: on its way into another
+    /// mailbox, where the list shows it, marked so; hidden for anything else, it's gone.
     #[test]
-    fn a_hidden_message_cant_be_opened() {
+    fn a_hidden_message_opens_only_on_its_way_somewhere() {
         let s = Store::memory();
-        let (id, _) = held_move(&s);
+        let (id, op) = held_move(&s);
+        let arriving = |thread: Vec<ThreadMessage>| thread.iter().map(|m| (m.summary.id, m.summary.flags & flags::ARRIVING != 0)).collect::<Vec<_>>();
+        assert_eq!(arriving(s.thread(id, false).unwrap()), [(id, true)], "flat");
+        assert_eq!(arriving(s.thread(id, true).unwrap()), [(id, true)], "conversation");
+        s.conn.execute("UPDATE ops SET op = ?2 WHERE id = ?1", params![op, json(&Op::Expunge { mailbox: "INBOX".into(), uid: 9 })]).unwrap();
         assert!(s.thread(id, false).unwrap().is_empty(), "flat");
         assert!(s.thread(id, true).unwrap().is_empty(), "conversation");
         assert!(s.summary(id).unwrap().is_some(), "move bookkeeping still sees it");
         s.undo_batch(7).unwrap();
-        assert_eq!(s.thread(id, false).unwrap().len(), 1);
+        assert_eq!(arriving(s.thread(id, false).unwrap()), [(id, false)]);
     }
 
     #[test]
