@@ -704,6 +704,8 @@ impl App {
                 }
             }
             Event::List { .. } => {}
+            // The split inbox's, for its tabs (not shown yet).
+            Event::CategoryCounts { .. } | Event::Explained { .. } => {}
             Event::Thread { req, id, messages } if req == self.thread_req && messages.is_empty() => {
                 // The open message is gone (moved, deleted, or an undo that came too late):
                 // close it rather than show an empty reader or mark it read later.
@@ -979,6 +981,7 @@ impl App {
             conversations: self.conversations() && self.view_role() != Some(Role::Drafts),
             limit: 3000,
             stream: at_once,
+            category: None,
         });
     }
 
