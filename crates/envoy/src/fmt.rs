@@ -22,23 +22,40 @@ pub fn list_date(ts: i64, format: &str) -> String {
     }
 }
 
+/// `1 message`, `2 messages`: a count and its noun, plural unless the count is one. For nouns
+/// whose plural adds an s (all of Envoy's).
+pub fn count(n: usize, noun: &str) -> String {
+    if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
+}
+
 pub fn full_date(ts: i64) -> String {
+    full_date_at(ts, Local::now())
+}
+
+/// [`full_date`] as of `now`.
+fn full_date_at(ts: i64, now: chrono::DateTime<Local>) -> String {
     let Some(d) = Local.timestamp_opt(ts, 0).single() else { return String::new() };
-    let now = Local::now();
-    let ago = now.signed_duration_since(d);
-    let rel = if ago.num_minutes() < 1 {
-        "just now".to_owned()
-    } else if ago.num_minutes() < 60 {
-        format!("{} min ago", ago.num_minutes())
-    } else if ago.num_hours() < 24 {
-        format!("{} h ago", ago.num_hours())
-    } else if ago.num_days() < 7 {
-        format!("{} days ago", ago.num_days())
-    } else {
-        String::new()
-    };
+    let rel = ago(now.signed_duration_since(d));
     let base = if d.year() == now.year() { d.format("%a, %b %-d, %-H:%M").to_string() } else { d.format("%a, %b %-d, %Y, %-H:%M").to_string() };
     if rel.is_empty() { base } else { format!("{base} ({rel})") }
+}
+
+/// How long ago, for the last week: `just now`, `5 min ago`, `1 hour ago`, `3 days ago`.
+/// Empty for longer ago, or for a date in the future (a sender's clock ahead of ours).
+fn ago(d: chrono::TimeDelta) -> String {
+    if d.num_seconds() < 0 {
+        String::new()
+    } else if d.num_minutes() < 1 {
+        "just now".to_owned()
+    } else if d.num_minutes() < 60 {
+        format!("{} min ago", d.num_minutes())
+    } else if d.num_hours() < 24 {
+        format!("{} ago", count(d.num_hours() as usize, "hour"))
+    } else if d.num_days() < 7 {
+        format!("{} ago", count(d.num_days() as usize, "day"))
+    } else {
+        String::new()
+    }
 }
 
 pub fn size(bytes: usize) -> String {
@@ -142,6 +159,37 @@ mod tests {
     fn subjects() {
         assert_eq!(base_subject("Re: Fwd: RE: lunch"), "lunch");
         assert_eq!(base_subject("Regarding"), "Regarding");
+    }
+
+    #[test]
+    fn counts_are_singular_only_for_one() {
+        assert_eq!(count(0, "message"), "0 messages");
+        assert_eq!(count(1, "message"), "1 message");
+        assert_eq!(count(2, "conversation"), "2 conversations");
+    }
+
+    #[test]
+    fn relative_times_say_one_day_not_one_days() {
+        let mins = |m: i64| chrono::TimeDelta::minutes(m);
+        assert_eq!(ago(chrono::TimeDelta::seconds(20)), "just now");
+        assert_eq!(ago(mins(1)), "1 min ago");
+        assert_eq!(ago(mins(59)), "59 min ago");
+        assert_eq!(ago(mins(60)), "1 hour ago");
+        assert_eq!(ago(mins(150)), "2 hours ago");
+        assert_eq!(ago(mins(24 * 60)), "1 day ago");
+        assert_eq!(ago(mins(36 * 60)), "1 day ago");
+        assert_eq!(ago(mins(6 * 24 * 60)), "6 days ago");
+        assert_eq!(ago(mins(7 * 24 * 60)), "", "a week or more: the date says it");
+        assert_eq!(ago(mins(-5)), "", "a date ahead of our clock isn't 'just now'");
+    }
+
+    #[test]
+    fn full_dates_end_with_how_long_ago() {
+        let now = Local.with_ymd_and_hms(2026, 6, 10, 12, 0, 0).unwrap();
+        let yesterday = Local.with_ymd_and_hms(2026, 6, 9, 11, 0, 0).unwrap().timestamp();
+        assert_eq!(full_date_at(yesterday, now), "Tue, Jun 9, 11:00 (1 day ago)");
+        let last_year = Local.with_ymd_and_hms(2025, 6, 10, 12, 0, 0).unwrap().timestamp();
+        assert_eq!(full_date_at(last_year, now), "Tue, Jun 10, 2025, 12:00");
     }
 
     #[test]

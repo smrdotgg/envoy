@@ -474,8 +474,7 @@ fn empty_list(s: &App, t: &Theme) -> El {
     let (title, sub): (String, String) = if !s.list_loaded {
         ("Loading…".into(), String::new())
     } else if let Some((n, name)) = &pending {
-        let noun = if *n == 1 { "message" } else { "messages" };
-        (format!("Downloading {name}…"), format!("{n} {noun} on the server. The newest appear here first."))
+        (format!("Downloading {name}…"), format!("{} on the server. The newest appear here first.", fmt::count(*n as usize, "message")))
     } else if syncing && s.applied_query.is_empty() {
         ("Syncing your mail…".into(), "Messages appear here as they download.".into())
     } else if !s.applied_query.is_empty() {
@@ -500,17 +499,18 @@ fn empty_list(s: &App, t: &Theme) -> El {
 
 fn list_header(s: &App, t: &Theme) -> El {
     let k = &t.k;
-    let unread: u32 = s.list.iter().filter(|m| m.thread_unread).count() as u32;
-    let noun = if s.conversations() { "conversations" } else { "messages" };
+    let unread = s.list.iter().filter(|m| m.thread_unread).count();
+    let noun = if s.conversations() { "conversation" } else { "message" };
     // While the rest of a long list is on its way (a frame or two), its counts are "at least".
     let more = if s.list_complete { "" } else { "+" };
     let n = s.list.len();
+    let counted = |n: usize, noun: &str| if more.is_empty() { fmt::count(n, noun) } else { format!("{n}{more} {noun}s") };
     let sub = if !s.applied_query.is_empty() {
-        format!("{n}{more} results for \u{201c}{}\u{201d}", s.applied_query)
+        format!("{} for \u{201c}{}\u{201d}", counted(n, "result"), s.applied_query)
     } else if unread > 0 {
-        format!("{unread}{more} unread · {n}{more} {noun}")
+        format!("{unread}{more} unread · {}", counted(n, noun))
     } else {
-        format!("{n}{more} {noun}")
+        counted(n, noun)
     };
     row()
         .key("list-header")
