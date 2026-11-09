@@ -15,7 +15,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::accounts::{self, Account, AuthKind};
 use crate::imap::{self, Credential, Session};
-use crate::model::{Draft, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
+use crate::model::{Category, Draft, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use crate::settings::Settings;
 use crate::store::{At, DraftRev, LocalDraft, Op, QueuedOp, Query, ReplyOf, Store};
 use crate::{drafts, oauth, paths, secrets, smtp};
@@ -34,7 +34,15 @@ pub enum Command {
     /// `stream`: send the top of a long list ahead of the rest ([`Event::List`]'s `more`), for a
     /// list the user is waiting on (a new view, a search). A list already on screen being read
     /// again (new mail, a sync) goes in one piece, so it never shrinks under the reader.
-    List { req: u64, view: View, query: String, conversations: bool, limit: u32, stream: bool },
+    /// `category`: a tab of the split inbox, shown when the query has no `category:` of its own;
+    /// the view's unread count per category comes with it ([`Event::CategoryCounts`]: after its
+    /// first page, before the whole list).
+    List { req: u64, view: View, query: String, conversations: bool, limit: u32, stream: bool, category: Option<Category> },
+    /// Moves conversations (those of `ids`) to `category` in the split inbox, by hand, here
+    /// only (the server never hears of categories); [`Command::UndoCategory`] with `undo` (a key
+    /// as [`Command::Move`]'s) takes it back.
+    MoveToCategory { ids: Vec<MessageId>, category: Category, undo: i64 },
+    UndoCategory { undo: i64 },
     Open { req: u64, id: MessageId, conversations: bool },
     /// Read a conversation ahead (the list's neighbours of the open one), so the UI can show it
     /// the moment it's opened. Answered with [`Event::Prefetched`]; downloads nothing.
@@ -116,6 +124,12 @@ pub enum Event {
     /// A list's rows. `more`: these are the top of a longer list, whose whole (starting with
     /// the same rows) follows in another `List` with the same `req`.
     List { req: u64, items: Vec<Summary>, more: bool },
+    /// A view's unread conversations (messages, outside conversation view) per category, by
+    /// [`Category::code`]: the split inbox's tabs. Sent with a list that asked for a category.
+    CategoryCounts { view: View, counts: [u32; 4] },
+    /// An opened message's conversation's category in the split inbox, and why, in words
+    /// ([`Store::explain`]). Follows its [`Event::Thread`].
+    Explained { id: MessageId, category: Category, why: String },
     Thread { req: u64, id: MessageId, messages: Vec<ThreadMessage> },
     /// A [`Command::Prefetch`]'s conversation, as `Thread` would bring it.
     Prefetched { id: MessageId, messages: Vec<ThreadMessage> },
@@ -244,6 +258,8 @@ impl Engine {
                 synced: Mutex::new(HashMap::new()),
                 undo_keys: Mutex::new(HashMap::new()),
                 wakers: Mutex::new(HashMap::new()),
+                category_undo: Mutex::new(HashMap::new()),
+                recategorizing: Default::default(),
             });
             shared.store_me();
             let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("envoy-io").build() {
@@ -320,6 +336,10 @@ struct Shared {
     undo_keys: Mutex<HashMap<i64, usize>>,
     /// Each account's worker's [`Worker::notify`], to wake it from off the engine's loop.
     wakers: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Corrections in the split inbox this run, by undo key: what takes each back.
+    category_undo: Mutex<HashMap<i64, Vec<crate::store::Moved>>>,
+    /// A pass sorting the whole cache again is running ([`recategorize`]).
+    recategorizing: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -516,6 +536,8 @@ fn reply(shared: &Arc<Shared>, reply: &Reply) -> Result<()> {
 async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
     // Before any worker can replay them.
     drop_unprovable_ops(&shared);
+    // Before any worker stores mail: it's sorted with the user's rules as it lands.
+    update_classifier(&shared);
     let mut workers: HashMap<String, Worker> = HashMap::new();
     let accounts = shared.accounts.read().map(|a| a.clone()).unwrap_or_default();
     shared.emit(Event::Accounts(accounts.clone()));
@@ -612,6 +634,70 @@ async fn backfill_contacts(shared: Arc<Shared>) {
     }
 }
 
+/// Gives the store the split inbox's rules (`inbox.rules`) and the accounts' addresses: mail
+/// that moves because of it shows at once, and a pass sorting the whole cache again, if one is
+/// needed (or was cut off by a quit), runs in the background ([`recategorize`]).
+fn update_classifier(shared: &Arc<Shared>) {
+    let Ok(settings) = shared.settings.read().map(|s| s.clone()) else { return };
+    let classifier = crate::category::Classifier::from_settings(&settings, shared.me());
+    match shared.with_writer(|st| {
+        st.set_classifier(classifier)?;
+        Ok((st.take_recategorized(), st.recategorizing()?))
+    }) {
+        Ok((moved, pass)) => {
+            if moved > 0 {
+                shared.emit(Event::Changed { account: String::new() });
+            }
+            if pass {
+                start_recategorizing(shared);
+            }
+        }
+        Err(e) => log::warn!("couldn't give the store the inbox rules: {e:#}"),
+    }
+}
+
+fn start_recategorizing(shared: &Arc<Shared>) {
+    if !shared.recategorizing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        tokio::spawn(recategorize(shared.clone()));
+    }
+}
+
+/// Sorts the whole cache again ([`Store::recategorize`]), a few hundred messages at a time with
+/// the writer free in between (a chunk is a few milliseconds), newest first so what's on screen
+/// is right first; the list follows as it goes, a few times a second at most.
+async fn recategorize(shared: Arc<Shared>) {
+    // The first chunk's changes show at once (a cache from before the split starts all in
+    // Other), then a few times a second.
+    let mut shown: Option<Instant> = None;
+    let mut unseen = 0;
+    let finished = loop {
+        let s = shared.clone();
+        match tokio::task::spawn_blocking(move || s.with_writer(|st| st.recategorize(500))).await {
+            Ok(Ok(pass)) => {
+                unseen += pass.changed;
+                if unseen > 0 && (!pass.more || shown.is_none_or(|t| t.elapsed() >= Duration::from_millis(400))) {
+                    shared.emit(Event::Changed { account: String::new() });
+                    (shown, unseen) = (Some(Instant::now()), 0);
+                }
+                if !pass.more {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(Err(e)) => {
+                log::warn!("sorting the inbox again: {e:#}");
+                break false;
+            }
+            Err(_) => break false,
+        }
+    };
+    shared.recategorizing.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Rules that changed again as it ended start another.
+    if finished && shared.with_writer(|st| st.recategorizing()).unwrap_or(false) {
+        start_recategorizing(&shared);
+    }
+}
+
 fn poke(workers: &HashMap<String, Worker>, account: &str, job: Job) {
     if let Some(w) = workers.get(account) {
         match job {
@@ -636,17 +722,28 @@ fn wake(workers: &HashMap<String, Worker>, account: &str) {
 
 async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd: Command) -> Result<()> {
     match cmd {
-        Command::List { req, view, query, conversations, limit, stream } => {
+        Command::List { req, view, query, conversations, limit, stream, category } => {
             let shared = shared.clone();
             tokio::task::spawn_blocking(move || {
                 let me = shared.me();
-                let q = Query::parse(&query);
+                let mut q = Query::parse(&query);
+                if let Some(c) = category
+                    && q.category.is_none()
+                {
+                    q.category = Query::in_category(c).category;
+                }
                 let items = shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| {
                     // The top of a long list goes out first, and the rest when it's read. A
                     // Drafts list goes in one piece: its rows are merged with the local drafts.
                     let mut first = |items| shared.emit(Event::List { req, items, more: true });
                     let page = if stream && !drafts::lists_drafts(&st, &view) { FIRST_PAGE } else { 0 };
                     let items = st.list_paged(&view, &q, conversations, limit, &me, page, &mut first)?;
+                    // The tabs' counts, after the first page (it never waits for them) and
+                    // before the whole list: the app shows both in the same frame.
+                    if category.is_some() {
+                        let counts = st.category_counts(&view, conversations)?;
+                        shared.emit(Event::CategoryCounts { view: view.clone(), counts });
+                    }
                     drafts::merge(&st, &view, &q, limit, items, |a| shared.sender(a))
                 });
                 match items {
@@ -672,6 +769,13 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             for (validity, account, mailbox, uids) in missing {
                 poke(workers, &account, Job::Bodies { mailbox, validity, uids, reply: Some(Reply::Thread(req, id, conversations)) });
             }
+            // Why it's in its tab: the writer has the rules. Off the loop, after it shows.
+            let shared = shared.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(Some((category, why))) = shared.with_writer(|st| st.explain(id)) {
+                    shared.emit(Event::Explained { id, category, why });
+                }
+            });
         }
         Command::Prefetch { id, conversations } => {
             let shared = shared.clone();
@@ -711,6 +815,19 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             shared.emit_pending();
         }
         Command::UndoMove { undo } => undo_move(shared, undo)?,
+        Command::MoveToCategory { ids, category, undo } => {
+            let moved = shared.with_writer(|st| st.move_to_category(&ids, category))?;
+            if let Ok(mut u) = shared.category_undo.lock() {
+                u.insert(undo, moved);
+            }
+            shared.emit(Event::Changed { account: String::new() });
+        }
+        Command::UndoCategory { undo } => {
+            if let Some(moved) = shared.category_undo.lock().ok().and_then(|mut u| u.remove(&undo)) {
+                shared.with_writer(|st| st.restore_categories(&moved))?;
+                shared.emit(Event::Changed { account: String::new() });
+            }
+        }
         Command::Send { draft, draft_id } => {
             if let Err(e) = queue_send(shared, workers, &draft, draft_id) {
                 // Not sent: kept as a draft here, and back in the composer, so nothing written is
@@ -893,6 +1010,8 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             shared.store_me();
             shared.emit(Event::Accounts(list));
             shared.emit(Event::AccountAdded(account.clone()));
+            // Its address is yours: mail to it is to you.
+            update_classifier(shared);
             workers.insert(account.id.clone(), spawn_worker(shared.clone(), account.id.clone()));
         }
         Command::RemoveAccount { id } => {
@@ -912,6 +1031,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             };
             shared.store_me();
             shared.with_writer(|st| st.forget_account(&id))?;
+            update_classifier(shared);
             shared.emit(Event::Accounts(list));
             shared.emit(Event::Changed { account: id });
         }
@@ -971,6 +1091,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             if let Ok(mut cur) = shared.settings.write() {
                 *cur = *s;
             }
+            update_classifier(shared);
             for w in workers.values() {
                 w.notify.notify_one();
             }
@@ -2518,10 +2639,15 @@ mod tests {
     }
 
     fn engine_with(st: Store) -> (Arc<Shared>, std::sync::mpsc::Receiver<Event>) {
+        engine_with_reader(st, Store::memory())
+    }
+
+    /// With a reader of its own: the same database as `st`, for lists.
+    fn engine_with_reader(st: Store, reader: Store) -> (Arc<Shared>, std::sync::mpsc::Receiver<Event>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let shared = Arc::new(Shared {
             writer: Arc::new(Mutex::new(st)),
-            reader: Arc::new(Mutex::new(Store::memory())),
+            reader: Arc::new(Mutex::new(reader)),
             events: Mutex::new(tx),
             waker: Arc::new(|| {}),
             settings: RwLock::new(Settings::default()),
@@ -2531,6 +2657,8 @@ mod tests {
             synced: Mutex::new(HashMap::new()),
             undo_keys: Default::default(),
             wakers: Default::default(),
+            category_undo: Default::default(),
+            recategorizing: Default::default(),
         });
         (shared, rx)
     }
@@ -3581,6 +3709,73 @@ mod tests {
         replay_times(&shared, &mut a, 3).await;
         assert_eq!(a.drafts().into_iter().map(|(_, s)| s).collect::<Vec<_>>(), vec!["v3".to_owned()], "a ends up with the draft");
         assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty());
+    }
+
+    /// The split inbox through the engine: a tab's list comes with every tab's unread count
+    /// (before the whole list); a correction moves a conversation and its undo moves it back; a rule in the
+    /// settings moves its sender's mail at once. None of it reaches a server (no worker runs).
+    #[tokio::test]
+    async fn the_split_inbox_lists_tabs_takes_corrections_and_follows_rules() {
+        let dir = std::env::temp_dir().join(format!("envoy-engine-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mail.sqlite");
+        let st = Store::open(&db).unwrap();
+        st.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        st.set_classifier(crate::category::Classifier::new(vec![], ["a@x.com".to_owned()])).unwrap();
+        let put = |uid: u32, headers: &str| {
+            let p = crate::mime::parse(format!("{headers}\r\n\r\nbody\r\n").as_bytes(), true).unwrap();
+            st.upsert_header("a", "INBOX", uid, 0, 10, uid as i64, &p).unwrap()
+        };
+        let news = put(1, "From: News <hello@news.example>\r\nTo: a@x.com\r\nSubject: Weekly\r\nMessage-ID: <n@x>\r\nList-Unsubscribe: <https://news.example/u>");
+        let direct = put(2, "From: Sam <sam@x.org>\r\nTo: a@x.com\r\nSubject: Dinner?\r\nMessage-ID: <s@x>");
+        let (shared, rx) = engine_with_reader(st, Store::open(&db).unwrap());
+        shared.accounts.write().unwrap().push(account("a"));
+        update_classifier(&shared);
+        assert!(!shared.recategorizing.load(std::sync::atomic::Ordering::SeqCst), "the same classifier: nothing to do");
+        let view = View::Role { account: None, role: Role::Inbox };
+        let list = |category: Option<Category>| {
+            let cmd = Command::List { req: 1, view: view.clone(), query: String::new(), conversations: true, limit: 100, stream: false, category };
+            (shared.clone(), cmd)
+        };
+        let (s, cmd) = list(Some(Category::Newsletters));
+        handle(&s, &mut HashMap::new(), cmd).await.unwrap();
+        let mut events = Vec::new();
+        while !events.iter().any(|e| matches!(e, Event::List { .. })) {
+            events.push(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        }
+        let counts = events.iter().position(|e| matches!(e, Event::CategoryCounts { .. })).expect("counts");
+        let rows = events.iter().position(|e| matches!(e, Event::List { .. })).unwrap();
+        assert!(counts < rows, "counts first: {events:?}");
+        let Event::CategoryCounts { counts, .. } = &events[counts] else { unreachable!() };
+        assert_eq!((counts[Category::Newsletters.code() as usize], counts[Category::Important.code() as usize]), (1, 1));
+        let Event::List { items, .. } = &events[rows] else { unreachable!() };
+        assert_eq!(items.iter().map(|m| (m.id, m.category)).collect::<Vec<_>>(), [(news, Category::Newsletters)]);
+        let category = |id| shared.with_writer(|st| Ok(st.summary(id)?.unwrap().category)).unwrap();
+        // Opened: why it's in its tab follows.
+        handle(&shared, &mut HashMap::new(), Command::Open { req: 2, id: news, conversations: true }).await.unwrap();
+        let why = loop {
+            if let Event::Explained { id, category, why } = rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                break (id, category, why);
+            }
+        };
+        assert_eq!(why, (news, Category::Newsletters, "Has an unsubscribe link".to_owned()));
+        // A correction, and its undo.
+        handle(&shared, &mut HashMap::new(), Command::MoveToCategory { ids: vec![news], category: Category::Important, undo: 9 }).await.unwrap();
+        assert_eq!(category(news), Category::Important);
+        assert!(rx.try_iter().any(|e| matches!(e, Event::Changed { .. })));
+        handle(&shared, &mut HashMap::new(), Command::UndoCategory { undo: 9 }).await.unwrap();
+        assert_eq!(category(news), Category::Newsletters);
+        handle(&shared, &mut HashMap::new(), Command::UndoCategory { undo: 9 }).await.unwrap(); // twice: nothing
+        // A rule for one sender, from settings: its mail moves now, no pass.
+        let mut settings = Settings::default();
+        settings.set("inbox.rules", serde_json::json!([{ "from": "sam@x.org", "category": "notifications" }])).unwrap();
+        let _ = rx.try_iter().count();
+        handle(&shared, &mut HashMap::new(), Command::Settings(Box::new(settings))).await.unwrap();
+        assert_eq!(category(direct), Category::Notifications);
+        assert!(rx.try_iter().any(|e| matches!(e, Event::Changed { .. })), "the list follows");
+        assert!(!shared.recategorizing.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
