@@ -25,7 +25,9 @@
 # start, 9 runs (the startup code didn't change across them); store and size checks, 9 runs.
 # Every store search and open now passes with room on every runner (the worst query median:
 # 9 ms Linux, 12 ms macOS, 21 ms Windows), and so do Windows' binary size (29.8 MB) and idle
-# memory (131–133 MB): their entries are gone. What's left is the runners' software GPUs
+# memory (131–133 MB): their entries are gone. Binary size has passed everywhere since the
+# size trim of 2026-11-09 (Linux 29.09 MB, Windows 27.08 MB, macOS 21.85 MB): its entries are
+# gone too. What's left is the runners' software GPUs
 # (lavapipe on Linux, WARP on Windows, a paravirtualized one in the macOS VM): cold start above
 # the OS floor is mostly Rune's own start there (70–1070 ms; 4 ms on an M4 Pro), and frames wait
 # on software rasterizing. On the M4 Pro, cold start (8 ms above the floor), keypress → frame
@@ -90,22 +92,10 @@ os = "windows"
 ceiling = 625
 seen = "257.8–413.5 ms over 6 runs, over or within 20% of budget in 6"
 
-# ── memory, binary ──
+# ── memory ──
 
 [[miss]]
 check = "app · idle memory"
 os = "linux"
 ceiling = 325
 seen = "242.7–259.1 MB over 6 runs, over or within 20% of budget in 6"
-
-[[miss]]
-check = "binary · size"
-os = "linux"
-ceiling = 33
-seen = "31.1–31.1 MB over 9 runs, over or within 20% of budget in 9"
-
-[[miss]]
-check = "binary · size"
-os = "windows"
-ceiling = 30.8
-seen = "30.31 MB after drafts (#3); main was 29.81 MB; tracked by a size-trim task"

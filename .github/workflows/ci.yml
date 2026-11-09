@@ -155,7 +155,7 @@ jobs:
       # the entries are per check and per OS, and each has a ceiling.
       - name: "Budget: open a cached message < 50 ms"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/store.json" --from "$MAILBOX/app.json" --only "open · " --only "app · open message" --label "${{ matrix.os }}"
-      - name: "Budget: binary size < 30 MB (KNOWN BUDGET MISS on Linux)"
+      - name: "Budget: binary size < 30 MB"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/size.json" --only "binary · " --label "${{ matrix.os }}"
       - name: "Budget: local search < 50 ms (KNOWN BUDGET MISS: end to end)"
         run: target/dist/envoy-bench check --known-misses "$MISSES" --from "$MAILBOX/store.json" --from "$MAILBOX/app.json" --only "search · " --only "app · search, end to end" --label "${{ matrix.os }}"
