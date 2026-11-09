@@ -1036,10 +1036,11 @@ impl App {
     pub fn go(&mut self, view: View) {
         self.screen = Screen::Mail;
         if self.view != view {
+            // Left before its row goes: a message back from a snooze, read, is dealt with.
+            self.close_message();
             self.view = view.clone();
             self.list.clear();
             self.list_loaded = false;
-            self.close_message();
             self.selection.clear();
         }
         if self.demo {
@@ -1242,11 +1243,18 @@ impl App {
     /// (then it's in its place by date), so j and k go on from where they were.
     fn unpin_left(&mut self) {
         let Some(open) = self.open else { return };
-        let Some(row) = self.list.iter_mut().find(|s| s.id == open) else { return };
-        if row.flags & flags::WOKEN == 0 || row.thread_unread {
+        // Its row, or (gone from the list) its conversation as the reader has it.
+        let (woken, unread) = match self.list.iter().find(|s| s.id == open) {
+            Some(row) => (row.flags & flags::WOKEN != 0, row.thread_unread),
+            None if self.thread_for == Some(open) => (self.thread.iter().any(|m| m.summary.flags & flags::WOKEN != 0), self.thread.iter().any(|m| !m.summary.seen())),
+            None => return,
+        };
+        if !woken || unread {
             return;
         }
-        row.flags &= !flags::WOKEN;
+        for row in self.list.iter_mut().filter(|s| s.id == open) {
+            row.flags &= !flags::WOKEN;
+        }
         self.send(Command::SetFlags { ids: vec![open], add: 0, remove: flags::WOKEN, thread: self.conversations() });
     }
 
@@ -4688,6 +4696,31 @@ mod tests {
         assert!(sent_since(&app, from, "Move").is_empty() && sent_since(&app, from, "Snooze").is_empty());
         assert!(app.list.iter().any(|s| s.id == id));
         assert!(app.toasts.iter().any(|t| t.text.contains("change it there")));
+    }
+
+    #[test]
+    fn going_to_another_folder_leaves_a_read_woken_message_dealt_with() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let first = app.list[0].id;
+        app.list[0].flags |= flags::WOKEN;
+        app.open_message(first);
+        app.list[0].thread_unread = false; // read
+        let from = app.sent.borrow().len();
+        app.go_role(Role::Sent);
+        let unpinned = sent_since(&app, from, "SetFlags");
+        assert!(unpinned.iter().any(|c| c.contains(&format!("ids: [{first}], add: 0, remove: {}", flags::WOKEN))), "{unpinned:?}");
+        // Its row gone from the list already (a search, say): the reader's conversation says.
+        crate::demo::populate(&mut app);
+        let first = app.list[0].id;
+        app.open_message(first);
+        for m in app.thread.iter_mut() {
+            m.summary.flags |= flags::WOKEN | flags::SEEN;
+        }
+        app.list.clear();
+        let from = app.sent.borrow().len();
+        app.close_message();
+        assert_eq!(sent_since(&app, from, "SetFlags").len(), 1);
     }
 
     #[test]
