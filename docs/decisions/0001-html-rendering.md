@@ -76,12 +76,26 @@ A feasibility study of live child web views concluded against them:
   declarations and candidate rules have caps. `tests/hostile.rs` in `envoy-html` keeps it so.
 - **Remote images are a per-sender opt-in.** `reading.loadImages` defaults to "ask":
   remote pictures (and background pictures) stay hidden behind a quiet "Images hidden" bar
-  that loads them once or always from that sender (`reading.imagesFrom`). Embedded `cid:`
-  pictures always show. Tracking pixels never load, `<img>` or background.
-- **"Open in browser" opens a sanitized copy** (`envoy_html::export`): no scripts, handlers,
-  refreshes, frames or forms; a strict CSP `<meta>` first in `<head>`; no referrer; remote
-  pictures only when they'd load in Envoy; the message's own pictures inlined as `data:` URIs.
-  The toolbar's Open original still writes the message's HTML as it came.
+  that loads them once or always from that sender (`reading.imagesFrom`: exactly `user@domain`,
+  `domain` or `@domain`; anything else is ignored and flagged in Settings). Embedded `cid:`
+  pictures always show. Tracking pixels never load, `<img>` or background: a picture or box at
+  most 3 px either way, by its effective size (`max-width`/`max-height` included).
+- **"Open in browser" opens a sanitized copy** (`envoy_html::export`), written from an
+  allowlist, not cleaned of what's known to be bad. Only plain HTML elements for reading mail
+  are written; `<svg>`, `<math>`, the legacy raw-text elements and anything that runs, embeds,
+  loads or takes input go with their content; other elements are unwrapped. Only presentational
+  attributes, plus checked URLs: links keep `http(s)`, `mailto`, `tel` and `#fragment`s (no
+  scheme-less paths, which a `file://` page resolves to local files); remote pictures stay only
+  when they'd load in Envoy, tracking pixels excluded. CSS `url()`s follow the same rule, and
+  `<` in sheets is escaped. A strict CSP, no referrer and no DNS prefetching come first in
+  `<head>`; a UTF-8 byte-order mark first in the file. The result is parsed back and checked
+  against the same allowlist; if it fails, the file holds the message's text instead.
+- **"Open original" opens the message as received**, as an `.eml` file for the system's mail
+  viewer, not as an `.html` file in a browser that would ignore the image setting.
+- **Exported files are private.** Both go to a folder only the user can open (Envoy's cache
+  folder on Linux, not the shared `/tmp`; the per-user temporary folder on macOS and Windows),
+  created 0700, each file 0600, created exclusively under a random name, and removed after a
+  day.
 - **Families map to generic faces.** Sans → the app's sans, mono → its mono, serif → a system
   serif by name (Georgia; DejaVu Serif on Linux). Rune only registers its bundled faces and a
   few system families (symbols, CJK, mono), so the serif request falls back to the sans face
@@ -128,7 +142,7 @@ the reading pane draws natively, so nothing sits over the window and nothing tak
 - The North Star's "Rendering" bullet ("pool of 2–3 warm views … opening one is a swap") no
   longer describes the plan. Revising it is for the user; this record doesn't edit it.
 - Mail that needs a browser gets one only on request, in the user's own browser, sanitized:
-  nothing in it runs, and it loads remote pictures only if Envoy would have.
+  nothing in it runs, and it loads only the remote pictures Envoy itself would load.
 - What the renderer still doesn't do (and how the score treats it): absolute/fixed positioning,
   flex and grid layout, floats that aren't columns, inline SVG, forms, embedded media, transforms
   and filters, multi-column text, `::before`/`::after` content, `rowspan` away from the table's
