@@ -421,10 +421,11 @@ pub enum Op {
     Copy { mailbox: String, uid: u32, dest: String },
     /// Delete for good (expunge), used in Trash.
     Expunge { mailbox: String, uid: u32 },
-    Send { raw_b64: String, from: String, to: Vec<String>, sent_mailbox: Option<String>, reply_of: Option<(String, u32)> },
+    /// `reply_of`: the message it answers, marked answered once it's out.
+    Send { raw_b64: String, from: String, to: Vec<String>, sent_mailbox: Option<String>, reply_of: Option<ReplyOf> },
     /// A send whose message is out (the SMTP server took it): what's left is a copy in Sent
-    /// (`sent_mailbox`, None once filed) and marking the original answered. Never sent again.
-    Delivered { raw_b64: String, sent_mailbox: Option<String>, reply_of: Option<(String, u32)> },
+    /// (`sent_mailbox`). Never sent again.
+    Delivered { raw_b64: String, sent_mailbox: Option<String> },
     /// Put a local draft's newest version in the Drafts mailbox, replacing the copies before
     /// it. Reads the draft when it runs, so one op covers any number of edits.
     SaveDraft { draft: i64 },
@@ -445,6 +446,28 @@ pub enum Op {
         #[serde(default)]
         left_by: Option<(i64, i64)>,
     },
+}
+
+/// The message a reply answers ([`Op::Send`]).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ReplyOf {
+    Original(Original),
+    /// Queued by an older Envoy: a mailbox and UID, without the account or generation they're
+    /// from, so they may name another message, on another account. Never acted on.
+    Legacy(String, u32),
+}
+
+/// A message as it was at one moment, pinned down so it's found again, or not at all: its
+/// account, mailbox and UID, its mailbox's generation (UIDVALIDITY) and its Message-ID
+/// ([`Store::original`]).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Original {
+    pub account: String,
+    pub mailbox: String,
+    pub uid: u32,
+    pub validity: u32,
+    pub message_id: String,
 }
 
 /// What [`Store::undo_batch`] managed.
@@ -478,12 +501,11 @@ pub struct At {
 }
 
 impl Op {
-    /// The mailbox and UID it acts on, if it names a message by UID (a send, the message it
-    /// replies to).
+    /// The mailbox and UID it acts on, if it names a message by UID on its own account. (A
+    /// send's original carries its own account and generation.)
     pub fn located(&self) -> Option<(&str, u32)> {
         match self {
             Op::SetFlags { mailbox, uid, .. } | Op::Move { mailbox, uid, .. } | Op::Copy { mailbox, uid, .. } | Op::Expunge { mailbox, uid } => Some((mailbox, *uid)),
-            Op::Send { reply_of: Some((mailbox, uid)), .. } | Op::Delivered { reply_of: Some((mailbox, uid)), .. } => Some((mailbox, *uid)),
             _ => None,
         }
     }
@@ -493,7 +515,6 @@ impl Op {
         let mut op = self.clone();
         match &mut op {
             Op::SetFlags { uid, .. } | Op::Move { uid, .. } | Op::Copy { uid, .. } | Op::Expunge { uid, .. } => *uid = to,
-            Op::Send { reply_of: Some((_, uid)), .. } | Op::Delivered { reply_of: Some((_, uid)), .. } => *uid = to,
             _ => return None,
         }
         Some(op)
@@ -985,6 +1006,21 @@ impl Store {
         self.location(id)
     }
 
+    /// Message `id` pinned down as it is now ([`Original`]), in one read. None if it's gone,
+    /// or its mailbox's generation isn't known: then nothing could prove a UID still names it.
+    pub fn original(&self, id: MessageId) -> Result<Option<Original>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT m.account, m.mailbox, m.uid, COALESCE(b.uidvalidity, 0), m.message_id
+                   FROM messages m LEFT JOIN mailboxes b ON b.account = m.account AND b.name = m.mailbox WHERE m.id = ?1",
+                params![id],
+                |r| Ok(Original { account: r.get(0)?, mailbox: r.get(1)?, uid: r.get(2)?, validity: r.get(3)?, message_id: r.get(4)? }),
+            )
+            .optional()?;
+        Ok(found.filter(|o| o.validity != 0))
+    }
+
     pub fn location(&self, id: MessageId) -> Result<Option<(String, String, u32)>> {
         Ok(self
             .conn
@@ -1264,6 +1300,16 @@ impl Store {
             },
             None => At::default(),
         };
+        self.insert_op(account, op, not_before, batch, &at)
+    }
+
+    /// Queues `op` for its message as it was pinned down earlier (`at`), not as the cache has
+    /// its UID now: marking a reply's original answered once the reply is out.
+    pub fn enqueue_located(&self, account: &str, op: &Op, at: &At) -> Result<i64> {
+        self.insert_op(account, op, 0, 0, at)
+    }
+
+    fn insert_op(&self, account: &str, op: &Op, not_before: i64, batch: i64, at: &At) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO ops (account, op, not_before, batch, uidvalidity, message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![account, json(op), not_before, batch, at.validity, at.message_id],
@@ -2482,7 +2528,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("mail.sqlite");
-        let reply = Op::Send { raw_b64: String::new(), from: "me@x.com".into(), to: vec!["you@x.com".into()], sent_mailbox: None, reply_of: Some(("INBOX".into(), 9)) };
+        let reply = Op::Send { raw_b64: String::new(), from: "me@x.com".into(), to: vec!["you@x.com".into()], sent_mailbox: None, reply_of: Some(ReplyOf::Legacy("INBOX".into(), 9)) };
         // Queued by the old Envoy, maybe before INBOX was reset: generation 8 is what the cache
         // has now, and UIDs 1 and 9 may be other messages than the ones these ops were for.
         let ops = [
@@ -2509,8 +2555,12 @@ mod tests {
             }
         }
         let s = Store::open(&db).unwrap();
-        let at: Vec<At> = s.ops("a", 0).unwrap().into_iter().map(|q| q.at).collect();
-        assert_eq!(at, vec![At::default(); 6], "nothing inferred from what the cache has now");
+        let queued = s.ops("a", 0).unwrap();
+        assert_eq!(queued.iter().map(|q| q.at.clone()).collect::<Vec<_>>(), vec![At::default(); 6], "nothing inferred from what the cache has now");
+        // The old send's original, as the old Envoy wrote it: just a mailbox and UID.
+        let old_send = r#"{"kind":"send","raw_b64":"","from":"me@x.com","to":["you@x.com"],"sent_mailbox":null,"reply_of":["INBOX",9]}"#;
+        assert_eq!(serde_json::from_str::<Op>(old_send).unwrap(), ops[2]);
+        assert_eq!(queued[2].op, ops[2]);
         // Ops queued from now on record theirs.
         let op = s.enqueue("a", &Op::Copy { mailbox: "INBOX".into(), uid: 9, dest: "Work".into() }).unwrap();
         assert_eq!(s.ops("a", 0).unwrap().into_iter().find(|q| q.id == op).unwrap().at, At { validity: 8, message_id: "<other@x>".into() });

@@ -17,7 +17,7 @@ use crate::accounts::{self, Account, AuthKind};
 use crate::imap::{self, Credential, Session};
 use crate::model::{Draft, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use crate::settings::Settings;
-use crate::store::{At, DraftRev, LocalDraft, Op, QueuedOp, Query, Store};
+use crate::store::{At, DraftRev, LocalDraft, Op, QueuedOp, Query, ReplyOf, Store};
 use crate::{drafts, oauth, paths, secrets, smtp};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1135,24 +1135,18 @@ fn queue_send(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, draft: &D
         return Err(anyhow!(why));
     }
     let undo = shared.setting_u32("compose.undoSendSeconds");
-    let (sent_mailbox, reply_of) = shared.with_writer(|st| {
-        let sent = if account.is_gmail() { None } else { st.mailbox_for_role(&account.id, Role::Sent)? };
-        let reply = match draft.reply_of {
-            Some(id) => st.location(id)?.map(|(_, m, u)| (m, u)),
-            None => None,
-        };
-        Ok((sent, reply))
-    })?;
-    let op = Op::Send {
-        raw_b64: base64::engine::general_purpose::STANDARD.encode(&built.raw),
-        from: built.from,
-        to: built.to,
-        sent_mailbox,
-        reply_of,
-    };
-    // The draft waits with the message (hidden from Drafts) and goes once it's out.
+    let raw_b64 = base64::engine::general_purpose::STANDARD.encode(&built.raw);
+    // The draft waits with the message (hidden from Drafts) and goes once it's out. The message
+    // replied to is pinned down in the same transaction, as it is now: its own account (which
+    // may not be the one sending), mailbox, UID, generation and Message-ID.
     let id = shared.with_writer(|st| {
         st.transaction(|st| {
+            let sent_mailbox = if account.is_gmail() { None } else { st.mailbox_for_role(&account.id, Role::Sent)? };
+            let reply_of = match draft.reply_of {
+                Some(id) => st.original(id)?.map(ReplyOf::Original),
+                None => None,
+            };
+            let op = Op::Send { raw_b64, from: built.from, to: built.to, sent_mailbox, reply_of };
             let id = st.enqueue_at(&account.id, &op, now() + undo as i64)?;
             if let Some(d) = draft_id {
                 st.draft_sending(d, draft, id, now())?;
@@ -1985,57 +1979,53 @@ impl OpRunner for ImapRunner<'_> {
 
 /// Replays an [`Op::Send`]: hands its message to the SMTP server, and once that's done
 /// records it at once ([`Op::Delivered`]), before anything else can fail, so the message is
-/// never sent again, whatever happens to filing it.
+/// never sent again, whatever happens to filing it. In the same transaction the message it
+/// replies to is queued to be marked answered, on its own account, by its UID only in the
+/// generation it was pinned down in (or where its Message-ID finds it in a new one); a reply
+/// whose original couldn't be pinned down marks nothing.
 async fn deliver_and_file(shared: &Shared, account: &Account, runner: &mut impl OpRunner, q: &mut QueuedOp) -> Result<()> {
     runner.deliver(&q.op).await?;
     let Op::Send { raw_b64, sent_mailbox, reply_of, .. } = &q.op else { return Ok(()) };
-    let delivered = Op::Delivered { raw_b64: raw_b64.clone(), sent_mailbox: sent_mailbox.clone(), reply_of: reply_of.clone() };
-    shared.with_writer(|st| st.rewrite_op(q.id, &delivered))?;
+    let delivered = Op::Delivered { raw_b64: raw_b64.clone(), sent_mailbox: sent_mailbox.clone() };
+    let answered = match reply_of {
+        Some(ReplyOf::Original(o)) if shared.account(&o.account).is_some() => Some(o),
+        Some(ReplyOf::Original(o)) => {
+            log::info!("{}: the message replied to was on {}, which is gone: not marked answered", account.email, o.account);
+            None
+        }
+        Some(ReplyOf::Legacy(..)) => {
+            log::info!("{}: a reply queued by an older Envoy doesn't say which message it answers for sure: not marked answered", account.email);
+            None
+        }
+        None => None,
+    };
+    shared.with_writer(|st| {
+        st.transaction(|st| {
+            st.rewrite_op(q.id, &delivered)?;
+            if let Some(o) = answered {
+                let flag = Op::SetFlags { mailbox: o.mailbox.clone(), uid: o.uid, add: flags::ANSWERED, remove: 0 };
+                st.enqueue_located(&o.account, &flag, &At { validity: o.validity, message_id: o.message_id.clone() })?;
+            }
+            Ok(())
+        })
+    })?;
     q.op = delivered;
     shared.emit(Event::Toast("Message sent".into()));
-    file_delivered(shared, account, runner, q).await
+    file_delivered(account, runner, q).await
 }
 
-/// What's left of a send once its message is out: a copy in Sent, and the original marked
-/// answered. Each step that's done is recorded, so a lost connection (which keeps the op
-/// queued, to finish on a new one) never files it twice. Other failures are given up on:
-/// the message is out, and these are niceties.
-async fn file_delivered(shared: &Shared, account: &Account, runner: &mut impl OpRunner, q: &mut QueuedOp) -> Result<()> {
-    let Op::Delivered { raw_b64, sent_mailbox, reply_of } = q.op.clone() else { return Ok(()) };
-    if let Some(sent) = &sent_mailbox {
-        match base64::engine::general_purpose::STANDARD.decode(&raw_b64) {
-            Ok(raw) => match runner.file_sent(sent, &raw).await {
-                Err(e) if imap::is_lost(&e) => return Err(e),
-                Err(e) => log::warn!("{}: couldn't save to Sent: {e:#}", account.email),
-                Ok(()) => {}
-            },
-            Err(e) => log::warn!("{}: couldn't save to Sent: {e}", account.email),
-        }
-        q.op = Op::Delivered { raw_b64: raw_b64.clone(), sent_mailbox: None, reply_of: reply_of.clone() };
-        shared.with_writer(|st| st.rewrite_op(q.id, &q.op))?;
-    }
-    // The message replied to is marked answered, in the generation it was replied in, or where
-    // its Message-ID finds it in a new one; never by a UID from an old one.
-    if let Some((mailbox, uid)) = reply_of {
-        let flag = Op::SetFlags { mailbox, uid, add: flags::ANSWERED, remove: 0 };
-        let r = match runner.run(&flag, &q.at).await {
-            Err(e) => match (e.downcast_ref::<imap::NewGeneration>(), &flag) {
-                (Some(imap::NewGeneration { validity, found: Some(found), .. }), _) => {
-                    let at = At { validity: *validity, message_id: q.at.message_id.clone() };
-                    match flag.at_uid(*found) {
-                        Some(moved) => runner.run(&moved, &at).await,
-                        None => Err(e),
-                    }
-                }
-                _ => Err(e),
-            },
-            ok => ok,
-        };
-        match r {
+/// What's left of a send once its message is out: a copy in Sent. A lost connection keeps the
+/// op queued, to file it on a new one; other failures are given up on (the message is out, and
+/// this is a nicety).
+async fn file_delivered(account: &Account, runner: &mut impl OpRunner, q: &QueuedOp) -> Result<()> {
+    let Op::Delivered { raw_b64, sent_mailbox: Some(sent) } = &q.op else { return Ok(()) };
+    match base64::engine::general_purpose::STANDARD.decode(raw_b64) {
+        Ok(raw) => match runner.file_sent(sent, &raw).await {
             Err(e) if imap::is_lost(&e) => return Err(e),
-            Err(e) => log::debug!("{}: the message replied to wasn't marked answered: {e:#}", account.email),
+            Err(e) => log::warn!("{}: couldn't save to Sent: {e:#}", account.email),
             Ok(()) => {}
-        }
+        },
+        Err(e) => log::warn!("{}: couldn't save to Sent: {e}", account.email),
     }
     Ok(())
 }
@@ -2061,7 +2051,7 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
         let mut r = match &q.op {
             Op::SaveDraft { .. } | Op::PurgeDraft { .. } => replay_draft(shared, account, runner, &q.op).await,
             Op::Send { .. } => deliver_and_file(shared, account, runner, &mut q).await,
-            Op::Delivered { .. } => file_delivered(shared, account, runner, &mut q).await,
+            Op::Delivered { .. } => file_delivered(account, runner, &q).await,
             op => runner.run(op, &q.at).await,
         };
         // The op's mailbox has a new generation since it was queued: its UID may name another
@@ -2823,7 +2813,7 @@ mod tests {
         legacy_op(&shared, &Op::Expunge { mailbox: "INBOX".into(), uid: 4 }, "<doomed@x>");
         // These stay: a move that can be found again, a send, a draft upload.
         let findable = legacy_op(&shared, &Op::Move { mailbox: "INBOX".into(), uid: 5, dest: "Archive".into() }, "<findable@x>");
-        let send = legacy_op(&shared, &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: Some(("INBOX".into(), 6)) }, "");
+        let send = legacy_op(&shared, &Op::Send { raw_b64: String::new(), from: String::new(), to: vec![], sent_mailbox: None, reply_of: Some(ReplyOf::Legacy("INBOX".into(), 6)) }, "");
         let draft = legacy_op(&shared, &Op::SaveDraft { draft: 1 }, "");
         drop_unprovable_ops(&shared);
         let left: Vec<i64> = shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().into_iter().map(|q| q.id).collect();
@@ -3333,6 +3323,43 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_message_replied_to_is_marked_answered_on_its_own_account() {
+        let (shared, _rx) = drafts_engine();
+        shared.settings.write().unwrap().set("compose.undoSendSeconds", serde_json::json!(0)).unwrap();
+        // The message is in a's INBOX at UID 1; b's INBOX has another message at UID 1.
+        let original = shared
+            .with_writer(|st| {
+                st.set_uidvalidity("a", "INBOX", 7)?;
+                st.set_uidvalidity("b", "INBOX", 3)?;
+                message_in(st, "b", "INBOX", 1, "<bystander@x>", "", 0);
+                Ok(message_in(st, "a", "INBOX", 1, "<original@x>", "", 0))
+            })
+            .unwrap();
+        // Replied to from b.
+        let reply = Draft { account: "b".into(), reply_of: Some(original), ..draft("Re: Plans") };
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: reply, draft_id: None }).await.unwrap();
+        let mut b = FakeServer::new(&shared, |_: &Shared| {});
+        replay_with(&shared, &account("b"), &mut b).await.unwrap();
+        assert!(matches!(b.ran.as_slice(), [Op::Send { .. }]), "sent, and nothing marked on b: {:?}", b.ran);
+        assert!(shared.with_writer(|st| st.ops("b", i64::MAX)).unwrap().is_empty());
+        // a marks it, by the UID, generation and Message-ID it had when the reply was sent.
+        let on_a: Vec<(Op, At)> = shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().into_iter().map(|q| (q.op, q.at)).collect();
+        assert_eq!(
+            on_a,
+            [(Op::SetFlags { mailbox: "INBOX".into(), uid: 1, add: flags::ANSWERED, remove: 0 }, At { validity: 7, message_id: "<original@x>".into() })]
+        );
+        // A message whose mailbox's generation isn't known can't be pinned down: a reply to it
+        // marks nothing, anywhere.
+        let unknown = shared.with_writer(|st| Ok(message_in(st, "a", "Archive", 4, "<unknown@x>", "", 0))).unwrap();
+        let reply = Draft { account: "b".into(), reply_of: Some(unknown), ..draft("Re: Old plans") };
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: reply, draft_id: None }).await.unwrap();
+        replay_with(&shared, &account("b"), &mut b).await.unwrap();
+        assert_eq!(b.ran.iter().filter(|op| matches!(op, Op::Send { .. })).count(), 2);
+        assert_eq!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().len(), 1, "only the first reply's");
+        assert!(shared.with_writer(|st| st.ops("b", i64::MAX)).unwrap().is_empty());
     }
 
     #[tokio::test]
