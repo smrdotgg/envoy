@@ -18,7 +18,7 @@ use crate::store::Store;
 
 mod wire;
 
-pub use wire::{Fetched, Lost};
+pub use wire::{Fetched, Lost, ServerFlags};
 
 pub type Stream = TlsStream<TcpStream>;
 pub type Session = async_imap::Session<Stream>;
@@ -500,8 +500,7 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
 
     // Flags and deletions for what we already have.
     if let Some(&(min_uid, _)) = local.first() {
-        let flags = wire::fetch(session, true, &format!("{min_uid}:{max_uid}"), "(UID FLAGS)", "FETCH flags").await?;
-        let server: std::collections::HashMap<u32, u32> = flags.iter().filter_map(|f| Some((f.uid?, f.flags.unwrap_or(0)))).collect();
+        let server = wire::uid_flags(session, min_uid, max_uid).await?;
         changed |= store.lock().map_err(|_| anyhow!("store poisoned"))?.reconcile(account, mailbox, &local, &server, window)?;
     }
     store.lock().map_err(|_| anyhow!("store poisoned"))?.mark_synced(account, mailbox)?;

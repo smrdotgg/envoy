@@ -232,6 +232,34 @@ pub(super) async fn fetch(session: &mut async_imap::Session<impl Io>, uid: bool,
     Ok(fetched)
 }
 
+/// The messages in a UID range and their flags, as a finished UID FETCH listed them: the only
+/// listing [`crate::store::Store::reconcile`] takes, so a cached message is deleted as gone
+/// only when an answer the server finished left it out. Made only here, by [`uid_flags`].
+#[derive(Debug)]
+pub struct ServerFlags {
+    flags: std::collections::HashMap<u32, u32>,
+}
+
+impl ServerFlags {
+    /// The message's flags, if the listing had it.
+    pub fn get(&self, uid: u32) -> Option<u32> {
+        self.flags.get(&uid).copied()
+    }
+
+    /// A listing for tests, as if a FETCH had finished with it.
+    #[cfg(test)]
+    pub fn finished(flags: impl IntoIterator<Item = (u32, u32)>) -> ServerFlags {
+        ServerFlags { flags: flags.into_iter().collect() }
+    }
+}
+
+/// UID FETCH of `lo:hi`'s flags. A message without FLAGS in the answer (unasked news of another
+/// one, say) still counts as there.
+pub(super) async fn uid_flags(session: &mut async_imap::Session<impl Io>, lo: u32, hi: u32) -> Result<ServerFlags> {
+    let fetched = fetch(session, true, &format!("{lo}:{hi}"), "(UID FLAGS)", "FETCH flags").await?;
+    Ok(ServerFlags { flags: fetched.iter().filter_map(|f| Some((f.uid?, f.flags.unwrap_or(0)))).collect() })
+}
+
 /// UID SEARCH: the UIDs a finished search found.
 pub(super) async fn uid_search(session: &mut async_imap::Session<impl Io>, query: &str) -> Result<HashSet<u32>> {
     let mut found = HashSet::new();
