@@ -17,7 +17,7 @@ use crate::accounts::{self, Account, AuthKind};
 use crate::imap::{self, Credential, Session};
 use crate::model::{Draft, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use crate::settings::Settings;
-use crate::store::{At, DraftRev, LocalDraft, Op, Query, Store};
+use crate::store::{At, DraftRev, LocalDraft, Op, QueuedOp, Query, Store};
 use crate::{drafts, oauth, paths, secrets, smtp};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1571,7 +1571,7 @@ async fn on_foreground<F: Foreground>(fg: &mut F, session: &mut Option<F::Sessio
     };
     let Err(e) = fg.run(s, job).await else { return Ok(()) };
     *session = None;
-    if fresh || !imap::connection_trouble(&e) {
+    if fresh || !imap::is_lost(&e) {
         return Err(e);
     }
     log::info!("the foreground connection was gone ({e:#}): trying a new one");
@@ -1600,8 +1600,11 @@ async fn foreground_job(shared: &Arc<Shared>, account: &Account, session: &mut S
                 move || shared.emit(Event::Changed { account: id.clone() })
             };
             let out = imap::sync_mailbox(session, &shared.writer, id, mailbox, window, &progress).await?;
-            if let Ok((unread, total)) = imap::status(session, mailbox).await {
-                shared.with_writer(|st| st.set_counts(id, mailbox, unread, total))?;
+            // Counts are a nicety; a lost connection isn't, and ends the job here.
+            match imap::status(session, mailbox).await {
+                Ok((unread, total)) => shared.with_writer(|st| st.set_counts(id, mailbox, unread, total))?,
+                Err(e) if imap::is_lost(&e) => return Err(e),
+                Err(e) => log::debug!("{}: no counts for {mailbox}: {e:#}", account.email),
             }
             shared.emit_mailboxes(id);
             if out.changed {
@@ -1768,8 +1771,10 @@ async fn session_loop(
         inbox_dirty = false;
         if full_due {
             for m in mailboxes.iter().filter(|m| m.selectable) {
-                if let Ok((unread, total)) = imap::status(&mut session, &m.name).await {
-                    shared.with_writer(|st| st.set_counts(&id, &m.name, unread, total))?;
+                match imap::status(&mut session, &m.name).await {
+                    Ok((unread, total)) => shared.with_writer(|st| st.set_counts(&id, &m.name, unread, total))?,
+                    Err(e) if imap::is_lost(&e) => return Err(e),
+                    Err(e) => log::debug!("{}: no counts for {}: {e:#}", account.email, m.name),
                 }
             }
             last_full = Some(Instant::now());
@@ -1877,6 +1882,10 @@ trait OpRunner {
     /// generation of its mailbox the op's UID is from; when the mailbox is in another now, the
     /// op doesn't run and the error is [`imap::NewGeneration`].
     fn run(&mut self, op: &Op, at: &At) -> impl std::future::Future<Output = Result<()>> + Send;
+    /// Hands an [`Op::Send`]'s message to the SMTP server.
+    fn deliver(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send;
+    /// Files a copy of a sent message in `mailbox` (APPEND).
+    fn file_sent(&mut self, mailbox: &str, raw: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send;
     /// The server's (unread, total) for a mailbox.
     fn status(&mut self, mailbox: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send;
     /// Puts a draft in `mailbox`, replacing its `previous` copy ([`imap::replace_draft`]).
@@ -1907,7 +1916,7 @@ impl OpRunner for ImapRunner<'_> {
     }
 
     async fn run(&mut self, op: &Op, at: &At) -> Result<()> {
-        let (shared, account, session) = (self.shared, self.account, &mut *self.session);
+        let session = &mut *self.session;
         let target = |uid: u32| imap::Target { uid, validity: at.validity, message_id: &at.message_id };
         match op {
             Op::SetFlags { mailbox, uid, add, remove } => imap::store_flags(session, mailbox, &target(*uid), *add, *remove).await,
@@ -1915,40 +1924,86 @@ impl OpRunner for ImapRunner<'_> {
             Op::Copy { mailbox, uid, dest } => imap::copy_message(session, mailbox, &target(*uid), dest).await,
             Op::Expunge { mailbox, uid } => imap::expunge(session, self.caps, mailbox, &target(*uid)).await,
             Op::SaveDraft { .. } | Op::PurgeDraft { .. } => Err(anyhow!("draft ops replay through replay_draft")),
-            Op::Send { raw_b64, from, to, sent_mailbox, reply_of } => {
-                let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
-                let cred = shared.credential(account).await?;
-                log::info!("{}: sending to {} recipient(s)", account.email, to.len());
-                let mut size = None;
-                let sent = smtp::send(account, &cred, from, to, &raw, &mut size).await;
-                // Kept whether it went or not: the next message is judged by it.
-                shared.learned_size(&account.id, size);
-                sent?;
-                log::info!("{}: sent", account.email);
-                shared.emit(Event::Toast("Message sent".into()));
-                // From here on the message is out; failures below must not resend it.
-                if let Some(sent) = sent_mailbox
-                    && let Err(e) = imap::append(session, sent, &raw, true).await
-                {
-                    log::warn!("couldn't save to Sent: {e:#}");
-                }
-                // The message replied to is marked answered, in the generation it was replied in,
-                // or where its Message-ID finds it in a new one; never by a UID from an old one.
-                if let Some((mailbox, uid)) = reply_of
-                    && let Err(e) = imap::store_flags(session, mailbox, &target(*uid), flags::ANSWERED, 0).await
-                {
-                    match e.downcast_ref::<imap::NewGeneration>() {
-                        Some(imap::NewGeneration { validity, found: Some(found), .. }) => {
-                            let moved = imap::Target { uid: *found, validity: *validity, message_id: &at.message_id };
-                            let _ = imap::store_flags(session, mailbox, &moved, flags::ANSWERED, 0).await;
-                        }
-                        _ => log::debug!("{}: the message replied to wasn't marked answered: {e:#}", account.email),
-                    }
-                }
-                Ok(())
-            }
+            Op::Send { .. } | Op::Delivered { .. } => Err(anyhow!("sends replay through deliver_and_file")),
         }
     }
+
+    async fn deliver(&mut self, op: &Op) -> Result<()> {
+        let (shared, account) = (self.shared, self.account);
+        let Op::Send { raw_b64, from, to, .. } = op else { return Err(anyhow!("not a send")) };
+        let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
+        let cred = shared.credential(account).await?;
+        log::info!("{}: sending to {} recipient(s)", account.email, to.len());
+        let mut size = None;
+        let sent = smtp::send(account, &cred, from, to, &raw, &mut size).await;
+        // Kept whether it went or not: the next message is judged by it. (It can't fail the
+        // send: a message the server took is reported sent.)
+        shared.learned_size(&account.id, size);
+        sent?;
+        log::info!("{}: sent", account.email);
+        Ok(())
+    }
+
+    async fn file_sent(&mut self, mailbox: &str, raw: &[u8]) -> Result<()> {
+        imap::append(self.session, mailbox, raw, true).await
+    }
+}
+
+/// Replays an [`Op::Send`]: hands its message to the SMTP server, and once that's done
+/// records it at once ([`Op::Delivered`]), before anything else can fail, so the message is
+/// never sent again, whatever happens to filing it.
+async fn deliver_and_file(shared: &Shared, account: &Account, runner: &mut impl OpRunner, q: &mut QueuedOp) -> Result<()> {
+    runner.deliver(&q.op).await?;
+    let Op::Send { raw_b64, sent_mailbox, reply_of, .. } = &q.op else { return Ok(()) };
+    let delivered = Op::Delivered { raw_b64: raw_b64.clone(), sent_mailbox: sent_mailbox.clone(), reply_of: reply_of.clone() };
+    shared.with_writer(|st| st.rewrite_op(q.id, &delivered))?;
+    q.op = delivered;
+    shared.emit(Event::Toast("Message sent".into()));
+    file_delivered(shared, account, runner, q).await
+}
+
+/// What's left of a send once its message is out: a copy in Sent, and the original marked
+/// answered. Each step that's done is recorded, so a lost connection (which keeps the op
+/// queued, to finish on a new one) never files it twice. Other failures are given up on:
+/// the message is out, and these are niceties.
+async fn file_delivered(shared: &Shared, account: &Account, runner: &mut impl OpRunner, q: &mut QueuedOp) -> Result<()> {
+    let Op::Delivered { raw_b64, sent_mailbox, reply_of } = q.op.clone() else { return Ok(()) };
+    if let Some(sent) = &sent_mailbox {
+        match base64::engine::general_purpose::STANDARD.decode(&raw_b64) {
+            Ok(raw) => match runner.file_sent(sent, &raw).await {
+                Err(e) if imap::is_lost(&e) => return Err(e),
+                Err(e) => log::warn!("{}: couldn't save to Sent: {e:#}", account.email),
+                Ok(()) => {}
+            },
+            Err(e) => log::warn!("{}: couldn't save to Sent: {e}", account.email),
+        }
+        q.op = Op::Delivered { raw_b64: raw_b64.clone(), sent_mailbox: None, reply_of: reply_of.clone() };
+        shared.with_writer(|st| st.rewrite_op(q.id, &q.op))?;
+    }
+    // The message replied to is marked answered, in the generation it was replied in, or where
+    // its Message-ID finds it in a new one; never by a UID from an old one.
+    if let Some((mailbox, uid)) = reply_of {
+        let flag = Op::SetFlags { mailbox, uid, add: flags::ANSWERED, remove: 0 };
+        let r = match runner.run(&flag, &q.at).await {
+            Err(e) => match (e.downcast_ref::<imap::NewGeneration>(), &flag) {
+                (Some(imap::NewGeneration { validity, found: Some(found), .. }), _) => {
+                    let at = At { validity: *validity, message_id: q.at.message_id.clone() };
+                    match flag.at_uid(*found) {
+                        Some(moved) => runner.run(&moved, &at).await,
+                        None => Err(e),
+                    }
+                }
+                _ => Err(e),
+            },
+            ok => ok,
+        };
+        match r {
+            Err(e) if imap::is_lost(&e) => return Err(e),
+            Err(e) => log::debug!("{}: the message replied to wasn't marked answered: {e:#}", account.email),
+            Ok(()) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Replays the account's due ops, in order, retrying failures with backoff. True when any
@@ -1971,6 +2026,8 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
     for mut q in ops {
         let mut r = match &q.op {
             Op::SaveDraft { .. } | Op::PurgeDraft { .. } => replay_draft(shared, account, runner, &q.op).await,
+            Op::Send { .. } => deliver_and_file(shared, account, runner, &mut q).await,
+            Op::Delivered { .. } => file_delivered(shared, account, runner, &mut q).await,
             op => runner.run(op, &q.at).await,
         };
         // The op's mailbox has a new generation since it was queued: its UID may name another
@@ -2020,9 +2077,12 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
                     recount.push(mailbox.clone());
                 }
             }
+            // The connection went (by the error's type, not its words): the op goes back in the
+            // queue as it was, no attempt counted, and the pass stops so the worker connects
+            // again. However often the network fails, a valid change is never given up on for it.
+            Err(e) if imap::is_lost(&e) => return Err(e),
             Err(e) => {
                 let msg = format!("{e:#}");
-                let connection_lost = msg.contains("timed out") || msg.contains("connection") || msg.contains("Connection") || msg.contains("broken pipe");
                 let draft_op = matches!(q.op, Op::SaveDraft { .. } | Op::PurgeDraft { .. });
                 // A message too big for its server: no retry changes that. Off the queue, back
                 // in the composer, saying why.
@@ -2059,7 +2119,7 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
                             _ => format!("Couldn't remove a draft from Drafts on {} ({msg}). Envoy keeps trying.", account.email),
                         }));
                     }
-                } else if q.attempts >= 5 && !connection_lost && !matches!(q.op, Op::Send { .. }) {
+                } else if q.attempts >= 5 && !matches!(q.op, Op::Send { .. } | Op::Delivered { .. }) {
                     // A move that never happened: its message shows again where it still is.
                     shared.with_writer(|st| st.op_dropped(q.id))?;
                     any = true;
@@ -2072,9 +2132,6 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
                         shared.emit(Event::Error(format!("Couldn't send yet ({msg}). Envoy will keep trying.")));
                     }
                 }
-                if connection_lost {
-                    return Err(e);
-                }
             }
         }
     }
@@ -2085,6 +2142,7 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
     for mailbox in &recount {
         match runner.status(mailbox).await {
             Ok((unread, total)) => shared.with_writer(|st| st.set_counts(&account.id, mailbox, unread, total))?,
+            Err(e) if imap::is_lost(&e) => return Err(e),
             Err(e) => log::debug!("{}: couldn't recount {mailbox}: {e:#}", account.email),
         }
     }
@@ -2164,7 +2222,7 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
                 shared.with_writer(|st| st.draft_purged(*d, now()))?;
             }
         }
-        op => return runner.run(op, &At::default()).await,
+        _ => return Err(anyhow!("not a draft op")),
     }
     Ok(())
 }
@@ -2265,6 +2323,11 @@ mod tests {
         /// Every mailbox is in generation `.0` (UIDVALIDITY), where messages are found again by
         /// Message-ID at these UIDs.
         generation: Option<(u32, Vec<(&'static str, u32)>)>,
+        /// A failing server's connection drops instead (inside a literal: an I/O error).
+        lost: bool,
+        /// Where sent messages were filed, and whether the next filing's connection drops.
+        filed: Vec<String>,
+        filing_drops: bool,
     }
 
     impl FakeServer {
@@ -2284,6 +2347,9 @@ mod tests {
                 cut_off: false,
                 too_big: None,
                 generation: None,
+                lost: false,
+                filed: vec![],
+                filing_drops: false,
             }
         }
 
@@ -2291,6 +2357,9 @@ mod tests {
         fn on_the_wire(&mut self) -> Result<()> {
             if let Some(during) = self.during.take() {
                 during(&self.shared);
+            }
+            if self.fail && self.lost {
+                return Err(anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "bytes remaining in stream")));
             }
             if self.fail { Err(anyhow::Error::new(async_imap::error::Error::No(self.failure.into()))) } else { Ok(()) }
         }
@@ -2311,6 +2380,12 @@ mod tests {
                 let e = imap::NewGeneration { mailbox: mailbox.to_owned(), validity: *validity, found };
                 return futures::future::Either::Left(async move { Err(e.into()) });
             }
+            self.ran.push(op.clone());
+            let r = self.on_the_wire();
+            futures::future::Either::Right(async move { r })
+        }
+
+        fn deliver(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send {
             let r = match (op, self.too_big) {
                 // Refused before a byte goes, the size learned, as smtp::send does.
                 (Op::Send { raw_b64, .. }, Some(limit)) => {
@@ -2322,7 +2397,13 @@ mod tests {
                     self.on_the_wire()
                 }
             };
-            futures::future::Either::Right(async move { r })
+            async move { r }
+        }
+
+        fn file_sent(&mut self, mailbox: &str, _: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            self.filed.push(mailbox.to_owned());
+            let r = if std::mem::take(&mut self.filing_drops) { Err(anyhow::Error::new(imap::Lost("APPEND: the connection closed".into()))) } else { Ok(()) };
+            async move { r }
         }
 
         fn status(&mut self, _: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send {
@@ -2355,7 +2436,7 @@ mod tests {
                 gone
             });
             let r = match r {
-                Ok(_) if std::mem::take(&mut self.cut_off) => Err(anyhow!("connection lost")),
+                Ok(_) if std::mem::take(&mut self.cut_off) => Err(anyhow::Error::new(imap::Lost("EXPUNGE: the connection closed before the server finished".into()))),
                 r => r,
             };
             async move { r }
@@ -2654,6 +2735,46 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn a_lost_connection_never_counts_toward_giving_up() {
+        let st = setup();
+        let id = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        let (shared, _rx) = engine_with(st);
+        due_move(&shared, vec![id], 7);
+        // The connection drops inside a literal, again and again (a flaky network): async-imap
+        // says "bytes remaining in stream". The move must wait it out, however long.
+        for _ in 0..8 {
+            let mut server = FakeServer { fail: true, ..FakeServer::new(&shared, |_: &Shared| {}) };
+            server.lost = true;
+            assert!(replay_with(&shared, &account("a"), &mut server).await.is_err(), "the pass stops, to reconnect");
+            assert_eq!(server.ran.len(), 1);
+            shared.with_writer(|st| Ok(st.conn_for_tests().execute("UPDATE ops SET not_before = 0", [])?)).unwrap();
+        }
+        let queued = shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap();
+        assert_eq!((queued.len(), queued[0].attempts), (1, 0), "still queued, no attempt counted");
+        assert!(visible(&shared.writer.lock().unwrap(), "INBOX").is_empty(), "still hidden");
+    }
+
+    #[tokio::test]
+    async fn a_message_out_before_the_connection_drops_is_never_sent_again() {
+        let (shared, _rx) = engine_with(setup());
+        let raw_b64 = base64::engine::general_purpose::STANDARD.encode(b"Subject: hi\r\n\r\nhello\r\n");
+        let send = Op::Send { raw_b64, from: "me@x.com".into(), to: vec!["you@x.com".into()], sent_mailbox: Some("Sent".into()), reply_of: None };
+        shared.with_writer(|st| st.enqueue("a", &send)).unwrap();
+        // SMTP takes it; the IMAP connection drops while it's filed in Sent.
+        let mut server = FakeServer { filing_drops: true, ..FakeServer::new(&shared, |_: &Shared| {}) };
+        assert!(replay_with(&shared, &account("a"), &mut server).await.is_err(), "the pass stops, to reconnect");
+        let sends = |server: &FakeServer| server.ran.iter().filter(|op| matches!(op, Op::Send { .. })).count();
+        assert_eq!(sends(&server), 1);
+        let queued = shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap();
+        assert!(matches!(&queued[..], [q] if matches!(&q.op, Op::Delivered { sent_mailbox: Some(_), .. }) && q.attempts == 0), "{:?}", queued.iter().map(|q| (&q.op, q.attempts)).collect::<Vec<_>>());
+        // On the new connection: filed, not sent again.
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(sends(&server), 1, "sent once: {:?}", server.ran);
+        assert_eq!(server.filed, ["Sent", "Sent"]);
+        assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty());
+    }
+
     #[test]
     fn changes_from_before_the_update_that_cant_be_proven_go_with_one_notice() {
         let st = setup();
@@ -2792,7 +2913,9 @@ mod tests {
             if self.refuse {
                 return Err(anyhow::Error::new(async_imap::error::Error::No("no such mailbox".into())));
             }
-            anyhow::ensure!(*session >= self.stale, "SELECT timed out (connection lost?)");
+            if *session < self.stale {
+                return Err(anyhow::Error::new(imap::Lost("SELECT timed out".into())));
+            }
             Ok(())
         }
     }
