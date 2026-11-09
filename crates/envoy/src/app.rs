@@ -416,6 +416,9 @@ pub struct App {
     pub view: View,
     pub list: Vec<Summary>,
     pub list_req: u64,
+    /// The list asked for last hasn't all arrived: a change made here meanwhile asks again
+    /// ([`App::list_changed_here`]).
+    pub list_pending: bool,
     pub list_loaded: bool,
     /// False while `list` is the top of a longer list whose rest is on its way.
     pub list_complete: bool,
@@ -519,6 +522,7 @@ impl App {
             view: View::Role { account: None, role: Role::Inbox },
             list: Vec::new(),
             list_req: 0,
+            list_pending: false,
             list_loaded: false,
             list_complete: true,
             list_gen: 0,
@@ -651,6 +655,7 @@ impl App {
                 self.list_complete = !more;
                 self.list_gen += 1;
                 if !more {
+                    self.list_pending = false;
                     // Selected rows that went (moved elsewhere, say) drop out; the rest stay
                     // selected wherever they are now. A first page isn't the whole list.
                     self.selection.retain(&self.list);
@@ -925,6 +930,7 @@ impl App {
             return;
         }
         self.list_req += 1;
+        self.list_pending = true;
         self.list_at_once = at_once;
         self.send(Command::List {
             req: self.list_req,
@@ -1041,6 +1047,7 @@ impl App {
             s.thread_unread = false;
         }
         self.send(Command::SetFlags { ids: vec![id], add: flags::SEEN, remove: 0, thread: self.conversations() });
+        self.list_changed_here();
         if self.demo {
             for m in self.thread.iter_mut() {
                 m.summary.flags |= flags::SEEN;
@@ -1089,6 +1096,15 @@ impl App {
         rows.iter()
             .map(|r| (r.account.clone(), r.mailbox.clone(), i64::from(r.thread_unread), if conversations { i64::from(r.thread_count.max(1)) } else { 1 }))
             .collect()
+    }
+
+    /// A change was just made here, optimistically, to rows on screen. A list read before it
+    /// and still on its way would show them as they were for a moment (an archived row coming
+    /// back, say), so it's asked for again: the engine reads the new one after the change.
+    fn list_changed_here(&mut self) {
+        if self.list_pending {
+            self.request_list_as(self.list_at_once);
+        }
     }
 
     pub fn close_message(&mut self) {
@@ -1292,6 +1308,7 @@ impl App {
         let snapshot = key.map(|key| self.snapshot(key, &ids));
         self.send(Command::Move { ids: ids.clone(), to, thread: self.conversations(), undo: key });
         self.after_remove(&ids, tx);
+        self.list_changed_here();
         let label = if forever { "Deleted forever".to_owned() } else { label };
         let Some(snapshot) = snapshot else {
             self.toast(label, false);
@@ -1360,7 +1377,9 @@ impl App {
         if let Some(c) = m.compose.take() {
             self.reopen(*c);
         }
-        if !self.restore_rows(&m) {
+        let shown = self.restore_rows(&m);
+        self.list_changed_here();
+        if !shown {
             return;
         }
         if let Some(id) = m.open {
@@ -1692,6 +1711,7 @@ impl App {
         let (add, remove) = if starred { (0, flags::FLAGGED) } else { (flags::FLAGGED, 0) };
         // Unstarring a conversation clears every star in it; starring marks the one message.
         self.send(Command::SetFlags { ids: vec![id], add, remove, thread: starred && self.conversations() });
+        self.list_changed_here();
     }
 
     pub fn toggle_read(&mut self, id: MessageId) {
@@ -1715,6 +1735,7 @@ impl App {
         let (add, remove) = if read { (flags::SEEN, 0) } else { (0, flags::SEEN) };
         let open_too = self.open.is_some_and(|o| ids.contains(&o));
         self.send(Command::SetFlags { ids, add, remove, thread: self.conversations() });
+        self.list_changed_here();
         if !read && open_too {
             self.close_message();
         }
@@ -1734,6 +1755,7 @@ impl App {
         }
         let (add, remove) = if star { (flags::FLAGGED, 0) } else { (0, flags::FLAGGED) };
         self.send(Command::SetFlags { ids, add, remove, thread: !star && self.conversations() });
+        self.list_changed_here();
     }
 
     // ── compose ──
@@ -3843,6 +3865,35 @@ mod tests {
         // Marked unread again: counted again.
         app.toggle_read(first);
         assert_eq!(inbox_counts(&app), (unread, total));
+    }
+
+    #[test]
+    fn a_list_read_before_a_change_doesnt_undo_it_on_screen() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let mut tx = Tx::default();
+        app.list = long_list(&app, 5);
+        // A sync asked for the list; before it comes, row 2 is archived.
+        app.reload();
+        let stale = app.list_req;
+        app.archive(vec![2], &mut tx);
+        assert!(app.list_req > stale, "asked again, after the archive");
+        // The list read before the archive arrives: it still has row 2.
+        app.apply(Event::List { req: stale, items: long_list(&app, 5), more: false }, &mut tx);
+        assert!(!app.list.iter().any(|s| s.id == 2), "the archived row doesn't come back");
+        app.apply(Event::List { req: app.list_req, items: long_list(&app, 5).into_iter().filter(|s| s.id != 2).collect(), more: false }, &mut tx);
+        assert!(!app.list_pending);
+        // Nothing on its way: nothing extra to ask for (the engine's reload follows the change).
+        let req = app.list_req;
+        app.archive(vec![3], &mut tx);
+        app.set_read(vec![4], true);
+        assert_eq!(app.list_req, req);
+        // A read mark made while a list is on its way isn't undone by it either.
+        app.reload();
+        let stale = app.list_req;
+        app.set_read(vec![5], false);
+        assert!(app.list_req > stale);
     }
 
     /// The demo account, and a second, non-Gmail one with a Work folder too; a row in each
