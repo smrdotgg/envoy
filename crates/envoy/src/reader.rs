@@ -218,40 +218,54 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
 
 /// A quiet line over mail whose remote images are hidden (`reading.loadImages` "ask" and a
 /// sender not in `reading.imagesFrom`): load them for this message, or always from the sender.
+/// On one line while it fits; in a narrower reader the actions wrap onto a second line, and a
+/// long address ends in "…" (the button still says it whole to assistive technology).
 fn images_bar(t: &Theme, id: i64, sender: &str) -> El {
     let k = &t.k;
-    let mut bar = row()
+    let label = row()
+        .gap(8.0)
+        .h(20.0)
+        .center_y()
+        .grow(1.0)
+        .min_w(0.0)
+        .child(icon(&icons::IMAGE, 14.0).color(k.c.icon_faint))
+        .child(text("Images hidden").font(k.ty.text_small).color(k.c.text_muted).truncate());
+    let mut actions = row().gap(2.0).center_y().shrink().child(
+        Button::new("Load images")
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .on_press(move |s: &mut App| s.load_images(id))
+            .build(k)
+            .key(format!("images-load-{id}")),
+    );
+    if !sender.trim().is_empty() {
+        let sender = sender.trim().to_lowercase();
+        let label = format!("Always load from {sender}");
+        let shown = label.clone();
+        actions = actions.child(
+            Button::new(label)
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Small)
+                .label_with(move |font, ink| text(shown).font(font).color(ink).truncate())
+                .on_press(move |s: &mut App| s.allow_images_from(&sender))
+                .build(k)
+                .shrink()
+                .key(format!("images-always-{id}")),
+        );
+    }
+    row()
         .key(format!("images-bar-{id}"))
         .w_full()
-        .gap(8.0)
+        .flex_wrap()
+        .gaps(0.0, 8.0)
         .pl(10.0)
         .pr(4.0)
         .py(2.0)
         .center_y()
         .radius(8.0)
         .fill(k.c.layer_01)
-        .child(icon(&icons::IMAGE, 14.0).color(k.c.icon_faint))
-        .child(text("Images hidden").font(k.ty.text_small).color(k.c.text_muted).grow(1.0).min_w(0.0))
-        .child(
-            Button::new("Load images")
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut App| s.load_images(id))
-                .build(k)
-                .key(format!("images-load-{id}")),
-        );
-    if !sender.trim().is_empty() {
-        let sender = sender.trim().to_lowercase();
-        bar = bar.child(
-            Button::new(format!("Always load from {sender}"))
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut App| s.allow_images_from(&sender))
-                .build(k)
-                .key(format!("images-always-{id}")),
-        );
-    }
-    bar
+        .child(label)
+        .child(actions)
 }
 
 /// A quiet line over mail the native renderer can't lay out as designed (positioned layers,
@@ -474,9 +488,39 @@ pub fn reader(s: &App, t: &Theme, _cx: &mut Cx<App>, layer: &mut Vec<El>) -> El 
 
 #[cfg(test)]
 mod tests {
-    use rune::{Env, Runtime};
+    use rune::{Cx, El, Env, Runtime, col};
 
     use crate::app::App;
+
+    fn bar_at(width: f32) -> Vec<rune::ElementInfo> {
+        fn view(w: &f32, _: &mut Cx<f32>) -> El {
+            let t = crate::theme::build(&envoy_core::settings::Settings::default(), false);
+            col().key("pane").w(*w).child(super::images_bar(&t, 7, "Maya.Chen-Reviews@northwind-design.example"))
+        }
+        let mut rt = Runtime::new(width, view, (width, 200.0), Env::new(false, 1.0));
+        rt.frame(0.0);
+        rt.elements()
+    }
+
+    #[test]
+    fn the_images_bar_wraps_instead_of_overflowing() {
+        for width in [640.0, 360.0, 240.0] {
+            let els = bar_at(width);
+            let find = |s: &str| els.iter().find(|e| e.text.as_deref().is_some_and(|t| t.starts_with(s))).unwrap_or_else(|| panic!("{s:?} at {width}")).rect;
+            for e in &els {
+                assert!(e.rect[0] >= -0.5 && e.rect[0] + e.rect[2] <= width + 0.5, "at {width} pt {:?} spans {:?}", e.text.as_deref().unwrap_or(&e.path), e.rect);
+            }
+            let (hidden, load, always) = (find("Images hidden"), find("Load images"), find("Always load from"));
+            let overlap = |a: [f32; 4], b: [f32; 4]| a[0] < b[0] + b[2] - 0.5 && b[0] < a[0] + a[2] - 0.5 && a[1] < b[1] + b[3] - 0.5 && b[1] < a[1] + a[3] - 0.5;
+            assert!(!overlap(hidden, load) && !overlap(hidden, always) && !overlap(load, always), "at {width} pt the bar's parts overlap: {hidden:?} {load:?} {always:?}");
+            let middle = |r: [f32; 4]| r[1] + r[3] / 2.0;
+            if width >= 640.0 {
+                assert!((middle(load) - middle(hidden)).abs() < 2.0, "one line at {width} pt: {hidden:?} {load:?}");
+            } else {
+                assert!(load[1] >= hidden[1] + hidden[3], "the actions move to a second line at {width} pt: {hidden:?} {load:?}");
+            }
+        }
+    }
 
     #[test]
     fn message_bodies_are_fitted_to_the_reader_they_are_in() {
