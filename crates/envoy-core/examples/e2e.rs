@@ -150,7 +150,7 @@ fn scenario(pass: Pass) {
     let proxy = (pass == Pass::Plain).then(|| Proxy::start(&home));
 
     println!("seeding {user}'s mailboxes…");
-    probe.reset(&["Trash", "Sent", "Archive", "Junk", "Drafts", "Old Projects"]);
+    probe.reset(&["Trash", "Sent", "Archive", "Junk", "Drafts", "Old Projects", "Receipts"]);
     for i in 0..3 {
         probe.append("Junk", "", &raw(user, &format!("Win a prize {i}"), &format!("<spam-{i}@x>")));
     }
@@ -301,6 +301,58 @@ fn scenario(pass: Pass) {
     watch_holds(&mut d, vec![Hold { what: "the move", deadline: due, on_server: Box::new(|| !probe.live("Old Projects").is_empty() || !probe.live("INBOX").contains(&ping.subject)) }]);
     d.until("the move on the server", 10, |_| (probe.live("Old Projects") == [ping.subject.clone()] && !probe.live("INBOX").contains(&ping.subject)).then_some(()));
     println!("✓ moved to \"Old Projects\", after the window and not before");
+
+    // ── Labels and moves of several messages at once ──
+    // A label is a copy in the label's mailbox (Gmail's labels are mailboxes; GreenMail's
+    // folders do for the check), the message staying where it is. Two messages moved at once
+    // (a multi-select) wait under one undo key. Each is undone first: nothing reaches the server.
+    deliver(user, "Batch one", "Eve <eve@localhost>", "First of two.", |b| b);
+    deliver(user, "Batch two", "Eve <eve@localhost>", "Second of two.", |b| b);
+    let batch = d.until("the two to move", 20, |d| {
+        let ids: Vec<_> = d.list(&inbox, "", false).iter().filter(|s| s.subject.starts_with("Batch ")).map(|s| s.id).collect();
+        (ids.len() == 2).then_some(ids)
+    });
+    let in_inbox = |d: &mut Driver, ids: &[i64]| d.list(&inbox, "", false).iter().filter(|s| ids.contains(&s.id)).count();
+    let (mark, before) = (d.mark(), epoch());
+    d.send(Command::Copy { ids: vec![digest.id], mailbox: "Receipts".into(), thread: false, undo: Some(30) });
+    d.send(Command::Move { ids: batch.clone(), to: MoveTarget::Mailbox("Old Projects".into()), thread: false, undo: Some(32) });
+    d.wait(mark, "the label held", 5, |e| matches!(e, Event::Held { undo: 30, ops: 1 }).then_some(()));
+    d.wait(mark, "the batch held", 5, |e| matches!(e, Event::Held { undo: 32, ops: 2 }).then_some(()));
+    let (label_undone, batch_undone) = (deadline("batch = 30"), deadline("batch = 32"));
+    assert_hold("the label", label_undone, before, epoch(), MOVE_HOLD);
+    assert_hold("the batch move", batch_undone, before, epoch(), MOVE_HOLD);
+    assert_eq!((in_inbox(&mut d, &batch), in_inbox(&mut d, &[digest.id])), (0, 1), "the batch leaves the inbox at once, the labeled message stays");
+    d.send(Command::UndoMove { undo: 30 });
+    d.send(Command::UndoMove { undo: 32 });
+    assert_eq!(in_inbox(&mut d, &batch), 2, "one undo brings both back");
+    untouched_until(&mut d, "the undone label or batch reached the server", label_undone.max(batch_undone) as f64 + 3.0, || {
+        probe.live("Receipts").is_empty() && probe.live("Old Projects") == [ping.subject.clone()] && probe.live("INBOX").iter().filter(|s| s.starts_with("Batch ")).count() == 2
+    });
+    println!("✓ a label and a two-message move, undone: back here, the server untouched past the window");
+    // Then for good: after the window, one copy in Receipts and the message still in the inbox;
+    // both moved messages in Old Projects.
+    let (mark, before) = (d.mark(), epoch());
+    d.send(Command::Copy { ids: vec![digest.id], mailbox: "Receipts".into(), thread: false, undo: Some(31) });
+    d.send(Command::Move { ids: batch.clone(), to: MoveTarget::Mailbox("Old Projects".into()), thread: false, undo: Some(33) });
+    d.wait(mark, "the label held", 5, |e| matches!(e, Event::Held { undo: 31, ops: 1 }).then_some(()));
+    d.wait(mark, "the batch held", 5, |e| matches!(e, Event::Held { undo: 33, ops: 2 }).then_some(()));
+    let (label_due, batch_due) = (deadline("batch = 31"), deadline("batch = 33"));
+    assert_hold("the label", label_due, before, epoch(), MOVE_HOLD);
+    assert_hold("the batch move", batch_due, before, epoch(), MOVE_HOLD);
+    watch_holds(
+        &mut d,
+        vec![
+            Hold { what: "the label", deadline: label_due, on_server: Box::new(|| !probe.live("Receipts").is_empty()) },
+            Hold { what: "the batch move", deadline: batch_due, on_server: Box::new(|| probe.live("Old Projects").len() > 1 || probe.live("INBOX").iter().filter(|s| s.starts_with("Batch ")).count() < 2) },
+        ],
+    );
+    d.until("the label and the batch on the server", 10, |_| {
+        let moved = sorted(probe.live("Old Projects")) == sorted(vec!["Batch one".to_owned(), "Batch two".to_owned(), ping.subject.clone()]);
+        let labeled = probe.live("Receipts") == [digest.subject.clone()] && probe.live("INBOX").contains(&digest.subject);
+        (moved && labeled && !probe.live("INBOX").iter().any(|s| s.starts_with("Batch "))).then_some(())
+    });
+    assert_eq!(in_inbox(&mut d, &[digest.id]), 1, "labeled, still in the inbox here too");
+    println!("✓ labeled: one copy in Receipts, the message where it was; both moved messages in Old Projects");
 
     // ── Sending, with undo ──
     let (mark, before) = (d.mark(), epoch());
