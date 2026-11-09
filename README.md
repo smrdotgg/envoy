@@ -232,6 +232,10 @@ cargo run -p envoy-core --example e2e           # both passes, ~3 minutes; `-- f
 docker stop envoy-greenmail
 ```
 
+CI runs it on a debug build and again on a dist build linked like the shipped Linux binary, with
+identical functions folded: `cargo rustc --profile dist -p envoy-core --example e2e -- -Clink-arg=-Wl,--icf=safe`,
+then `target/dist/examples/e2e`.
+
 Each pass empties its GreenMail user's mailboxes first, so it can run again against the same server.
 
 **Latency budgets** ([`docs/NORTH_STAR.md`](docs/NORTH_STAR.md)) are checked in CI on all three OSes
