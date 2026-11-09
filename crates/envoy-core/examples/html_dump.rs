@@ -81,8 +81,8 @@ fn outline(nodes: &[Node], depth: usize) {
                     outline(kids, depth + 2);
                 }
             }
-            Node::Columns { cells, align } => {
-                println!("{pad}Columns {align:?}");
+            Node::Columns { cells, align, rtl } => {
+                println!("{pad}Columns {align:?}{}", if *rtl { " rtl" } else { "" });
                 for (s, kids) in cells {
                     println!("{pad}  Col [{}]", boxed(s));
                     outline(kids, depth + 2);

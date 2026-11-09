@@ -2,6 +2,14 @@
 //! with links, boxes and buttons with borders and background pictures, table rows on their
 //! column grid, fluid columns that wrap, images.
 //!
+//! Nothing reaches past the reader, whatever widths the mail asks for: the tree is drawn at
+//! the width the reader has ([`Ctx::width`]), and each box knows the room it gets from it
+//! (`Local::room`). Fixed widths, minimums, pictures and padding are capped at that room, as
+//! `max-width: 100%` does in mail clients; text breaks inside a word that's longer than its
+//! line (long links); fluid columns stack when the message is narrow, as responsive mail does
+//! on phones. The tree itself doesn't change with the width: dragging the divider rebuilds
+//! these elements, never the tree.
+//!
 //! Colours adapt to the theme by default: near-white backgrounds drop away, near-black text
 //! becomes the theme's ink, dark accents brighten in dark mode. Coloured boxes (buttons,
 //! banners, pictures) keep their own colours and their text's. "Original" draws the mail as
@@ -22,8 +30,34 @@ pub struct Ctx<'a> {
     pub adapt: bool,
     pub load_images: bool,
     pub copy_links: bool,
+    /// `reading.maxWidth`: the widest a message is drawn.
     pub max_w: f32,
+    /// The width the reader gives the message, in points, as last laid out (up to a few points
+    /// under: it's read in steps). What the mail sizes is fitted to it.
+    pub width: f32,
 }
+
+impl Ctx<'_> {
+    /// The width the message's content is laid out at: the reader's, up to `reading.maxWidth`,
+    /// less the page's margin when it's drawn on a page of its own ("Original").
+    fn content_width(&self) -> f32 {
+        if self.adapt { self.width.min(self.max_w) } else { self.width.min(self.max_w + 2.0 * PAGE_PAD) - 2.0 * PAGE_PAD }.max(0.0)
+    }
+}
+
+/// The margin round mail drawn as designed, on a light page of its own.
+const PAGE_PAD: f32 = 16.0;
+
+/// Fluid columns stack, one under another, when the message is laid out narrower than this:
+/// two columns of 240 points, where MJML and Cerberus templates switch to one column.
+const STACK_BELOW: f32 = 480.0;
+
+/// Fluid columns also stack when one of them would be narrower than this.
+const MIN_COLUMN: f32 = 120.0;
+
+/// The most of a box's room its side padding (or margins) may take: past it, both sides shrink
+/// in proportion, so a padded box in a narrow column still has room for its content.
+const MAX_INSET: f32 = 1.0 / 3.0;
 
 /// The serif face for `font-family: Georgia, serif` and kin: one every install of the OS has
 /// (Rune falls back to the sans face when it's missing).
@@ -42,6 +76,16 @@ struct Local {
     ink: Color,
     /// The email's own background behind this point (before adapting), if it set one.
     under: Option<Rgba>,
+    /// The widest the content here can be, in points: the message's width less the padding,
+    /// margins and column shares around it. Fixed sizes are capped at it.
+    room: f32,
+}
+
+/// Left and right insets (padding or margins) fitted to `room`: as given, or shrunk in
+/// proportion to [`MAX_INSET`] of it.
+fn fit_sides(left: f32, right: f32, room: f32) -> (f32, f32) {
+    let (sum, most) = (left + right, room.max(0.0) * MAX_INSET);
+    if sum > most && sum > 0.0 { (left * most / sum, right * most / sum) } else { (left, right) }
 }
 
 fn srgb8(r: u8, g: u8, b: u8) -> Color {
@@ -197,7 +241,8 @@ fn para(cx: &Ctx, p: &Para, l: Local) -> El {
         Family::Serif => font.family(rune::Family::Named(SERIF)),
         Family::Mono => font.mono(),
     };
-    let mut e = rich(content, spans).font(font).wrap().selectable(true).align(align);
+    // A word longer than its line (a long link) breaks inside rather than running off.
+    let mut e = rich(content, spans).font(font).wrap_anywhere().selectable(true).align(align);
     if !strikes.is_empty() {
         e = e.strikes(strikes);
     }
@@ -216,21 +261,33 @@ fn para(cx: &Ctx, p: &Para, l: Local) -> El {
 fn image(cx: &Ctx, img: &Img, l: Local) -> El {
     let k = &cx.t.k;
     let state = cx.images.get(&img.src);
+    let room = l.room.max(1.0);
     let mut e = match state {
         Some(ImageState::Ready(i)) => {
             let [pw, ph] = i.size().unwrap_or([img.width.unwrap_or(100.0) as u32, img.height.unwrap_or(100.0) as u32]);
             let ratio = pw.max(1) as f32 / ph.max(1) as f32;
             let w = img.width.unwrap_or(pw as f32).min(cx.max_w);
             let e = el().pixels(i.pixels());
-            // In a box sized by its content an image takes its own size; elsewhere it fills
-            // the column up to its width, scaling down when the column is narrower.
-            if l.tight { e.w(w).h(w / ratio) } else { e.w_full().max_w(w).aspect_ratio(ratio) }
+            // In a box sized by its content an image takes its own size, scaled down to the
+            // room it has; elsewhere it fills the column up to its width, scaling down when
+            // the column is narrower.
+            if l.tight {
+                let w = w.min(room);
+                e.w(w).h(w / ratio)
+            } else {
+                e.w_full().max_w(w).aspect_ratio(ratio)
+            }
         }
         Some(ImageState::Loading) if cx.load_images => {
             let (w, h) = (img.width.unwrap_or(0.0).min(cx.max_w), img.height.unwrap_or(0.0));
             if w > 0.0 && h > 0.0 {
                 let e = el().radius(4.0).fill(k.c.layer_01);
-                if l.tight { e.w(w).h(h) } else { e.w_full().max_w(w).aspect_ratio(w / h) }
+                if l.tight {
+                    let fit = w.min(room);
+                    e.w(fit).h(fit * h / w)
+                } else {
+                    e.w_full().max_w(w).aspect_ratio(w / h)
+                }
             } else {
                 el()
             }
@@ -239,7 +296,10 @@ fn image(cx: &Ctx, img: &Img, l: Local) -> El {
             if img.alt.is_empty() || img.alt.len() > 120 {
                 return el();
             }
-            text(format!("[{}]", img.alt)).font(rune::TextStyle::new(12.0, 400.0).italic()).color(k.c.text_faint)
+            // The picture's description in its place, kept to the picture's width and the
+            // room it has: two lines at most, ending in "…" when it's longer.
+            let w = img.width.map_or(room, |w| w.max(48.0).min(room));
+            text(format!("[{}]", img.alt)).font(rune::TextStyle::new(12.0, 400.0).italic()).color(k.c.text_faint).wrap_anywhere().max_lines(2).max_w(w)
         }
     };
     if let Some(h) = &img.href {
@@ -256,7 +316,8 @@ fn items(a: Align) -> fn(El) -> El {
     }
 }
 
-/// A box's own look and content; its width and margins are the caller's.
+/// A box's own look and content; its width and margins are the caller's, and `l.room` is the
+/// widest the box can be.
 fn styled_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
     let picture = cx.picture(&s.bg_image);
     let own = s.bg.map(rgba);
@@ -280,8 +341,9 @@ fn styled_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
     } else {
         (None, false, l.ink)
     };
-    let inner = Local { on_color, tight: s.tight || l.tight, ink, under: s.bg.or(l.under) };
-    let mut e = items(s.align)(col()).pt(s.pad[0]).pr(s.pad[1]).pb(s.pad[2]).pl(s.pad[3]);
+    let (pl, pr) = fit_sides(s.pad[3], s.pad[1], l.room);
+    let inner = Local { on_color, tight: s.tight || l.tight, ink, under: s.bg.or(l.under), room: (l.room - pl - pr).max(0.0) };
+    let mut e = items(s.align)(col()).pt(s.pad[0]).pr(pr).pb(s.pad[2]).pl(pl);
     e = match s.valign {
         VAlign::Top => e.justify_start(),
         VAlign::Middle => e.justify_center(),
@@ -316,8 +378,18 @@ fn styled_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
 
 /// A box in a column of blocks: its width, then its margins.
 fn block_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
-    let mut e = styled_box(cx, s, children, l);
     let tight = s.tight || l.tight;
+    let (ml, mr) = fit_sides(s.margin[3], s.margin[1], l.room);
+    let outer = (l.room - ml - mr).max(0.0);
+    // The widest the box can be: its own width, capped by its maximum and the room it has.
+    let own = match s.width {
+        Some(Len::Px(w)) => w.min(outer),
+        Some(Len::Pct(p)) if !tight && p < 99.5 => outer * (p / 100.0).clamp(0.05, 1.0),
+        _ => outer,
+    }
+    .min(s.max_width.unwrap_or(f32::MAX))
+    .max(s.min_width.min(outer));
+    let mut e = styled_box(cx, s, children, Local { room: own, ..l });
     if tight {
         if let Some(Len::Px(w)) = s.width {
             e = e.w_full().max_w(w);
@@ -336,56 +408,113 @@ fn block_box(cx: &Ctx, s: &BoxStyle, children: &[Node], l: Local) -> El {
         }));
     }
     if s.min_width > 0.0 {
-        e = e.min_w(s.min_width.min(cx.max_w));
+        e = e.min_w(s.min_width.min(outer));
     }
     if s.margin != [0.0; 4] {
         // Margins as padding round it, so a full-width box with margins still fits.
-        let wrap = items(s.align)(col()).pt(s.margin[0]).pr(s.margin[1]).pb(s.margin[2]).pl(s.margin[3]);
+        let wrap = items(s.align)(col()).pt(s.margin[0]).pr(mr).pb(s.margin[2]).pl(ml);
         e = if tight { wrap.child(e) } else { wrap.w_full().child(e) };
     }
     e
 }
 
 fn cells(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], gap: f32, l: Local) -> El {
+    // The room the cells share, and their minimums (small fixed columns, longest words):
+    // as given while they all fit, so a cell may take more than its share at the expense of
+    // the others; scaled down together when they don't.
+    let free = (l.room - gap * cells.len().saturating_sub(1) as f32).max(0.0);
+    let mins: f32 = cells.iter().map(|(s, _)| s.min_width.min(free)).sum();
+    let scale = if mins > free && mins > 0.0 { free / mins } else { 1.0 };
     // Cells stretch to the row's height, as table cells do; `valign` places their content.
     let mut r = row().w_full().gap(gap).items_stretch();
     for (s, kids) in cells {
-        let mut c = styled_box(cx, s, kids, Local { tight: false, ..l });
+        let min = s.min_width.min(free) * scale;
+        let w = match s.width {
+            Some(Len::Px(w)) if kids.is_empty() => w.min(40.0).min(free),
+            Some(Len::Px(w)) => w.min(free),
+            Some(Len::Pct(p)) => l.room * (p / 100.0).clamp(0.01, 1.0),
+            None => free,
+        }
+        .max(min)
+        .min(free);
+        let mut c = styled_box(cx, s, kids, Local { tight: false, room: w, ..l });
         c = match s.width {
-            Some(Len::Px(w)) if kids.is_empty() => c.w(w.min(40.0)),
+            Some(Len::Px(w)) if kids.is_empty() => c.w(w.min(40.0)).shrink(),
             Some(Len::Px(w)) => c.w(w).shrink(),
+            // In a box sized by its content (a menu, a button row), shares would be of a width
+            // taken from the content: too narrow by the padding. Cells take their content's.
+            Some(Len::Pct(_)) if l.tight => c.shrink(),
             Some(Len::Pct(p)) => c.w_frac((p / 100.0).clamp(0.01, 1.0)).shrink(),
             None if s.tight => c,
             None => c.grow(1.0).min_w(0.0),
         };
-        if s.min_width > 0.0 {
-            c = c.min_w(s.min_width.min(cx.max_w));
+        if min > 0.0 {
+            c = c.min_w(min);
         }
         r = r.child(c);
     }
     r
 }
 
-fn columns(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], align: Align, l: Local) -> El {
+/// Whether a row of fluid columns stands one under another: when the message is narrow (as
+/// responsive mail's phone layout does), or one column would be too narrow to read. Columns
+/// of fixed widths wrap by themselves when they don't fit.
+fn stacks(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], room: f32) -> bool {
+    let shares = || cells.iter().filter_map(|(s, _)| match s.width {
+        Some(Len::Pct(p)) if p < 99.5 => Some(room * p / 100.0),
+        _ => None,
+    });
+    cells.len() > 1 && shares().next().is_some() && (cx.content_width() < STACK_BELOW || shares().any(|w| w < MIN_COLUMN))
+}
+
+/// The widest a column can be in `room`: its width, within its minimum and maximum.
+fn column_width(s: &BoxStyle, room: f32) -> f32 {
+    match s.width {
+        Some(Len::Pct(p)) => room * (p / 100.0).clamp(0.05, 1.0),
+        Some(Len::Px(w)) => w.min(room),
+        None => room,
+    }
+    .min(s.max_width.unwrap_or(f32::MAX))
+    .max(s.min_width.min(room))
+}
+
+fn columns(cx: &Ctx, cells: &[(BoxStyle, Vec<Node>)], align: Align, rtl: bool, l: Local) -> El {
+    let room = l.room;
+    // Right-to-left columns that won't fit side by side stack in source order, as they do in
+    // browsers (a row reversed would wrap last column first).
+    let wraps = rtl && cells.iter().map(|(s, _)| column_width(s, room)).sum::<f32>() > room + 0.5;
+    if wraps || stacks(cx, cells, room) {
+        let mut c = items(align)(col()).w_full();
+        for (s, kids) in cells {
+            let own = room.min(s.max_width.unwrap_or(f32::MAX));
+            let mut e = styled_box(cx, s, kids, Local { tight: false, room: own, ..l }).w_full();
+            if let Some(m) = s.max_width {
+                e = e.max_w(m);
+            }
+            c = c.child(e);
+        }
+        return c;
+    }
     let mut r = row().w_full().flex_wrap().items_start();
     r = match align {
         Align::Left => r.justify_start(),
         Align::Center => r.justify_center(),
         Align::Right => r.justify_end(),
     };
-    for (s, kids) in cells {
-        let mut c = styled_box(cx, s, kids, Local { tight: false, ..l });
+    let ordered: Box<dyn Iterator<Item = &(BoxStyle, Vec<Node>)>> = if rtl { Box::new(cells.iter().rev()) } else { Box::new(cells.iter()) };
+    for (s, kids) in ordered {
+        let mut c = styled_box(cx, s, kids, Local { tight: false, room: column_width(s, room), ..l });
         // A hair under the exact share, so columns that add up to the row stay on one line.
         c = match s.width {
             Some(Len::Pct(p)) => c.w_frac((p / 100.0 - 0.001).clamp(0.05, 1.0)),
-            Some(Len::Px(w)) => c.w(w.min(cx.max_w)),
+            Some(Len::Px(w)) => c.w(w.min(room)),
             None => c.w_full(),
         };
         if let Some(m) = s.max_width {
             c = c.max_w((m - 0.5).max(1.0));
         }
         if s.min_width > 0.0 {
-            c = c.min_w(s.min_width.min(cx.max_w));
+            c = c.min_w(s.min_width.min(room));
         }
         c = match s.valign {
             VAlign::Top => c.self_start(),
@@ -403,17 +532,19 @@ fn node(cx: &Ctx, n: &Node, l: Local) -> El {
         Node::Para(p) => para(cx, p, l),
         Node::Box { style, children } => block_box(cx, style, children, l),
         Node::Row { cells: c, gap } => cells(cx, c, *gap, l),
-        Node::Columns { cells: c, align } => columns(cx, c, *align, l),
+        Node::Columns { cells: c, align, rtl } => columns(cx, c, *align, *rtl, l),
         Node::Image(img) => image(cx, img, l),
         Node::Rule => el().h(1.0).w_full().my(10.0).fill(k.c.border_muted),
         Node::Space(h) => el().h(h.min(40.0)),
         Node::Blank(h) => el().h(h.min(48.0)),
         Node::List { ordered, marker, items } => {
             let mut c = col().w_full().gap(4.0).pl(if *marker { 4.0 } else { 0.0 });
+            // The marker's column and the gap beside it.
+            let inner = Local { room: (l.room - if *marker { 32.0 } else { 0.0 }).max(0.0), ..l };
             for (i, it) in items.iter().enumerate() {
                 let mut body = col().grow(1.0).min_w(0.0);
                 for n in it {
-                    body = body.child(node(cx, n, l));
+                    body = body.child(node(cx, n, inner));
                 }
                 let mut line = row().w_full().gap(8.0).items_start();
                 if *marker {
@@ -427,14 +558,14 @@ fn node(cx: &Ctx, n: &Node, l: Local) -> El {
         Node::Quote(kids) => {
             let mut c = col().w_full().pl(12.0).my(4.0).border_sides([0.0, 0.0, 0.0, 2.0], k.c.border_strong);
             for n in kids {
-                c = c.child(node(cx, n, Local { ink: k.c.text_muted, ..l }));
+                c = c.child(node(cx, n, Local { ink: k.c.text_muted, room: (l.room - 14.0).max(0.0), ..l }));
             }
             c
         }
         Node::Pre(t) => text(t.clone())
             .font(rune::TextStyle::new(12.5, 400.0).mono().lh(19.0))
             .color(l.ink)
-            .wrap()
+            .wrap_anywhere()
             .selectable(true)
             .w_full()
             .padding(10.0)
@@ -446,18 +577,22 @@ fn node(cx: &Ctx, n: &Node, l: Local) -> El {
 pub fn render(cx: &Ctx, doc: &Doc) -> El {
     let original = !cx.adapt;
     let ink = if original { srgb8(0x22, 0x22, 0x22) } else { cx.t.k.c.text_base };
-    let l = Local { on_color: false, tight: false, ink, under: doc.background };
-    let mut c = col().key("html").w_full().max_w(cx.max_w);
+    let l = Local { on_color: false, tight: false, ink, under: doc.background, room: cx.content_width() };
+    let mut c = col().key("html").w_full().min_w(0.0).max_w(cx.max_w);
     for n in &doc.nodes {
         c = c.child(node(cx, n, l));
     }
     if original {
         let page = doc.background.map(rgba).unwrap_or(Color::WHITE);
-        col().w_full().max_w(cx.max_w + 32.0).padding(16.0).radius(12.0).fill(page).child(c)
+        col().w_full().min_w(0.0).max_w(cx.max_w + 2.0 * PAGE_PAD).padding(PAGE_PAD).radius(12.0).fill(page).child(c)
     } else {
         c
     }
 }
+
+#[cfg(test)]
+#[path = "html_view_tests.rs"]
+mod fit_tests;
 
 #[cfg(test)]
 mod tests {

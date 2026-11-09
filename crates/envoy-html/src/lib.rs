@@ -180,8 +180,10 @@ pub enum Node {
     /// model every row of the table shares, or a fixed width; `gap` is the cell spacing.
     Row { cells: Vec<(BoxStyle, Vec<Node>)>, gap: f32 },
     /// Inline-block columns: side by side while they fit, wrapping onto new lines when the pane
-    /// is narrow (`width`, `min_width`, `max_width` per column).
-    Columns { cells: Vec<(BoxStyle, Vec<Node>)>, align: Align },
+    /// is narrow (`width`, `min_width`, `max_width` per column). Cells are in source order;
+    /// `rtl` (`dir="rtl"` on their parent) puts them right to left while they stand side by
+    /// side, and keeps source order when they stack.
+    Columns { cells: Vec<(BoxStyle, Vec<Node>)>, align: Align, rtl: bool },
     Image(Img),
     Rule,
     /// Vertical space; neighbours collapse to the larger (as margins do).
@@ -514,6 +516,7 @@ impl Builder {
         b.styles = vec![None; b.els.len()];
         b
     }
+
 
     fn index_children(&mut self, h: &Handle, parent: u32, ancestors: css::Bloom, sheets: &mut Vec<(String, Option<String>)>, depth: usize) {
         let mut prev = NONE;
@@ -974,9 +977,11 @@ fn box_style(h: &Handle, t: &str, st: &[(Rc<str>, Rc<str>)], ctx: &mut Ctx, cell
         Some(Len::Pct(p)) if p < 100.0 => Some(p / 100.0 * ctx.avail),
         _ => None,
     });
+    // A percentage minimum can't be told before layout, and a block fills its container
+    // anyway (`body { min-width: 100% }`): only points count.
     b.min_width = style(st, "min-width").and_then(len_attr).map_or(0.0, |l| match l {
         Len::Px(w) => w,
-        Len::Pct(p) => p / 100.0 * ctx.avail,
+        Len::Pct(_) => 0.0,
     });
     b.radius = style(st, "border-radius")
         .or_else(|| style(st, "border-top-left-radius"))
@@ -1168,6 +1173,17 @@ impl Builder {
             let mut cctx = ctx.clone();
             text_style(c, &t, &st, &mut cctx);
             let mut bs = box_style(c, &t, &st, &mut cctx, 0.0);
+            // A percentage maximum on a column with a percentage width is part of its share
+            // (MJML's `width: 50%; max-width: 50%`): kept as a share, not as points of the
+            // design's width, so a stacked column can fill the pane.
+            if let (Some(Len::Pct(w)), Some(m)) = (bs.width, style(&st, "max-width").and_then(len_attr)) {
+                if let Len::Pct(m) = m {
+                    bs.width = Some(Len::Pct(w.min(m)));
+                }
+                if matches!(m, Len::Pct(_)) {
+                    bs.max_width = None;
+                }
+            }
             cctx.avail = match bs.width {
                 Some(Len::Px(w)) => w,
                 Some(Len::Pct(p)) => ctx.avail * p / 100.0,
@@ -1197,11 +1213,8 @@ impl Builder {
             }
             cells.push((bs, tidy(inner)));
         }
-        if rtl {
-            cells.reverse();
-        }
         if cells.iter().any(|(s, kids)| !kids.is_empty() || s.bg.is_some()) {
-            out.push(Node::Columns { cells, align: ctx.align });
+            out.push(Node::Columns { cells, align: ctx.align, rtl });
         }
     }
 
@@ -1374,6 +1387,14 @@ impl Builder {
             "br" => {
                 if para.runs.iter().all(|r| r.text.trim().is_empty()) {
                     self.blank_hint += 1;
+                }
+                // A space before a line break hangs off the line's end, unseen (and would put
+                // a centred line off centre).
+                if !ctx.pre
+                    && let Some(last) = para.runs.last_mut()
+                {
+                    let kept = last.text.trim_end_matches(' ').len();
+                    last.text.truncate(kept);
                 }
                 let br = Ctx { pre: true, ..ctx };
                 self.push_text(para, &br, "\n");
@@ -1689,7 +1710,7 @@ impl Builder {
                 self.children(c, &cctx, &mut v, &mut p);
                 flush(&mut v, &mut p);
                 let height = attr(c, "height").and_then(|x| x.trim_end_matches("px").trim().parse::<f32>().ok()).or_else(|| style(&cst, "height").and_then(|x| length(x, BASE))).unwrap_or(0.0);
-                cells.push(GCell { col, span, rows: rspan, style: bs, decl, nodes: tidy(v), height });
+                cells.push(GCell { col, span, rows: rspan, style: bs, decl, nodes: tidy(v), height, least: 0.0 });
                 if rspan > 1 {
                     started.push((col, rspan - 1, span));
                 }
@@ -1757,16 +1778,15 @@ impl Builder {
             return;
         }
 
-        // The column model, shared by every row.
-        let claims: Vec<table::Claim> = grid
-            .iter()
-            .flat_map(|r| r.cells.iter())
-            .map(|c| {
-                let (lo, hi) = table::estimate(&c.nodes);
-                let edge = c.style.pad[1] + c.style.pad[3] + c.style.border.as_ref().map_or(0.0, |b| b.widths[1] + b.widths[3]);
-                table::Claim { col: c.col, span: c.span, width: c.decl, min: lo + edge, max: hi * 1.1 + edge }
-            })
-            .collect();
+        // The column model, shared by every row; and each cell's narrowest, its longest word
+        // and its edges, so a narrow pane breaks words only once every column is that narrow.
+        let mut claims: Vec<table::Claim> = Vec::new();
+        for c in grid.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+            let (lo, hi) = table::estimate(&c.nodes);
+            let edge = c.style.pad[1] + c.style.pad[3] + c.style.border.as_ref().map_or(0.0, |b| b.widths[1] + b.widths[3]);
+            c.least = lo.min(WORD_MIN) * WORD_SLACK + edge;
+            claims.push(table::Claim { col: c.col, span: c.span, width: c.decl, min: lo + edge, max: hi * 1.1 + edge });
+        }
         let model = table::resolve(ncols, &claims, twidth, declared);
         if !declared {
             tstyle.width = Some(Len::Px(model.width + tstyle.pad[1] + tstyle.pad[3] + spacing * (ncols - 1) as f32));
@@ -1776,7 +1796,7 @@ impl Builder {
         let min_of = |col: usize, span: usize| -> f32 { (col..(col + span).min(ncols)).filter(|&i| model.fixed[i] && model.widths[i] <= 120.0).map(|i| model.widths[i]).sum() };
         let cell = |c: GCell, scale: f32| -> (BoxStyle, Vec<Node>) {
             let f = frac(c.col, c.span) / scale;
-            (BoxStyle { width: Some(Len::Pct(f * 100.0)), min_width: c.style.min_width.max(min_of(c.col, c.span)), ..c.style }, c.nodes)
+            (BoxStyle { width: Some(Len::Pct(f * 100.0)), min_width: c.style.min_width.max(min_of(c.col, c.span)).max(c.least), ..c.style }, c.nodes)
         };
         let nrows = grid.len();
         let mut grid: Vec<Option<GRow>> = grid.into_iter().map(Some).collect();
@@ -1864,7 +1884,17 @@ struct GCell {
     decl: Option<Len>,
     nodes: Vec<Node>,
     height: f32,
+    /// The narrowest it can be: its longest word (up to [`WORD_MIN`]) and its edges.
+    least: f32,
 }
+
+/// A word longer than this, in points (a link, an address), doesn't hold its table column
+/// open in a narrow pane: it breaks instead.
+const WORD_MIN: f32 = 140.0;
+
+/// How much wider a word may draw than [`table::estimate`] reckons (digits and capitals run
+/// wider than its average letter): a cell held open for a word is held this much wider.
+const WORD_SLACK: f32 = 1.2;
 
 struct GRow {
     style: BoxStyle,
@@ -2297,6 +2327,26 @@ mod tests {
                <img src="https://img.example/hero.png" width="600" style="max-width:100%;height:auto">"#,
         );
         assert_eq!(doc.images, ["https://img.example/min.jpg", "https://img.example/wide.png", "https://img.example/hero.png"]);
+    }
+
+    #[test]
+    fn spaces_before_a_line_break_are_dropped() {
+        let doc = parse("<p style='text-align:center'>Company Inc, Belfast <br>Don't like these emails? <a href='https://x.example'>Unsubscribe</a></p>");
+        assert_eq!(plain(&doc), "Company Inc, Belfast\nDon't like these emails? Unsubscribe");
+    }
+
+    #[test]
+    fn percentage_minimums_and_shares_are_left_to_layout() {
+        // `min-width: 100%` was 760 points (the desktop pane) whatever the reader's width;
+        // MJML's `max-width: 50%` on a 50% column was 300 points of its 600 px design.
+        let doc = parse(
+            r#"<body style="min-width:100%"><div style="background:#eee;padding:4px">x</div>
+               <div style="width:600px"><div style="display:inline-block;width:50%;max-width:50%">a</div><div style="display:inline-block;width:100%;max-width:33%">b</div><div style="display:inline-block;width:100%;max-width:300px">c</div></div></body>"#,
+        );
+        assert!(find(&doc.nodes, &|n| matches!(n, Node::Box { style, .. } if style.min_width > 0.0)).is_none(), "{:#?}", doc.nodes);
+        let Some(Node::Columns { cells, .. }) = find(&doc.nodes, &|n| matches!(n, Node::Columns { .. })) else { panic!("{:#?}", doc.nodes) };
+        let shares: Vec<(Option<Len>, Option<f32>)> = cells.iter().map(|(s, _)| (s.width, s.max_width)).collect();
+        assert_eq!(shares, [(Some(Len::Pct(50.0)), None), (Some(Len::Pct(33.0)), None), (Some(Len::Pct(100.0)), Some(300.0))]);
     }
 
     #[test]
