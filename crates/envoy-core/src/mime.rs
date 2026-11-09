@@ -23,6 +23,56 @@ pub struct Parsed {
     pub attachments: Vec<Attachment>,
     /// Pictures shown inside the message (`cid:`), not listed as files.
     pub inline: Vec<Attachment>,
+    /// What the inbox split reads of the headers ([`crate::category`]).
+    pub bulk_headers: BulkHeaders,
+}
+
+/// The headers that say whether a message is bulk or automated, as found (`""`, `false`: not
+/// there). The sync asks for exactly these ([`BULK_HEADERS`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BulkHeaders {
+    /// `List-Id`'s id, lowercase, without the angle brackets or the list's name.
+    pub list_id: String,
+    pub list_unsubscribe: bool,
+    pub list_post: bool,
+    /// `Precedence`, lowercase (`bulk`, `list`, `junk`).
+    pub precedence: String,
+    /// `Auto-Submitted`, lowercase (`auto-generated`, `auto-replied`, `no`).
+    pub auto_submitted: String,
+    /// A header only a notification system sends (`X-GitHub-Reason` and the like).
+    pub platform: bool,
+}
+
+/// The header fields [`BulkHeaders`] come from, as IMAP names them (`HEADER.FIELDS`).
+pub const BULK_HEADERS: &str = "LIST-ID LIST-UNSUBSCRIBE LIST-POST PRECEDENCE AUTO-SUBMITTED X-GITHUB-REASON X-GITLAB-PROJECT X-BUGZILLA-REASON X-JIRA-FINGERPRINT";
+
+/// Notification systems' own headers ([`BulkHeaders::platform`]), lowercase.
+const PLATFORM_HEADERS: &[&str] = &["x-github-reason", "x-gitlab-project", "x-bugzilla-reason", "x-jira-fingerprint"];
+
+fn bulk_headers(msg: &mail_parser::Message) -> BulkHeaders {
+    let mut b = BulkHeaders::default();
+    for (name, value) in msg.headers_raw() {
+        let value = value.trim();
+        match name.to_ascii_lowercase().as_str() {
+            "list-id" => b.list_id = list_id(value),
+            "list-unsubscribe" => b.list_unsubscribe |= !value.is_empty(),
+            "list-post" => b.list_post |= !value.is_empty() && !value.eq_ignore_ascii_case("no"),
+            "precedence" => b.precedence = value.to_ascii_lowercase(),
+            "auto-submitted" => b.auto_submitted = value.split(';').next().unwrap_or("").trim().to_ascii_lowercase(),
+            n if PLATFORM_HEADERS.contains(&n) => b.platform = true,
+            _ => {}
+        }
+    }
+    b
+}
+
+/// `"Rust users" <users.rust-lang.org>` → `users.rust-lang.org`; a bare id as it is.
+fn list_id(value: &str) -> String {
+    let id = match (value.rfind('<'), value.rfind('>')) {
+        (Some(a), Some(b)) if a < b => &value[a + 1..b],
+        _ => value,
+    };
+    id.trim().to_lowercase()
 }
 
 fn addr(a: &Addr) -> Address {
@@ -80,6 +130,7 @@ pub fn parse(raw: &[u8], headers_only: bool) -> Option<Parsed> {
         html: None,
         attachments: Vec::new(),
         inline: Vec::new(),
+        bulk_headers: bulk_headers(&msg),
     };
     if headers_only {
         return Some(p);

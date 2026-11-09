@@ -249,6 +249,7 @@ pub fn merge(st: &Store, view: &View, query: &Query, limit: u32, mut items: Vec<
             thread_count: 1,
             participants: String::new(),
             thread_unread: false,
+            category: crate::model::Category::Important,
         };
         show(&mut row, d);
         items.push(row);
@@ -283,9 +284,9 @@ fn people(field: &str) -> Vec<Address> {
 
 /// Whether a local draft matches a search, for drafts the search index doesn't have: words in
 /// its subject, recipients or text, and the `to:` and `subject:` filters. A draft is read, not
-/// starred, from you and has no attachments, which settles the other filters.
+/// starred, from you (so Important) and has no attachments, which settles the other filters.
 fn matches(q: &Query, d: &Draft) -> bool {
-    if q.unread == Some(true) || q.starred == Some(true) || q.attachment || !q.from.is_empty() {
+    if q.unread == Some(true) || q.starred == Some(true) || q.attachment || !q.from.is_empty() || q.category.is_some_and(|m| m & 1 << crate::model::Category::Important.code() == 0) {
         return false;
     }
     let all = format!("{} {} {} {} {}", d.subject, d.to, d.cc, d.bcc, d.body).to_lowercase();

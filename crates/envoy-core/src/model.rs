@@ -90,6 +90,81 @@ impl Role {
     }
 }
 
+/// Where a conversation goes in the split inbox: decided here, from its headers and the user's
+/// rules (see `category.rs`), never on the server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Category {
+    /// Mail from people that isn't for you in particular: copied, or sent to a group.
+    #[default]
+    Other,
+    Newsletters,
+    Notifications,
+    /// Mail from people you write to, sent to you, or in a conversation you're part of.
+    Important,
+}
+
+impl Category {
+    /// In the order the inbox shows them.
+    pub const ALL: [Category; 4] = [Category::Important, Category::Other, Category::Newsletters, Category::Notifications];
+
+    /// As stored (`messages.category`). Other is 0, the column's default: a message that hasn't
+    /// been sorted yet shows in Other, never nowhere.
+    pub fn code(self) -> i64 {
+        match self {
+            Category::Other => 0,
+            Category::Newsletters => 1,
+            Category::Notifications => 2,
+            Category::Important => 3,
+        }
+    }
+
+    pub fn from_code(code: i64) -> Category {
+        match code {
+            1 => Category::Newsletters,
+            2 => Category::Notifications,
+            3 => Category::Important,
+            _ => Category::Other,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Category::Important => "important",
+            Category::Other => "other",
+            Category::Newsletters => "newsletters",
+            Category::Notifications => "notifications",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::Important => "Important",
+            Category::Other => "Other",
+            Category::Newsletters => "Newsletters",
+            Category::Notifications => "Notifications",
+        }
+    }
+
+    /// A category's name as typed (`newsletters`, `Newsletter`), any case.
+    pub fn parse(s: &str) -> Option<Category> {
+        let s = s.trim().to_lowercase();
+        let s = s.strip_suffix('s').unwrap_or(&s);
+        Category::ALL.into_iter().find(|c| c.as_str().strip_suffix('s').unwrap_or(c.as_str()) == s)
+    }
+
+    /// Which wins when a conversation's messages disagree: a person over a machine, and you
+    /// over anyone.
+    pub fn strength(self) -> u8 {
+        match self {
+            Category::Newsletters => 0,
+            Category::Notifications => 1,
+            Category::Other => 2,
+            Category::Important => 3,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mailbox {
     pub account: String,
@@ -167,6 +242,8 @@ pub struct Summary {
     pub participants: String,
     /// Some message in the conversation is unread.
     pub thread_unread: bool,
+    /// Its conversation's category (the same for every message of it).
+    pub category: Category,
 }
 
 impl Summary {

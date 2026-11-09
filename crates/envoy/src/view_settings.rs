@@ -260,6 +260,38 @@ fn control(s: &App, t: &Theme, d: &'static SettingDef, layer: &mut Vec<El>) -> E
                     .child(text(format!("Ignored, not an address or domain: {}", problems.join(", "))).font(k.ty.text_xsmall).color(k.c.danger.fg).wrap().max_w(320.0))
             }
         }
+        Kind::Rules => {
+            // One rule per line, as search writes filters (`from:*@github.com notifications`);
+            // saved as settings.json's objects once every line is a rule.
+            let current = envoy_core::settings::rules_text(&v);
+            let edit = s.settings_ui.edits.get(key).cloned().unwrap_or_else(|| TextEdit::new(current.clone()));
+            let (_, problems) = envoy_core::settings::rules_from_text(&edit.text);
+            let area = TextArea::new(&edit)
+                .label(d.title)
+                .rows(5)
+                .width(Some(320.0))
+                .invalid(!problems.is_empty())
+                .on_edit(edit_access(key, current))
+                .on_change(move |s: &mut App, _: &mut Tx| {
+                    let text = s.settings_ui.edits.get(key).map(|e| e.text.clone()).unwrap_or_default();
+                    let (rules, problems) = envoy_core::settings::rules_from_text(&text);
+                    if problems.is_empty() {
+                        s.set_setting(key, rules);
+                    }
+                })
+                .build(k)
+                .key(format!("field-{key}"));
+            let note = if !problems.is_empty() {
+                text(format!("Not a rule: {}", problems.join("; "))).font(k.ty.text_xsmall).color(k.c.danger.fg).wrap().max_w(320.0)
+            } else if edit.text.trim().is_empty() {
+                text("For example: from:*@github.com notifications").font(k.ty.text_xsmall).color(k.c.text_faint)
+            } else {
+                text(format!("{} rule{}, the first that matches wins", edit.text.lines().filter(|l| !l.trim().is_empty()).count(), if edit.text.lines().filter(|l| !l.trim().is_empty()).count() == 1 { "" } else { "s" }))
+                    .font(k.ty.text_xsmall)
+                    .color(k.c.text_faint)
+            };
+            col().key(format!("ctl-{key}")).gap(4.0).items_end().child(area).child(note)
+        }
         Kind::Keybinding => {
             let current = v.as_str().unwrap_or_default().to_owned();
             let edit = s.settings_ui.edits.get(key).cloned().unwrap_or_else(|| TextEdit::new(current.clone()));
