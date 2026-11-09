@@ -6,7 +6,7 @@
 //! sidebar keeps its size however many accounts there are (each account's inbox gets the same
 //! tabs, and so does the unified inbox); and with `inbox.split` off they're simply gone.
 //!
-//! Search looks in every category (the tabs make way for the results) unless it says
+//! Search looks in every category (no tab is chosen while it shows) unless it says
 //! `category:`. Categories are worked out by envoy-core on this computer and never reach the
 //! server.
 

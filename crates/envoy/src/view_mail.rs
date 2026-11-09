@@ -394,19 +394,6 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
         .group_opacity(1.0, 0.0);
     let subject = if m.subject.is_empty() { "(no subject)".to_owned() } else { m.subject.clone() };
     let subject_style = if unread { rune::TextStyle { weight: 600.0, ..k.ty.text_small } } else { k.ty.text_small };
-    // Search looks across the split inbox's tabs: each result says which it's in.
-    let chip = category_chips(s).then(|| {
-        row()
-            .key(format!("cat-{id}"))
-            .h(18.0)
-            .px(6.0)
-            .gap(4.0)
-            .center_y()
-            .radius(5.0)
-            .fill(k.c.layer_02)
-            .child(icon(category_icon(m.category), 11.0).color(k.c.icon_faint))
-            .child(text(m.category.label()).font(k.ty.text_xsmall).color(k.c.text_muted))
-    });
 
     // Quick actions, shown while the row is hovered.
     let act = |ic: &'static rune::Icon, label: &str, key: &str, f: fn(&mut App, i64, &mut Tx)| {
@@ -489,13 +476,7 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
             .grow(1.0)
             .min_w(0.0)
             .child(top)
-            .child({
-                let mut line = row().gap(6.0).center_y().w_full().child(text(subject).font(subject_style).color(k.c.text_base).truncate().grow(1.0).min_w(0.0));
-                if let Some(chip) = chip {
-                    line = line.child(chip);
-                }
-                line.child(star)
-            });
+            .child(row().gap(6.0).center_y().w_full().child(text(subject).font(subject_style).color(k.c.text_base).truncate().grow(1.0).min_w(0.0)).child(star));
         if preview_on {
             c = c.child(text(if m.preview.is_empty() { " ".to_owned() } else { m.preview.clone() }).font(k.ty.text_xsmall).color(k.c.text_faint).truncate().w_full());
         }
@@ -609,23 +590,23 @@ fn list_header(s: &App, t: &Theme) -> El {
         .items_end()
         .child(text(s.view_title()).font(rune::TextStyle::new(18.0, 650.0).lh(24.0)).color(k.c.text_base))
         .child(text(sub).font(k.ty.text_xsmall).color(k.c.text_faint).pb(2.0).truncate().min_w(0.0).grow(1.0));
-    match s.list_category() {
-        Some(_) => col().key("list-head").w_full().child(title).child(category_tabs(s, t)),
-        None => title,
-    }
+    // The tabs stay while searching (none of them chosen: search looks in all of them), so the
+    // list doesn't move as a search starts or ends.
+    if s.split_applies() { col().key("list-head").w_full().child(title).child(category_tabs(s, t)) } else { title }
 }
 
 /// The split inbox's tabs: each category with its unread count, the one shown underlined in
-/// the accent colour. Names where they fit: every tab's in a wide list, the shown tab's in the
-/// default one, none in a narrow one (icons and counts, the names in their tooltips).
+/// the accent colour (none while searching). Names where they fit: every tab's in a wide list,
+/// the shown tab's in the default one, none in a narrow one (icons and counts, the names in
+/// their tooltips).
 fn category_tabs(s: &App, t: &Theme) -> El {
     let k = &t.k;
     let width = if s.settings.str("inbox.readingPane") == "right" { s.list_width } else { f32::MAX };
     let keys = ["keys.showImportant", "keys.showOther", "keys.showNewsletters", "keys.showNotifications"];
     let mut tabs = row().key("category-tabs").role("tablist").label("Inbox categories").focus_group().w_full().px(10.0).pb(6.0).gap(2.0);
     for (c, key) in Category::ALL.into_iter().zip(keys) {
-        let selected = s.category == c;
-        let narrow = !(width >= 560.0 || (selected && width >= 340.0));
+        let selected = s.list_category() == Some(c);
+        let narrow = !(width >= 560.0 || (s.category == c && width >= 340.0));
         let n = s.category_count(c);
         let fg = if selected { t.accent } else { k.c.text_muted };
         let mut tab = row()
@@ -669,17 +650,12 @@ fn category_tabs(s: &App, t: &Theme) -> El {
     tabs
 }
 
-/// Rows say which tab of the split inbox they're in: in a search of a split inbox, which looks
-/// in all of them.
-fn category_chips(s: &App) -> bool {
-    s.split_applies() && !s.applied_query.is_empty()
-}
 
 /// Everything outside a row's own message that its look depends on, hashed once a frame.
 fn rows_env(s: &App, t: &Theme) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (t.compact, t.dark, s.settings.str("appearance.accent"), s.settings.bool("inbox.showPreview"), s.settings.bool("inbox.showAvatars"), category_chips(s)).hash(&mut h);
+    (t.compact, t.dark, s.settings.str("appearance.accent"), s.settings.bool("inbox.showPreview"), s.settings.bool("inbox.showAvatars")).hash(&mut h);
     // A Sent or Drafts list (a role view or the mailbox itself) shows recipients, and a draft
     // only Discard: list_row reads the view's role.
     let role = s.view_role();
@@ -693,7 +669,7 @@ fn rows_env(s: &App, t: &Theme) -> u64 {
 fn row_version(m: &Summary, marks: RowMarks, env: u64) -> impl std::hash::Hash + '_ {
     let to = m.to.first().map(|a| (a.name.as_str(), a.email.as_str()));
     (
-        (m.id, m.flags, m.thread_unread, m.thread_count, m.date, m.has_attachments, m.category, marks, env),
+        (m.id, m.flags, m.thread_unread, m.thread_count, m.date, m.has_attachments, marks, env),
         (m.participants.as_str(), m.from.name.as_str(), m.from.email.as_str(), to, m.subject.as_str(), m.preview.as_str()),
     )
 }
