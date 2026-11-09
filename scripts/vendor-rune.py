@@ -11,6 +11,8 @@ applied, in name order, after copying. One that no longer applies (Rune changed
 there, or took the change) stops the script: drop it or redo it.
 - 0002-zbus-5: Rune's D-Bus services (portals, tray) on zbus 5, the version
   AccessKit's AT-SPI bridge uses, so Linux builds carry one D-Bus stack, not two.
+- 0003-windows-dx12-only: no Vulkan backend on Windows, where DX12 always has an
+  adapter (WARP); Vulkan was only the fallback for a DX12 that listed none.
 
 Usage: scripts/vendor-rune.py <path-to-rune-checkout>
 """
