@@ -487,7 +487,7 @@ pub fn rules_from_text(text: &str) -> (Value, Vec<String>) {
     let mut problems = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         match crate::category::Rule::parse_text(line) {
-            Ok(r) => rules.push(serde_json::to_value(r).unwrap_or(Value::Null)),
+            Ok(r) => rules.push(r.to_json()),
             Err(e) => problems.push(format!("{line}: {e}")),
         }
     }

@@ -91,9 +91,8 @@ impl Role {
 }
 
 /// Where a conversation goes in the split inbox: decided here, from its headers and the user's
-/// rules (see `category.rs`), never on the server.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// rules (see `category.rs`), never on the server. Written as [`Category::as_str`] names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Category {
     /// Mail from people that isn't for you in particular: copied, or sent to a group.
     #[default]

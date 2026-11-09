@@ -605,7 +605,8 @@ pub struct Store {
     /// write that touched them is: [`Store::transaction`]'s end, or the write's own), addresses
     /// newly written to (their mail moves), and the addresses written to, read once.
     classifier: std::cell::RefCell<crate::category::Classifier>,
-    dirty: std::cell::RefCell<HashSet<(String, String)>>,
+    /// `account \0 thread`, as list.rs keys conversations.
+    dirty: std::cell::RefCell<HashSet<String>>,
     new_correspondents: std::cell::RefCell<Vec<String>>,
     written: std::cell::RefCell<Option<HashSet<String>>>,
     /// Inside [`Store::transaction`].
