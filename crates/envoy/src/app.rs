@@ -1,5 +1,6 @@
 //! The window's state and everything that changes it.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use rune::{KeyEvent, Keybind, Mods, TextEdit, Tx};
@@ -368,10 +369,20 @@ pub enum Action {
 }
 
 /// Which picker: Move to… (`v`) or Label… (`l`, Gmail).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Picker {
     Move,
     Label,
+}
+
+/// A picker's options and the note on what it leaves out ([`App::picker_options`]), with what
+/// they were built for: the picker, the targets, and the mailboxes' fingerprint.
+pub struct PickerCache {
+    which: Picker,
+    ids: Vec<MessageId>,
+    mailboxes: u64,
+    options: Vec<ComboboxOption>,
+    note: Option<String>,
 }
 
 const ACTIONS: &[(Action, &str)] = &[
@@ -435,6 +446,8 @@ pub struct App {
     /// The Move to… and Label… pickers.
     pub move_picker: ComboboxState,
     pub label_picker: ComboboxState,
+    /// [`App::picker_options`]'s last answer, and what it was for.
+    pub picker_cache: RefCell<Option<PickerCache>>,
     /// The opened row (its newest message in conversation view).
     pub open: Option<MessageId>,
     pub thread: Vec<ThreadMessage>,
@@ -531,6 +544,7 @@ impl App {
             selection: Selection::default(),
             move_picker: ComboboxState::default(),
             label_picker: ComboboxState::default(),
+            picker_cache: RefCell::new(None),
             open: None,
             thread: Vec::new(),
             thread_req: 0,
@@ -1535,9 +1549,22 @@ impl App {
         if self.selection.is_empty() { self.open.into_iter().collect() } else { self.selection.ids(&self.list) }
     }
 
-    /// The rows (or the open message's summary) of these ids.
+    /// The rows (or the open message's summary) of these ids, in their order: one pass over the
+    /// list, however many there are (a select-all of thousands).
     fn rows_of(&self, ids: &[MessageId]) -> Vec<&Summary> {
-        ids.iter().filter_map(|id| self.list.iter().find(|s| s.id == *id).or_else(|| self.thread.iter().map(|m| &m.summary).find(|s| s.id == *id))).collect()
+        let wanted: HashSet<MessageId> = ids.iter().copied().collect();
+        let mut found: HashMap<MessageId, &Summary> = self.list.iter().filter(|s| wanted.contains(&s.id)).map(|s| (s.id, s)).collect();
+        for m in &self.thread {
+            if wanted.contains(&m.summary.id) {
+                found.entry(m.summary.id).or_insert(&m.summary);
+            }
+        }
+        ids.iter().filter_map(|id| found.get(id).copied()).collect()
+    }
+
+    /// The distinct `(account, mailbox)`s these rows are in.
+    fn places<'a>(rows: &[&'a Summary]) -> HashSet<(&'a str, &'a str)> {
+        rows.iter().map(|r| (r.account.as_str(), r.mailbox.as_str())).collect()
     }
 
     /// What the sidebar calls mailbox `name` of the account these messages are in.
@@ -1548,8 +1575,8 @@ impl App {
 
     /// Every one of them is in Spam: `!` and the Spam button take them back to the inbox.
     pub fn all_in_junk(&self, ids: &[MessageId]) -> bool {
-        let rows = self.rows_of(ids);
-        !rows.is_empty() && rows.iter().all(|r| self.role_of(&r.account, &r.mailbox) == Role::Junk)
+        let places = Self::places(&self.rows_of(ids));
+        !places.is_empty() && places.iter().all(|(account, mailbox)| self.role_of(account, mailbox) == Role::Junk)
     }
 
     /// Spam, or "not spam" for messages already in Spam.
@@ -1560,8 +1587,8 @@ impl App {
 
     /// Every one of them is in a Gmail account, where labels are a thing.
     pub fn all_gmail(&self, ids: &[MessageId]) -> bool {
-        let rows = self.rows_of(ids);
-        !rows.is_empty() && rows.iter().all(|r| self.accounts.iter().any(|a| a.id == r.account && a.is_gmail()))
+        let accounts: HashSet<&str> = self.rows_of(ids).iter().map(|r| r.account.as_str()).collect();
+        !accounts.is_empty() && accounts.iter().all(|id| self.accounts.iter().any(|a| a.id == *id && a.is_gmail()))
     }
 
     /// Selects or unselects a row (x on the keyboard's row, a row's checkbox, mod-click).
@@ -1647,29 +1674,72 @@ impl App {
     /// account's labels. Messages from several accounts get only what every one of their
     /// accounts has (each role by its own folder there, folders by name), so nothing is sent
     /// to a folder its account lacks. Where every message already is isn't offered.
+    ///
+    /// Linear in the targets and the mailboxes, and built again only when either changes: the
+    /// open picker asks every frame ([`App::picker_cache`]).
     pub fn picker_options(&self, which: Picker, ids: &[MessageId]) -> (Vec<ComboboxOption>, Option<String>) {
+        // What the answer depends on: the picker, the targets, and the mailboxes (not their
+        // counts). Checking that reads neither the list nor the rows.
+        let mailboxes = self.mailboxes_fingerprint();
+        if let Some(c) = self.picker_cache.borrow().as_ref()
+            && c.which == which
+            && c.mailboxes == mailboxes
+            && c.ids == ids
+        {
+            return (c.options.clone(), c.note.clone());
+        }
         let rows = self.rows_of(ids);
-        let mut accounts: Vec<&str> = rows.iter().map(|r| r.account.as_str()).collect();
+        let places = Self::places(&rows);
+        let mut accounts: Vec<&str> = places.iter().map(|(a, _)| *a).collect::<HashSet<_>>().into_iter().collect();
         accounts.sort_unstable();
-        accounts.dedup();
         let boxes: Vec<&[Mailbox]> = accounts.iter().map(|a| self.mailboxes.get(*a).map_or(&[][..], |m| m.as_slice())).collect();
-        let Some(first) = boxes.first() else { return (Vec::new(), None) };
-        let has_role = |b: &[Mailbox], roles: &[Role]| b.iter().any(|m| roles.contains(&m.role) && m.selectable);
+        let options = Self::build_picker(which, &places, &boxes);
+        let note = (accounts.len() > 1).then(|| format!("Only folders all {} accounts have", accounts.len()));
+        *self.picker_cache.borrow_mut() = Some(PickerCache { which, ids: ids.to_vec(), mailboxes, options: options.clone(), note: note.clone() });
+        (options, note)
+    }
+
+    /// Every account's mailboxes as a picker shows them (names, roles, what can be selected,
+    /// nesting), hashed: their unread counts change all the time, and don't count.
+    fn mailboxes_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // Each account's hash summed: the map's order doesn't matter.
+        self.mailboxes.iter().fold(0u64, |sum, (account, boxes)| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            account.hash(&mut h);
+            for m in boxes {
+                (&m.name, &m.display, m.role, m.selectable, m.depth).hash(&mut h);
+            }
+            sum.wrapping_add(h.finish())
+        })
+    }
+
+    /// [`App::picker_options`]'s options for messages in `places`, whose accounts' mailboxes are
+    /// `boxes`: the first account's, filtered by name sets of the others'.
+    fn build_picker(which: Picker, places: &HashSet<(&str, &str)>, boxes: &[&[Mailbox]]) -> Vec<ComboboxOption> {
+        let Some(first) = boxes.first() else { return Vec::new() };
+        // Per account: its selectable mailboxes' names, and the roles they have.
+        let names: Vec<HashSet<&str>> = boxes.iter().map(|b| b.iter().filter(|m| m.selectable).map(|m| m.name.as_str()).collect()).collect();
+        let roles: Vec<HashSet<Role>> = boxes.iter().map(|b| b.iter().filter(|m| m.selectable).map(|m| m.role).collect()).collect();
+        // Where the messages are: each place's role, and the names of the mailboxes.
+        let role_of: HashMap<(&str, &str), Role> = boxes.iter().flat_map(|b| b.iter()).map(|m| ((m.account.as_str(), m.name.as_str()), m.role)).collect();
+        let here_roles: Vec<Role> = places.iter().map(|p| role_of.get(p).copied().unwrap_or(Role::Other)).collect();
+        let here_names: HashSet<&str> = places.iter().map(|(_, m)| *m).collect();
         let mut out = Vec::new();
         if which == Picker::Move {
-            let roles: [(&str, &str, &[Role]); 4] =
+            let wanted_roles: [(&str, &str, &[Role]); 4] =
                 [("role:inbox", "Inbox", &[Role::Inbox]), ("role:archive", "Archive", &[Role::Archive, Role::All]), ("role:junk", "Spam", &[Role::Junk]), ("role:trash", "Trash", &[Role::Trash])];
-            for (id, label, wanted) in roles {
-                let everywhere = boxes.iter().all(|b| has_role(b, wanted));
-                let already = rows.iter().all(|r| wanted.contains(&self.role_of(&r.account, &r.mailbox)));
+            for (id, label, wanted) in wanted_roles {
+                let everywhere = roles.iter().all(|r| wanted.iter().any(|w| r.contains(w)));
+                let already = here_roles.iter().all(|r| wanted.contains(r));
                 if everywhere && !already {
                     out.push(ComboboxOption::new(id, label));
                 }
             }
         }
         for m in first.iter().filter(|m| m.role == Role::Other && m.selectable) {
-            let everywhere = boxes.iter().all(|b| b.iter().any(|o| o.name == m.name && o.selectable));
-            let already = rows.iter().all(|r| r.mailbox == m.name);
+            let everywhere = names.iter().all(|n| n.contains(m.name.as_str()));
+            let already = here_names.len() == 1 && here_names.contains(m.name.as_str());
             if !everywhere || already {
                 continue;
             }
@@ -1681,8 +1751,7 @@ impl App {
             }
             out.push(option);
         }
-        let note = (accounts.len() > 1).then(|| format!("Only folders all {} accounts have", accounts.len()));
-        (out, note)
+        out
     }
 
     /// A picker's choice: moves (undoable, like archive) or labels the targets.
@@ -4012,6 +4081,46 @@ mod tests {
         assert!(sent_since(&app, from, "Move")[0].contains("to: Mailbox(\"Work\")"));
         assert_eq!(app.toasts.last().map(|t| (t.text.as_str(), t.undo.is_some())), Some(("Moved 2 to Work", true)));
         assert!(!app.list.iter().any(|s| s.id == mine || s.id == theirs));
+    }
+
+    #[test]
+    fn a_picker_for_a_huge_selection_is_built_in_linear_time() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        // 40 000 selected rows, 300 folders.
+        app.list = long_list(&app, 40_000);
+        let folder = |i: usize| Mailbox { account: "demo".into(), name: format!("Folder {i}"), display: format!("Folder {i}"), role: Role::Other, unread: 0, total: 0, depth: 0, selectable: true };
+        app.mailboxes.get_mut("demo").unwrap().extend((0..300).map(folder));
+        let ids = ids(&app.list);
+        let started = std::time::Instant::now();
+        let (options, _) = app.picker_options(Picker::Move, &ids);
+        assert_eq!(options.len(), 3 + 3 + 300, "archive, spam, trash, the three labels, the 300 folders");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}: quadratic in the selection?", started.elapsed());
+        // Asked again (every frame the picker is open): the same answer, not built again.
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(app.picker_options(Picker::Move, &ids).0.len(), options.len());
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?} for 100 frames", started.elapsed());
+    }
+
+    #[test]
+    fn picker_options_follow_the_targets_and_the_folders() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let first = app.list[0].id;
+        let names = |app: &App, which| app.picker_options(which, &[first]).0.into_iter().map(|o| o.label).collect::<Vec<_>>();
+        assert_eq!(names(&app, Picker::Label), ["Receipts", "Travel", "Work"]);
+        // A folder appears (the engine reports the account's mailboxes again).
+        let mut boxes = app.mailboxes["demo"].clone();
+        boxes.push(Mailbox { name: "Taxes".into(), display: "Taxes".into(), ..boxes.last().unwrap().clone() });
+        app.apply(Event::Mailboxes { account: "demo".into(), mailboxes: boxes }, &mut Tx::default());
+        assert_eq!(names(&app, Picker::Label), ["Receipts", "Travel", "Work", "Taxes"]);
+        // Other targets: what they're offered.
+        let mut row = app.list[1].clone();
+        row.mailbox = "Work".into();
+        app.list[1] = row.clone();
+        assert!(!app.picker_options(Picker::Label, &[row.id]).0.iter().any(|o| o.id == "mb:Work"), "it's in Work already");
     }
 
     #[test]
