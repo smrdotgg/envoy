@@ -5,9 +5,9 @@ use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant
 
 use envoy_core::engine::{Command, MoveTarget};
 use envoy_core::html::Verdict;
-use envoy_core::model::{Role, ThreadMessage, View};
+use envoy_core::model::{MessageId, Role, ThreadMessage, View};
 
-use crate::app::App;
+use crate::app::{App, Picker};
 use crate::theme::{Theme, avatar_color};
 use crate::{fmt, icons};
 
@@ -36,7 +36,7 @@ fn tool(t: &Theme, ic: &'static rune::Icon, label: &str, key: &str, f: impl Fn(&
         .key(key.to_owned())
 }
 
-fn header(s: &App, t: &Theme) -> El {
+fn header(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
     let k = &t.k;
     let Some(first) = s.thread.first() else { return el() };
     let last = s.thread.last().map(|m| &m.summary).unwrap_or(&first.summary);
@@ -67,7 +67,13 @@ fn header(s: &App, t: &Theme) -> El {
             if let Some(id) = open {
                 s.move_to(vec![id], if in_junk { MoveTarget::Inbox } else { MoveTarget::Junk }, tx)
             }
-        }))
+        }));
+    let targets: Vec<MessageId> = open.into_iter().collect();
+    tools = tools.child(crate::triage::picker(s, t, Picker::Move, &targets, layer));
+    if s.all_gmail(&targets) {
+        tools = tools.child(crate::triage::picker(s, t, Picker::Label, &targets, layer));
+    }
+    tools = tools
         .child(el().w(1.0).h(18.0).mx(6.0).fill(k.c.border_muted))
         .child(tool(t, &icons::MAIL_DOT, "Mark as unread", "t-unread", move |s, _| {
             if let Some(id) = open {
@@ -402,8 +408,11 @@ fn message_card(s: &App, t: &Theme, m: &ThreadMessage, is_last: bool) -> El {
     card
 }
 
-pub fn reader(s: &App, t: &Theme, _cx: &mut Cx<App>) -> El {
+pub fn reader(s: &App, t: &Theme, _cx: &mut Cx<App>, layer: &mut Vec<El>) -> El {
     let k = &t.k;
+    if !s.selection.is_empty() {
+        return crate::triage::selection_panel(s, t, layer);
+    }
     if s.open.is_none() {
         return placeholder(s, t);
     }
@@ -440,7 +449,7 @@ pub fn reader(s: &App, t: &Theme, _cx: &mut Cx<App>) -> El {
     }
     let is_sent_view = matches!(&s.view, View::Role { role: Role::Sent, .. });
     let _ = is_sent_view;
-    col().key("reader").w_full().h_full().min_h(0.0).child(header(s, t)).child(
+    col().key("reader").w_full().h_full().min_h(0.0).child(header(s, t, layer)).child(
         col().key("reader-scroll").scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(12.0).grow(1.0).min_h(0.0).w_full().child(cards),
     )
 }

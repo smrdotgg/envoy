@@ -7,7 +7,7 @@ use rune_kit::shell::{PaneMotion, Sidebar, SidebarRow, SidebarSection, SidebarTo
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Spinner, TextInput};
 
 use envoy_core::engine::Command;
-use envoy_core::model::{Mailbox, Role, Summary, SyncState, View};
+use envoy_core::model::{Mailbox, MessageId, Role, Summary, SyncState, View};
 
 use crate::app::{App, Screen, row_key, unread_count};
 use crate::theme::{Theme, avatar_color};
@@ -297,11 +297,63 @@ fn avatar(name: &str, email: &str, t: &Theme, size: f32) -> El {
         .child(text(fmt::initial(name)).font(rune::TextStyle::new(size * 0.42, 600.0)).color(Color::WHITE))
 }
 
+/// How a row is marked: picked for an action (or open, when nothing is), ticked, and the
+/// keyboard's row while selecting. Part of a row's memo version ([`row_version`]).
+#[derive(Clone, Copy, Hash, PartialEq, Debug)]
+struct RowMarks {
+    highlight: bool,
+    checked: bool,
+    cursor: bool,
+}
+
+fn row_marks(s: &App, id: MessageId) -> RowMarks {
+    if s.selection.is_empty() {
+        RowMarks { highlight: s.open == Some(id), checked: false, cursor: false }
+    } else {
+        let checked = s.selection.contains(id);
+        RowMarks { highlight: checked, checked, cursor: s.selection.cursor() == Some(id) }
+    }
+}
+
+/// The checkbox in a row's left margin: shown while the row is hovered, and on a selected row.
+/// Pressing it selects the row (shift: the rows up to it) without opening anything.
+fn row_checkbox(t: &Theme, id: MessageId, checked: bool) -> El {
+    let k = &t.k;
+    let mut b = el()
+        .size(16.0, 16.0)
+        .center()
+        .radius(4.0)
+        .border(1.5, if checked { t.accent } else { k.c.border_strong })
+        .fill(if checked { t.accent } else { t.card });
+    if checked {
+        b = b.child(icon(&icons::CHECK, 12.0).color(Color::WHITE));
+    }
+    el().key(format!("check-{id}"))
+        .role("checkbox")
+        .label("Select")
+        .checked(checked)
+        .pin(Some(2.0), Some(0.0), None, Some(0.0))
+        .w(24.0)
+        .center()
+        .cursor(Cursor::Pointer)
+        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            if tx.mods().shift {
+                s.press_row(id, tx.mods(), tx);
+            } else {
+                s.toggle_selected(id);
+                tx.instant();
+            }
+        })
+        .child(b)
+        .group_opacity(if checked { 1.0 } else { 0.0 }, 1.0)
+}
+
 fn list_row(s: &App, i: usize, t: &Theme) -> El {
     let k = &t.k;
     let m: &Summary = &s.list[i];
     let id = m.id;
-    let selected = s.open == Some(id);
+    let marks = row_marks(s, id);
+    let selected = marks.highlight;
     let unread = m.thread_unread;
     let compact = t.compact;
     let preview_on = s.settings.bool("inbox.showPreview");
@@ -377,7 +429,8 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
         .child(icon(star_icon, 15.0).color(if m.flagged() { t.star } else { k.c.icon_faint }))
         .group_opacity(if m.flagged() { 1.0 } else { 0.0 }, 1.0);
 
-    let dot = el().size(7.0, 7.0).radius(3.5).fill(if unread { t.unread } else { Color::TRANSPARENT });
+    // The checkbox takes the unread dot's place while it shows.
+    let dot = el().size(7.0, 7.0).radius(3.5).fill(if unread { t.unread } else { Color::TRANSPARENT }).group_opacity(if marks.checked { 0.0 } else { 1.0 }, 0.0);
     let attach = if m.has_attachments { Some(icon(&icons::PAPERCLIP, 13.0).color(k.c.icon_faint)) } else { None };
 
     let body: El = if compact {
@@ -424,7 +477,7 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
     let mut r = row()
         .key(row_key(id))
         .role("row")
-        .label(format!("{}{}, {}", if unread { "Unread, " } else { "" }, m.from.display(), m.subject))
+        .label(format!("{}{}{}, {}", if marks.checked { "Selected, " } else { "" }, if unread { "Unread, " } else { "" }, m.from.display(), m.subject))
         .w_full()
         .gap(10.0)
         .px(if compact { 10.0 } else { 12.0 })
@@ -433,9 +486,10 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
         .radius(10.0)
         .hover_group()
         .fill(if selected { t.selected } else { Color::TRANSPARENT })
+        .border(1.5, if marks.cursor { t.accent } else { Color::TRANSPARENT })
         .hover(if selected { Color::TRANSPARENT } else { k.c.hover })
         .press(k.c.pressed)
-        .on_press(move |s: &mut App| s.open_message(id))
+        .on_press_tx(move |s: &mut App, tx: &mut Tx| s.press_row(id, tx.mods(), tx))
         .on_double_press(move |s: &mut App| {
             if s.settings.str("inbox.readingPane") == "off" {
                 s.open_message(id);
@@ -445,7 +499,7 @@ fn list_row(s: &App, i: usize, t: &Theme) -> El {
     if avatars && !compact {
         r = r.child(avatar(m.from.display(), &m.from.email, t, 34.0));
     }
-    r.child(body).child(actions)
+    r.child(body).child(actions).child(row_checkbox(t, id, marks.checked))
 }
 
 /// Messages the server says the current view has (from the folder counts), and its name.
@@ -536,12 +590,13 @@ fn rows_env(s: &App, t: &Theme) -> u64 {
     h.finish()
 }
 
-/// A row's version for `memo`: what `list_row` shows of its message, whether it's selected,
-/// and `env`. A press of j changes two rows' versions, so only those two are built again.
-fn row_version(m: &Summary, selected: bool, env: u64) -> impl std::hash::Hash + '_ {
+/// A row's version for `memo`: what `list_row` shows of its message, how it's marked, and
+/// `env`. A press of j changes two rows' versions, so only those two are built again; so does
+/// x (the row ticked, and the open row, no longer highlighted once a selection starts).
+fn row_version(m: &Summary, marks: RowMarks, env: u64) -> impl std::hash::Hash + '_ {
     let to = m.to.first().map(|a| (a.name.as_str(), a.email.as_str()));
     (
-        (m.id, m.flags, m.thread_unread, m.thread_count, m.date, m.has_attachments, selected, env),
+        (m.id, m.flags, m.thread_unread, m.thread_count, m.date, m.has_attachments, marks, env),
         (m.participants.as_str(), m.from.name.as_str(), m.from.email.as_str(), to, m.subject.as_str(), m.preview.as_str()),
     )
 }
@@ -551,7 +606,7 @@ fn keys_version(list: &[Summary]) -> u64 {
     list.iter().fold(0xcbf2_9ce4_8422_2325u64 ^ list.len() as u64, |h, m| (h ^ m.id as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
-pub fn message_list(s: &App, t: &Theme) -> El {
+pub fn message_list(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
     let est = if t.compact { 36.0 } else if s.settings.bool("inbox.showPreview") { 78.0 } else { 60.0 };
     let body = if s.list.is_empty() {
         empty_list(s, t)
@@ -570,13 +625,19 @@ pub fn message_list(s: &App, t: &Theme) -> El {
                     |s: &App, i| Cow::Owned(row_key(s.list[i].id)),
                     move |s: &App, i| {
                         let m = &s.list[i];
-                        rune::memo(row_key(m.id), row_version(m, s.open == Some(m.id), env), || list_row(s, i, &theme))
+                        rune::memo(row_key(m.id), row_version(m, row_marks(s, m.id), env), || list_row(s, i, &theme))
                     },
                 )
                 .virtual_rows_version(keys_version(&s.list)),
         )
     };
-    col().key("list-pane").w_full().h_full().min_h(0.0).child(list_header(s, t)).child(body)
+    // Without a reader beside the list, the selection bar takes the header's place.
+    let header = if !s.selection.is_empty() && s.settings.str("inbox.readingPane") == "off" {
+        col().w_full().px(10.0).pt(8.0).pb(4.0).child(crate::triage::selection_bar(s, t, layer))
+    } else {
+        list_header(s, t)
+    };
+    col().key("list-pane").w_full().h_full().min_h(0.0).child(header).child(body)
 }
 
 fn drag_handle(t: &Theme, vertical: bool) -> El {
@@ -603,31 +664,38 @@ fn drag_handle(t: &Theme, vertical: bool) -> El {
         .child(line)
 }
 
-pub fn mail_main(s: &App, t: &Theme, cx: &mut Cx<App>) -> El {
+pub fn mail_main(s: &App, t: &Theme, cx: &mut Cx<App>, layer: &mut Vec<El>) -> El {
     let pane = s.settings.str("inbox.readingPane");
-    let has_open = s.open.is_some();
+    // Selecting shows the list: the reader full width would hide what's being selected.
+    let has_open = s.open.is_some() && s.selection.is_empty();
     match pane.as_str() {
-        "bottom" => col()
-            .w_full()
-            .h_full()
-            .min_h(0.0)
-            .child(col().w_full().h(s.list_height).min_h(0.0).child(message_list(s, t)))
-            .child(drag_handle(t, false))
-            .child(col().w_full().grow(1.0).min_h(0.0).child(reader::reader(s, t, cx))),
+        "bottom" => {
+            let list = message_list(s, t, layer);
+            col()
+                .w_full()
+                .h_full()
+                .min_h(0.0)
+                .child(col().w_full().h(s.list_height).min_h(0.0).child(list))
+                .child(drag_handle(t, false))
+                .child(col().w_full().grow(1.0).min_h(0.0).child(reader::reader(s, t, cx, layer)))
+        }
         "off" => {
             if has_open {
-                col().w_full().h_full().min_h(0.0).child(reader::reader(s, t, cx))
+                col().w_full().h_full().min_h(0.0).child(reader::reader(s, t, cx, layer))
             } else {
-                col().w_full().h_full().min_h(0.0).child(message_list(s, t))
+                col().w_full().h_full().min_h(0.0).child(message_list(s, t, layer))
             }
         }
-        _ => row()
-            .w_full()
-            .h_full()
-            .min_h(0.0)
-            .child(col().w(s.list_width).h_full().min_h(0.0).child(message_list(s, t)))
-            .child(drag_handle(t, true))
-            .child(col().grow(1.0).h_full().min_w(0.0).min_h(0.0).child(reader::reader(s, t, cx))),
+        _ => {
+            let list = message_list(s, t, layer);
+            row()
+                .w_full()
+                .h_full()
+                .min_h(0.0)
+                .child(col().w(s.list_width).h_full().min_h(0.0).child(list))
+                .child(drag_handle(t, true))
+                .child(col().grow(1.0).h_full().min_w(0.0).min_h(0.0).child(reader::reader(s, t, cx, layer)))
+        }
     }
 }
 
@@ -636,7 +704,7 @@ pub fn mail_screen(s: &App, t: &Theme, cx: &mut Cx<App>, layer: &mut Vec<El>) ->
     let main = match s.screen {
         Screen::Settings => view_settings::settings_main(s, t, layer),
         Screen::AddAccount => crate::view_account::add_account(s, t, layer),
-        Screen::Mail => mail_main(s, t, cx),
+        Screen::Mail => mail_main(s, t, cx, layer),
     };
     let framed = s.settings.bool("appearance.windowFrame");
     let tb = if s.screen == Screen::Mail { toolbar(s, t) } else { Toolbar::new().title(if s.screen == Screen::Settings { "Settings" } else { "Add account" }) };
@@ -656,6 +724,40 @@ pub fn mail_screen(s: &App, t: &Theme, cx: &mut Cx<App>, layer: &mut Vec<El>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selecting_builds_again_only_the_rows_it_marks() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let all: Vec<MessageId> = app.list.iter().map(|m| m.id).collect();
+        app.open_message(all[0]);
+        let marks = |app: &App| all.iter().map(|id| row_marks(app, *id)).collect::<Vec<_>>();
+        let changed = |a: &[RowMarks], b: &[RowMarks]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+        let mut tx = Tx::default();
+        let mut before = marks(&app);
+        // Each step re-versions (and so rebuilds) at most the two rows it touches, as j does:
+        // a selection starting (the ticked row, the open one no longer highlighted), another
+        // row ticked or the keyboard moving (the row it leaves, the one it reaches).
+        type Step = Box<dyn Fn(&mut App, &mut Tx)>;
+        let steps: [(&str, Step); 5] = [
+            ("x on a row", Box::new(|app, _| app.toggle_selected(app.list[3].id))),
+            ("mod-click another", Box::new(|app, tx| app.press_row(app.list[5].id, rune::Mods { cmd: true, ..Default::default() }, tx))),
+            ("shift+j", Box::new(|app, _| {
+                let from = app.selection.cursor().unwrap();
+                app.selection.extend(&app.list, from, 1);
+            })),
+            ("j", Box::new(|app, _| {
+                app.selection.move_cursor(&app.list, 1);
+            })),
+            ("untick", Box::new(|app, _| app.toggle_selected(app.list[3].id))),
+        ];
+        for (what, step) in steps {
+            step(&mut app, &mut tx);
+            let after = marks(&app);
+            assert!(changed(&before, &after) <= 2, "{what}: {} rows rebuilt", changed(&before, &after));
+            before = after;
+        }
+    }
 
     #[test]
     fn rows_are_built_again_when_the_view_changes_how_they_show() {

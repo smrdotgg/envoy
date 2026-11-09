@@ -178,6 +178,13 @@ pub const SCHEMA: &[SettingDef] = &[
     def("keys.goInbox", "Keyboard", "Go to inbox", "Show the inbox.", Kind::Keybinding, S("mod+1")),
     def("keys.goStarred", "Keyboard", "Go to starred", "Show starred messages.", Kind::Keybinding, S("mod+2")),
     def("keys.goSent", "Keyboard", "Go to sent", "Show sent messages.", Kind::Keybinding, S("mod+3")),
+    def("keys.select", "Keyboard", "Select", "Select the message, or unselect it. Archive, delete, spam, read, star and move then act on every selected message.", Kind::Keybinding, S("x")),
+    def("keys.selectNext", "Keyboard", "Extend selection down", "Select the next (older) message too.", Kind::Keybinding, S("shift+j, shift+down")),
+    def("keys.selectPrevious", "Keyboard", "Extend selection up", "Select the previous (newer) message too.", Kind::Keybinding, S("shift+k, shift+up")),
+    def("keys.selectAll", "Keyboard", "Select all", "Select every message in the list.", Kind::Keybinding, S("mod+a")),
+    def("keys.spam", "Keyboard", "Report spam", "Move the open or selected messages to Spam (or back to the inbox, from Spam).", Kind::Keybinding, S("!")),
+    def("keys.moveTo", "Keyboard", "Move to…", "Move the open or selected messages to a folder you pick.", Kind::Keybinding, S("v")),
+    def("keys.label", "Keyboard", "Label…", "Add a label to the open or selected messages (Gmail).", Kind::Keybinding, S("l")),
 ];
 
 pub fn schema(key: &str) -> Option<&'static SettingDef> {
