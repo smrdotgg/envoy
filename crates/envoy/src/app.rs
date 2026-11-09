@@ -396,6 +396,7 @@ pub enum Action {
     MoveOther,
     MoveNewsletters,
     MoveNotifications,
+    Snooze,
 }
 
 /// Which picker: Move to… (`v`) or Label… (`l`, Gmail).
@@ -453,6 +454,7 @@ const ACTIONS: &[(Action, &str)] = &[
     (Action::MoveOther, "keys.moveOther"),
     (Action::MoveNewsletters, "keys.moveNewsletters"),
     (Action::MoveNotifications, "keys.moveNotifications"),
+    (Action::Snooze, "keys.snooze"),
 ];
 
 pub struct App {
@@ -492,6 +494,8 @@ pub struct App {
     /// The Move to… and Label… pickers.
     pub move_picker: ComboboxState,
     pub label_picker: ComboboxState,
+    /// The snooze picker (`b`): ready-made times, or one typed ([`App::snooze_options`]).
+    pub snooze_picker: ComboboxState,
     /// [`App::picker_options`]'s last answer, and what it was for.
     pub picker_cache: RefCell<Option<PickerCache>>,
     /// The opened row (its newest message in conversation view).
@@ -597,6 +601,7 @@ impl App {
             selection: Selection::default(),
             move_picker: ComboboxState::default(),
             label_picker: ComboboxState::default(),
+            snooze_picker: ComboboxState::default(),
             picker_cache: RefCell::new(None),
             open: None,
             thread: Vec::new(),
@@ -1079,6 +1084,9 @@ impl App {
         if self.open == Some(id) && !self.thread.is_empty() {
             return;
         }
+        if self.open != Some(id) {
+            self.unpin_left();
+        }
         self.pending_step = 0;
         self.open = Some(id);
         self.thread.clear();
@@ -1218,6 +1226,7 @@ impl App {
     }
 
     pub fn close_message(&mut self) {
+        self.unpin_left();
         self.pending_step = 0;
         self.open = None;
         self.thread.clear();
@@ -1225,6 +1234,19 @@ impl App {
         self.prefetched.clear();
         self.mark_read_at = None;
         self.mark_read_when_shown = None;
+    }
+
+    /// The open row is being left: back from a snooze and read now, it's been dealt with, and
+    /// isn't pinned atop the inbox any more. It keeps its place until the list is read again
+    /// (then it's in its place by date), so j and k go on from where they were.
+    fn unpin_left(&mut self) {
+        let Some(open) = self.open else { return };
+        let Some(row) = self.list.iter_mut().find(|s| s.id == open) else { return };
+        if row.flags & flags::WOKEN == 0 || row.thread_unread {
+            return;
+        }
+        row.flags &= !flags::WOKEN;
+        self.send(Command::SetFlags { ids: vec![open], add: 0, remove: flags::WOKEN, thread: self.conversations() });
     }
 
     fn index_of_open(&self) -> Option<usize> {
@@ -1423,10 +1445,26 @@ impl App {
             None => matches!(self.view, View::Role { role: Role::Trash, .. }),
         };
         let forever = to == MoveTarget::Trash && in_trash;
+        let thread = self.conversations();
+        self.take_away(ids, label, forever, tx, move |ids, undo| Command::Move { ids, to, thread, undo });
+    }
+
+    /// [`App::move_away`]'s part shared with snoozing: off the list at once, `command(ids,
+    /// undo key)` to the engine, and a toast with Undo for the undo window (none when
+    /// `forever`). Messages the server snoozed itself are left alone: they're its to move.
+    fn take_away(&mut self, mut ids: Vec<MessageId>, label: String, forever: bool, tx: &mut Tx, command: impl FnOnce(Vec<MessageId>, Option<i64>) -> Command) {
+        let before = ids.len();
+        ids.retain(|id| !self.snoozed_by_server(*id));
+        if ids.len() < before {
+            self.toast("Your mail provider snoozed that: change it there", false);
+        }
+        if ids.is_empty() {
+            return;
+        }
         let window = self.settings.u32("behavior.undoSeconds");
         let key = (window > 0 && !forever).then(|| self.next_stamp());
         let snapshot = key.map(|key| self.snapshot(key, &ids));
-        self.send(Command::Move { ids: ids.clone(), to, thread: self.conversations(), undo: key });
+        self.send(command(ids.clone(), key));
         self.after_remove(&ids, tx);
         self.list_changed_here();
         let label = if forever { "Deleted forever".to_owned() } else { label };
@@ -1625,6 +1663,90 @@ impl App {
             }
         };
         self.move_away(ids, to, label, tx);
+    }
+
+    // ── snoozes ──
+
+    /// Row `id` is in the server's own snoozed mailbox (no wake time in its name): shown, never
+    /// moved (envoy_core::snooze).
+    pub fn snoozed_by_server(&self, id: MessageId) -> bool {
+        self.list.iter().find(|s| s.id == id).is_some_and(|s| self.role_of(&s.account, &s.mailbox) == Role::Snoozed && envoy_core::snooze::wake_of(&s.mailbox).is_none())
+    }
+
+    /// Opens the snooze picker for the targets (not drafts), its field ready for a typed time.
+    pub fn open_snooze_picker(&mut self) {
+        let ids: Vec<MessageId> = self.targets().into_iter().filter(|id| !self.is_draft_row(*id)).collect();
+        if ids.is_empty() {
+            if !self.targets().is_empty() {
+                self.toast("Drafts can't be snoozed", false);
+            }
+            return;
+        }
+        let state = &mut self.snooze_picker;
+        state.open = true;
+        state.search.clear();
+        state.search.focused = true;
+        state.active = None;
+    }
+
+    /// What the snooze picker offers now: the time typed in its field, if it reads as one;
+    /// Later today, Tonight, Tomorrow, This weekend, Next week (those still ahead); and a note
+    /// on typing one. Each id ends with its time (Unix seconds).
+    pub fn snooze_options(&self) -> Vec<ComboboxOption> {
+        let now = chrono::Local::now();
+        let mut out = Vec::new();
+        let typed = self.snooze_picker.search.text.trim();
+        if !typed.is_empty() {
+            // Its detail is what was typed, so it's never filtered out by it.
+            let mut o = match envoy_core::snooze::parse_when(typed, &now) {
+                Some(at) => ComboboxOption::new(format!("typed:{at}"), fmt::snooze_until(at)),
+                None => ComboboxOption { disabled: true, ..ComboboxOption::new("typed:none", "Not a time ahead that Envoy can read") },
+            };
+            o.detail = typed.to_owned();
+            out.push(o);
+        }
+        for p in envoy_core::snooze::presets(&now) {
+            let mut o = ComboboxOption::new(format!("{}:{}", p.id, p.at), p.label);
+            o.detail = fmt::snooze_until(p.at);
+            out.push(o);
+        }
+        out.push(ComboboxOption { disabled: true, detail: "type it: fri 9am, in 2 days".into(), ..ComboboxOption::new("pick", "Pick date & time…") });
+        out
+    }
+
+    /// The snooze picker's choice.
+    pub fn pick_snooze(&mut self, option: &str, tx: &mut Tx) {
+        if let Some(at) = option.rsplit(':').next().and_then(|t| t.parse::<i64>().ok()) {
+            self.snooze(self.targets(), at, tx);
+        }
+    }
+
+    /// Snoozes messages until `until` (Unix seconds): off the list at once, to their buckets on
+    /// the server once the undo window is over, back atop the inbox at that time. In Snoozed,
+    /// a new time for them.
+    pub fn snooze(&mut self, mut ids: Vec<MessageId>, until: i64, tx: &mut Tx) {
+        ids.retain(|id| !self.is_draft_row(*id));
+        if ids.is_empty() {
+            return;
+        }
+        let when = fmt::snooze_until(until);
+        let label = if ids.len() == 1 { format!("Snoozed until {when}") } else { format!("Snoozed {} until {when}", ids.len()) };
+        let thread = self.conversations();
+        self.take_away(ids, label, false, tx, move |ids, undo| Command::Snooze { ids, until, thread, undo });
+    }
+
+    /// Takes snoozed messages back to the inbox now.
+    pub fn unsnooze(&mut self, ids: Vec<MessageId>, tx: &mut Tx) {
+        if ids.is_empty() {
+            return;
+        }
+        let label = if ids.len() == 1 { "Unsnoozed".to_owned() } else { format!("Unsnoozed {}", ids.len()) };
+        self.move_away(ids, MoveTarget::Inbox, label, tx);
+    }
+
+    /// Every account's snooze mailboxes (buckets, and the server's own), for the sidebar.
+    pub fn has_snoozed(&self, account: Option<&str>) -> bool {
+        self.mailboxes.iter().filter(|(a, _)| account.is_none_or(|x| x == a.as_str())).flat_map(|(_, m)| m.iter()).any(|m| m.role == Role::Snoozed)
     }
 
     // ── several at once ──
@@ -1928,11 +2050,13 @@ impl App {
         for id in &ids {
             self.count_read(*id, read);
         }
+        // Read is dealt with: back from a snooze, it's no longer pinned.
+        let unpin = if read && self.list.iter().any(|s| ids.contains(&s.id) && s.flags & flags::WOKEN != 0) { flags::WOKEN } else { 0 };
         for s in self.list.iter_mut().filter(|s| ids.contains(&s.id)) {
             s.thread_unread = !read;
-            if read { s.flags |= flags::SEEN } else { s.flags &= !flags::SEEN }
+            if read { s.flags = (s.flags | flags::SEEN) & !unpin } else { s.flags &= !flags::SEEN }
         }
-        let (add, remove) = if read { (flags::SEEN, 0) } else { (0, flags::SEEN) };
+        let (add, remove) = if read { (flags::SEEN, unpin) } else { (0, flags::SEEN) };
         let open_too = self.open.is_some_and(|o| ids.contains(&o));
         self.send(Command::SetFlags { ids, add, remove, thread: self.conversations() });
         self.list_changed_here();
@@ -2887,6 +3011,7 @@ impl App {
             }
             Action::MoveTo => self.open_picker(Picker::Move),
             Action::Label => self.open_picker(Picker::Label),
+            Action::Snooze => self.open_snooze_picker(),
             Action::Search => {
                 self.screen = Screen::Mail;
                 self.search.focused = true;
@@ -4450,5 +4575,127 @@ mod tests {
             }
         }
         assert_eq!(seen.get("z"), Some(&"keys.undo"));
+    }
+
+    // ── snoozes ──
+
+    #[test]
+    fn b_snoozes_the_open_message_with_undo() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let all = ids(&app.list);
+        app.open_message(all[0]);
+        assert!(key(&mut app, "b"));
+        assert!(app.snooze_picker.open && app.snooze_picker.search.focused, "its field ready for a typed time");
+        let options = app.snooze_options();
+        let tomorrow = options.iter().find(|o| o.id.starts_with("tomorrow:")).expect("Tomorrow offered");
+        assert_eq!(tomorrow.label, "Tomorrow");
+        assert!(options.last().is_some_and(|o| o.disabled && o.label == "Pick date & time…"), "how to type one");
+        let at: i64 = tomorrow.id.rsplit(':').next().unwrap().parse().unwrap();
+        let from = app.sent.borrow().len();
+        app.pick_snooze(&tomorrow.id.clone(), &mut tx);
+        let snoozes = sent_since(&app, from, "Snooze");
+        assert_eq!(snoozes.len(), 1, "{snoozes:?}");
+        assert!(snoozes[0].contains(&format!("ids: [{}], until: {at}, thread: true, undo: Some(", all[0])), "{}", snoozes[0]);
+        assert_eq!(ids(&app.list), all[1..], "off the list at once");
+        let toast = app.toasts.iter().find(|t| t.undo.is_some()).map(|t| t.text.clone()).unwrap_or_default();
+        assert_eq!(toast, format!("Snoozed until {}", fmt::snooze_until(at)));
+        // z: back where it was, and the engine takes the snooze back.
+        assert!(key(&mut app, "z"));
+        assert_eq!(ids(&app.list), all);
+        assert_eq!(sent_since(&app, from, "UndoMove").len(), 1);
+    }
+
+    #[test]
+    fn a_typed_time_is_offered_first_and_nonsense_is_said_to_be() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.snooze_picker.search = TextEdit::new("in 3 days");
+        let first = app.snooze_options().remove(0);
+        assert!(first.id.starts_with("typed:") && !first.disabled && first.detail == "in 3 days", "{first:?}");
+        app.snooze_picker.search = TextEdit::new("whenever");
+        let first = app.snooze_options().remove(0);
+        assert!(first.disabled && first.detail == "whenever", "{first:?}");
+    }
+
+    #[test]
+    fn a_selection_snoozes_together_and_drafts_never() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        let all = ids(&app.list);
+        app.toggle_selected(all[1]);
+        app.toggle_selected(all[2]);
+        let from = app.sent.borrow().len();
+        app.snooze(app.targets(), 2_000_000_000, &mut tx);
+        assert_eq!(sent_since(&app, from, "Snooze").len(), 1);
+        assert!(app.toasts.iter().any(|t| t.text.starts_with("Snoozed 2 until ")));
+        // Drafts aren't snoozed.
+        app.view = View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() };
+        app.list = crate::demo::list_for(&app.view);
+        app.open = app.list.first().map(|s| s.id);
+        let from = app.sent.borrow().len();
+        assert!(key(&mut app, "b"));
+        assert!(!app.snooze_picker.open || sent_since(&app, from, "Snooze").is_empty());
+        app.snooze(app.targets(), 2_000_000_000, &mut tx);
+        assert!(sent_since(&app, from, "Snooze").is_empty());
+    }
+
+    #[test]
+    fn the_snoozed_view_says_when_each_wakes_and_unsnoozes() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        assert!(app.has_snoozed(Some("demo")));
+        app.go(View::Role { account: Some("demo".into()), role: Role::Snoozed });
+        assert_eq!(app.view_title(), "Snoozed");
+        let wakes: Vec<i64> = app.list.iter().map(|s| envoy_core::snooze::wake_of(&s.mailbox).unwrap()).collect();
+        assert!(wakes.len() == 2 && wakes[0] <= wakes[1], "soonest first: {wakes:?}");
+        let from = app.sent.borrow().len();
+        let first = app.list[0].id;
+        app.unsnooze(vec![first], &mut tx);
+        assert!(sent_since(&app, from, "Move")[0].contains("to: Inbox"));
+        assert!(app.toasts.iter().any(|t| t.text == "Unsnoozed"));
+    }
+
+    #[test]
+    fn what_the_server_snoozed_itself_isnt_moved_from_here() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        app.mailboxes.get_mut("demo").unwrap().push(Mailbox { account: "demo".into(), name: "Snoozed by server".into(), display: "Snoozed".into(), role: Role::Snoozed, unread: 0, total: 1, depth: 0, selectable: true });
+        let id = app.list[0].id;
+        app.list[0].mailbox = "Snoozed by server".into();
+        let from = app.sent.borrow().len();
+        app.archive(vec![id], &mut tx);
+        app.snooze(vec![id], 2_000_000_000, &mut tx);
+        assert!(sent_since(&app, from, "Move").is_empty() && sent_since(&app, from, "Snooze").is_empty());
+        assert!(app.list.iter().any(|s| s.id == id));
+        assert!(app.toasts.iter().any(|t| t.text.contains("change it there")));
+    }
+
+    #[test]
+    fn a_message_back_from_a_snooze_is_unpinned_once_read_and_left() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let all = ids(&app.list);
+        // Back from a snooze, unread: opened (the demo marks it read), then left by j.
+        app.list[0].flags |= flags::WOKEN;
+        app.open_message(all[0]);
+        let from = app.sent.borrow().len();
+        app.list[0].thread_unread = false;
+        app.open_message(all[1]);
+        let unpinned = sent_since(&app, from, "SetFlags");
+        assert!(unpinned.iter().any(|c| c.contains(&format!("ids: [{}], add: 0, remove: {}", all[0], flags::WOKEN))), "{unpinned:?}");
+        assert_eq!(app.list[0].flags & flags::WOKEN, 0);
+        // Left unread: still pinned.
+        app.list[2].flags |= flags::WOKEN;
+        app.list[2].thread_unread = true;
+        app.open = Some(all[2]);
+        let from = app.sent.borrow().len();
+        app.close_message();
+        assert!(sent_since(&app, from, "SetFlags").is_empty());
+        assert_ne!(app.list[2].flags & flags::WOKEN, 0);
     }
 }

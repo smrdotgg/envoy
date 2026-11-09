@@ -273,6 +273,25 @@ const SCENES: &[Scene] = &[
         scene_open(s);
         s.open_picker(app::Picker::Label);
     }),
+    ("snooze", |s| {
+        scene_open(s);
+        s.open_snooze_picker();
+    }),
+    ("snooze-typed", |s| {
+        scene_open(s);
+        s.open_snooze_picker();
+        s.snooze_picker.search = rune::TextEdit::new("fri 9am");
+    }),
+    ("snoozed", |s| {
+        s.view = View::Role { account: Some("demo".into()), role: Role::Snoozed };
+        s.list = demo::list_for(&s.view);
+    }),
+    ("woken", |s| {
+        // Back from a snooze: atop the inbox, marked, until it's dealt with.
+        s.list[3].flags |= envoy_core::model::flags::WOKEN;
+        let back = s.list.remove(3);
+        s.list.insert(0, back);
+    }),
     ("toast", |s| {
         // The second conversation archived: its notice, with Undo, under the list and reader.
         scene_open(s);

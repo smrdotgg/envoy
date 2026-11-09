@@ -203,6 +203,7 @@ pub const SCHEMA: &[SettingDef] = &[
     def("keys.moveOther", "Keyboard", "Move to Other", "Move the open or selected conversations to Other, and future mail from their senders.", Kind::Keybinding, S("alt+2")),
     def("keys.moveNewsletters", "Keyboard", "Move to Newsletters", "Move the open or selected conversations to Newsletters, and future mail from their senders.", Kind::Keybinding, S("alt+3")),
     def("keys.moveNotifications", "Keyboard", "Move to Notifications", "Move the open or selected conversations to Notifications, and future mail from their senders.", Kind::Keybinding, S("alt+4")),
+    def("keys.snooze", "Keyboard", "Snooze…", "Put the open or selected messages away until a time you pick; they come back to the top of the inbox then. In Snoozed, pick a new time.", Kind::Keybinding, S("b")),
 ];
 
 pub fn schema(key: &str) -> Option<&'static SettingDef> {

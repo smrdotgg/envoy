@@ -1,5 +1,5 @@
 //! Acting on several messages at once: the selection bar and the panel the reader shows while
-//! rows are selected, and the Move to… and Label… pickers.
+//! rows are selected, and the Move to…, Label… and Snooze… pickers.
 
 use rune::{El, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Combobox, ControlSize, IconButton, IconButtonVariant};
@@ -56,6 +56,30 @@ pub fn picker(s: &App, t: &Theme, which: Picker, ids: &[MessageId], layer: &mut 
         .width(300.0)
         .max_height(320.0)
         .on_choose(move |s: &mut App, option: &str, tx: &mut Tx| s.pick(which, option, tx))
+        .build(k, layer)
+}
+
+/// Snooze…: an icon button that opens the times to snooze the targets until (also `b`):
+/// ready-made ones, or one typed in its field ("fri 9am"). In Snoozed it picks a new time.
+pub fn snooze_picker(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
+    let k = &t.k;
+    let label = if s.view_role() == Some(Role::Snoozed) { "Snooze until another time…" } else { "Snooze…" };
+    let state = &s.snooze_picker;
+    // Built only while it's open: the closed picker is just its button.
+    let options = if state.open { s.snooze_options() } else { Vec::new() };
+    let mut trigger = IconButton::new(&icons::CLOCK).variant(IconButtonVariant::GhostMuted).label(label).help(label).expanded(state.open);
+    let shortcut = key_label(&s.settings, "keys.snooze");
+    if !shortcut.is_empty() {
+        trigger = trigger.shortcut(shortcut);
+    }
+    Combobox::new("snooze-picker", state, &options, |s: &mut App| &mut s.snooze_picker)
+        .label(label)
+        .trigger(trigger.build(k).key("t-snooze-picker"))
+        .search_placeholder("Snooze until… (try \u{201c}fri 9am\u{201d})")
+        .empty_message("Type a time, like \u{201c}tomorrow 5pm\u{201d}")
+        .width(340.0)
+        .max_height(320.0)
+        .on_choose(|s: &mut App, option: &str, tx: &mut Tx| s.pick_snooze(option, tx))
         .build(k, layer)
 }
 
@@ -119,6 +143,7 @@ pub fn selection_bar(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
             "keys.star",
             move |s, _| s.set_starred(s.targets(), any_unstarred),
         ))
+        .child(snooze_picker(s, t, layer))
         .child(picker(s, t, Picker::Move, &ids, layer))
         .children(s.all_gmail(&ids).then(|| picker(s, t, Picker::Label, &ids, layer)))
 }
@@ -135,6 +160,7 @@ pub fn selection_panel(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
     let hints: Vec<String> = [
         key("archive", "keys.archive"),
         key("delete", "keys.delete"),
+        key("snooze", "keys.snooze"),
         key("move", "keys.moveTo"),
         key("read", "keys.markUnread"),
         key("star", "keys.star"),
