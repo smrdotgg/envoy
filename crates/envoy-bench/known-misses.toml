@@ -26,7 +26,7 @@
 # Every store search and open now passes with room on every runner (the worst query median:
 # 9 ms Linux, 12 ms macOS, 21 ms Windows), and so do Windows' binary size (29.8 MB) and idle
 # memory (131–133 MB): their entries are gone. Binary size has passed everywhere since the
-# size trim of 2026-11-09 (Linux 29.09 MB, Windows 27.08 MB, macOS 21.85 MB): its entries are
+# size trim of 2026-11-09 (Linux 29.22 MB, Windows 27.22 MB, macOS 21.90 MB): its entries are
 # gone too. What's left is the runners' software GPUs
 # (lavapipe on Linux, WARP on Windows, a paravirtualized one in the macOS VM): cold start above
 # the OS floor is mostly Rune's own start there (70–1070 ms; 4 ms on an M4 Pro), and frames wait
