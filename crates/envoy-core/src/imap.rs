@@ -446,14 +446,18 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
     let uidvalidity = mb.uid_validity;
     let mut changed = false;
     let mut new_messages = 0;
-    let (local, max_uid) = {
+    let (local, max_uid, held) = {
         let st = store.lock().map_err(|_| anyhow!("store poisoned"))?;
+        // A new generation: the cached UIDs mean nothing now. Messages waiting to move away
+        // are hidden again in it once it's downloaded, by Message-ID.
+        let mut held = Vec::new();
         if st.uidvalidity(account, mailbox)? != uidvalidity {
+            held = st.held_messages(account, mailbox)?;
             st.clear_mailbox(account, mailbox)?;
             st.set_uidvalidity(account, mailbox, uidvalidity)?;
             changed = true;
         }
-        (st.local_uids(account, mailbox)?, st.max_uid(account, mailbox)?)
+        (st.local_uids(account, mailbox)?, st.max_uid(account, mailbox)?, held)
     };
 
     if mb.exists == 0 {
@@ -488,6 +492,9 @@ pub async fn sync_mailbox(session: &mut async_imap::Session<impl Io>, store: &Mu
                 break;
             }
             hi = lo - 1;
+        }
+        if !held.is_empty() {
+            store.lock().map_err(|_| anyhow!("store poisoned"))?.rehide(account, mailbox, &held)?;
         }
     } else {
         let fetched = wire::fetch(session, true, &format!("{}:*", max_uid + 1), HEADER_QUERY, "FETCH new").await?;
@@ -546,8 +553,56 @@ pub async fn select(session: &mut async_imap::Session<impl Io>, mailbox: &str) -
     Ok(())
 }
 
-pub async fn store_flags(session: &mut async_imap::Session<impl Io>, mailbox: &str, uid: u32, add: u32, remove: u32) -> Result<()> {
-    select(session, mailbox).await?;
+/// The message a queued op acts on: UID `uid` in generation `validity` (the UIDVALIDITY) of its
+/// mailbox, and its Message-ID, to find it again in another generation.
+#[derive(Clone, Copy, Debug)]
+pub struct Target<'a> {
+    pub uid: u32,
+    pub validity: u32,
+    pub message_id: &'a str,
+}
+
+/// A queued op's UID is from another generation of its mailbox than the server has now (its
+/// UIDVALIDITY changed: the mailbox was recreated, or reset), so it may name a different
+/// message, or none: the op didn't run. `found`: the message's UID in this generation, when its
+/// Message-ID finds exactly one.
+#[derive(Debug, PartialEq)]
+pub struct NewGeneration {
+    pub mailbox: String,
+    pub validity: u32,
+    pub found: Option<u32>,
+}
+
+impl std::fmt::Display for NewGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is a new generation (UIDVALIDITY {}) since the change was queued", self.mailbox, self.validity)
+    }
+}
+
+impl std::error::Error for NewGeneration {}
+
+/// SELECTs `mailbox` for an op on `target`: Ok only when the mailbox is still in the target's
+/// generation. Otherwise nothing is sent with the target's UID, and the error
+/// ([`NewGeneration`]) says where its message is now, if its Message-ID finds it once. An
+/// unknown generation (0) is never taken for the current one.
+async fn select_target(session: &mut async_imap::Session<impl Io>, mailbox: &str, target: &Target<'_>) -> Result<()> {
+    let selected = wire::select(session, mailbox).await?;
+    if target.validity != 0 && selected.uid_validity == target.validity {
+        return Ok(());
+    }
+    let found = match target.message_id {
+        "" => None,
+        message_id => match uids_with_message_id(session, message_id).await?.as_slice() {
+            [uid] => Some(*uid),
+            _ => None,
+        },
+    };
+    Err(NewGeneration { mailbox: mailbox.to_owned(), validity: selected.uid_validity, found }.into())
+}
+
+pub async fn store_flags(session: &mut async_imap::Session<impl Io>, mailbox: &str, target: &Target<'_>, add: u32, remove: u32) -> Result<()> {
+    select_target(session, mailbox, target).await?;
+    let uid = target.uid;
     if add != 0 {
         wire::ok(session, &format!("UID STORE {uid} +FLAGS.SILENT ({})", flag_names(add)), "STORE").await?;
     }
@@ -557,8 +612,9 @@ pub async fn store_flags(session: &mut async_imap::Session<impl Io>, mailbox: &s
     Ok(())
 }
 
-pub async fn move_message(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
-    select(session, mailbox).await?;
+pub async fn move_message(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, target: &Target<'_>, dest: &str) -> Result<()> {
+    select_target(session, mailbox, target).await?;
+    let uid = target.uid;
     if caps.moves {
         wire::ok(session, &format!("UID MOVE {uid} {}", quoted(dest)), "MOVE").await?;
     } else {
@@ -569,16 +625,15 @@ pub async fn move_message(session: &mut async_imap::Session<impl Io>, caps: Caps
 }
 
 /// Copies a message to `dest`, leaving it where it is: on Gmail, adds the label `dest`.
-pub async fn copy_message(session: &mut async_imap::Session<impl Io>, mailbox: &str, uid: u32, dest: &str) -> Result<()> {
-    select(session, mailbox).await?;
+pub async fn copy_message(session: &mut async_imap::Session<impl Io>, mailbox: &str, target: &Target<'_>, dest: &str) -> Result<()> {
+    select_target(session, mailbox, target).await?;
+    let uid = target.uid;
     wire::ok(session, &format!("UID COPY {uid} {}", quoted(dest)), "COPY").await
 }
 
-pub async fn expunge(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, uid: u32, select_first: bool) -> Result<()> {
-    if select_first {
-        select(session, mailbox).await?;
-    }
-    delete_uids(session, caps, &[uid]).await
+pub async fn expunge(session: &mut async_imap::Session<impl Io>, caps: Caps, mailbox: &str, target: &Target<'_>) -> Result<()> {
+    select_target(session, mailbox, target).await?;
+    delete_uids(session, caps, &[target.uid]).await
 }
 
 /// Deletes these messages from the selected mailbox: flags them \Deleted and, with UIDPLUS,
@@ -1135,19 +1190,19 @@ mod tests {
         // (an error), never be taken as done (its message deleted here, a deletion reported).
         for how in BREAKS {
             let (mut s, _log) = fake::session(breaking("UID STORE", "* 1 FETCH (UID 101 FLAGS (\\Seen))\r\n", how)).await;
-            assert!(store_flags(&mut s, "INBOX", 101, flags::SEEN, 0).await.is_err(), "STORE {how:?}");
+            assert!(store_flags(&mut s, "INBOX", &at(101), flags::SEEN, 0).await.is_err(), "STORE {how:?}");
             // Without UIDPLUS the \Deleted STORE is the whole deletion.
             let (mut s, _log) = fake::session(breaking("UID STORE", "", how)).await;
-            assert!(expunge(&mut s, caps(false), "INBOX", 101, true).await.is_err(), "STORE \\Deleted {how:?}");
+            assert!(expunge(&mut s, caps(false), "INBOX", &at(101)).await.is_err(), "STORE \\Deleted {how:?}");
             let (mut s, _log) = fake::session(breaking("UID EXPUNGE", "* 1 EXPUNGE\r\n", how)).await;
-            assert!(expunge(&mut s, caps(true), "INBOX", 101, true).await.is_err(), "UID EXPUNGE {how:?}");
+            assert!(expunge(&mut s, caps(true), "INBOX", &at(101)).await.is_err(), "UID EXPUNGE {how:?}");
             let (mut s, _log) = fake::session(breaking("UID COPY", "", how)).await;
-            assert!(copy_message(&mut s, "INBOX", 101, "Work").await.is_err(), "COPY {how:?}");
+            assert!(copy_message(&mut s, "INBOX", &at(101), "Work").await.is_err(), "COPY {how:?}");
             let (mut s, log) = fake::session(breaking("UID COPY", "", how)).await;
-            assert!(move_message(&mut s, caps(false), "INBOX", 101, "Work").await.is_err(), "COPY to move {how:?}");
+            assert!(move_message(&mut s, caps(false), "INBOX", &at(101), "Work").await.is_err(), "COPY to move {how:?}");
             assert!(!commands(&log).iter().any(|c| c.starts_with("UID STORE")), "not deleted where it was: {how:?}");
             let (mut s, _log) = fake::session(breaking("UID MOVE", "* 1 EXPUNGE\r\n", how)).await;
-            assert!(move_message(&mut s, Caps { moves: true, ..caps(true) }, "INBOX", 101, "Work").await.is_err(), "MOVE {how:?}");
+            assert!(move_message(&mut s, Caps { moves: true, ..caps(true) }, "INBOX", &at(101), "Work").await.is_err(), "MOVE {how:?}");
             let (mut s, _log) = fake::session(breaking("APPEND", "", how)).await;
             assert!(append(&mut s, "Sent", b"Subject: x\r\n\r\nhi\r\n", true).await.is_err(), "APPEND {how:?}");
         }
@@ -1247,6 +1302,87 @@ mod tests {
         assert!(!news && started.elapsed() >= Duration::from_millis(300));
     }
 
+    /// A message by UID in generation 7, the fake servers' UIDVALIDITY.
+    fn at(uid: u32) -> Target<'static> {
+        Target { uid, validity: 7, message_id: "" }
+    }
+
+    /// A server whose INBOX is in generation 8 (it was reset since generation 7), where
+    /// `<moved@x>` is UID 5 now, `<twice@x>` is two messages, and `<gone@x>` none.
+    fn reset_server(c: &str) -> Option<String> {
+        Some(match c {
+            c if c.starts_with("SELECT") => fake::selected(8, 9),
+            "UID SEARCH UNDELETED HEADER Message-ID \"<moved@x>\"" => "* SEARCH 5\r\nTAG OK done\r\n".into(),
+            "UID SEARCH UNDELETED HEADER Message-ID \"<twice@x>\"" => "* SEARCH 5 6\r\nTAG OK done\r\n".into(),
+            c if c.starts_with("UID SEARCH") => "* SEARCH\r\nTAG OK done\r\n".into(),
+            c if c.starts_with("UID FETCH 5 ") => fake::message_ids(&[(5, "<moved@x>")]),
+            c if c.starts_with("UID FETCH 5,6 ") || c.starts_with("UID FETCH 6,5 ") => fake::message_ids(&[(5, "<twice@x>"), (6, "<twice@x>")]),
+            _ => return None,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_op_never_runs_on_a_uid_from_another_generation() {
+        // Queued against generation 7 for UID 1. The mailbox is generation 8 now: UID 1 may be
+        // anything. Nothing is sent with it; the message is looked for by its Message-ID.
+        let target = |message_id| Target { uid: 1, validity: 7, message_id };
+        let cases = [("<moved@x>", Some(5)), ("<twice@x>", None), ("<gone@x>", None), ("", None)];
+        for (message_id, found) in cases {
+            let want = NewGeneration { mailbox: "INBOX".into(), validity: 8, found };
+            let new_generation = |r: Result<()>| r.unwrap_err().downcast::<NewGeneration>().unwrap();
+            let (mut s, log) = fake::session(reset_server).await;
+            assert_eq!(new_generation(move_message(&mut s, Caps { moves: true, ..caps(true) }, "INBOX", &target(message_id), "Archive").await), want, "{message_id}");
+            assert_eq!(new_generation(move_message(&mut s, caps(false), "INBOX", &target(message_id), "Archive").await), want);
+            assert_eq!(new_generation(copy_message(&mut s, "INBOX", &target(message_id), "Work").await), want);
+            assert_eq!(new_generation(store_flags(&mut s, "INBOX", &target(message_id), flags::SEEN, 0).await), want);
+            assert_eq!(new_generation(expunge(&mut s, caps(true), "INBOX", &target(message_id)).await), want);
+            let sent: Vec<String> = commands(&log).into_iter().filter(|c| c.starts_with("UID MOVE") || c.starts_with("UID COPY") || c.starts_with("UID STORE") || c.starts_with("UID EXPUNGE")).collect();
+            assert!(sent.is_empty(), "{message_id}: {sent:?}");
+        }
+        // Not knowing the generation (an op from before it was recorded, its mailbox gone) is
+        // never taken for knowing it.
+        let (mut s, log) = fake::session(reset_server).await;
+        assert!(move_message(&mut s, caps(true), "INBOX", &Target { uid: 1, validity: 0, message_id: "" }, "Archive").await.is_err());
+        assert!(!commands(&log).iter().any(|c| c.starts_with("UID COPY")));
+        // The same generation: it runs.
+        let (mut s, log) = fake::session(reset_server).await;
+        move_message(&mut s, Caps { moves: true, ..caps(true) }, "INBOX", &Target { uid: 1, validity: 8, message_id: "" }, "Archive").await.unwrap();
+        assert_eq!(commands(&log).last().map(String::as_str), Some("UID MOVE 1 \"Archive\""));
+    }
+
+    #[tokio::test]
+    async fn a_reset_keeps_messages_waiting_to_move_hidden() {
+        let store = synced_store().await;
+        // 102 is archived, undoably: hidden while its move waits.
+        let op = {
+            let st = store.lock().unwrap();
+            let id = st.id_for_uid("a", "INBOX", 102).unwrap().unwrap();
+            let op = st.enqueue_held("a", &crate::store::Op::Move { mailbox: "INBOX".into(), uid: 102, dest: "Archive".into() }, i64::MAX, 3).unwrap();
+            assert!(st.hide_local(id, op).unwrap());
+            assert_eq!(st.ops("a", i64::MAX).unwrap()[0].at, crate::store::At { validity: 7, message_id: "<102@x>".into() }, "queued with its generation");
+            op
+        };
+        // The server resets the mailbox: generation 8, the same messages at new UIDs.
+        let (mut s, _log) = fake::session(|c: &str| {
+            let renumbered = |a: String| a.replace("UIDVALIDITY 7", "UIDVALIDITY 8").replace("UID 10", "UID 20").replace("UIDNEXT 104", "UIDNEXT 204");
+            inbox_server(c).map(renumbered)
+        })
+        .await;
+        sync_mailbox(&mut s, &store, "a", "INBOX", 50, &|| {}).await.unwrap();
+        let st = store.lock().unwrap();
+        let shown: Vec<u32> = st.list(&crate::model::View::Mailbox { account: "a".into(), mailbox: "INBOX".into() }, &crate::store::Query::default(), false, 10, &HashSet::new()).unwrap().iter().map(|m| m.uid).collect();
+        assert_eq!(sorted(shown), vec![201, 203], "the archived message stays hidden in the new generation");
+        // Undo still brings it back: it's held by the same op.
+        st.undo_batch(3).unwrap();
+        assert_eq!(st.list(&crate::model::View::Mailbox { account: "a".into(), mailbox: "INBOX".into() }, &crate::store::Query::default(), false, 10, &HashSet::new()).unwrap().len(), 3);
+        assert!(st.ops("a", i64::MAX).unwrap().iter().all(|q| q.id != op), "its move taken back");
+    }
+
+    fn sorted(mut v: Vec<u32>) -> Vec<u32> {
+        v.sort_unstable();
+        v
+    }
+
     fn caps(uidplus: bool) -> Caps {
         Caps { moves: false, idle: false, uidplus }
     }
@@ -1262,8 +1398,8 @@ mod tests {
     #[tokio::test]
     async fn without_uidplus_deleting_only_flags_the_message() {
         let (mut s, log) = fake::session(|c| c.starts_with("SELECT").then(|| fake::selected(7, 10))).await;
-        expunge(&mut s, caps(false), "Trash", 5, true).await.unwrap();
-        move_message(&mut s, caps(false), "INBOX", 6, "Archive").await.unwrap();
+        expunge(&mut s, caps(false), "Trash", &at(5)).await.unwrap();
+        move_message(&mut s, caps(false), "INBOX", &at(6), "Archive").await.unwrap();
         let cmds = commands(&log);
         assert!(!expunges_everything(&cmds), "a plain EXPUNGE would destroy everything else flagged \\Deleted: {cmds:?}");
         assert!(cmds.contains(&"UID STORE 5 +FLAGS.SILENT (\\Deleted)".to_owned()), "{cmds:?}");
@@ -1273,7 +1409,7 @@ mod tests {
     #[tokio::test]
     async fn with_uidplus_only_the_given_messages_are_expunged() {
         let (mut s, log) = fake::session(|c| c.starts_with("SELECT").then(|| fake::selected(7, 10))).await;
-        expunge(&mut s, caps(true), "Trash", 5, true).await.unwrap();
+        expunge(&mut s, caps(true), "Trash", &at(5)).await.unwrap();
         let cmds = commands(&log);
         assert!(!expunges_everything(&cmds), "{cmds:?}");
         assert_eq!(cmds.last().map(String::as_str), Some("UID EXPUNGE 5"));

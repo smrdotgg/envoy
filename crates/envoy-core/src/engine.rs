@@ -17,7 +17,7 @@ use crate::accounts::{self, Account, AuthKind};
 use crate::imap::{self, Credential, Session};
 use crate::model::{Draft, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use crate::settings::Settings;
-use crate::store::{DraftRev, LocalDraft, Op, Query, Store};
+use crate::store::{At, DraftRev, LocalDraft, Op, Query, Store};
 use crate::{drafts, oauth, paths, secrets, smtp};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1370,9 +1370,10 @@ fn move_local(st: &Store, ids: &[MessageId], to: &MoveTarget, hold: Option<(i64,
         };
         let unread = st.summary(*id)?.is_some_and(|s| !s.seen());
         if *to == MoveTarget::Trash && here == Role::Trash {
+            // Queued first, while the message (its Message-ID) is still here to record.
+            st.enqueue(&account, &Op::Expunge { mailbox: mailbox.clone(), uid })?;
             st.remove_local(*id)?;
             st.bump_counts(&account, &mailbox, if unread { -1 } else { 0 }, -1)?;
-            st.enqueue(&account, &Op::Expunge { mailbox: mailbox.clone(), uid })?;
         } else if *to == MoveTarget::Archive && matches!(here, Role::All | Role::Archive) {
             continue;
         } else {
@@ -1852,8 +1853,10 @@ async fn replay_ops(shared: &Arc<Shared>, account: &Account, session: &mut Sessi
 
 /// Carries out queued ops on the server. A seam so replay can be tested without a server.
 trait OpRunner {
-    /// Every op but the draft ones, which replay through the two calls below.
-    fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send;
+    /// Every op but the draft ones, which replay through the two calls below. `at`: which
+    /// generation of its mailbox the op's UID is from; when the mailbox is in another now, the
+    /// op doesn't run and the error is [`imap::NewGeneration`].
+    fn run(&mut self, op: &Op, at: &At) -> impl std::future::Future<Output = Result<()>> + Send;
     /// The server's (unread, total) for a mailbox.
     fn status(&mut self, mailbox: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send;
     /// Puts a draft in `mailbox`, replacing its `previous` copy ([`imap::replace_draft`]).
@@ -1883,13 +1886,14 @@ impl OpRunner for ImapRunner<'_> {
         imap::purge_message_id(self.session, self.caps, mailbox, message_id, known, search).await
     }
 
-    async fn run(&mut self, op: &Op) -> Result<()> {
+    async fn run(&mut self, op: &Op, at: &At) -> Result<()> {
         let (shared, account, session) = (self.shared, self.account, &mut *self.session);
+        let target = |uid: u32| imap::Target { uid, validity: at.validity, message_id: &at.message_id };
         match op {
-            Op::SetFlags { mailbox, uid, add, remove } => imap::store_flags(session, mailbox, *uid, *add, *remove).await,
-            Op::Move { mailbox, uid, dest } => imap::move_message(session, self.caps, mailbox, *uid, dest).await,
-            Op::Copy { mailbox, uid, dest } => imap::copy_message(session, mailbox, *uid, dest).await,
-            Op::Expunge { mailbox, uid } => imap::expunge(session, self.caps, mailbox, *uid, true).await,
+            Op::SetFlags { mailbox, uid, add, remove } => imap::store_flags(session, mailbox, &target(*uid), *add, *remove).await,
+            Op::Move { mailbox, uid, dest } => imap::move_message(session, self.caps, mailbox, &target(*uid), dest).await,
+            Op::Copy { mailbox, uid, dest } => imap::copy_message(session, mailbox, &target(*uid), dest).await,
+            Op::Expunge { mailbox, uid } => imap::expunge(session, self.caps, mailbox, &target(*uid)).await,
             Op::SaveDraft { .. } | Op::PurgeDraft { .. } => Err(anyhow!("draft ops replay through replay_draft")),
             Op::Send { raw_b64, from, to, sent_mailbox, reply_of } => {
                 let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
@@ -1908,8 +1912,18 @@ impl OpRunner for ImapRunner<'_> {
                 {
                     log::warn!("couldn't save to Sent: {e:#}");
                 }
-                if let Some((mailbox, uid)) = reply_of {
-                    let _ = imap::store_flags(session, mailbox, *uid, flags::ANSWERED, 0).await;
+                // The message replied to is marked answered, in the generation it was replied in,
+                // or where its Message-ID finds it in a new one; never by a UID from an old one.
+                if let Some((mailbox, uid)) = reply_of
+                    && let Err(e) = imap::store_flags(session, mailbox, &target(*uid), flags::ANSWERED, 0).await
+                {
+                    match e.downcast_ref::<imap::NewGeneration>() {
+                        Some(imap::NewGeneration { validity, found: Some(found), .. }) => {
+                            let moved = imap::Target { uid: *found, validity: *validity, message_id: &at.message_id };
+                            let _ = imap::store_flags(session, mailbox, &moved, flags::ANSWERED, 0).await;
+                        }
+                        _ => log::debug!("{}: the message replied to wasn't marked answered: {e:#}", account.email),
+                    }
                 }
                 Ok(())
             }
@@ -1934,11 +1948,40 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
     // Mailboxes moved out of or copied into, or whose unread messages changed: their counts get
     // re-read once the pass is done.
     let mut recount: Vec<String> = Vec::new();
-    for q in ops {
-        let r = match &q.op {
+    for mut q in ops {
+        let mut r = match &q.op {
             Op::SaveDraft { .. } | Op::PurgeDraft { .. } => replay_draft(shared, account, runner, &q.op).await,
-            op => runner.run(op).await,
+            op => runner.run(op, &q.at).await,
         };
+        // The op's mailbox has a new generation since it was queued: its UID may name another
+        // message now, and it didn't run. Its message found again by Message-ID, it runs there;
+        // not found (or found twice), it's dropped, and what it hid shows again.
+        if let Err(e) = &r
+            && let Some(g) = e.downcast_ref::<imap::NewGeneration>()
+        {
+            match g.found.and_then(|uid| q.op.at_uid(uid)) {
+                Some(op) => {
+                    log::info!("{}: {} was reset since a change was queued; its message was found again by Message-ID", account.email, g.mailbox);
+                    let validity = g.validity;
+                    shared.with_writer(|st| st.relocate_op(q.id, &op, validity))?;
+                    q.op = op;
+                    q.at.validity = validity;
+                    r = runner.run(&q.op, &q.at).await;
+                }
+                None => {
+                    let mailbox = g.mailbox.clone();
+                    log::warn!("{}: dropped a change: {e:#}, and its message wasn't found again", account.email);
+                    shared.with_writer(|st| st.op_dropped(q.id))?;
+                    any = true;
+                    shared.emit(Event::Changed { account: account.id.clone() });
+                    shared.emit(Event::Error(format!(
+                        "A change to a message in {mailbox} on {} was dropped: the folder was reset on the server, and the message couldn't be found in it again.",
+                        account.email
+                    )));
+                    continue;
+                }
+            }
+        }
         match r {
             Ok(()) => {
                 shared.with_writer(|st| st.op_done(q.id))?;
@@ -2099,7 +2142,7 @@ async fn replay_draft(shared: &Arc<Shared>, account: &Account, runner: &mut impl
                 shared.with_writer(|st| st.draft_purged(*d, now()))?;
             }
         }
-        op => return runner.run(op).await,
+        op => return runner.run(op, &At::default()).await,
     }
     Ok(())
 }
@@ -2197,6 +2240,9 @@ mod tests {
         cut_off: bool,
         /// Sends are refused as bigger than this ([`smtp::TooBig`]), which is learned.
         too_big: Option<u64>,
+        /// Every mailbox is in generation `.0` (UIDVALIDITY), where messages are found again by
+        /// Message-ID at these UIDs.
+        generation: Option<(u32, Vec<(&'static str, u32)>)>,
     }
 
     impl FakeServer {
@@ -2215,6 +2261,7 @@ mod tests {
                 unsure: false,
                 cut_off: false,
                 too_big: None,
+                generation: None,
             }
         }
 
@@ -2233,7 +2280,15 @@ mod tests {
     }
 
     impl OpRunner for FakeServer {
-        fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send {
+        fn run(&mut self, op: &Op, at: &At) -> impl std::future::Future<Output = Result<()>> + Send {
+            // A mailbox in another generation than the op's: it doesn't run.
+            if let (Some((validity, moved)), Some((mailbox, _))) = (&self.generation, op.located())
+                && at.validity != *validity
+            {
+                let found = moved.iter().find(|(m, _)| *m == at.message_id).map(|(_, uid)| *uid);
+                let e = imap::NewGeneration { mailbox: mailbox.to_owned(), validity: *validity, found };
+                return futures::future::Either::Left(async move { Err(e.into()) });
+            }
             let r = match (op, self.too_big) {
                 // Refused before a byte goes, the size learned, as smtp::send does.
                 (Op::Send { raw_b64, .. }, Some(limit)) => {
@@ -2245,7 +2300,7 @@ mod tests {
                     self.on_the_wire()
                 }
             };
-            async move { r }
+            futures::future::Either::Right(async move { r })
         }
 
         fn status(&mut self, _: &str) -> impl std::future::Future<Output = Result<(u32, u32)>> + Send {
@@ -2525,6 +2580,44 @@ mod tests {
         assert!(visible(&st, "INBOX").is_empty());
         st.op_done(due[0].id).unwrap();
         assert!(st.summary(a).unwrap().is_none(), "the local copy goes once the server has it");
+    }
+
+    #[tokio::test]
+    async fn changes_queued_before_a_reset_follow_their_message_or_are_dropped() {
+        let st = setup();
+        let archived = message(&st, "INBOX", 1, "<archived@x>", "", 0);
+        let gone = message(&st, "INBOX", 2, "<gone@x>", "", 0);
+        let read = message(&st, "INBOX", 3, "<read@x>", "", 0);
+        st.set_uidvalidity("a", "INBOX", 7).unwrap();
+        let (shared, rx) = engine_with(st);
+        // Archived, archived, marked read: queued against generation 7.
+        due_move(&shared, vec![archived], 1);
+        due_move(&shared, vec![gone], 2);
+        set_flags(&shared, vec![read], flags::SEEN, 0, false).unwrap();
+        let at: Vec<At> = shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().into_iter().map(|q| q.at).collect();
+        let at_7 = |m: &str| At { validity: 7, message_id: m.into() };
+        assert_eq!(at, [at_7("<archived@x>"), at_7("<gone@x>"), at_7("<read@x>")]);
+        // The server reset INBOX (generation 8): two of the messages are found again, at new
+        // UIDs; the other isn't there.
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        server.generation = Some((8, vec![("<archived@x>", 5), ("<read@x>", 6)]));
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(
+            server.ran,
+            [
+                Op::Move { mailbox: "INBOX".into(), uid: 5, dest: "Archive".into() },
+                Op::SetFlags { mailbox: "INBOX".into(), uid: 6, add: flags::SEEN, remove: 0 },
+            ],
+            "each by its new UID; nothing by an old one"
+        );
+        shared
+            .with_writer(|st| {
+                assert!(st.ops("a", i64::MAX)?.is_empty(), "the dropped one too");
+                assert_eq!(visible(st, "INBOX"), vec![read, gone], "the one that couldn't follow its message shows again");
+                Ok(())
+            })
+            .unwrap();
+        assert!(rx.try_iter().any(|e| matches!(&e, Event::Error(m) if m.contains("was dropped"))), "and the user is told");
     }
 
     fn listed(name: &str, role: Role) -> imap::ListedMailbox {
