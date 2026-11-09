@@ -16,6 +16,8 @@ mod selection;
 mod theme;
 mod toast;
 mod triage;
+#[cfg(test)]
+mod ui_tests;
 mod view_account;
 mod view_mail;
 mod view_settings;

@@ -125,6 +125,66 @@ pub fn list_for(view: &View) -> Vec<Summary> {
         .collect()
 }
 
+/// The drafts written in demo mode, which has no store: kept for the session, so Drafts lists
+/// them as it lists local drafts (`envoy_core::drafts::merge`) and they open again from there.
+#[derive(Default)]
+pub struct Drafts(Vec<(i64, Draft, i64)>);
+
+impl Drafts {
+    /// Keeps draft `id` as it is now.
+    pub fn keep(&mut self, id: i64, draft: Draft) {
+        self.forget(id);
+        self.0.push((id, draft, now()));
+    }
+
+    pub fn forget(&mut self, id: i64) {
+        self.0.retain(|d| d.0 != id);
+    }
+
+    /// The draft a Drafts row stands for: a sample's row once it's edited, else a new one's.
+    pub fn of_row(&self, row: MessageId) -> Option<(i64, Draft)> {
+        let id = envoy_core::drafts::draft_of_list_id(row).unwrap_or(row);
+        self.0.iter().find(|d| d.0 == id).map(|d| (d.0, d.1.clone()))
+    }
+}
+
+/// [`list_for`], with the drafts written this session in Drafts: a sample draft as last edited,
+/// a new one added (with an id of `envoy_core::drafts::list_id`'s). Newest first.
+pub fn list_with(view: &View, drafts: &Drafts) -> Vec<Summary> {
+    let mut list = list_for(view);
+    let in_drafts = match view {
+        View::Role { role, .. } => *role == Role::Drafts,
+        View::Mailbox { mailbox, .. } => mailbox == DRAFTS,
+        _ => false,
+    };
+    if !in_drafts {
+        return list;
+    }
+    for (id, d, updated) in &drafts.0 {
+        let at = list.iter().position(|m| m.id == *id);
+        let row = match at {
+            Some(i) => &mut list[i],
+            None => {
+                // The sample draft's row (from you, in Drafts, read), as this draft's.
+                let (i, sample) = SAMPLES.iter().enumerate().find(|(_, s)| s.mailbox == DRAFTS).expect("a sample draft");
+                list.push(Summary { id: envoy_core::drafts::list_id(*id), uid: 0, thread: format!("draft:{id}"), ..summary(i, sample) });
+                list.last_mut().expect("just pushed")
+            }
+        };
+        row.subject = d.subject.clone();
+        // As far as it parses: it may be half typed.
+        row.to = match envoy_core::smtp::parse_recipients(&d.to) {
+            Ok(to) => to.into_iter().map(|m| addr(m.name.as_deref().unwrap_or_default(), m.email.as_ref())).collect(),
+            Err(_) => vec![addr("", d.to.trim())],
+        };
+        row.preview = envoy_core::mime::preview(Some(&d.body), None);
+        row.date = *updated;
+        row.has_attachments = !d.attachments.is_empty();
+    }
+    list.sort_by_key(|r| std::cmp::Reverse((r.date, r.id)));
+    list
+}
+
 /// A sample draft, as it opens in the composer.
 pub fn draft_for(id: MessageId) -> Option<Draft> {
     let s = SAMPLES.get(usize::try_from(id - 1).ok()?).filter(|s| s.mailbox == DRAFTS)?;
