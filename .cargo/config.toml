@@ -4,3 +4,13 @@
 # deprecated APIs and shared cache. Search is FTS5, which stays, as do JSON (json_each) and STAT4.
 # About 0.3 MB of the shipped binary on every OS (docs/NORTH_STAR.md: < 30 MB).
 LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_SOUNDEX -USQLITE_ENABLE_LOAD_EXTENSION -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_SHARED_CACHE"
+
+[target.x86_64-unknown-linux-gnu]
+# An address-significance table (.llvm_addrsig) in what rustc compiles, so the linker's
+# `--icf=safe` (crates/envoy/build.rs) can fold identical functions and constants: without one,
+# lld counts every address as taken and folds nothing. Rust code says which addresses matter
+# (functions and promoted constants have none; statics do), and C code, which carries no table,
+# is never folded. About 0.55 MB of the shipped Linux binary; Windows' linker already folds
+# (/OPT:ICF), as does macOS' (ld64's deduplication). Nothing else changes: the table only steers
+# the linker, and other builds ignore it. A RUSTFLAGS in the environment replaces this.
+rustflags = ["-Cllvm-args=-addrsig"]
