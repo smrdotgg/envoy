@@ -6,6 +6,12 @@ fragile. This copies only the crates we build, strips their tests, examples and
 dev-dependencies, and writes a tiny workspace manifest so `*.workspace = true`
 keys keep resolving.
 
+Envoy's own changes to Rune are kept as patches in scripts/rune-patches/ and
+applied, in name order, after copying. One that no longer applies (Rune changed
+there, or took the change) stops the script: drop it or redo it.
+- 0002-zbus-5: Rune's D-Bus services (portals, tray) on zbus 5, the version
+  AccessKit's AT-SPI bridge uses, so Linux builds carry one D-Bus stack, not two.
+
 Usage: scripts/vendor-rune.py <path-to-rune-checkout>
 """
 import pathlib
@@ -59,6 +65,10 @@ def main() -> None:
     rev = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     (dst / "REV").write_text(rev + "\n")
     print(f"vendored rune {rev} into {dst}")
+    repo = dst.parent.parent
+    for patch in sorted((pathlib.Path(__file__).resolve().parent / "rune-patches").glob("*.patch")):
+        subprocess.run(["git", "-C", str(repo), "apply", str(patch)], check=True)
+        print(f"applied {patch.name}")
 
 
 if __name__ == "__main__":

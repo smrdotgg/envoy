@@ -4,7 +4,7 @@ use super::{Backend, Shortcut, ShortcutError, ShortcutId, Sink};
 use futures_util::StreamExt;
 use std::{collections::HashMap, sync::mpsc, thread::JoinHandle, time::Duration};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant, fdo};
+use zbus::{Connection, Proxy, fdo, zvariant::{OwnedObjectPath, OwnedValue as OwnedVariant, Value as Variant}};
 
 const DEST: &str = "org.freedesktop.portal.Desktop";
 const PATH: &str = "/org/freedesktop/portal/desktop";
@@ -37,7 +37,7 @@ fn response_status(status: u32) -> Result<(), ShortcutError> {
 }
 fn timed_out() -> ShortcutError { ShortcutError::Backend("portal request timed out".into()) }
 
-async fn request<B: serde::Serialize + zbus::Type>(conn: &Connection, portal: &Proxy<'_>, token: &str,
+async fn request<B: serde::Serialize + zbus::zvariant::Type>(conn: &Connection, portal: &Proxy<'_>, token: &str,
     method: &str, body: &B) -> Result<HashMap<String, OwnedVariant>, ShortcutError> {
     let sender = conn.unique_name().ok_or(ShortcutError::Unsupported)?.trim_start_matches(':').replace('.', "_");
     let path = format!("{PATH}/request/{sender}/{token}");

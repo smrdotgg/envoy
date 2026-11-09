@@ -5,7 +5,7 @@ use super::{Handler, TrayError, TrayEvent, TrayItem, TraySpec};
 use futures_util::StreamExt;
 use std::{collections::HashMap, sync::{Arc, Mutex, mpsc}, thread::JoinHandle, time::Duration};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant, object_server::SignalEmitter};
+use zbus::{Connection, Proxy, object_server::SignalEmitter, zvariant::{OwnedObjectPath, OwnedValue as OwnedVariant, Value as Variant}};
 
 const ITEM_PATH: &str = "/StatusNotifierItem";
 const MENU_PATH: &str = "/MenuBar";
@@ -35,13 +35,13 @@ fn pixmaps(spec: &TraySpec) -> Pixmaps {
 /// Menu ids are the item's position plus one; 0 is the root.
 fn properties(menu: &[TrayItem], id: i32) -> HashMap<String, OwnedVariant> {
     let mut map = HashMap::new();
-    if id == ROOT { map.insert("children-display".into(), OwnedVariant::from(zbus::Str::from_static("submenu"))); return map; }
+    if id == ROOT { map.insert("children-display".into(), OwnedVariant::from(zbus::zvariant::Str::from_static("submenu"))); return map; }
     match menu.get(id as usize - 1) {
         Some(TrayItem::Action { label, enabled, .. }) => {
-            map.insert("label".into(), OwnedVariant::from(zbus::Str::from(label.clone())));
+            map.insert("label".into(), OwnedVariant::from(zbus::zvariant::Str::from(label.clone())));
             if !enabled { map.insert("enabled".into(), OwnedVariant::from(false)); }
         }
-        Some(TrayItem::Separator) => { map.insert("type".into(), OwnedVariant::from(zbus::Str::from_static("separator"))); }
+        Some(TrayItem::Separator) => { map.insert("type".into(), OwnedVariant::from(zbus::zvariant::Str::from_static("separator"))); }
         None => {}
     }
     map
@@ -163,9 +163,9 @@ impl Native {
             };
             runtime.block_on(async move {
                 let setup = async {
-                    let conn = zbus::connection::Builder::session()
-                        .serve_at(ITEM_PATH, Item { model: model.clone(), on_event: on_event.clone() })
-                        .serve_at(MENU_PATH, Menu { model: model.clone(), on_event })
+                    let conn = zbus::connection::Builder::session()?
+                        .serve_at(ITEM_PATH, Item { model: model.clone(), on_event: on_event.clone() })?
+                        .serve_at(MENU_PATH, Menu { model: model.clone(), on_event })?
                         .build().await?;
                     let bus = Proxy::new(&conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus").await?;
                     let owners = bus.receive_signal_with_args("NameOwnerChanged", &[(0, WATCHER)]).await?;
@@ -227,7 +227,7 @@ impl Drop for Native {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zbus::Type;
+    use zbus::zvariant::Type;
 
     fn menu() -> Vec<TrayItem> { vec![TrayItem::action("show", "Show"), TrayItem::Separator, TrayItem::action("quit", "Quit").enabled(false)] }
 

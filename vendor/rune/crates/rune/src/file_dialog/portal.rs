@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use std::{collections::HashMap, path::PathBuf, sync::atomic::{AtomicU32, AtomicU64, Ordering}, time::Duration};
 use tokio::sync::oneshot;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant, fdo};
+use zbus::{Connection, Proxy, fdo, zvariant::{OwnedObjectPath, OwnedValue as OwnedVariant, Value as Variant}};
 
 const DEST: &str = "org.freedesktop.portal.Desktop";
 const PATH: &str = "/org/freedesktop/portal/desktop";

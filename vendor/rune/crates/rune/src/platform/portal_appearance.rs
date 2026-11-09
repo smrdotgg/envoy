@@ -6,7 +6,7 @@
 use futures_util::StreamExt;
 use std::{sync::{Arc, Mutex, OnceLock, Weak, atomic::{AtomicU8, Ordering}, mpsc}, time::Duration};
 use winit::window::Window;
-use zbus::{Connection, OwnedVariant, Proxy, Variant};
+use zbus::{Connection, Proxy, zvariant::{OwnedValue as OwnedVariant, Value as Variant}};
 
 const DEST: &str = "org.freedesktop.portal.Desktop";
 const PATH: &str = "/org/freedesktop/portal/desktop";
@@ -50,7 +50,7 @@ fn scheme_dark(scheme: u32) -> Option<bool> {
 fn scheme(value: &Variant<'_>) -> Option<u32> {
     match value {
         Variant::U32(x) => Some(*x),
-        Variant::Variant(inner) => scheme(inner),
+        Variant::Value(inner) => scheme(inner),
         _ => None,
     }
 }
