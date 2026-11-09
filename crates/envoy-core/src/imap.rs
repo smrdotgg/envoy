@@ -89,6 +89,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bulk downloads, which can legitimately take a while on a slow link.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(180);
+/// A [`probe`]: a connection that still works answers a NOOP in a round trip.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Whether the connection still answers: a NOOP, within a few seconds. One dropped without a
+/// word (the computer slept, a NAT forgot it) never answers, and is found out here instead of
+/// by the next real command's 30 s wait. Failing, the connection is done with.
+pub async fn probe(session: &mut Connection<impl Io>) -> Result<()> {
+    wire::ok_within(session, "NOOP", "NOOP", PROBE_TIMEOUT).await
+}
 
 pub enum Credential {
     Password(String),
@@ -960,7 +969,8 @@ pub(crate) mod fake {
     /// A logged-in session with a server that answers each command with `answer(command)`:
     /// the response lines, where `TAG` stands for the command's tag. `None` answers
     /// `TAG OK done`. An answer ending in [`HANG_UP`] closes the connection after what comes
-    /// before it, as a server does with one left idle too long (or going away mid-answer).
+    /// before it, as a server does with one left idle too long (or going away mid-answer);
+    /// [`SILENT`] answers nothing.
     pub async fn session(answer: impl Fn(&str) -> Option<String> + Send + 'static) -> (super::Connection<DuplexStream>, Log) {
         let (client, server) = tokio::io::duplex(1 << 20);
         let log: Log = Arc::default();
@@ -994,6 +1004,10 @@ pub(crate) mod fake {
                 seen.lock().unwrap().push(command.clone());
                 let reply = if command.starts_with("LOGIN") { None } else { answer(&command) };
                 let reply = reply.unwrap_or_else(|| "TAG OK done\r\n".into()).replace("TAG", &tag);
+                // No answer, the connection left open: a dead one's packets go nowhere.
+                if reply == SILENT {
+                    continue;
+                }
                 // Some of an answer, then the connection closes.
                 if let Some(before) = reply.strip_suffix(HANG_UP) {
                     let _ = w.write_all(before.as_bytes()).await;
@@ -1010,6 +1024,9 @@ pub(crate) mod fake {
 
     /// What an answer ends with to close the connection there.
     pub const HANG_UP: &str = "<hang up>";
+
+    /// An answer that never comes, the connection staying open: one dropped without a word.
+    pub const SILENT: &str = "<silent>";
 
     /// A SELECT's answer.
     pub fn selected(validity: u32, uid_next: u32) -> String {
