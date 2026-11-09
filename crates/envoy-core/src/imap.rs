@@ -900,7 +900,7 @@ async fn message_ids_of(session: &mut Connection<impl Io>, set: &str) -> Result<
 
 /// Deletes snooze bucket `bucket` if the server says it's empty right before (and unsubscribes
 /// it). Only for Gmail, where DELETE removes a label and never mail, and a week past the bucket's
-/// time ([`snooze::may_delete`]): the caller sees to both. True when it's gone, deleted here or
+/// time ([`snooze::old_enough`]): the caller sees to both. True when it's gone, deleted here or
 /// found gone already.
 pub async fn cleanup_bucket(session: &mut Connection<impl Io>, bucket: &str, inbox: &str) -> Result<bool> {
     // Never the selected mailbox; selected first, so the STATUS is right before the DELETE.

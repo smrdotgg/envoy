@@ -159,19 +159,9 @@ pub fn wakes_instead(wake: i64, now: i64) -> bool {
     wake <= now + TOO_CLOSE
 }
 
-/// A bucket whose time is `wake` is woken at `now`, after this Envoy's `jitter`.
-pub fn due(wake: i64, jitter: i64, now: i64) -> bool {
-    now >= wake + jitter
-}
-
 /// A bucket is old enough to delete (on Gmail, if it's empty): a week past its time.
 pub fn old_enough(wake: i64, now: i64) -> bool {
     now >= wake + KEEP_EMPTY
-}
-
-/// A bucket may be deleted: old enough, and the server just said it holds nothing.
-pub fn may_delete(wake: i64, now: i64, messages: u32) -> bool {
-    old_enough(wake, now) && messages == 0
 }
 
 /// This Envoy's wait before waking a bucket on a server without MOVE: 0 to [`MAX_JITTER`]
@@ -682,15 +672,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn buckets_wake_on_time_and_go_only_a_day_later_when_empty() {
+    fn buckets_are_old_enough_to_delete_a_week_on() {
         let wake = 1_000_000;
-        assert!(!due(wake, 0, wake - 1));
-        assert!(due(wake, 0, wake));
-        assert!(!due(wake, 12, wake + 11), "this Envoy's jitter");
-        assert!(due(wake, 12, wake + 12));
-        assert!(!may_delete(wake, wake + KEEP_EMPTY - 1, 0), "not before a day has passed");
-        assert!(may_delete(wake, wake + KEEP_EMPTY, 0));
-        assert!(!may_delete(wake, wake + 10 * KEEP_EMPTY, 1), "never with anything in it");
+        assert!(!old_enough(wake, wake + KEEP_EMPTY - 1));
+        assert!(old_enough(wake, wake + KEEP_EMPTY));
     }
 
     #[test]
