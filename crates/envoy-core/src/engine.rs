@@ -974,7 +974,7 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                     View::Role { account, role: Role::Snoozed } => {
                         let mut boxes = Vec::new();
                         for a in accts.iter().filter(|a| account.as_ref().is_none_or(|x| x == *a)) {
-                            let done: HashSet<String> = st.buckets(a)?.into_iter().filter(|b| b.done).map(|b| b.name).collect();
+                            let done = st.done_buckets(a)?;
                             boxes.extend(st.mailboxes(a)?.into_iter().filter(|m| m.role == Role::Snoozed && m.selectable && !done.contains(&m.name)).map(|m| (a.clone(), m.name)));
                         }
                         boxes
@@ -2230,7 +2230,7 @@ async fn session_loop(
         inbox_dirty = false;
         if full_due {
             // Buckets done with are empty and left alone: not counted.
-            let done: HashSet<String> = shared.with_writer(|st| st.buckets(&id))?.into_iter().filter(|b| b.done).map(|b| b.name).collect();
+            let done = shared.with_writer(|st| st.done_buckets(&id))?;
             for m in mailboxes.iter().filter(|m| m.selectable && !done.contains(&m.name)) {
                 match imap::status(&mut session, &m.name).await {
                     Ok((unread, total)) => shared.with_writer(|st| st.set_counts(&id, &m.name, unread, total))?,

@@ -243,24 +243,15 @@ impl Store {
         Ok(match view {
             View::Mailbox { account, mailbox } => Scope::Boxes(vec![(account.clone(), mailbox.clone())]),
             // Every bucket not done with (and the server's own snoozed mailbox), soonest to
-            // wake first: the order Snoozed lists them in.
+            // wake first: the order Snoozed lists them in. Only names that are buckets have the
+            // role with a stamp at their end, and stamps sort as their times do.
             View::Role { account, role: Role::Snoozed } => {
                 let mut stmt = self.conn.prepare_cached(
                     "SELECT account, name FROM mailboxes m WHERE role = 'snoozed' AND selectable = 1 AND (?1 IS NULL OR account = ?1)
-                       AND NOT EXISTS (SELECT 1 FROM snooze_done d WHERE d.account = m.account AND d.name = m.name) ORDER BY account, name",
+                       AND NOT EXISTS (SELECT 1 FROM snooze_done d WHERE d.account = m.account AND d.name = m.name)
+                     ORDER BY substr(name, -14) GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9]Z' DESC, substr(name, -14), account, name",
                 )?;
-                let boxes: Vec<(String, String)> = stmt.query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-                let mut layout: Option<(String, super::BucketLayout)> = None;
-                let mut keyed: Vec<(i64, (String, String))> = Vec::with_capacity(boxes.len());
-                for (a, name) in boxes {
-                    if layout.as_ref().is_none_or(|(of, _)| *of != a) {
-                        layout = Some((a.clone(), self.bucket_layout(&a)?));
-                    }
-                    let wake = layout.as_ref().and_then(|(_, l)| l.wake(&name)).map_or(i64::MAX, |(_, w)| w);
-                    keyed.push((wake, (a, name)));
-                }
-                keyed.sort_by_key(|(wake, _)| *wake);
-                Scope::Boxes(keyed.into_iter().map(|(_, b)| b).collect())
+                Scope::Boxes(stmt.query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
             }
             View::Role { account, role } => {
                 let mut stmt = self.conn.prepare_cached("SELECT account, name FROM mailboxes WHERE role = ?1 AND (?2 IS NULL OR account = ?2) ORDER BY account, name")?;
@@ -369,7 +360,9 @@ impl Store {
     }
 
     /// Takes row `r` into the list: once the first page fills, it's completed and handed out,
-    /// and reading goes on to the whole list's limit. True when the whole list is full.
+    /// and reading goes on to the whole list's limit. True when the whole list is full. (One
+    /// body for the loops that read rows, not a copy in each.)
+    #[inline(never)]
     fn take_paged(&self, g: &mut Grouper, r: &Row, pages: &mut Pages, scope: &Scope, filter: &Filter) -> Result<bool> {
         let mut took = g.take(r, true)?;
         if matches!(took, Took::Full) && g.limit < pages.limit {

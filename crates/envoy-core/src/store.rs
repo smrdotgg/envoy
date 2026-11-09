@@ -1953,6 +1953,13 @@ impl Store {
         Ok(rows.into_iter().filter_map(|(name, done)| layout.wake(&name).map(|(_, wake)| (wake, done)).map(|(wake, done)| Bucket { name, wake, done })).collect())
     }
 
+    /// The account's buckets done with (empty, and left alone).
+    pub fn done_buckets(&self, account: &str) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached("SELECT name FROM snooze_done WHERE account = ?1")?;
+        let names = stmt.query_map(params![account], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(names)
+    }
+
     /// Forgets what's known of buckets the account no longer has.
     pub fn forget_gone_buckets(&self, account: &str) -> Result<()> {
         self.conn.execute("DELETE FROM snooze_done WHERE account = ?1 AND name NOT IN (SELECT name FROM mailboxes WHERE account = ?1)", params![account])?;
