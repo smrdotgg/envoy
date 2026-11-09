@@ -80,6 +80,8 @@ struct Row {
     recipients: String,
     has_body: bool,
     flags: u32,
+    /// How many of `recipients` were in To (-1: not known).
+    to_count: i64,
 }
 
 /// A raw message's header section.
@@ -238,8 +240,7 @@ impl Store {
         if known & signals::KNOWN != 0 {
             return Ok(());
         }
-        let s = category::signals_of(p, &self.classifier.borrow().me);
-        self.conn.execute("UPDATE messages SET signals = ?2, list_id = ?3 WHERE id = ?1", params![id, s, p.bulk_headers.list_id])?;
+        self.conn.execute("UPDATE messages SET signals = ?2, list_id = ?3, to_count = ?4 WHERE id = ?1", params![id, category::signals_of(p), p.bulk_headers.list_id, p.to.len()])?;
         self.dirty.borrow_mut().insert(key(&account, &thread));
         self.flush_unless_batched()
     }
@@ -290,6 +291,7 @@ impl Store {
                     recipients: r.get(7)?,
                     has_body: r.get::<_, i64>(8)? != 0,
                     flags: r.get(9)?,
+                    to_count: r.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -299,10 +301,11 @@ impl Store {
         }
         if backfill {
             for row in rows.iter_mut().filter(|r| r.signals & signals::KNOWN == 0 && r.has_body) {
-                if let Some((s, list_id)) = self.signals_from_raw(row.id)? {
-                    self.conn.execute("UPDATE messages SET signals = ?2, list_id = ?3 WHERE id = ?1", params![row.id, s, list_id])?;
+                if let Some((s, list_id, to_count)) = self.signals_from_raw(row.id)? {
+                    self.conn.execute("UPDATE messages SET signals = ?2, list_id = ?3, to_count = ?4 WHERE id = ?1", params![row.id, s, list_id, to_count])?;
                     row.signals = s;
                     row.list_id = list_id;
+                    row.to_count = to_count as i64;
                 }
             }
         }
@@ -316,7 +319,10 @@ impl Store {
         let classifier = self.classifier.borrow();
         let mut verdicts = Vec::with_capacity(rows.len());
         for (r, role) in rows.iter().zip(&row_roles).filter(|p| !any || counts(p)) {
-            let known = r.signals & signals::KNOWN != 0;
+            // To you, by your addresses as they are now: the first `to_count` recipients were in
+            // To; where that isn't known (cached before the split), any of them.
+            let recipients = from_json::<Vec<Address>>(&r.recipients);
+            let to = usize::try_from(r.to_count).map_or(recipients.len(), |n| n.min(recipients.len()));
             let facts = Facts {
                 from: &r.from,
                 subject: &r.subject,
@@ -325,7 +331,7 @@ impl Store {
                 from_me: classifier.is_me(&r.from) || *role == Role::Sent,
                 written_to: self.is_written_to(&r.from)?,
                 gmail_important: gmail.contains(&r.message_id.as_str()),
-                addressed_to_me: !known && from_json::<Vec<Address>>(&r.recipients).iter().any(|a| classifier.is_me(&a.email)),
+                to_me: recipients[..to].iter().any(|a| classifier.is_me(&a.email)),
             };
             verdicts.push(classifier.verdict(&facts));
         }
@@ -341,11 +347,12 @@ impl Store {
             .map(Category::from_code))
     }
 
-    /// What a downloaded message's headers say, for one stored before they were read.
-    fn signals_from_raw(&self, id: MessageId) -> Result<Option<(u32, String)>> {
+    /// What a downloaded message's headers say, for one stored before they were read: its
+    /// signals, list id, and how many of its recipients were in To.
+    fn signals_from_raw(&self, id: MessageId) -> Result<Option<(u32, String, usize)>> {
         let raw: Option<Vec<u8>> = self.conn.prepare_cached("SELECT raw FROM bodies WHERE id = ?1")?.query_row([id], |r| r.get(0)).optional()?;
         let Some(p) = raw.as_deref().and_then(|raw| mime::parse(header_block(raw), true)) else { return Ok(None) };
-        Ok(Some((category::signals_of(&p, &self.classifier.borrow().me), p.bulk_headers.list_id)))
+        Ok(Some((category::signals_of(&p), p.bulk_headers.list_id, p.to.len())))
     }
 
     /// Marks the conversations of mail from these addresses (lowercase).
@@ -410,7 +417,7 @@ impl Store {
 }
 
 /// A conversation's messages, newest first (ties as lists order them), by the thread index.
-pub(super) const THREAD_ROWS: &str = "SELECT id, mailbox, message_id, from_email, subject, signals, list_id, recipients, has_body, flags FROM messages
+pub(super) const THREAD_ROWS: &str = "SELECT id, mailbox, message_id, from_email, subject, signals, list_id, recipients, has_body, flags, to_count FROM messages
     WHERE account = ?1 AND thread = ?2 ORDER BY date DESC, id DESC";
 /// Sets a conversation's category, touching only the rows it changes (and so their indexes), by
 /// the thread index: left to itself SQLite takes `messages_by_category` (it has every column
@@ -567,6 +574,22 @@ mod tests {
         assert_eq!(cat(&st, news), Category::Newsletters);
     }
 
+    /// Whether mail is to you depends on your addresses: one added later (another account),
+    /// or removed, re-sorts the mail sent to it.
+    #[test]
+    fn adding_or_removing_an_address_re_sorts_mail_to_it() {
+        let st = store();
+        let alias = put(&st, "INBOX", 1, "From: Sam <sam@ortiz.family>\r\nTo: Me <ME@alias.example>\r\nSubject: Hi\r\nMessage-ID: <h@x>");
+        let copied = put(&st, "INBOX", 2, "From: Bo <bo@x.example>\r\nTo: team@x.example\r\nCc: me@alias.example\r\nSubject: Team\r\nMessage-ID: <t@x>");
+        assert_eq!((cat(&st, alias), cat(&st, copied)), (Category::Other, Category::Other), "not yours yet");
+        st.set_classifier(Classifier::new(vec![], [ME.to_owned(), "me@alias.example".to_owned()])).unwrap();
+        finish_pass(&st);
+        assert_eq!((cat(&st, alias), cat(&st, copied)), (Category::Important, Category::Other), "to you, and only copied");
+        st.set_classifier(classifier(vec![])).unwrap();
+        finish_pass(&st);
+        assert_eq!(cat(&st, alias), Category::Other, "yours no longer");
+    }
+
     #[test]
     fn tab_counts_are_unread_conversations_per_category() {
         let st = store();
@@ -605,7 +628,7 @@ mod tests {
         assert_eq!(Query::parse("category:zz").category, Some(0));
         assert_eq!(Query::parse("category:n category:news").category, Some(1 << Category::Newsletters.code()), "both apply");
         assert_eq!(Query::parse("category:").category, None);
-        assert_eq!(Query::in_category(Category::Other).category, Some(1));
+        assert_eq!(Query::in_category(Category::Other).categories(), Some(1));
         assert!(!Query::parse("category:other").is_empty());
     }
 

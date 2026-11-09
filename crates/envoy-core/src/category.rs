@@ -28,10 +28,14 @@ use serde_json::{Value, json};
 pub use crate::model::Category;
 
 /// Bumped when the heuristics change: stored categories are worked out again, in the background.
-pub const HEURISTICS: u32 = 1;
+/// 2: whether mail is to you is judged from its recipients with your addresses as they are now,
+/// no longer stored as a signal.
+pub const HEURISTICS: u32 = 2;
 
-/// What a message's headers say about it ([`crate::mime::BulkHeaders`], and whether it's to you),
-/// stored as `messages.signals` so a rule change never needs the headers again.
+/// What a message's headers say about it ([`crate::mime::BulkHeaders`]), stored as
+/// `messages.signals` so a rule change never needs the headers again. None of it depends on your
+/// addresses (whether it's to you is worked out when it's judged, from its recipients), so your
+/// addresses changing never leaves a stale signal.
 pub mod signals {
     /// The headers were read (the sync asked for the bulk headers, or the whole message was
     /// downloaded). Messages cached by an Envoy from before the split lack it until their body
@@ -48,12 +52,10 @@ pub mod signals {
     pub const AUTO: u32 = 1 << 6;
     /// A notification system's own headers (`X-GitHub-Reason`, …).
     pub const PLATFORM: u32 = 1 << 7;
-    /// One of your addresses is in `To` (not only `Cc`).
-    pub const TO_ME: u32 = 1 << 8;
 }
 
-/// [`signals`] for a parsed message, `me` being your addresses (lowercase).
-pub fn signals_of(p: &crate::mime::Parsed, me: &HashSet<String>) -> u32 {
+/// [`signals`] for a parsed message.
+pub fn signals_of(p: &crate::mime::Parsed) -> u32 {
     use signals::*;
     let b = &p.bulk_headers;
     let mut s = KNOWN;
@@ -69,7 +71,6 @@ pub fn signals_of(p: &crate::mime::Parsed, me: &HashSet<String>) -> u32 {
     set(&mut s, b.precedence == "list", LIST);
     set(&mut s, !b.auto_submitted.is_empty() && b.auto_submitted != "no", AUTO);
     set(&mut s, b.platform, PLATFORM);
-    set(&mut s, p.to.iter().any(|a| me.contains(&a.email.to_lowercase())), TO_ME);
     s
 }
 
@@ -87,9 +88,9 @@ pub struct Facts<'a> {
     pub written_to: bool,
     /// Gmail has it in Important.
     pub gmail_important: bool,
-    /// One of your addresses is among its recipients (`To` or `Cc`): stands in for
-    /// [`signals::TO_ME`] where the headers weren't read.
-    pub addressed_to_me: bool,
+    /// One of your addresses (as they are now) is in `To`, not only `Cc`; for a message cached
+    /// before the split, which doesn't know which recipients were in `To`, among its recipients.
+    pub to_me: bool,
 }
 
 /// Why a message (or conversation) is where it is, to tell the user.
@@ -426,8 +427,7 @@ pub fn verdict(f: &Facts) -> Verdict {
     if f.gmail_important {
         return v(Category::Important, Why::GmailImportant);
     }
-    let to_me = if has(KNOWN) { has(TO_ME) } else { f.addressed_to_me };
-    if to_me {
+    if f.to_me {
         return v(Category::Important, Why::ToYou);
     }
     v(Category::Other, Why::Rest)
@@ -544,12 +544,12 @@ mod tests {
         let f = Facts {
             from: &p.from.email,
             subject: &p.subject,
-            signals: signals_of(&p, &me),
+            signals: signals_of(&p),
             list_id: &p.bulk_headers.list_id,
             from_me: me.contains(&p.from.email.to_lowercase()),
             written_to,
             gmail_important,
-            addressed_to_me: false,
+            to_me: p.to.iter().any(|a| me.contains(&a.email.to_lowercase())),
         };
         verdict(&f)
     }
@@ -615,11 +615,11 @@ mod tests {
     #[test]
     fn messages_cached_before_the_split_are_judged_by_what_the_cache_has() {
         // No headers read: whether it's to you comes from its recipients (To and Cc together).
-        let f = Facts { from: "bo@example.org", subject: "hi", signals: 0, addressed_to_me: true, ..Facts::default() };
+        let f = Facts { from: "bo@example.org", subject: "hi", signals: 0, to_me: true, ..Facts::default() };
         assert_eq!(verdict(&f), v(Category::Important, Why::ToYou));
         let f = Facts { from: "bo@example.org", subject: "hi", signals: 0, ..Facts::default() };
         assert_eq!(verdict(&f), v(Category::Other, Why::Rest));
-        let f = Facts { from: "noreply@bank.example", subject: "Statement", signals: 0, addressed_to_me: true, ..Facts::default() };
+        let f = Facts { from: "noreply@bank.example", subject: "Statement", signals: 0, to_me: true, ..Facts::default() };
         assert_eq!(verdict(&f).category, Category::Notifications);
     }
 

@@ -34,10 +34,11 @@ pub enum Command {
     /// `stream`: send the top of a long list ahead of the rest ([`Event::List`]'s `more`), for a
     /// list the user is waiting on (a new view, a search). A list already on screen being read
     /// again (new mail, a sync) goes in one piece, so it never shrinks under the reader.
-    /// `category`: a tab of the split inbox, shown when the query has no `category:` of its own;
-    /// the view's unread count per category comes with it ([`Event::CategoryCounts`]: after its
-    /// first page, before the whole list).
-    List { req: u64, view: View, query: String, conversations: bool, limit: u32, stream: bool, category: Option<Category> },
+    /// `category`: a tab of the split inbox, shown when the query has no `category:` of its own.
+    /// `counts`: the split inbox's tabs are on screen (with a tab or a search under them): the
+    /// view's unread count per category comes with the list ([`Event::CategoryCounts`], under the
+    /// same `req`: after its first page, before the whole list).
+    List { req: u64, view: View, query: String, conversations: bool, limit: u32, stream: bool, category: Option<Category>, counts: bool },
     /// Moves conversations (those of `ids`) to `category` in the split inbox, by hand, here
     /// only (the server never hears of categories); [`Command::UndoCategory`] with `undo` (a key
     /// as [`Command::Move`]'s) takes it back.
@@ -125,8 +126,8 @@ pub enum Event {
     /// the same rows) follows in another `List` with the same `req`.
     List { req: u64, items: Vec<Summary>, more: bool },
     /// A view's unread conversations (messages, outside conversation view) per category, by
-    /// [`Category::code`]: the split inbox's tabs. Sent with a list that asked for a category.
-    CategoryCounts { view: View, counts: [u32; 4] },
+    /// [`Category::code`]: the split inbox's tabs. Sent with list `req`, which asked for them.
+    CategoryCounts { req: u64, view: View, counts: [u32; 4] },
     /// An opened message's conversation's category in the split inbox, and why, in words
     /// ([`Store::explain`]). Follows its [`Event::Thread`].
     Explained { id: MessageId, category: Category, why: String },
@@ -722,16 +723,11 @@ fn wake(workers: &HashMap<String, Worker>, account: &str) {
 
 async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd: Command) -> Result<()> {
     match cmd {
-        Command::List { req, view, query, conversations, limit, stream, category } => {
+        Command::List { req, view, query, conversations, limit, stream, category, counts } => {
             let shared = shared.clone();
             tokio::task::spawn_blocking(move || {
                 let me = shared.me();
-                let mut q = Query::parse(&query);
-                if let Some(c) = category
-                    && q.category.is_none()
-                {
-                    q.category = Query::in_category(c).category;
-                }
+                let q = Query { tab: category, ..Query::parse(&query) };
                 let items = shared.reader.lock().map_err(|_| anyhow!("store poisoned")).and_then(|st| {
                     // The top of a long list goes out first, and the rest when it's read. A
                     // Drafts list goes in one piece: its rows are merged with the local drafts.
@@ -740,9 +736,9 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                     let items = st.list_paged(&view, &q, conversations, limit, &me, page, &mut first)?;
                     // The tabs' counts, after the first page (it never waits for them) and
                     // before the whole list: the app shows both in the same frame.
-                    if category.is_some() {
+                    if counts {
                         let counts = st.category_counts(&view, conversations)?;
-                        shared.emit(Event::CategoryCounts { view: view.clone(), counts });
+                        shared.emit(Event::CategoryCounts { req, view: view.clone(), counts });
                     }
                     drafts::merge(&st, &view, &q, limit, items, |a| shared.sender(a))
                 });
@@ -3734,11 +3730,11 @@ mod tests {
         update_classifier(&shared);
         assert!(!shared.recategorizing.load(std::sync::atomic::Ordering::SeqCst), "the same classifier: nothing to do");
         let view = View::Role { account: None, role: Role::Inbox };
-        let list = |category: Option<Category>| {
-            let cmd = Command::List { req: 1, view: view.clone(), query: String::new(), conversations: true, limit: 100, stream: false, category };
+        let list = |req: u64, query: &str, category: Option<Category>| {
+            let cmd = Command::List { req, view: view.clone(), query: query.into(), conversations: true, limit: 100, stream: false, category, counts: true };
             (shared.clone(), cmd)
         };
-        let (s, cmd) = list(Some(Category::Newsletters));
+        let (s, cmd) = list(1, "", Some(Category::Newsletters));
         handle(&s, &mut HashMap::new(), cmd).await.unwrap();
         let mut events = Vec::new();
         while !events.iter().any(|e| matches!(e, Event::List { .. })) {
@@ -3751,6 +3747,15 @@ mod tests {
         assert_eq!((counts[Category::Newsletters.code() as usize], counts[Category::Important.code() as usize]), (1, 1));
         let Event::List { items, .. } = &events[rows] else { unreachable!() };
         assert_eq!(items.iter().map(|m| (m.id, m.category)).collect::<Vec<_>>(), [(news, Category::Newsletters)]);
+        // A search under the tabs: every category's rows, and the counts with them, under its req.
+        let (s, cmd) = list(3, "from:sam", None);
+        handle(&s, &mut HashMap::new(), cmd).await.unwrap();
+        let mut events = Vec::new();
+        while !events.iter().any(|e| matches!(e, Event::List { req: 3, .. })) {
+            events.push(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        }
+        assert!(events.iter().any(|e| matches!(e, Event::CategoryCounts { req: 3, .. })), "counts during a search: {events:?}");
+        assert!(events.iter().any(|e| matches!(e, Event::List { req: 3, items, .. } if items.len() == 1 && items[0].id == direct)), "{events:?}");
         let category = |id| shared.with_writer(|st| Ok(st.summary(id)?.unwrap().category)).unwrap();
         // Opened: why it's in its tab follows.
         handle(&shared, &mut HashMap::new(), Command::Open { req: 2, id: news, conversations: true }).await.unwrap();

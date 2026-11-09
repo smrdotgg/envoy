@@ -689,7 +689,7 @@ impl App {
     }
 
     /// Applies one engine event. True when what's on screen should be re-read.
-    fn apply(&mut self, ev: Event, tx: &mut Tx) -> bool {
+    pub(crate) fn apply(&mut self, ev: Event, tx: &mut Tx) -> bool {
         let mut reload = false;
         match ev {
             Event::Accounts(a) => {
@@ -734,7 +734,10 @@ impl App {
                 }
             }
             Event::List { .. } => {}
-            Event::CategoryCounts { view, counts } => self.category_counts = Some((view, counts)),
+            // Only the newest list's: an older request's, arriving late, would put back what
+            // changed since.
+            Event::CategoryCounts { req, view, counts } if req == self.list_req => self.category_counts = Some((view, counts)),
+            Event::CategoryCounts { .. } => {}
             Event::Explained { id, category, why } => self.explained = Some((id, category, why)),
             Event::Thread { req, id, messages } if req == self.thread_req && messages.is_empty() => {
                 // The open message is gone (moved, deleted, or an undo that came too late):
@@ -984,7 +987,7 @@ impl App {
     fn request_list_as(&mut self, at_once: bool) {
         let category = self.list_category();
         if self.demo {
-            let q = envoy_core::store::Query::parse(&self.applied_query);
+            let q = envoy_core::store::Query { tab: category, ..envoy_core::store::Query::parse(&self.applied_query) };
             let words: Vec<String> = q.text.iter().map(|w| w.to_lowercase()).collect();
             self.list = crate::demo::list_with(&self.view, &self.demo_drafts)
                 .into_iter()
@@ -995,11 +998,10 @@ impl App {
                         && q.unread.is_none_or(|u| u == m.thread_unread)
                         && q.starred.is_none_or(|st| st == m.flagged())
                         && (!q.attachment || m.has_attachments)
-                        && q.category.is_none_or(|mask| mask & 1 << m.category.code() != 0)
-                        && category.is_none_or(|c| m.category == c)
+                        && q.categories().is_none_or(|mask| mask & 1 << m.category.code() != 0)
                 })
                 .collect();
-            if category.is_some() {
+            if self.split_applies() {
                 self.category_counts = Some((self.view.clone(), crate::demo::category_counts(&self.view)));
             }
             self.list_loaded = true;
@@ -1018,6 +1020,8 @@ impl App {
             limit: 3000,
             stream: at_once,
             category,
+            // The tabs show over a search too, and keep counting.
+            counts: self.split_applies(),
         });
     }
 
