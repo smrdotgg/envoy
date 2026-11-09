@@ -1503,29 +1503,61 @@ async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedRece
             },
         };
         let Some(account) = shared.account(&id) else { return };
-        if session.is_none() {
-            let connected = match shared.credential(&account).await {
-                Ok(cred) => imap::connect(&account, &cred).await,
-                Err(e) => Err(e),
-            };
-            match connected {
-                Ok(s) => session = Some(s),
-                Err(e) => {
-                    log::warn!("{}: foreground connect failed: {e:#}", account.email);
-                    let _ = fallback.send(job);
-                    notify.notify_one();
-                    continue;
-                }
-            }
-        }
-        let Some(s) = session.as_mut() else { continue };
-        if let Err(e) = foreground_job(&shared, &account, s, &job).await {
-            log::warn!("{}: {e:#}", account.email);
-            session = None;
+        if let Err(e) = on_foreground(&mut ImapForeground { shared: &shared, account: &account }, &mut session, &job).await {
+            log::warn!("{}: foreground: {e:#}", account.email);
             let _ = fallback.send(job);
             notify.notify_one();
         }
     }
+}
+
+/// What [`on_foreground`] needs of a connection: a seam, so it can be tested without a server.
+trait Foreground {
+    type Session: Send;
+    fn connect(&mut self) -> impl std::future::Future<Output = Result<Self::Session>> + Send;
+    fn run(&mut self, session: &mut Self::Session, job: &Job) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+struct ImapForeground<'a> {
+    shared: &'a Arc<Shared>,
+    account: &'a Account,
+}
+
+impl Foreground for ImapForeground<'_> {
+    type Session = Session;
+
+    async fn connect(&mut self) -> Result<Session> {
+        let cred = self.shared.credential(self.account).await?;
+        imap::connect(self.account, &cred).await
+    }
+
+    async fn run(&mut self, session: &mut Session, job: &Job) -> Result<()> {
+        foreground_job(self.shared, self.account, session, job).await
+    }
+}
+
+/// Runs `job` on the foreground connection `session`, opening one if there is none; leaves in
+/// `session` what the next job can use. A connection left open since an earlier job may have
+/// been dropped meanwhile without a word (servers and NATs close idle connections early,
+/// GreenMail after 30 s): when the job fails on one for want of a connection, it runs once more
+/// on a fresh one, rather than wait behind the background connection's work. An error means it
+/// didn't run here: the caller hands it to the background connection.
+async fn on_foreground<F: Foreground>(fg: &mut F, session: &mut Option<F::Session>, job: &Job) -> Result<()> {
+    let fresh = session.is_none();
+    let s = match session {
+        Some(s) => s,
+        None => session.insert(fg.connect().await?),
+    };
+    let Err(e) = fg.run(s, job).await else { return Ok(()) };
+    *session = None;
+    if fresh || !imap::connection_trouble(&e) {
+        return Err(e);
+    }
+    log::info!("the foreground connection was gone ({e:#}): trying a new one");
+    let mut s = fg.connect().await?;
+    fg.run(&mut s, job).await?;
+    *session = Some(s);
+    Ok(())
 }
 
 async fn foreground_job(shared: &Arc<Shared>, account: &Account, session: &mut Session, job: &Job) -> Result<()> {
@@ -2534,6 +2566,62 @@ mod tests {
         server.counts = (1, 2);
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(unread(&shared, "a"), 1);
+    }
+
+    /// A foreground connection whose sessions are numbered as they're opened. `stale`: sessions
+    /// below it were dropped by the server (jobs on them fail as a lost connection would);
+    /// `refuse`: the server answers jobs with NO; `offline`: connecting fails.
+    #[derive(Default)]
+    struct FakeForeground {
+        opened: u32,
+        stale: u32,
+        refuse: bool,
+        offline: bool,
+        ran_on: Vec<u32>,
+    }
+
+    impl Foreground for FakeForeground {
+        type Session = u32;
+
+        async fn connect(&mut self) -> Result<u32> {
+            anyhow::ensure!(!self.offline, "Couldn't reach imap.x.com:993");
+            self.opened += 1;
+            Ok(self.opened)
+        }
+
+        async fn run(&mut self, session: &mut u32, _: &Job) -> Result<()> {
+            self.ran_on.push(*session);
+            if self.refuse {
+                return Err(anyhow::Error::new(async_imap::error::Error::No("no such mailbox".into())));
+            }
+            anyhow::ensure!(*session >= self.stale, "SELECT timed out (connection lost?)");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_foreground_connection_is_replaced_before_falling_back() {
+        // The open connection was closed by the server while idle: the job runs on a new one,
+        // which is kept for the next.
+        let mut fg = FakeForeground { opened: 1, stale: 2, ..Default::default() };
+        let mut session = Some(1);
+        on_foreground(&mut fg, &mut session, &Job::Sync).await.unwrap();
+        assert_eq!((fg.ran_on.as_slice(), session), (&[1, 2][..], Some(2)));
+        // Once only: a job that fails on a fresh connection goes to the background one.
+        let mut fg = FakeForeground { stale: 9, ..Default::default() };
+        let mut session = None;
+        assert!(on_foreground(&mut fg, &mut session, &Job::Sync).await.is_err());
+        assert_eq!((fg.ran_on.as_slice(), session), (&[1][..], None));
+        // A server that answers NO isn't a lost connection: no second try.
+        let mut fg = FakeForeground { opened: 1, refuse: true, ..Default::default() };
+        let mut session = Some(1);
+        assert!(on_foreground(&mut fg, &mut session, &Job::Sync).await.is_err());
+        assert_eq!((fg.ran_on.as_slice(), fg.opened, session), (&[1][..], 1, None));
+        // Offline: the dropped connection can't be replaced either.
+        let mut fg = FakeForeground { opened: 1, stale: 2, offline: true, ..Default::default() };
+        let mut session = Some(1);
+        assert!(on_foreground(&mut fg, &mut session, &Job::Sync).await.is_err());
+        assert_eq!(session, None);
     }
 
     // ── drafts ──
