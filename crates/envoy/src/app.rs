@@ -210,6 +210,12 @@ pub enum Unsaved {
 }
 
 impl Unsaved {
+    fn id(&self) -> i64 {
+        match self {
+            Unsaved::Save { id, .. } | Unsaved::Unsent { id, .. } => *id,
+        }
+    }
+
     /// For the recovery file.
     fn recovered(&self) -> envoy_core::drafts::Recovered {
         match self {
@@ -1687,10 +1693,6 @@ impl App {
             }
             .map_err(|e| format!("{e:#}"))
         };
-        // Files added and taken off that the engine may not have got to, before the text (a
-        // draft written again as a new one takes its files along) and after (a draft only the
-        // text puts in the store).
-        self.flush_files(&files);
         self.close_with(
             |u| {
                 let Some(engine) = &engine else { return Err("the mail database isn't open".into()) };
@@ -1705,6 +1707,8 @@ impl App {
                 envoy_core::drafts::save_recovery(&envoy_core::drafts::recovery_dir(), &drafts).map_err(|e| format!("{e:#}"))
             },
         );
+        // Then files added and taken off that the engine may not have got to: the text is in, so
+        // their draft is too (or the one that replaced it, which close_with points them at).
         self.flush_files(&files);
         self.file_ops.clear();
         self.engine = engine;
@@ -1730,7 +1734,10 @@ impl App {
     /// last place left.
     fn close_with(&mut self, mut write: impl FnMut(&Unsaved) -> Result<bool, String>, recover: impl FnOnce(Vec<Unsaved>) -> Result<(), String>) {
         let mut failed = Vec::new();
+        // Drafts written again as new ones: old id, and the new one its file changes went to.
+        let mut replaced: Vec<(i64, i64)> = Vec::new();
         for u in self.unsaved() {
+            let old = u.id();
             let u = match write(&u) {
                 Ok(true) => continue,
                 Ok(false) => {
@@ -1744,7 +1751,18 @@ impl App {
                 }
             };
             match write(&u) {
-                Ok(true) => {}
+                // Its files' changes not yet made go to the new draft (the latest, if several).
+                Ok(true) => {
+                    let new = u.id();
+                    let before = replaced.iter().rev().find(|r| r.0 == old).map_or(old, |r| r.1);
+                    replaced.push((old, new));
+                    for op in &mut self.file_ops {
+                        let (FileOp::Attach { draft, .. } | FileOp::Detach { draft, .. }) = op;
+                        if *draft == before {
+                            *draft = new;
+                        }
+                    }
+                }
                 Ok(false) => failed.push(u),
                 Err(e) => {
                     eprintln!("couldn't save a draft ({e}): keeping it in the recovery file");
@@ -2031,14 +2049,8 @@ impl App {
         let draft = c.draft_id;
         if !self.demo {
             self.file_ops.retain(|op| !matches!(op, FileOp::Attach { file, .. } if file.id == id));
+            // Made again on close, harmlessly: no answer says it's done, so it's never dropped.
             self.file_ops.push(FileOp::Detach { draft, file: id });
-            // Made again on close, harmlessly: only the latest few are kept.
-            let detaches = self.file_ops.iter().filter(|op| matches!(op, FileOp::Detach { .. })).count();
-            if detaches > 64
-                && let Some(i) = self.file_ops.iter().position(|op| matches!(op, FileOp::Detach { .. }))
-            {
-                self.file_ops.remove(i);
-            }
             self.send(Command::DetachFile { draft, file: id });
         }
     }
@@ -3064,6 +3076,46 @@ mod tests {
         let oops = ids(&app)[2];
         app.remove_file(oops);
         assert_eq!(flushed(&app), [FileOp::Detach { draft, file: a }, FileOp::Detach { draft, file: oops }]);
+    }
+
+    #[test]
+    fn a_draft_written_again_on_close_takes_its_file_changes() {
+        let mut app = App::new(true);
+        let draft = composer_with_two_files(&mut app);
+        let a = ids(&app)[0];
+        app.attach_paths(vec!["/files/late.pdf".into()]);
+        let late = app.compose.as_ref().unwrap().files[2].clone();
+        app.remove_file(a);
+        // Its save refused on close: written again as a new draft, which gets them.
+        let mut written = Vec::new();
+        app.close_with(
+            |u| match u {
+                Unsaved::Save { id, .. } if *id == draft => Ok(false),
+                Unsaved::Save { id, .. } => {
+                    written.push(*id);
+                    Ok(true)
+                }
+                Unsaved::Unsent { .. } => Ok(true),
+            },
+            |failed| panic!("nothing for the recovery file: {failed:?}"),
+        );
+        // (The latest, if more than one of its saves was waiting.)
+        let new = *written.last().expect("written again");
+        assert!(written.iter().all(|w| *w != draft));
+        assert_eq!(flushed(&app), [FileOp::Attach { draft: new, file: late, source: FileSource::Path("/files/late.pdf".into()) }, FileOp::Detach { draft: new, file: a }]);
+    }
+
+    #[test]
+    fn every_file_taken_off_is_taken_off_again_on_close() {
+        let mut app = App::new(true);
+        let draft = composer_with_two_files(&mut app);
+        app.attach_paths((0..100).map(|i| format!("/files/{i}.txt").into()).collect());
+        let taken: Vec<i64> = ids(&app);
+        for id in &taken {
+            app.remove_file(*id);
+        }
+        // No answer says a file is off: none is forgotten.
+        assert_eq!(flushed(&app), taken.iter().map(|&file| FileOp::Detach { draft, file }).collect::<Vec<_>>());
     }
 
     #[test]

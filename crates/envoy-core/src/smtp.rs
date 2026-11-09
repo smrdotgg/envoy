@@ -192,11 +192,17 @@ async fn connect(account: &Account, insecure: bool) -> Result<(AsyncSmtpConnecti
     Ok((conn, ehlo_size(ehlo.message())))
 }
 
+/// QUIT, without waiting long for its answer: what matters is known by then (the message
+/// went, or can't), and a server slow to say goodbye mustn't turn that into a timeout.
+async fn bye(conn: &mut AsyncSmtpConnection) {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.quit()).await;
+}
+
 /// What the account's SMTP server says it takes (connecting, and leaving before logging in).
 pub async fn server_size(account: &Account) -> Result<Option<u64>> {
     let work = async {
         let (mut conn, size) = connect(account, crate::imap::insecure_tls()).await?;
-        let _ = conn.quit().await;
+        bye(&mut conn).await;
         Ok::<_, anyhow::Error>(size)
     };
     tokio::time::timeout(std::time::Duration::from_secs(60), work).await.map_err(|_| anyhow!("SMTP timed out"))?
@@ -250,7 +256,7 @@ async fn send_with(account: &Account, cred: &Credential, from: &str, to: &[Strin
         *learned = size;
         // What the server takes now, before a byte of the message goes.
         if let Some(limit) = size.filter(|l| raw.len() as u64 > *l) {
-            let _ = conn.quit().await;
+            bye(&mut conn).await;
             return Err(TooBig { size: raw.len(), limit: Some(limit) }.into());
         }
         conn.auth(&mech, &creds).await?;
@@ -258,7 +264,7 @@ async fn send_with(account: &Account, cred: &Credential, from: &str, to: &[Strin
             let refused = e.status().is_some_and(|c| c.to_string() == "552") || e.to_string().contains("5.3.4");
             return Err(if refused { anyhow::Error::new(TooBig { size: raw.len(), limit: size }) } else { e.into() });
         }
-        let _ = conn.quit().await;
+        bye(&mut conn).await;
         Ok::<_, anyhow::Error>(())
     };
     tokio::time::timeout(std::time::Duration::from_secs(120), work).await.map_err(|_| anyhow!("SMTP send timed out"))?.context("SMTP send failed")
@@ -399,9 +405,9 @@ mod tests {
     }
 
     /// An SMTP server on localhost for one connection, STARTTLS and all (a throwaway
-    /// certificate): its EHLO says `ehlo`, it answers the message's end with `end`. Returns its
-    /// port, and the commands it got.
-    async fn fake_server(ehlo: &'static str, end: &'static str) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+    /// certificate): its EHLO says `ehlo`, it answers the message's end with `end`, and QUIT
+    /// only if `bye` (otherwise it never answers it). Returns its port, and the commands it got.
+    async fn fake_server(ehlo: &'static str, end: &'static str, bye: bool) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -446,7 +452,11 @@ mod tests {
                         b"354 Go on\r\n"
                     }
                     "QUIT\r\n" => {
-                        let _ = conn.get_mut().write_all(b"221 Bye\r\n").await;
+                        if bye {
+                            let _ = conn.get_mut().write_all(b"221 Bye\r\n").await;
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                        }
                         break;
                     }
                     _ => b"250 OK\r\n",
@@ -467,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_message_over_what_the_server_says_now_never_goes() {
-        let (port, server) = fake_server("250-localhost\r\n250-SIZE 10\r\n250 AUTH PLAIN LOGIN\r\n", "250 OK\r\n").await;
+        let (port, server) = fake_server("250-localhost\r\n250-SIZE 10\r\n250 AUTH PLAIN LOGIN\r\n", "250 OK\r\n", true).await;
         let mut learned = None;
         let err = send_to(port, &mut learned).await.unwrap_err();
         let refused = too_big(&err).expect("too big");
@@ -478,22 +488,34 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_refusing_a_message_as_too_big_is_heard_as_that() {
-        let (port, server) = fake_server("250-localhost\r\n250 AUTH PLAIN LOGIN\r\n", "552 5.3.4 Message size exceeds fixed maximum message size\r\n").await;
+        let (port, server) = fake_server("250-localhost\r\n250 AUTH PLAIN LOGIN\r\n", "552 5.3.4 Message size exceeds fixed maximum message size\r\n", true).await;
         let mut learned = None;
         let err = send_to(port, &mut learned).await.unwrap_err();
         assert_eq!(too_big(&err).map(|t| (t.size, t.limit)), Some((BIG.len(), None)), "{err:#}");
         assert!(err.to_string().contains("SMTP send failed") && format!("{err:#}").contains("refused it as too big"), "{err:#}");
         server.await.unwrap();
         // Any other refusal is just that.
-        let (port, server) = fake_server("250-localhost\r\n250 AUTH PLAIN LOGIN\r\n", "451 4.3.0 Try again later\r\n").await;
+        let (port, server) = fake_server("250-localhost\r\n250 AUTH PLAIN LOGIN\r\n", "451 4.3.0 Try again later\r\n", true).await;
         let err = send_to(port, &mut learned).await.unwrap_err();
         assert!(too_big(&err).is_none(), "{err:#}");
         server.await.unwrap();
     }
 
     #[tokio::test]
+    async fn a_server_that_never_says_goodbye_changes_nothing() {
+        let quick = std::time::Duration::from_secs(10);
+        // Too big: said so at once, not after QUIT's answer that never comes.
+        let (port, _server) = fake_server("250-localhost\r\n250-SIZE 10\r\n250 AUTH PLAIN LOGIN\r\n", "250 OK\r\n", false).await;
+        let err = tokio::time::timeout(quick, send_to(port, &mut None)).await.expect("told at once").unwrap_err();
+        assert!(too_big(&err).is_some(), "{err:#}");
+        // Sent: it went, whatever QUIT does (a send reported failed would go again).
+        let (port, _server) = fake_server("250-localhost\r\n250 AUTH PLAIN LOGIN\r\n", "250 OK\r\n", false).await;
+        tokio::time::timeout(quick, send_to(port, &mut None)).await.expect("told at once").unwrap();
+    }
+
+    #[tokio::test]
     async fn a_send_learns_what_its_server_takes() {
-        let (port, server) = fake_server("250-localhost\r\n250-SIZE 35882577\r\n250 AUTH PLAIN LOGIN\r\n", "250 OK\r\n").await;
+        let (port, server) = fake_server("250-localhost\r\n250-SIZE 35882577\r\n250 AUTH PLAIN LOGIN\r\n", "250 OK\r\n", true).await;
         let mut learned = None;
         send_to(port, &mut learned).await.unwrap();
         assert_eq!(learned, Some(35_882_577));
