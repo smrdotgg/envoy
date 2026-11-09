@@ -13,6 +13,9 @@ there, or took the change) stops the script: drop it or redo it.
   AccessKit's AT-SPI bridge uses, so Linux builds carry one D-Bus stack, not two.
 - 0003-windows-dx12-only: no Vulkan backend on Windows, where DX12 always has an
   adapter (WARP); Vulkan was only the fallback for a DX12 that listed none.
+- 0004-keycaps-feature: the `--keys`/`--pointer` overlay of headless runs behind a
+  `keycaps` feature (in Rune's defaults; Envoy leaves it off), so its second
+  runtime isn't built into Envoy.
 
 Usage: scripts/vendor-rune.py <path-to-rune-checkout>
 """

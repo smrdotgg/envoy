@@ -154,16 +154,21 @@ impl Args {
                     let v = val(&mut i);
                     a.duration = Some(if v == "auto" { Length::Auto } else { Length::Seconds(num(&v)) });
                 }
+                #[cfg(feature = "keycaps")]
                 "--keys" => {
                     let corner = argv.get(i + 1).and_then(|v| crate::input::keycaps::Corner::parse(v));
                     if corner.is_some() { i += 1; }
                     a.keys = Some(corner.unwrap_or_default());
                 }
+                #[cfg(feature = "keycaps")]
                 "--keys-theme" => {
                     let v = val(&mut i);
                     a.keys_theme = crate::input::keycaps::parse_theme(&v).unwrap_or_else(|| die("--keys-theme is auto, light or dark"));
                 }
+                #[cfg(feature = "keycaps")]
                 "--pointer" => a.pointer = true,
+                #[cfg(not(feature = "keycaps"))]
+                "--keys" | "--keys-theme" | "--pointer" => die("keycaps and click ripples require the rune/keycaps feature"),
                 "--desktop" => a.desktop = Some(val(&mut i).into()),
                 "--tree" => a.tree = Some(val(&mut i).into()),
                 "--html" => a.html = Some(val(&mut i).into()),
