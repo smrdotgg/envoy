@@ -1891,7 +1891,8 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
     // Claimed: an undo from here on can't cancel these, since the server may be doing them.
     let ops = shared.with_writer(|st| st.claim_due(&account.id, now()))?;
     let mut any = false;
-    // Mailboxes moved out of or copied into: their counts get re-read once the pass is done.
+    // Mailboxes moved out of or copied into, or whose unread messages changed: their counts get
+    // re-read once the pass is done.
     let mut recount: Vec<String> = Vec::new();
     for q in ops {
         let r = match &q.op {
@@ -1905,6 +1906,7 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
                 let changed = match &q.op {
                     Op::Move { mailbox, .. } | Op::Expunge { mailbox, .. } => Some(mailbox),
                     Op::Copy { dest, .. } => Some(dest),
+                    Op::SetFlags { mailbox, add, remove, .. } if (add | remove) & flags::SEEN != 0 => Some(mailbox),
                     _ => None,
                 };
                 if let Some(mailbox) = changed
@@ -2513,6 +2515,25 @@ mod tests {
         let in_work = message(&shared.writer.lock().unwrap(), "Work", 4, "<4@x>", "", 0);
         copy_and_hold(&shared, vec![in_work], "Work", false, Some(11), now()).unwrap();
         assert!(rx.try_iter().any(|e| matches!(e, Event::Held { undo: 11, ops: 0 })));
+    }
+
+    #[tokio::test]
+    async fn read_marks_recount_their_mailbox_once_on_the_server() {
+        let st = setup();
+        let a = message(&st, "INBOX", 1, "<1@x>", "", 0);
+        message(&st, "INBOX", 2, "<2@x>", "", 0);
+        st.set_counts("a", "INBOX", 2, 2).unwrap();
+        let (shared, _rx) = engine_with(st);
+        set_flags(&shared, vec![a], flags::SEEN, 0, false).unwrap();
+        assert_eq!(unread(&shared, "a"), 1, "counted down at once");
+        // A STATUS from the other connection lands before the mark reaches the server.
+        shared.with_writer(|st| st.set_counts("a", "INBOX", 2, 2)).unwrap();
+        assert_eq!(unread(&shared, "a"), 1, "the queued mark still counts");
+        // The mark replays; the recount after it reads the server's new count.
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        server.counts = (1, 2);
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(unread(&shared, "a"), 1);
     }
 
     // ── drafts ──
