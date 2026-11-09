@@ -1,0 +1,8 @@
+{"events": [
+  {"t": 0.2, "type": "tap", "key": "m1"},
+  {"t": 0.6, "type": "key", "name": "x"},
+  {"t": 0.8, "type": "key", "name": "J", "shift": true},
+  {"t": 1.0, "type": "key", "name": "J", "shift": true},
+  {"t": 1.4, "type": "key", "name": "e"},
+  {"t": 2.2, "type": "key", "name": "z"}
+]}
