@@ -118,7 +118,7 @@ pub const SCHEMA: &[SettingDef] = &[
     def("reading.loadImages", "Reading", "Load remote images",
         "Pictures HTML mail loads from the internet, which can tell the sender you opened it. Ask: hidden, with a bar to load them once or always from that sender. Pictures embedded in the message always show; tracking pixels never load.",
         Kind::Enum(&[("ask", "Ask (load from senders I allow)"), ("always", "Always"), ("never", "Never")]), S("ask")),
-    def("reading.imagesFrom", "Reading", "Load images from", "Senders whose remote images load without asking. One per line: an address, or a domain such as example.com (its subdomains too).",
+    def("reading.imagesFrom", "Reading", "Load images from", "Senders whose remote images load without asking. One per line: an address, or a domain such as example.com or @example.com (its subdomains too).",
         Kind::List, L(&[])),
     def("reading.htmlColors", "Reading", "HTML mail colors", "Adapt colors to the current theme, or show mail exactly as designed on a light page.",
         Kind::Enum(&[("adapt", "Adapt to theme"), ("original", "Original (light page)")]), S("adapt")),
@@ -315,13 +315,9 @@ impl Settings {
             "ask" => {
                 let sender = sender.trim().to_lowercase();
                 let domain = sender.rsplit_once('@').map_or("", |(_, d)| d);
-                self.list("reading.imagesFrom").iter().any(|e| {
-                    let e = e.trim_start_matches('@');
-                    if e.contains('@') {
-                        *e == sender
-                    } else {
-                        !domain.is_empty() && (domain == e || domain.strip_suffix(e).is_some_and(|sub| sub.ends_with('.')))
-                    }
+                self.list("reading.imagesFrom").iter().filter_map(|e| image_sender(e)).any(|e| match e {
+                    ImageSender::Address(a) => a == sender,
+                    ImageSender::Domain(d) => !domain.is_empty() && (domain == d || domain.strip_suffix(d).is_some_and(|sub| sub.ends_with('.'))),
                 })
             }
             _ => false,
@@ -331,6 +327,47 @@ impl Settings {
     /// The user's overrides, for "show only modified".
     pub fn overrides(&self) -> impl Iterator<Item = &str> {
         self.user.keys().map(String::as_str)
+    }
+}
+
+/// What a `reading.imagesFrom` entry allows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImageSender<'a> {
+    /// This address only.
+    Address(&'a str),
+    /// This domain and its subdomains.
+    Domain(&'a str),
+}
+
+/// Reads a `reading.imagesFrom` entry (already trimmed and lowercased): exactly `user@domain`,
+/// `domain`, or `@domain`. Anything else allows nothing: `@@northwind.dev`,
+/// `@maya@northwind.dev`, `maya@`, and a bare top-level domain (`dev`), which would cover every
+/// sender under it.
+pub fn image_sender(entry: &str) -> Option<ImageSender<'_>> {
+    if let Some(domain) = entry.strip_prefix('@') {
+        return is_domain(domain).then_some(ImageSender::Domain(domain));
+    }
+    match entry.split_once('@') {
+        None => is_domain(entry).then_some(ImageSender::Domain(entry)),
+        Some((user, domain)) => {
+            let user_ok = !user.is_empty() && user.chars().all(|c| c.is_alphanumeric() || "!#$%&'*+/=?^_`{|}~.-".contains(c));
+            (user_ok && is_domain(domain)).then_some(ImageSender::Address(entry))
+        }
+    }
+}
+
+/// Two or more dot-separated labels of letters, digits and inner hyphens.
+fn is_domain(d: &str) -> bool {
+    let labels: Vec<&str> = d.split('.').collect();
+    labels.len() >= 2 && d.len() <= 253 && labels.iter().all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_alphanumeric() || c == '-'))
+}
+
+/// Entries of a list setting that are ignored because they can't be read (shown under the
+/// field in Settings).
+pub fn list_problems<'a>(key: &str, items: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    match key {
+        "reading.imagesFrom" => items.into_iter().map(|i| i.trim().to_lowercase()).filter(|i| !i.is_empty() && image_sender(i).is_none()).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -462,6 +499,25 @@ mod tests {
         s.set("reading.loadImages", serde_json::json!("always")).unwrap();
         assert!(s.remote_images_from("anyone@anywhere.example"));
         assert!(s.set("reading.imagesFrom", serde_json::json!("a@b.c")).is_err(), "a list, not a string");
+    }
+
+    #[test]
+    fn malformed_image_senders_allow_nothing() {
+        // `trim_start_matches('@')` once turned these into grants.
+        let mut s = Settings::default();
+        let bad = ["@@northwind.dev", "@maya@northwind.dev", "maya@@northwind.dev", "maya@", "@", "dev", "@dev", "northwind..dev", ".northwind.dev", "-x.dev", "maya@north wind.dev", "<maya@northwind.dev>", "*.northwind.dev"];
+        s.set("reading.imagesFrom", serde_json::json!(bad)).unwrap();
+        for sender in ["maya@northwind.dev", "a@mail.northwind.dev", "anyone@x.dev"] {
+            assert!(!s.remote_images_from(sender), "{sender} allowed by a malformed entry");
+        }
+        assert_eq!(list_problems("reading.imagesFrom", bad), bad.map(str::to_owned), "each one shown as ignored");
+        let good = ["maya@northwind.dev", "northwind.dev", "@northwind.dev", "Ann.Lee+news@Mail.Example.co.uk", "bücher.example"];
+        assert!(list_problems("reading.imagesFrom", good).is_empty());
+        s.set("reading.imagesFrom", serde_json::json!(["@northwind.dev"])).unwrap();
+        assert!(s.remote_images_from("maya@northwind.dev") && s.remote_images_from("a@mail.northwind.dev"));
+        s.set("reading.imagesFrom", serde_json::json!(["maya@northwind.dev"])).unwrap();
+        assert!(s.remote_images_from("Maya@Northwind.dev") && !s.remote_images_from("bo@northwind.dev"));
+        assert!(list_problems("inbox.other", ["@@x"]).is_empty(), "other lists aren't read as senders");
     }
 
     #[test]
