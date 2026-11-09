@@ -150,6 +150,12 @@ CREATE TABLE IF NOT EXISTS draft_ends (
 );
 -- Sent messages whose copy the server refused to file in Sent for good: kept here, never lost,
 -- never sent again. `op`: the send's, so keeping it twice replaces it.
+-- One row, rewritten with synchronous = FULL to put every earlier commit on disk
+-- ([`Store::sync_to_disk`]).
+CREATE TABLE IF NOT EXISTS durable_mark (
+    id INTEGER PRIMARY KEY,
+    n INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS unfiled_sent (
     op INTEGER PRIMARY KEY,
     account TEXT NOT NULL,
@@ -916,17 +922,30 @@ impl Store {
         &self.conn
     }
 
-    /// Runs `f` with each commit on disk before it returns (`PRAGMA synchronous = FULL`), then
-    /// back to NORMAL, where a commit can roll back on a power cut or an OS crash (never on the
-    /// app's): for writes that something outside the database is deleted on the strength of.
-    pub fn durably<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+    /// Makes everything committed so far, by any connection, survive a power cut or an OS crash,
+    /// which may roll back commits made at `synchronous = NORMAL` (never the app's own crash):
+    /// for when something outside the database is deleted on the strength of what's in it.
+    /// Setting FULL alone isn't enough, since it syncs only the commits that follow, and the
+    /// text may be in already, written earlier at NORMAL, with nothing left to write. So it
+    /// writes a marker row with FULL: that commit fsyncs the write-ahead log, and with it every
+    /// commit before it (those already checkpointed were synced into the database file then).
+    /// An error means nothing is known to be on disk.
+    pub fn sync_to_disk(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA synchronous = FULL")?;
-        let out = f(self);
-        if let Err(e) = self.conn.execute_batch("PRAGMA synchronous = NORMAL") {
+        let marked = self.conn.execute("INSERT INTO durable_mark (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + 1", []);
+        let restored = self.conn.execute_batch("PRAGMA synchronous = NORMAL");
+        marked?;
+        if let Err(e) = restored {
             // Only slower: every commit is synced.
             log::warn!("couldn't set the cache's commits back to NORMAL: {e}");
         }
-        out
+        Ok(())
+    }
+
+    /// How many times [`Store::sync_to_disk`] has synced this cache.
+    #[cfg(test)]
+    pub(crate) fn syncs_to_disk(&self) -> i64 {
+        self.conn.query_row("SELECT COALESCE((SELECT n FROM durable_mark WHERE id = 1), 0)", [], |r| r.get(0)).unwrap()
     }
 
     /// Runs `f` in one transaction, which takes the write lock as it begins. Begun deferred, a
@@ -935,6 +954,15 @@ impl Store {
     /// came to write: SQLite waits only for a lock asked for outside a transaction. Only the
     /// writer runs these (the reader's snapshots are its own, [`Store::list`]), so within one
     /// Envoy taking the lock at once costs nothing: its mutex already orders the writes.
+    /// Runs `f`, which only reads, on one snapshot of the cache: what another connection commits
+    /// meanwhile doesn't show halfway. It takes no write lock, so no writer waits for it.
+    pub fn snapshot<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
         let out = f(self)?;
@@ -2162,15 +2190,17 @@ mod tests {
     }
 
     #[test]
-    fn durable_writes_are_synced_and_the_rest_go_back_to_normal() {
-        const FULL: i64 = 2;
+    fn syncing_to_disk_commits_with_full_sync_and_goes_back_to_normal() {
         const NORMAL: i64 = 1;
         let s = Store::memory();
         let synchronous = |s: &Store| s.conn.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0)).unwrap();
-        assert_eq!(synchronous(&s), NORMAL);
-        assert_eq!(s.durably(|s| Ok(synchronous(s))).unwrap(), FULL);
-        assert_eq!(synchronous(&s), NORMAL);
-        assert!(s.durably(|_| -> Result<()> { anyhow::bail!("refused") }).is_err());
+        assert_eq!((synchronous(&s), s.syncs_to_disk()), (NORMAL, 0));
+        // Nothing written since: it still commits (a FULL-synced write), each time.
+        s.sync_to_disk().unwrap();
+        s.sync_to_disk().unwrap();
+        assert_eq!((synchronous(&s), s.syncs_to_disk()), (NORMAL, 2));
+        s.conn.execute_batch("DROP TABLE durable_mark").unwrap();
+        assert!(s.sync_to_disk().is_err(), "a sync that didn't commit is an error");
         assert_eq!(synchronous(&s), NORMAL, "after an error too");
     }
 
