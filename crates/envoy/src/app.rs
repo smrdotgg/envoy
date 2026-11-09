@@ -280,6 +280,8 @@ pub struct MovedAway {
     pub open: Option<MessageId>,
     /// A composer that closed because its draft was among them.
     pub compose: Option<Box<Compose>>,
+    /// Demo mode's drafts discarded from its Drafts list, for Undo to keep again.
+    pub demo_drafts: Vec<crate::demo::Kept>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1379,6 +1381,7 @@ impl App {
             rows: self.list.iter().filter(|s| ids.contains(&s.id)).cloned().collect(),
             open: self.open.filter(|o| ids.contains(o)),
             compose: None,
+            demo_drafts: Vec::new(),
         }
     }
 
@@ -1418,6 +1421,7 @@ impl App {
     /// and the reload that follows confirms it.
     fn restore(&mut self, mut m: MovedAway, tx: &mut Tx) {
         self.send(Command::UndoMove { undo: m.key });
+        self.demo_drafts.put_back(std::mem::take(&mut m.demo_drafts));
         for (account, mailbox, unread, total) in self.counted(&m.rows) {
             self.bump_counts(&account, &mailbox, unread, total);
         }
@@ -1482,9 +1486,14 @@ impl App {
         }
         let window = self.settings.u32("behavior.undoSeconds");
         let key = (window > 0).then(|| self.next_stamp());
-        let snapshot = key.map(|key| self.snapshot(key, &rows));
+        let mut snapshot = key.map(|key| self.snapshot(key, &rows));
         for row in &rows {
             self.send(Command::DiscardDraftRow { row: *row, undo: key });
+        }
+        // No engine in demo mode: its drafts leave the session's, and Undo keeps them again.
+        let taken = self.demo_drafts.take_rows(&rows);
+        if let Some(s) = &mut snapshot {
+            s.demo_drafts = taken;
         }
         self.after_remove(&rows, tx);
         let label = if rows.len() == 1 { "Draft discarded".to_owned() } else { format!("{} drafts discarded", rows.len()) };
@@ -1794,7 +1803,7 @@ impl App {
             return;
         };
         // Nothing to put back on screen: Undo only calls the copies back.
-        let snapshot = MovedAway { key, view: self.view.clone(), query: self.applied_query.clone(), rows: Vec::new(), open: None, compose: None };
+        let snapshot = MovedAway { key, view: self.view.clone(), query: self.applied_query.clone(), rows: Vec::new(), open: None, compose: None, demo_drafts: Vec::new() };
         self.toast_seq += 1;
         self.toasts.push(Toast { id: self.toast_seq, text, undo: Some(Undo::Move(Box::new(snapshot))), until: self.clock + window as f64, error: false, open_path: None });
         while self.toasts.len() > 3 {
@@ -2516,6 +2525,9 @@ impl App {
                 });
                 self.demo_reads.push(DemoRead { at, draft, file, found });
             }
+            // Saved with its files, as the engine's path saves a draft before attaching: put
+            // away before they're read, it's still in Drafts, and they land there.
+            self.compose_edited();
             return;
         }
         // The draft goes in the store first: a file is kept with its draft, never without one.
@@ -2594,17 +2606,24 @@ impl App {
         }
         let mut changed = false;
         for r in done {
-            let found = r.found.lock().ok().and_then(|mut f| f.take());
-            let Some(f) = self.compose_for(r.draft).and_then(|c| c.file_mut(r.file)).filter(|f| f.status == FileStatus::Attaching) else { continue };
-            match found {
-                Some(Ok(size)) => {
-                    f.size = size as usize;
-                    f.status = FileStatus::Attached;
+            let Some(found) = r.found.lock().ok().and_then(|mut f| f.take()) else { continue };
+            let land = |f: &mut DraftAttachment| {
+                if f.status != FileStatus::Attaching {
+                    return false;
                 }
-                Some(Err(why)) => f.status = FileStatus::Failed(why),
-                None => continue,
+                match &found {
+                    Ok(size) => (f.size, f.status) = (*size as usize, FileStatus::Attached),
+                    Err(why) => f.status = FileStatus::Failed(why.clone()),
+                }
+                true
+            };
+            if let Some(f) = self.compose_for(r.draft).and_then(|c| c.file_mut(r.file)) {
+                changed |= land(f);
             }
-            changed = true;
+            // The draft as demo mode keeps it, whether a composer shows it or it was put away.
+            if let Some(f) = self.demo_drafts.file_mut(r.draft, r.file) {
+                changed |= land(f);
+            }
         }
         changed
     }
@@ -3509,6 +3528,74 @@ mod tests {
         // Discarded: gone from Drafts.
         app.discard_compose(&mut Tx::default());
         assert_eq!(app.list.len(), 1, "only the sample draft: {:?}", app.list);
+    }
+
+    fn demo_drafts_view() -> View {
+        View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() }
+    }
+
+    #[test]
+    fn a_demo_draft_put_away_while_its_files_are_read_gets_them() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let dir = std::env::temp_dir().join(format!("envoy-demo-park-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (notes, gone) = (dir.join("notes.txt"), dir.join("missing.pdf"));
+        std::fs::write(&notes, b"hello").unwrap();
+        app.compose_new();
+        let id = app.compose.as_ref().unwrap().draft_id;
+        app.attach_paths(vec![notes, gone]);
+        // Another composer before demo mode's 0.8 s reads finish: this one goes to Drafts, files
+        // and all, as they are.
+        app.compose_new();
+        assert_ne!(app.compose.as_ref().unwrap().draft_id, id);
+        let t = app.clock;
+        for i in 1..=50 {
+            app.tick(t + 1.0 + i as f64, &mut Tx::default());
+            if app.demo_reads.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(app.demo_reads.is_empty());
+        app.compose = None;
+        app.go(demo_drafts_view());
+        app.open_message(envoy_core::drafts::list_id(id));
+        let c = app.compose.as_ref().expect("opened from Drafts");
+        assert_eq!(c.draft_id, id);
+        assert_eq!((c.files[0].status.clone(), c.files[0].size), (FileStatus::Attached, 5), "read while put away");
+        assert!(matches!(&c.files[1].status, FileStatus::Failed(why) if why.contains("missing.pdf")), "{:?}", c.files[1].status);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discarding_a_demo_draft_from_drafts_lasts_and_undo_brings_it_back() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let mut tx = Tx::default();
+        app.compose_new();
+        let c = app.compose.as_mut().unwrap();
+        c.subject = TextEdit::new("Lunch plans");
+        let row = envoy_core::drafts::list_id(c.draft_id);
+        app.compose_edited();
+        app.compose_new(); // puts it away in Drafts
+        app.compose = None;
+        app.go(demo_drafts_view());
+        assert!(app.list.iter().any(|r| r.id == row));
+        app.delete(vec![row], &mut tx);
+        assert!(!app.list.iter().any(|r| r.id == row), "off the list at once");
+        // Elsewhere and back: still gone.
+        app.go_role(Role::Inbox);
+        app.go(demo_drafts_view());
+        assert!(!app.list.iter().any(|r| r.id == row), "discarded for good: {:?}", app.list);
+        // Undo: back, and it stays back.
+        assert!(app.undo_last(&mut tx));
+        assert!(app.list.iter().any(|r| r.id == row && r.subject == "Lunch plans"), "{:?}", app.list);
+        app.go_role(Role::Inbox);
+        app.go(demo_drafts_view());
+        assert!(app.list.iter().any(|r| r.id == row), "{:?}", app.list);
+        app.open_message(row);
+        assert_eq!(app.compose.as_ref().map(|c| c.subject.text.as_str()), Some("Lunch plans"));
     }
 
     // ── attachments ──

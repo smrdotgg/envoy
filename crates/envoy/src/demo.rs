@@ -128,9 +128,33 @@ pub fn list_for(view: &View) -> Vec<Summary> {
 /// The drafts written in demo mode, which has no store: kept for the session, so Drafts lists
 /// them as it lists local drafts (`envoy_core::drafts::merge`) and they open again from there.
 #[derive(Default)]
-pub struct Drafts(Vec<(i64, Draft, i64)>);
+pub struct Drafts(Vec<Kept>);
+
+/// A demo draft: its id, content, and when it was last saved (Unix seconds).
+pub type Kept = (i64, Draft, i64);
 
 impl Drafts {
+    /// Takes out the drafts these Drafts rows stand for (discarded from the list), for Undo to
+    /// [`Self::put_back`].
+    pub fn take_rows(&mut self, rows: &[MessageId]) -> Vec<Kept> {
+        let ids: Vec<i64> = rows.iter().map(|r| envoy_core::drafts::draft_of_list_id(*r).unwrap_or(*r)).collect();
+        let (taken, kept) = std::mem::take(&mut self.0).into_iter().partition(|d| ids.contains(&d.0));
+        self.0 = kept;
+        taken
+    }
+
+    pub fn put_back(&mut self, drafts: Vec<Kept>) {
+        for d in drafts {
+            self.forget(d.0);
+            self.0.push(d);
+        }
+    }
+
+    /// File `file` of draft `draft`, as kept.
+    pub fn file_mut(&mut self, draft: i64, file: i64) -> Option<&mut envoy_core::model::DraftAttachment> {
+        self.0.iter_mut().find(|d| d.0 == draft)?.1.attachments.iter_mut().find(|f| f.id == file)
+    }
+
     /// Keeps draft `id` as it is now.
     pub fn keep(&mut self, id: i64, draft: Draft) {
         self.forget(id);
