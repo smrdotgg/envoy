@@ -1978,8 +1978,8 @@ impl OpRunner for ImapRunner<'_> {
 }
 
 /// Replays an [`Op::Send`]: hands its message to the SMTP server, and once that's done
-/// records it at once ([`Op::Delivered`]), before anything else can fail, so the message is
-/// never sent again, whatever happens to filing it. In the same transaction the message it
+/// records it at once ([`Op::Delivered`]), before anything else can fail, retrying until the
+/// record sticks, so the message is never sent again, whatever happens to filing it. In the same transaction the message it
 /// replies to is queued to be marked answered, on its own account, by its UID only in the
 /// generation it was pinned down in (or where its Message-ID finds it in a new one); a reply
 /// whose original couldn't be pinned down marks nothing.
@@ -1999,16 +1999,30 @@ async fn deliver_and_file(shared: &Shared, account: &Account, runner: &mut impl 
         }
         None => None,
     };
-    shared.with_writer(|st| {
-        st.transaction(|st| {
-            st.rewrite_op(q.id, &delivered)?;
-            if let Some(o) = answered {
-                let flag = Op::SetFlags { mailbox: o.mailbox.clone(), uid: o.uid, add: flags::ANSWERED, remove: 0 };
-                st.enqueue_located(&o.account, &flag, &At { validity: o.validity, message_id: o.message_id.clone() })?;
+    // The message is out: from here this op never goes back to SMTP. Recording that is
+    // retried, with backoff, until it sticks (a failure here isn't a failure to send, and
+    // replay's retry would send it again); only a crash before then could.
+    let mut wait = Duration::from_millis(100);
+    loop {
+        let recorded = shared.with_writer(|st| {
+            st.transaction(|st| {
+                st.rewrite_op(q.id, &delivered)?;
+                if let Some(o) = answered {
+                    let flag = Op::SetFlags { mailbox: o.mailbox.clone(), uid: o.uid, add: flags::ANSWERED, remove: 0 };
+                    st.enqueue_located(&o.account, &flag, &At { validity: o.validity, message_id: o.message_id.clone() })?;
+                }
+                Ok(())
+            })
+        });
+        match recorded {
+            Ok(()) => break,
+            Err(e) => {
+                log::error!("{}: a message went out, but recording that failed ({e:#}); trying again in {wait:?}", account.email);
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(30));
             }
-            Ok(())
-        })
-    })?;
+        }
+    }
     q.op = delivered;
     shared.emit(Event::Toast("Message sent".into()));
     file_delivered(account, runner, q).await
@@ -2796,6 +2810,47 @@ mod tests {
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(sends(&server), 1, "sent once: {:?}", server.ran);
         assert_eq!(server.filed, ["Sent", "Sent"]);
+        assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty());
+    }
+
+    /// Queues a send to be filed in Sent, due now.
+    fn queue_reply(shared: &Shared) {
+        let raw_b64 = base64::engine::general_purpose::STANDARD.encode(b"Subject: hi\r\n\r\nhello\r\n");
+        let send = Op::Send { raw_b64, from: "me@x.com".into(), to: vec!["you@x.com".into()], sent_mailbox: Some("Sent".into()), reply_of: None };
+        shared.with_writer(|st| st.enqueue("a", &send)).unwrap();
+    }
+
+    fn sends(server: &FakeServer) -> usize {
+        server.ran.iter().filter(|op| matches!(op, Op::Send { .. })).count()
+    }
+
+    fn make_due(shared: &Shared) {
+        shared.with_writer(|st| Ok(st.conn_for_tests().execute("UPDATE ops SET not_before = 0", [])?)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_message_out_is_never_sent_again_though_recording_it_fails() {
+        let (shared, _rx) = engine_with(setup());
+        queue_reply(&shared);
+        // SMTP takes it; recording that fails for a while (the disk is full, say).
+        let trigger = "CREATE TRIGGER no_delivered BEFORE UPDATE OF op ON ops WHEN json_extract(NEW.op, '$.kind') = 'delivered'
+                       BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;";
+        shared.with_writer(|st| Ok(st.conn_for_tests().execute_batch(trigger)?)).unwrap();
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        let clears = async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            shared.with_writer(|st| Ok(st.conn_for_tests().execute_batch("DROP TRIGGER no_delivered")?)).unwrap();
+        };
+        let a = account("a");
+        let (first, ()) = tokio::join!(replay_with(&shared, &a, &mut server), clears);
+        let _ = first;
+        // However replay goes on from there, the message isn't sent again.
+        for _ in 0..3 {
+            make_due(&shared);
+            let _ = replay_with(&shared, &account("a"), &mut server).await;
+        }
+        assert_eq!(sends(&server), 1, "{:?}", server.ran);
+        assert_eq!(server.filed, ["Sent"]);
         assert!(shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().is_empty());
     }
 
