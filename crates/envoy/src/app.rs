@@ -41,6 +41,7 @@ pub struct Compose {
     pub in_reply_to: String,
     pub references: String,
     pub reply_of: Option<MessageId>,
+    /// What the title bar says while the subject is empty ([`Compose::shown_title`]).
     pub title: String,
     pub minimized: bool,
     pub error: Option<String>,
@@ -118,6 +119,16 @@ impl Compose {
             timed: 0,
             dirty_since: None,
             edited_at: 0.0,
+        }
+    }
+
+    /// What its title bar says, minimized or not: the subject as it's typed, or, while there's
+    /// none, what it was opened as ("New message", "Draft").
+    pub fn shown_title(&self) -> &str {
+        match self.subject.text.trim() {
+            "" if self.title.is_empty() => "New message",
+            "" => &self.title,
+            subject => subject,
         }
     }
 
@@ -2380,7 +2391,7 @@ impl App {
         self.park_compose();
         let mut c = Compose::new(draft.account.clone(), id);
         c.lifecycle = lifecycle;
-        c.title = if draft.subject.trim().is_empty() { "Draft".into() } else { draft.subject.clone() };
+        c.title = "Draft".into();
         c.show_cc = !draft.cc.trim().is_empty() || !draft.bcc.trim().is_empty();
         c.to = TextEdit::new(draft.to);
         c.cc = TextEdit::new(draft.cc);
@@ -3157,6 +3168,29 @@ mod tests {
     fn type_into_body(app: &mut App, text: &str) {
         app.compose.as_mut().unwrap().body.text.insert_str(0, text);
         app.compose_edited();
+    }
+
+    #[test]
+    fn a_composers_title_is_its_subject_once_one_is_typed() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        let title = |app: &App| app.compose.as_ref().unwrap().shown_title().to_owned();
+        app.compose_new();
+        assert_eq!(title(&app), "New message");
+        app.compose.as_mut().unwrap().minimized = true;
+        app.compose.as_mut().unwrap().subject.text = "Lunch on Friday".into();
+        app.compose_edited();
+        assert_eq!(title(&app), "Lunch on Friday", "minimized, it says which message it is");
+        app.compose.as_mut().unwrap().subject.text = "  ".into();
+        assert_eq!(title(&app), "New message", "and what it was once the subject is cleared");
+        // A draft opened from Drafts: its subject, as it's edited.
+        let draft = Draft { account: "demo".into(), subject: "Plans".into(), ..Draft::default() };
+        app.apply(Event::DraftOpened { id: 9, draft, at: DraftRev::default(), restored: false, notice: None }, &mut Tx::default());
+        assert_eq!(title(&app), "Plans");
+        app.compose.as_mut().unwrap().subject.text = "Plans, moved".into();
+        assert_eq!(title(&app), "Plans, moved");
+        app.compose.as_mut().unwrap().subject.text.clear();
+        assert_eq!(title(&app), "Draft", "not the subject it had");
     }
 
     #[test]
