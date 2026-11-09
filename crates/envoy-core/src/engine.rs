@@ -1802,7 +1802,7 @@ async fn changed_since_synced(shared: &Shared, account: &str, session: &mut imap
             Ok(now) => {
                 let synced = shared.synced.lock().ok().and_then(|s| s.get(&(account.to_owned(), m.clone())).copied());
                 if synced.is_none_or(|was| was.moved_on(now)) {
-                    log::debug!("{account}: {m} changed since it was synced ({synced:?}, now {now:?})");
+                    log::debug!("{account}: {m} changed since it was synced");
                     changed.push(m.clone());
                 }
             }
