@@ -34,14 +34,15 @@ lto = "fat"
 incremental = false
 strip = true
 
-# Code that never runs per frame or per keystroke is built for size (docs/NORTH_STAR.md: < 30 MB).
-# Rune, wgpu, naga (shaders at startup), text shaping and rasterizing, layout, SQLite, serde_json
-# and accessibility tree updates stay at opt-level 3.
+# Code that never runs per frame is built for size (docs/NORTH_STAR.md: < 30 MB). Rune, wgpu,
+# naga (shaders at startup), text shaping and rasterizing, layout, SQLite, serde_json,
+# accessibility tree updates, Windows' COM bindings and UI Automation bridge stay at opt-level 3.
 [profile.dist.package]
-# "s" where throughput still counts a little: image decoders (remote images in mail, off the UI
-# thread), HTML and mail parsing (once per message, then cached), TLS and its crypto, the engine's
-# async runtime, the rasterizer of Wayland's client-side decorations, Vulkan's function loader,
-# Windows' COM bindings.
+# "s" where speed still counts: image decoders (remote images in mail, off the UI thread), HTML,
+# mail and IMAP parsing, TLS and its crypto, the engine's async runtime, the windowing system's
+# event loop and input path (winit, Wayland and X11 clients, keyboard), the AT-SPI bridge (busy
+# while a screen reader runs), the rasterizer of Wayland's client-side decorations, Vulkan's
+# function loader.
 image = { opt-level = "s" }
 image-webp = { opt-level = "s" }
 zune-jpeg = { opt-level = "s" }
@@ -61,6 +62,8 @@ string_cache = { opt-level = "s" }
 htmd = { opt-level = "s" }
 html-escape = { opt-level = "s" }
 mail-parser = { opt-level = "s" }
+async-imap = { opt-level = "s" }
+imap-proto = { opt-level = "s" }
 nom = { opt-level = "s" }
 quoted_printable = { opt-level = "s" }
 rustls = { opt-level = "s" }
@@ -72,52 +75,45 @@ rand_chacha = { opt-level = "s" }
 tokio = { opt-level = "s" }
 mio = { opt-level = "s" }
 futures-util = { opt-level = "s" }
+winit = { opt-level = "s" }
+calloop = { opt-level = "s" }
+wayland-client = { opt-level = "s" }
+wayland-backend = { opt-level = "s" }
+smithay-client-toolkit = { opt-level = "s" }
+sctk-adwaita = { opt-level = "s" }
+x11rb = { opt-level = "s" }
+x11rb-protocol = { opt-level = "s" }
+xkbcommon-dl = { opt-level = "s" }
+xkeysym = { opt-level = "s" }
+accesskit_unix = { opt-level = "s" }
+accesskit_atspi_common = { opt-level = "s" }
+atspi = { opt-level = "s" }
+atspi-common = { opt-level = "s" }
+atspi-proxies = { opt-level = "s" }
 tiny-skia = { opt-level = "s" }
 tiny-skia-path = { opt-level = "s" }
 ash = { opt-level = "s" }
-windows = { opt-level = "s" }
-windows-core = { opt-level = "s" }
-# "z", smaller still (no loop vectorizing, less inlining), where it doesn't: D-Bus and the AT-SPI
-# bridge, Windows' UI Automation bridge (both idle until an assistive client asks), IMAP, SMTP and
-# HTTP protocol code (network-bound), the windowing system's event plumbing (an event at a time),
-# Wayland protocol tables, X11 and cursor loading, clipboard, URL parsing, the keychain, logging
-# setup.
+# "z", smaller still (no loop vectorizing, less inlining), where it doesn't: D-Bus itself and its
+# async-io runtime, SMTP and HTTP (network-bound), Wayland protocol tables, X11's library loader,
+# cursors, clipboard, URL parsing, the keychain, logging setup.
 zbus = { opt-level = "z" }
 zvariant = { opt-level = "z" }
 zbus_names = { opt-level = "z" }
-accesskit_unix = { opt-level = "z" }
-accesskit_atspi_common = { opt-level = "z" }
-atspi = { opt-level = "z" }
-atspi-common = { opt-level = "z" }
-atspi-proxies = { opt-level = "z" }
 async-io = { opt-level = "z" }
 async-executor = { opt-level = "z" }
 async-process = { opt-level = "z" }
 async-broadcast = { opt-level = "z" }
 blocking = { opt-level = "z" }
 polling = { opt-level = "z" }
-accesskit_windows = { opt-level = "z" }
-async-imap = { opt-level = "z" }
-imap-proto = { opt-level = "z" }
 lettre = { opt-level = "z" }
 email-encoding = { opt-level = "z" }
 ureq = { opt-level = "z" }
 ureq-proto = { opt-level = "z" }
-winit = { opt-level = "z" }
-calloop = { opt-level = "z" }
-wayland-client = { opt-level = "z" }
-wayland-backend = { opt-level = "z" }
 wayland-cursor = { opt-level = "z" }
 wayland-protocols = { opt-level = "z" }
 wayland-protocols-wlr = { opt-level = "z" }
 wayland-protocols-plasma = { opt-level = "z" }
-smithay-client-toolkit = { opt-level = "z" }
-sctk-adwaita = { opt-level = "z" }
-x11rb = { opt-level = "z" }
-x11rb-protocol = { opt-level = "z" }
 x11-dl = { opt-level = "z" }
-xkbcommon-dl = { opt-level = "z" }
-xkeysym = { opt-level = "z" }
 xcursor = { opt-level = "z" }
 libloading = { opt-level = "z" }
 arboard = { opt-level = "z" }
