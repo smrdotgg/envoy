@@ -23,9 +23,11 @@ use serde::{Deserialize, Serialize};
 use crate::mime::{self, Parsed};
 use crate::model::{Address, Attachment, Body, Mailbox, MessageId, Role, Summary, ThreadMessage, View, flags};
 
+mod categories;
 mod contacts;
 mod drafts;
 mod list;
+pub use categories::{Moved, Pass};
 pub use drafts::{DraftRev, DraftUpload, LocalDraft};
 
 const SCHEMA: &str = r#"
@@ -63,10 +65,30 @@ CREATE TABLE IF NOT EXISTS messages (
     has_attachments INTEGER NOT NULL DEFAULT 0,
     has_body INTEGER NOT NULL DEFAULT 0,
     held_op INTEGER NOT NULL DEFAULT 0,
+    category INTEGER NOT NULL DEFAULT 0,
+    signals INTEGER NOT NULL DEFAULT 0,
+    list_id TEXT NOT NULL DEFAULT '',
     UNIQUE (account, mailbox, uid)
 );
 CREATE INDEX IF NOT EXISTS messages_thread ON messages (account, thread);
 CREATE INDEX IF NOT EXISTS messages_flagged ON messages (flags) WHERE flags & 2;
+-- The split inbox (store/categories.rs). Addresses you've sent mail to, lowercase.
+CREATE TABLE IF NOT EXISTS written_to (email TEXT PRIMARY KEY) WITHOUT ROWID;
+-- Conversations moved to a category by hand.
+CREATE TABLE IF NOT EXISTS category_overrides (
+    account TEXT NOT NULL,
+    thread TEXT NOT NULL,
+    category INTEGER NOT NULL,
+    PRIMARY KEY (account, thread)
+) WITHOUT ROWID;
+-- What the stored categories were worked out with (`config`, a classifier's fingerprint), and
+-- a pass working them out again, if one is under way: it has done the messages from
+-- `pass_below` up (ids, newest first).
+CREATE TABLE IF NOT EXISTS category_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    config TEXT NOT NULL DEFAULT '',
+    pass_below INTEGER
+);
 CREATE TABLE IF NOT EXISTS bodies (
     id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     raw BLOB NOT NULL,
@@ -197,6 +219,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     // UIDs may be from before a reset the old Envoy didn't guard against, so nothing is
     // inferred from what the cache has now ([`Store::drop_unprovable_ops`]).
     ("ops", "uidvalidity", OPS_GENERATION),
+    // The split inbox: a conversation's category, and what its headers say. Sorted again in
+    // the background once the classifier is set (`Store::recategorize`).
+    ("messages", "category", "ALTER TABLE messages ADD COLUMN category INTEGER NOT NULL DEFAULT 0"),
+    ("messages", "signals", "ALTER TABLE messages ADD COLUMN signals INTEGER NOT NULL DEFAULT 0"),
+    ("messages", "list_id", "ALTER TABLE messages ADD COLUMN list_id TEXT NOT NULL DEFAULT ''"),
 ];
 
 /// [`MIGRATIONS`]'s step that gives queued ops a generation ([`At`]): unknown for the ones
@@ -224,10 +251,19 @@ COMMIT;
 /// so no write from its life brings it back: the last 10,000 ends, in the order they happened
 /// (`seq`; a draft's id says when it was started, not when it ended). They replace the
 /// clock-stamped tombstones, and the id-ordered trigger, of earlier builds.
+///
+/// The split inbox: `messages_by_category` is `messages_by_date` with the category after the
+/// mailbox, so a category of the inbox is scanned newest first like a folder of its own, never
+/// touching the table. `messages_unread` holds only the unread messages' categories, for the
+/// counts on the inbox's tabs. `messages_from` finds a sender's mail when a rule or a reply makes
+/// it move. Building them takes about as long as `messages_by_date`, once.
 const POST_MIGRATION: &str = "
 DROP INDEX IF EXISTS messages_box_date;
 DROP INDEX IF EXISTS messages_list;
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages (account, mailbox, date DESC, id DESC, flags, held_op, has_attachments, thread, message_id, from_email, from_name);
+CREATE INDEX IF NOT EXISTS messages_by_category ON messages (account, mailbox, category, date DESC, id DESC, flags, held_op, has_attachments, thread, message_id, from_email, from_name);
+CREATE INDEX IF NOT EXISTS messages_unread ON messages (account, mailbox, category, thread, flags, held_op) WHERE flags & 1 = 0 AND flags & 16 = 0 AND held_op = 0;
+CREATE INDEX IF NOT EXISTS messages_from ON messages (lower(from_email));
 DROP TRIGGER IF EXISTS drafts_tombstone;
 DROP TABLE IF EXISTS draft_tombstones;
 DROP TRIGGER IF EXISTS drafts_end;
@@ -348,10 +384,13 @@ CREATE TABLE messages_new (
     has_attachments INTEGER NOT NULL DEFAULT 0,
     has_body INTEGER NOT NULL DEFAULT 0,
     held_op INTEGER NOT NULL DEFAULT 0,
+    category INTEGER NOT NULL DEFAULT 0,
+    signals INTEGER NOT NULL DEFAULT 0,
+    list_id TEXT NOT NULL DEFAULT '',
     UNIQUE (account, mailbox, uid)
 );
-INSERT INTO messages_new (id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op)
-    SELECT id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op FROM messages;
+INSERT INTO messages_new (id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op, category, signals, list_id)
+    SELECT id, account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, preview, has_attachments, has_body, held_op, category, signals, list_id FROM messages;
 DROP TABLE messages;
 ALTER TABLE messages_new RENAME TO messages;
 CREATE INDEX messages_box_date ON messages (account, mailbox, date DESC);
@@ -561,6 +600,18 @@ pub struct Store {
     contacts_backfill: std::cell::Cell<bool>,
     /// Your addresses, lowercase ([`Store::set_me`]).
     me: std::cell::RefCell<HashSet<String>>,
+    /// The split inbox (store/categories.rs): what categories are worked out with, the
+    /// conversations whose category wants working out again (`(account, thread)`, done when the
+    /// write that touched them is: [`Store::transaction`]'s end, or the write's own), addresses
+    /// newly written to (their mail moves), and the addresses written to, read once.
+    classifier: std::cell::RefCell<crate::category::Classifier>,
+    dirty: std::cell::RefCell<HashSet<(String, String)>>,
+    new_correspondents: std::cell::RefCell<Vec<String>>,
+    written: std::cell::RefCell<Option<HashSet<String>>>,
+    /// Inside [`Store::transaction`].
+    depth: std::cell::Cell<u32>,
+    /// Messages whose category changed since [`Store::take_recategorized`] last asked.
+    recategorized: std::cell::Cell<usize>,
 }
 
 fn json<T: Serialize>(v: &T) -> String {
@@ -586,7 +637,8 @@ struct AttachmentRow {
     inline: bool,
 }
 
-/// A parsed search: free text for FTS plus `from:`, `to:`, `subject:`, `is:`, `has:` filters.
+/// A parsed search: free text for FTS plus `from:`, `to:`, `subject:`, `is:`, `has:` and
+/// `category:` filters.
 #[derive(Default, Debug, PartialEq)]
 pub struct Query {
     pub text: Vec<String>,
@@ -596,14 +648,31 @@ pub struct Query {
     pub unread: Option<bool>,
     pub starred: Option<bool>,
     pub attachment: bool,
+    /// The categories to keep, a bit per [`crate::model::Category::code`]: `category:` (each
+    /// category whose name starts with what's typed, so `category:n` is both of Newsletters and
+    /// Notifications; one that names none keeps nothing), or the inbox tab shown. None: every
+    /// category, as search does unless asked.
+    pub category: Option<u8>,
 }
 
 impl Query {
+    /// Only `category`, as the inbox's tab asks.
+    pub fn in_category(category: crate::model::Category) -> Query {
+        Query { category: Some(1 << category.code()), ..Query::default() }
+    }
+
     pub fn parse(q: &str) -> Query {
         let mut out = Query::default();
         for tok in q.split_whitespace() {
             let lower = tok.to_lowercase();
-            if let Some(v) = lower.strip_prefix("from:") {
+            if let Some(v) = lower.strip_prefix("category:") {
+                // Empty (as it's typed): no condition at all, as `from:`.
+                if !v.is_empty() {
+                    let named = crate::model::Category::ALL.iter().filter(|c| c.as_str().starts_with(v) || crate::model::Category::parse(v) == Some(**c));
+                    let mask = named.fold(0u8, |m, c| m | 1 << c.code());
+                    out.category = Some(out.category.map_or(mask, |m| m & mask));
+                }
+            } else if let Some(v) = lower.strip_prefix("from:") {
                 out.from.push(v.to_owned());
             } else if let Some(v) = lower.strip_prefix("to:") {
                 out.to.push(v.to_owned());
@@ -634,7 +703,7 @@ fn fts_term(t: &str) -> String {
     format!("\"{}\"*", clean.replace('"', ""))
 }
 
-const SUMMARY_COLS: &str = "m.id, m.account, m.mailbox, m.uid, m.thread, m.subject, m.from_name, m.from_email, m.recipients, m.date, m.flags, m.preview, m.has_attachments, m.message_id";
+const SUMMARY_COLS: &str = "m.id, m.account, m.mailbox, m.uid, m.thread, m.subject, m.from_name, m.from_email, m.recipients, m.date, m.flags, m.preview, m.has_attachments, m.message_id, m.category";
 
 fn summary_row(r: &rusqlite::Row) -> rusqlite::Result<(Summary, String)> {
     let recipients: String = r.get(8)?;
@@ -655,6 +724,7 @@ fn summary_row(r: &rusqlite::Row) -> rusqlite::Result<(Summary, String)> {
             thread_count: 1,
             participants: String::new(),
             thread_unread: false,
+            category: crate::model::Category::from_code(r.get(14)?),
         },
         r.get(13)?,
     ))
@@ -675,9 +745,24 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
-        let fts_next = std::cell::Cell::new(has_table(&conn, "fts_next")?);
-        let contacts_backfill = std::cell::Cell::new(has_table(&conn, "contacts_backfill")?);
-        Ok(Store { conn, fts_next, contacts_backfill, me: Default::default() })
+        let fts_next = has_table(&conn, "fts_next")?;
+        let contacts_backfill = has_table(&conn, "contacts_backfill")?;
+        Ok(Store::with(conn, fts_next, contacts_backfill))
+    }
+
+    fn with(conn: Connection, fts_next: bool, contacts_backfill: bool) -> Store {
+        Store {
+            conn,
+            fts_next: std::cell::Cell::new(fts_next),
+            contacts_backfill: std::cell::Cell::new(contacts_backfill),
+            me: Default::default(),
+            classifier: Default::default(),
+            dirty: Default::default(),
+            new_correspondents: Default::default(),
+            written: Default::default(),
+            depth: Default::default(),
+            recategorized: Default::default(),
+        }
     }
 
     #[cfg(test)]
@@ -685,7 +770,7 @@ impl Store {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         migrate(&conn).unwrap();
-        Store { conn, fts_next: std::cell::Cell::new(false), contacts_backfill: std::cell::Cell::new(false), me: Default::default() }
+        Store::with(conn, false, false)
     }
 
     /// Copies the next `chunk` message ids' worth of an old cache's search index into
@@ -803,9 +888,10 @@ impl Store {
     }
 
     pub fn role_of(&self, account: &str, mailbox: &str) -> Role {
+        // Asked for every message stored (the split inbox): prepared once.
         self.conn
-            .query_row("SELECT role FROM mailboxes WHERE account = ?1 AND name = ?2", params![account, mailbox], |r| r.get::<_, String>(0))
-            .optional()
+            .prepare_cached("SELECT role FROM mailboxes WHERE account = ?1 AND name = ?2")
+            .and_then(|mut stmt| stmt.query_row(params![account, mailbox], |r| r.get::<_, String>(0)).optional())
             .ok()
             .flatten()
             .map_or(Role::Other, |s| Role::parse(&s))
@@ -840,14 +926,17 @@ impl Store {
         let mut recipients = p.to.clone();
         recipients.extend(p.cc.iter().cloned());
         let date = p.date.filter(|d| *d > 0).unwrap_or(internal_date);
-        let id: MessageId = self.conn.query_row(
-            "INSERT INTO messages (account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT (account, mailbox, uid) DO UPDATE SET flags = ?11
-             RETURNING id",
-            params![account, mailbox, uid, p.message_id, thread, p.subject, p.from.name, p.from.email, json(&recipients), date, fl, size],
-            |r| r.get(0),
+        // What the split inbox needs of the headers, read now: they aren't kept.
+        let signals = crate::category::signals_of(p, &self.classifier.borrow().me);
+        let (id, thread): (MessageId, String) = self.conn.query_row(
+            "INSERT INTO messages (account, mailbox, uid, message_id, thread, subject, from_name, from_email, recipients, date, flags, size, signals, list_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT (account, mailbox, uid) DO UPDATE SET flags = ?11, signals = ?13, list_id = ?14
+             RETURNING id, thread",
+            params![account, mailbox, uid, p.message_id, thread, p.subject, p.from.name, p.from.email, json(&recipients), date, fl, size, signals, p.bulk_headers.list_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        self.stored(account, mailbox, &thread, &p.from.email, fl, &recipients)?;
         let people = format!(
             "{} {} {}",
             p.from.name,
@@ -880,6 +969,8 @@ impl Store {
             "UPDATE messages SET has_body = 1, preview = ?2, has_attachments = ?3 WHERE id = ?1",
             params![id, preview, has_files],
         )?;
+        // A message cached before the split, whose headers weren't read: they are now.
+        self.headers_arrived(id, p)?;
         let body_text = match (&p.text, &p.html) {
             (Some(t), _) => mime::truncate_chars(t, 20_000),
             (None, Some(h)) => mime::truncate_chars(&mime::preview(None, Some(h)), 20_000),
@@ -989,12 +1080,30 @@ impl Store {
         Ok(out)
     }
 
+    /// Runs `f` in one transaction, taking the write lock as it begins (see above). The
+    /// categories of the conversations it touched are worked out once, at its end, in it
+    /// (store/categories.rs).
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
-        let out = f(self)?;
-        tx.commit()?;
-        Ok(out)
+        self.depth.set(self.depth.get() + 1);
+        let out = f(self).and_then(|out| {
+            self.flush_categories()?;
+            Ok(out)
+        });
+        self.depth.set(self.depth.get() - 1);
+        match out {
+            Ok(out) => {
+                tx.commit()?;
+                Ok(out)
+            }
+            Err(e) => {
+                // Rolled back: what it noted for later goes with it.
+                self.forget_pending();
+                Err(e)
+            }
+        }
     }
+
 
     /// UIDs to download in full: of the newest `limit` in the mailbox to show (not held for a
     /// move, not flagged \Deleted), the ones that have no body yet and
@@ -1283,6 +1392,9 @@ impl Store {
         }
         if query.attachment {
             conds.push("m.has_attachments = 1".into());
+        }
+        if let Some(mask) = query.category {
+            conds.push(format!("(1 << m.category) & {mask} != 0"));
         }
         let fetch = if conversations { limit.saturating_mul(4).max(2000) } else { limit };
         let sql = format!("SELECT {SUMMARY_COLS} FROM messages m WHERE {} ORDER BY m.date DESC, m.id DESC LIMIT {fetch}", conds.join(" AND "));
@@ -1655,6 +1767,7 @@ impl Store {
         self.conn.execute("DELETE FROM unfiled_sent WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM contacts WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM contact_sources WHERE account = ?1", params![account])?;
+        self.conn.execute("DELETE FROM category_overrides WHERE account = ?1", params![account])?;
         Ok(())
     }
 
@@ -2132,6 +2245,8 @@ mod tests {
         let all_queries = [
             "", "p", "pa", "pancakes", "plans p", "meeting", "zzz", "from:", "from:a", "from:ana", "from:LIMA", "from:émile", "to:bo", "subject:re", "subject:",
             "is:unread", "is:read", "is:starred", "has:attachment", "has:attachment is:unread", "from:ana is:unread", "re picnic", "to: from:c", "q",
+            // The split inbox's tabs, and category: searches.
+            "category:important", "category:other", "category:newsletters", "category:n", "category:notifications is:unread", "category:imp p", "category:zzz",
         ];
         let mut compared = 0usize;
         for (seed, n, views, queries, limits) in [
@@ -2139,9 +2254,12 @@ mod tests {
             (2, 600, &all_views[..], &all_queries[..], &[1, 7, 40, 3000][..]),
             (3, 600, &all_views[..], &all_queries[..], &[1, 7, 40, 3000][..]),
             (4, 600, &all_views[..], &all_queries[..], &[1, 7, 40, 3000][..]),
-            (5, 2600, &all_views[..5], &["", "p", "from:a", "is:unread", "has:attachment", "meeting"][..], &[1, 150, 3000][..]),
+            (5, 2600, &all_views[..5], &["", "p", "from:a", "is:unread", "has:attachment", "meeting", "category:other", "category:n"][..], &[1, 150, 3000][..]),
         ] {
             let s = oracle_store(seed, n);
+            // Every category in use, a conversation's the same on all its messages, as the store
+            // keeps them.
+            s.conn.execute("UPDATE messages SET category = (unicode(substr(thread, -4, 1)) + length(thread)) % 4", []).unwrap();
             for view in views {
                 for q in queries {
                     let query = Query::parse(q);

@@ -425,10 +425,10 @@ pub fn flag_names(bits: u32) -> String {
     v.join(" ")
 }
 
-/// Bcc (in copies of mail you sent) and the headers that tell bulk mail ([`mime::is_bulk`]) are
-/// for recipient suggestions.
-const HEADER_QUERY: &str =
-    "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID LIST-UNSUBSCRIBE PRECEDENCE AUTO-SUBMITTED)])";
+/// A new message's flags, size, and the headers the list, recipient suggestions and the split
+/// inbox read: the envelope, Bcc (in copies of mail you sent), and whether it's bulk or automated
+/// ([`mime::is_bulk`], [`mime::BULK_HEADERS`]): a few short lines.
+const HEADER_QUERY: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-ID LIST-UNSUBSCRIBE LIST-POST PRECEDENCE AUTO-SUBMITTED X-GITHUB-REASON X-GITLAB-PROJECT X-BUGZILLA-REASON X-JIRA-FINGERPRINT)])";
 
 fn store_header(store: &Store, account: &str, mailbox: &str, f: &Fetched) -> Result<bool> {
     let (Some(uid), Some(header)) = (f.uid, f.header.as_deref()) else { return Ok(false) };
@@ -1104,6 +1104,20 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// New mail is fetched with the headers the split inbox reads, so it's sorted as it lands;
+    /// and a header block of that shape is read into its signals.
+    #[test]
+    fn new_mail_comes_with_the_headers_the_split_inbox_reads() {
+        let fields = HEADER_QUERY.split_once("HEADER.FIELDS (").unwrap().1.trim_end_matches(")])");
+        for h in mime::BULK_HEADERS.split_whitespace() {
+            assert!(fields.split_whitespace().any(|f| f == h), "{h} isn't fetched: {fields}");
+        }
+        let block = b"From: GitHub <notifications@github.com>\r\nTo: me@x.example\r\nSubject: [x] PR\r\nList-ID: x/y <y.x.github.com>\r\nX-GitHub-Reason: mention\r\n\r\n";
+        let p = mime::parse(block, true).unwrap();
+        assert_eq!(p.bulk_headers.list_id, "y.x.github.com");
+        assert!(p.bulk_headers.platform && !p.bulk_headers.list_unsubscribe);
+    }
 
     /// A mailbox of `n` messages (UID = sequence number + 100), the ones in `deleted` flagged
     /// \Deleted, answering SELECT and header FETCHes by sequence range.

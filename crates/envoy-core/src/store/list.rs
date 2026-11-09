@@ -20,7 +20,7 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Row, params_from_iter};
 
 use super::{Query, SUMMARY_COLS, Store, fts_term, summary_row};
-use crate::model::{Address, Role, Summary, View, flags};
+use crate::model::{Address, Category, Role, Summary, View, flags};
 
 /// The list's order, in every query that feeds it: newest first, and among messages of the
 /// same second the newer id (stored later) first. Ids never change, so neither does the order
@@ -36,7 +36,7 @@ const LIGHT_COLS: &str = "m.id, m.account, m.thread, m.message_id, m.date, m.fla
 const FEW_HITS: usize = 4000;
 
 /// Which messages a view covers.
-enum Scope {
+pub(super) enum Scope {
     /// These mailboxes, `(account, name)`.
     Boxes(Vec<(String, String)>),
     /// Flagged messages anywhere but Trash and Spam, in one account or all.
@@ -47,6 +47,8 @@ enum Scope {
 struct Filter {
     conds: Vec<String>,
     args: Vec<SqlValue>,
+    /// The categories kept ([`Query::category`]), whose scan reads `messages_by_category`.
+    categories: Option<Vec<i64>>,
 }
 
 impl Filter {
@@ -81,7 +83,13 @@ impl Filter {
         if query.attachment {
             conds.push("m.has_attachments = 1".into());
         }
-        Filter { conds, args }
+        // Codes the code writes, not the user: inlined.
+        let categories = query.category.map(|mask| Category::ALL.iter().map(|c| c.code()).filter(|c| mask & 1 << c != 0).collect::<Vec<i64>>());
+        if let Some(codes) = &categories {
+            let list = if codes.is_empty() { "-1".to_owned() } else { codes.iter().map(i64::to_string).collect::<Vec<_>>().join(", ") };
+            conds.push(format!("m.category IN ({list})"));
+        }
+        Filter { conds, args, categories }
     }
 
     fn sql(&self) -> String {
@@ -218,7 +226,7 @@ impl Grouper<'_> {
 }
 
 impl Store {
-    fn scope(&self, view: &View) -> Result<Scope> {
+    pub(super) fn scope(&self, view: &View) -> Result<Scope> {
         Ok(match view {
             View::Mailbox { account, mailbox } => Scope::Boxes(vec![(account.clone(), mailbox.clone())]),
             View::Role { account, role } => {
@@ -393,16 +401,31 @@ fn scan_sql(scope: &Scope, filter: &Filter, few: Option<&Hits>) -> (String, Vec<
             format!("SELECT {LIGHT_COLS} FROM messages m WHERE m.id IN (SELECT value FROM json_each(?)) AND {} AND {within} ORDER BY {ORDER}", filter.sql())
         }
         (Scope::Boxes(boxes), None) => {
-            // One ordered index scan per mailbox; SQLite merges them by date.
-            let arms: Vec<String> = boxes
-                .iter()
-                .map(|(a, b)| {
+            // One ordered index scan per mailbox; SQLite merges them by date. With categories,
+            // one per mailbox and category, each a range of `messages_by_category` in the same
+            // order: a category of the inbox reads like a folder of its own.
+            let mut arms: Vec<String> = Vec::new();
+            for (a, b) in boxes {
+                let mut arm = |category: Option<i64>| {
                     args.push(a.clone().into());
                     args.push(b.clone().into());
+                    if let Some(c) = category {
+                        args.push(c.into());
+                    }
                     args.extend(filter.args.iter().cloned());
-                    format!("SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_by_date WHERE m.account = ? AND m.mailbox = ? AND {}", filter.sql())
-                })
-                .collect();
+                    let (index, category) = if category.is_some() { ("messages_by_category", " AND m.category = ?") } else { ("messages_by_date", "") };
+                    arms.push(format!("SELECT {LIGHT_COLS} FROM messages m INDEXED BY {index} WHERE m.account = ? AND m.mailbox = ?{category} AND {}", filter.sql()));
+                };
+                match &filter.categories {
+                    Some(codes) => codes.iter().for_each(|c| arm(Some(*c))),
+                    None => arm(None),
+                }
+            }
+            if arms.is_empty() {
+                // Categories that name none: nothing matches.
+                args.extend(filter.args.iter().cloned());
+                return (format!("SELECT {LIGHT_COLS} FROM messages m WHERE 0 AND {}", filter.sql()), args);
+            }
             // Columns 5 and 1 of LIGHT_COLS: date, id.
             if arms.len() == 1 { format!("{} ORDER BY {ORDER}", arms[0]) } else { format!("{} ORDER BY 5 DESC, 1 DESC", arms.join(" UNION ALL ")) }
         }
@@ -476,5 +499,41 @@ mod tests {
             assert!(plan.iter().any(|p| p.contains("COVERING INDEX messages_by_date")), "{n} mailboxes: {plan:?}");
             assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{n} mailboxes: {plan:?}");
         }
+    }
+
+    fn plan(st: &Store, sql: &str, args: &[SqlValue]) -> Vec<String> {
+        let mut stmt = st.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map(params_from_iter(args.iter()), |r| r.get::<_, String>(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// A tab of the split inbox (one category, in one inbox or several) reads its range of
+    /// `messages_by_category` in the list's order, as a folder reads `messages_by_date`: no table,
+    /// no sort, so it stops at the limit and costs what today's list costs. So does `category:n`
+    /// (two categories). The tabs' counts read only unread messages; a sender's mail is found by
+    /// its index.
+    #[test]
+    fn a_category_reads_its_own_index_in_order() {
+        let st = Store::memory();
+        for (boxes, q) in [
+            (vec![("a".to_owned(), "INBOX".to_owned())], "category:important"),
+            (vec![("a".to_owned(), "INBOX".to_owned()), ("b".to_owned(), "INBOX".to_owned())], "category:newsletters"),
+            (vec![("a".to_owned(), "INBOX".to_owned())], "category:n is:unread"),
+        ] {
+            let filter = Filter::new(&Query::parse(q));
+            let (sql, args) = scan_sql(&Scope::Boxes(boxes.clone()), &filter, None);
+            let plan = plan(&st, &sql, &args);
+            assert!(plan.iter().any(|p| p.contains("COVERING INDEX messages_by_category")), "{q}: {plan:?}");
+            assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE") || p.contains("messages_by_date")), "{q}: {plan:?}");
+        }
+        let counts = plan(&st, super::super::categories::COUNT_UNREAD, &["a".to_owned().into(), "INBOX".to_owned().into()]);
+        assert!(counts.iter().any(|p| p.contains("COVERING INDEX messages_unread")), "{counts:?}");
+        let senders = plan(&st, super::super::categories::SENDERS_THREADS, &[r#"["a@x.example"]"#.to_owned().into()]);
+        assert!(senders.iter().any(|p| p.contains("INDEX messages_from")), "{senders:?}");
+        let thread = plan(&st, super::super::categories::THREAD_ROWS, &["a".to_owned().into(), "t".to_owned().into()]);
+        assert!(thread.iter().any(|p| p.contains("INDEX messages_thread")), "{thread:?}");
+        // Setting a conversation's category reads only it (left to itself SQLite walks the
+        // account in messages_by_category: quadratic over a download).
+        let set = plan(&st, super::super::categories::SET_CATEGORY, &["a".to_owned().into(), "t".to_owned().into(), 1i64.into()]);
+        assert!(set.iter().any(|p| p.contains("INDEX messages_thread (account=? AND thread=?)")), "{set:?}");
     }
 }

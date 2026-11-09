@@ -27,6 +27,10 @@ pub enum Kind {
     Keybinding,
     /// A list of strings (a JSON array), trimmed, lowercased and without repeats.
     List,
+    /// The split inbox's rules: a JSON array of `{ "from": …, "list": …, "category": … }`
+    /// ([`crate::category::Rule`]), kept as written; entries that can't be read do nothing and
+    /// are listed among the problems.
+    Rules,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -110,6 +114,12 @@ pub const SCHEMA: &[SettingDef] = &[
         Kind::Enum(&[("relative", "Smart (10:42, Tue, Mar 4)"), ("short", "Short (2026-03-04)"), ("long", "Long (Mar 4, 2026, 10:42)")]), S("relative")),
     def("inbox.unifiedInbox", "Inbox", "Unified inbox", "With more than one account, show an inbox that combines all of them.",
         Kind::Bool, B(true)),
+    def("inbox.split", "Inbox", "Split inbox",
+        "Sort the inbox into Important, Other, Newsletters and Notifications, each with its unread count. Decided on this computer from each message's headers and your rules; nothing changes on the server. Search looks in all four unless asked (category:newsletters).",
+        Kind::Bool, B(true)),
+    def("inbox.rules", "Inbox", "Split inbox rules",
+        "Where mail goes, before Envoy's own judgment. One rule per line: from: an address, a domain or a pattern such as *@github.com, and/or list: a mailing list's id, then a category (important, other, newsletters or notifications). The first rule that matches wins. Moving a conversation to a category adds a rule for its sender.",
+        Kind::Rules, L(&[])),
     // Reading
     def("reading.markAsRead", "Reading", "Mark as read", "When an opened message is marked read.",
         Kind::Enum(&[("immediately", "Immediately"), ("delay", "After a delay"), ("never", "Only when I mark it")]), S("immediately")),
@@ -185,6 +195,14 @@ pub const SCHEMA: &[SettingDef] = &[
     def("keys.spam", "Keyboard", "Report spam", "Move the open or selected messages to Spam (or back to the inbox, from Spam).", Kind::Keybinding, S("!")),
     def("keys.moveTo", "Keyboard", "Move to…", "Move the open or selected messages to a folder you pick.", Kind::Keybinding, S("v")),
     def("keys.label", "Keyboard", "Label…", "Add a label to the open or selected messages (Gmail).", Kind::Keybinding, S("l")),
+    def("keys.showImportant", "Keyboard", "Show Important", "Show the split inbox's Important mail.", Kind::Keybinding, S("1")),
+    def("keys.showOther", "Keyboard", "Show Other", "Show the split inbox's Other mail.", Kind::Keybinding, S("2")),
+    def("keys.showNewsletters", "Keyboard", "Show Newsletters", "Show the split inbox's newsletters.", Kind::Keybinding, S("3")),
+    def("keys.showNotifications", "Keyboard", "Show Notifications", "Show the split inbox's notifications.", Kind::Keybinding, S("4")),
+    def("keys.moveImportant", "Keyboard", "Move to Important", "Move the open or selected conversations to Important, and future mail from their senders.", Kind::Keybinding, S("alt+1")),
+    def("keys.moveOther", "Keyboard", "Move to Other", "Move the open or selected conversations to Other, and future mail from their senders.", Kind::Keybinding, S("alt+2")),
+    def("keys.moveNewsletters", "Keyboard", "Move to Newsletters", "Move the open or selected conversations to Newsletters, and future mail from their senders.", Kind::Keybinding, S("alt+3")),
+    def("keys.moveNotifications", "Keyboard", "Move to Notifications", "Move the open or selected conversations to Notifications, and future mail from their senders.", Kind::Keybinding, S("alt+4")),
 ];
 
 pub fn schema(key: &str) -> Option<&'static SettingDef> {
@@ -229,6 +247,9 @@ impl Settings {
                         None => s.problems.push(format!("Unknown setting \"{k}\"")),
                         Some(d) => match validate(d, &v) {
                             Ok(v) => {
+                                if d.kind == Kind::Rules {
+                                    s.problems.extend(crate::category::parse_rules(&v).1.into_iter().map(|p| format!("\"{k}\": {p}")));
+                                }
                                 s.user.insert(k, v);
                             }
                             Err(e) => s.problems.push(format!("\"{k}\": {e}")),
@@ -440,7 +461,37 @@ fn validate(d: &SettingDef, v: &Value) -> Result<Value, String> {
             }
             Ok(Value::Array(out))
         }
+        // Kept as written, so a hand edit with a typo isn't lost the next time the file is saved.
+        Kind::Rules => v.as_array().map(|_| v.clone()).ok_or_else(|| "expected a list of rules".into()),
     }
+}
+
+/// The split inbox's rules as Settings shows them: one per line ([`crate::category::Rule::text`]),
+/// and entries that can't be read, as they are.
+pub fn rules_text(v: &Value) -> String {
+    let items = v.as_array().cloned().unwrap_or_default();
+    items
+        .iter()
+        .map(|item| match crate::category::parse_rules(&Value::Array(vec![item.clone()])).0.first() {
+            Some(rule) => rule.text(),
+            None => item.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reads rules typed one per line ([`rules_text`]'s form): the list to save, and the lines that
+/// aren't rules, with why.
+pub fn rules_from_text(text: &str) -> (Value, Vec<String>) {
+    let mut rules = Vec::new();
+    let mut problems = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match crate::category::Rule::parse_text(line) {
+            Ok(r) => rules.push(serde_json::to_value(r).unwrap_or(Value::Null)),
+            Err(e) => problems.push(format!("{line}: {e}")),
+        }
+    }
+    (Value::Array(rules), problems)
 }
 
 /// A commented reference of every setting and its default, written next to `settings.json`
@@ -526,6 +577,31 @@ mod tests {
         s.set("reading.imagesFrom", serde_json::json!(["maya@northwind.dev"])).unwrap();
         assert!(s.remote_images_from("Maya@Northwind.dev") && !s.remote_images_from("bo@northwind.dev"));
         assert!(list_problems("inbox.other", ["@@x"]).is_empty(), "other lists aren't read as senders");
+    }
+
+    #[test]
+    fn rules_keep_what_was_written_and_say_whats_wrong() {
+        let dir = std::env::temp_dir().join(format!("envoy-settings-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{ "inbox.rules": [ { "from": "*@GitHub.com", "category": "notifications" }, { "list": "rust-lang.org", "category": "newsletters" }, { "from": "x", "category": "important" } ] }"#,
+        )
+        .unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.value("inbox.rules").as_array().unwrap().len(), 3, "kept as written, the bad one too");
+        assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
+        assert!(s.problems[0].starts_with("\"inbox.rules\": rule 3"), "{:?}", s.problems);
+        let text = rules_text(&s.value("inbox.rules"));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[..2], ["from:*@github.com notifications", "list:rust-lang.org newsletters"]);
+        assert!(lines[2].contains("\"from\":\"x\""), "shown as it is: {}", lines[2]);
+        let (v, problems) = rules_from_text("from:*@github.com notifications\n\nnonsense\n  list:rust-lang.org newsletter ");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(v, serde_json::json!([{ "from": "*@github.com", "category": "notifications" }, { "list": "rust-lang.org", "category": "newsletters" }]));
+        assert!(Settings::default().bool("inbox.split"), "on by default");
+        assert!(Settings::default().set("inbox.rules", serde_json::json!("from:a@b.c other")).is_err(), "a list");
     }
 
     #[test]
