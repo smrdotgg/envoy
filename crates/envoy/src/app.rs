@@ -178,16 +178,6 @@ pub enum FileOp {
     Detach { draft: i64, file: i64 },
 }
 
-/// A file demo mode is pretending to read: attached at `at` (app clock), with what a thread of
-/// its own found on disk (demo mode has no engine to read it; the UI thread never touches the
-/// disk).
-pub struct DemoRead {
-    pub at: f64,
-    pub draft: i64,
-    pub file: i64,
-    pub found: std::sync::Arc<std::sync::Mutex<Option<Result<u64, String>>>>,
-}
-
 /// A draft save handed to the engine and not yet confirmed written: kept to try again, and to
 /// write on the spot if the window closes first.
 pub struct PendingSave {
@@ -300,8 +290,6 @@ pub struct MovedAway {
     pub open: Option<MessageId>,
     /// A composer that closed because its draft was among them.
     pub compose: Option<Box<Compose>>,
-    /// Demo mode's drafts discarded from its Drafts list, for Undo to keep again.
-    pub demo_drafts: Vec<crate::demo::Kept>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -480,6 +468,9 @@ pub struct App {
     /// ([`App::list_changed_here`]).
     pub list_pending: bool,
     pub list_loaded: bool,
+    /// The view on screen has listed a row since it was opened: empty now, it isn't waiting for
+    /// mail to download (its last row went: discarded, moved away).
+    pub list_had_rows: bool,
     /// False while `list` is the top of a longer list whose rest is on its way.
     pub list_complete: bool,
     /// Counts the lists the engine sent that replaced `list`.
@@ -535,15 +526,15 @@ pub struct App {
     pub list_drag_start: Option<f32>,
     pub list_width: f32,
     pub list_height: f32,
+    /// Demo mode (`--demo`): the sample mail's, on an in-process server. Its settings are
+    /// never read from or written to settings.json, and the sidebar says it's the demo.
     pub demo: bool,
+    /// The demo's server, once its engine started ([`crate::demo::start`]).
+    pub demo_server: Option<std::sync::Arc<envoy_core::demo::Server>>,
     pub settings_checked_at: f64,
     pub confirm_delete: Option<Vec<MessageId>>,
     pub images: HashMap<String, ImageState>,
     pub image_cache: Option<rune::ImageCache>,
-    /// Files demo mode is pretending to read.
-    pub demo_reads: Vec<DemoRead>,
-    /// Drafts written in demo mode, listed in its Drafts.
-    pub demo_drafts: crate::demo::Drafts,
     /// Changes to drafts' files the engine may not have made yet.
     pub file_ops: Vec<FileOp>,
     /// The largest message each account's SMTP server takes, as it said ([`Event::SendLimit`]).
@@ -595,6 +586,7 @@ impl App {
             explained: None,
             list_pending: false,
             list_loaded: false,
+            list_had_rows: false,
             list_complete: true,
             list_gen: 0,
             list_at_once: true,
@@ -639,12 +631,11 @@ impl App {
             list_width,
             list_height,
             demo,
+            demo_server: None,
             settings_checked_at: 0.0,
             confirm_delete: None,
             images: HashMap::new(),
             image_cache: None,
-            demo_reads: Vec::new(),
-            demo_drafts: Default::default(),
             file_ops: Vec::new(),
             send_limits: HashMap::new(),
             #[cfg(test)]
@@ -679,6 +670,71 @@ impl App {
             Some(e) => e.drain(),
             None => return false,
         };
+        self.take(events, tx)
+    }
+
+    /// Waits for the engine's answers to everything asked so far, applying them as [`App::pump`]
+    /// does: for headless scenes and tests, never a window's frame (which never waits). Done
+    /// once the list, the open conversation, drafts' saves and sends and every account's sync
+    /// are in, and the engine has been quiet a moment; false if that took over ten seconds.
+    pub fn settle(&mut self) -> bool {
+        self.settle_until(|_| true)
+    }
+
+    /// [`App::settle`], until `done` holds too.
+    pub fn settle_until(&mut self, done: impl Fn(&App) -> bool) -> bool {
+        use std::time::{Duration, Instant};
+        const QUIET: Duration = Duration::from_millis(40);
+        let started = Instant::now();
+        let mut heard = Instant::now();
+        loop {
+            let Some(engine) = &self.engine else { return done(self) };
+            let events = engine.wait(Duration::from_millis(5));
+            if !events.is_empty() {
+                self.take(events, &mut Tx::default());
+                heard = Instant::now();
+            } else if heard.elapsed() >= QUIET && !self.waiting() && done(self) {
+                return true;
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                return false;
+            }
+        }
+    }
+
+    /// Conversation `id` as the engine reads it, without opening it: for tests (with an engine).
+    #[cfg(test)]
+    pub fn read_thread(&mut self, id: MessageId) -> Vec<ThreadMessage> {
+        use std::time::{Duration, Instant};
+        self.send(Command::Prefetch { id, conversations: self.conversations() });
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(10) {
+            let Some(engine) = &self.engine else { break };
+            for ev in engine.wait(Duration::from_millis(20)) {
+                match ev {
+                    Event::Prefetched { id: got, messages } if got == id => return messages,
+                    ev => {
+                        if self.apply(ev, &mut Tx::default()) {
+                            self.reload();
+                        }
+                    }
+                }
+            }
+        }
+        panic!("conversation {id} never came");
+    }
+
+    /// Something asked of the engine hasn't been answered ([`App::settle`]).
+    fn waiting(&self) -> bool {
+        self.list_pending
+            || self.open.is_some_and(|id| self.thread_for != Some(id))
+            || !self.pending_saves.is_empty()
+            || !self.pending_sends.is_empty()
+            || self.sync.values().any(|s| matches!(s, SyncState::Connecting | SyncState::Syncing(_)))
+    }
+
+    /// Applies engine events; true when anything visible changed.
+    fn take(&mut self, events: Vec<Event>, tx: &mut Tx) -> bool {
         // A conversation read ahead changes nothing on screen.
         let changed = events.iter().any(|e| !matches!(e, Event::Prefetched { .. }));
         let mut reload = false;
@@ -733,6 +789,7 @@ impl App {
             Event::List { req, items, more } if req == self.list_req && !(more && !self.list_at_once) => {
                 self.list = items;
                 self.list_loaded = true;
+                self.list_had_rows |= !self.list.is_empty();
                 self.list_complete = !more;
                 self.list_gen += 1;
                 if !more {
@@ -921,15 +978,6 @@ impl App {
             self.images.retain(|_, st| !matches!(st, ImageState::Ready(_)));
         }
         for (url, message) in wanted {
-            if self.demo {
-                // No engine in demo mode: fetch right here (demo only; blocks briefly).
-                let st = match (envoy_core::engine::fetch_image(&url, None), &self.image_cache) {
-                    (Ok((w, h, rgba)), Some(cache)) => ImageState::Ready(cache.rgba(w, h, rgba)),
-                    _ => ImageState::Failed,
-                };
-                self.images.insert(url, st);
-                continue;
-            }
             self.images.insert(url.clone(), ImageState::Loading);
             self.send(Command::FetchImage { url, message });
         }
@@ -999,28 +1047,6 @@ impl App {
     /// on screen is read again ([`App::reload`]) and comes whole, changes animating.
     fn request_list_as(&mut self, at_once: bool) {
         let category = self.list_category();
-        if self.demo {
-            let q = envoy_core::store::Query { tab: category, ..envoy_core::store::Query::parse(&self.applied_query) };
-            let words: Vec<String> = q.text.iter().map(|w| w.to_lowercase()).collect();
-            self.list = crate::demo::list_with(&self.view, &self.demo_drafts)
-                .into_iter()
-                .filter(|m| {
-                    let hay = format!("{} {} {} {}", m.subject, m.preview, m.from.name, m.from.email).to_lowercase();
-                    words.iter().all(|w| hay.contains(w.as_str()))
-                        && q.from.iter().all(|f| format!("{} {}", m.from.name, m.from.email).to_lowercase().contains(f.as_str()))
-                        && q.unread.is_none_or(|u| u == m.thread_unread)
-                        && q.starred.is_none_or(|st| st == m.flagged())
-                        && (!q.attachment || m.has_attachments)
-                        && q.categories().is_none_or(|mask| mask & 1 << m.category.code() != 0)
-                })
-                .collect();
-            if self.split_applies() {
-                self.category_counts = Some((self.view.clone(), crate::demo::category_counts(&self.view)));
-            }
-            self.list_loaded = true;
-            self.selection.retain(&self.list);
-            return;
-        }
         self.list_req += 1;
         self.list_pending = true;
         self.list_at_once = at_once;
@@ -1047,11 +1073,8 @@ impl App {
             self.view = view.clone();
             self.list.clear();
             self.list_loaded = false;
+            self.list_had_rows = false;
             self.selection.clear();
-        }
-        if self.demo {
-            self.list = crate::demo::list_with(&self.view, &self.demo_drafts);
-            self.list_loaded = true;
         }
         self.request_list();
         self.send(Command::Watch { view });
@@ -1105,16 +1128,6 @@ impl App {
         // Read ahead: show it now; the Open above brings it fresh a moment later.
         if let Some(messages) = self.prefetched.remove(&id) {
             self.set_thread(id, messages);
-        }
-        if self.demo {
-            self.thread = crate::demo::thread_for(id);
-            self.thread_for = Some(id);
-            self.explained = self.list.iter().find(|s| s.id == id).map(|s| (id, s.category, crate::demo::why(s.category).to_owned()));
-            self.expanded = self.thread.iter().filter(|m| !m.summary.seen()).map(|m| m.summary.id).collect();
-            if let Some(last) = self.thread.last() {
-                self.expanded.insert(last.summary.id);
-            }
-            self.request_images();
         }
         // Marked read once it actually shows: the engine may find nothing (it was moved, or a
         // late undo reopened a message that's still on its way out).
@@ -1175,15 +1188,10 @@ impl App {
         }
         self.send(Command::SetFlags { ids: vec![id], add: flags::SEEN, remove: 0, thread: self.conversations() });
         self.list_changed_here();
-        if self.demo {
-            for m in self.thread.iter_mut() {
-                m.summary.flags |= flags::SEEN;
-            }
-        }
     }
 
     /// Moves the sidebar's counts at once for a change made here. The engine's own counts
-    /// replace them a moment later (in demo mode nothing else would).
+    /// replace them a moment later.
     fn bump_counts(&mut self, account: &str, mailbox: &str, unread: i64, total: i64) {
         if let Some(m) = self.mailboxes.get_mut(account).and_then(|boxes| boxes.iter_mut().find(|m| m.name == mailbox)) {
             m.unread = (m.unread as i64 + unread).max(0) as u32;
@@ -1303,8 +1311,7 @@ impl App {
     /// settings file changes.
     pub fn tick(&mut self, clock: f64, tx: &mut Tx) -> bool {
         self.clock = clock;
-        let mut changed = self.finish_demo_reads(clock, tx);
-        changed |= self.autosave(clock, tx);
+        let mut changed = self.autosave(clock, tx);
         self.retry_saves(clock, tx);
         self.sync_reading();
         if let Some((id, at)) = self.mark_read_at {
@@ -1508,7 +1515,6 @@ impl App {
             rows: self.list.iter().filter(|s| ids.contains(&s.id)).cloned().collect(),
             open: self.open.filter(|o| ids.contains(o)),
             compose: None,
-            demo_drafts: Vec::new(),
         }
     }
 
@@ -1549,7 +1555,6 @@ impl App {
     /// and the reload that follows confirms it.
     fn restore(&mut self, mut m: MovedAway, tx: &mut Tx) {
         self.send(Command::UndoMove { undo: m.key });
-        self.demo_drafts.put_back(std::mem::take(&mut m.demo_drafts));
         for (account, mailbox, unread, total) in self.counted(&m.rows) {
             self.bump_counts(&account, &mailbox, unread, total);
         }
@@ -1614,14 +1619,9 @@ impl App {
         }
         let window = self.settings.u32("behavior.undoSeconds");
         let key = (window > 0).then(|| self.next_stamp());
-        let mut snapshot = key.map(|key| self.snapshot(key, &rows));
+        let snapshot = key.map(|key| self.snapshot(key, &rows));
         for row in &rows {
             self.send(Command::DiscardDraftRow { row: *row, undo: key });
-        }
-        // No engine in demo mode: its drafts leave the session's, and Undo keeps them again.
-        let taken = self.demo_drafts.take_rows(&rows);
-        if let Some(s) = &mut snapshot {
-            s.demo_drafts = taken;
         }
         self.after_remove(&rows, tx);
         let label = if rows.len() == 1 { "Draft discarded".to_owned() } else { format!("{} drafts discarded", rows.len()) };
@@ -2063,7 +2063,7 @@ impl App {
             return;
         };
         // Nothing to put back on screen: Undo only calls the copies back.
-        let snapshot = MovedAway { key, view: self.view.clone(), query: self.applied_query.clone(), category: self.list_category(), rows: Vec::new(), open: None, compose: None, demo_drafts: Vec::new() };
+        let snapshot = MovedAway { key, view: self.view.clone(), query: self.applied_query.clone(), category: self.list_category(), rows: Vec::new(), open: None, compose: None };
         self.toast_seq += 1;
         self.toasts.push(Toast { id: self.toast_seq, text, undo: Some(Undo::Move(Box::new(snapshot))), until: self.clock + window as f64, error: false, open_path: None });
         while self.toasts.len() > 3 {
@@ -2248,15 +2248,14 @@ impl App {
         c.references = refs;
         c.reply_of = reply_of;
         c.title = subject;
-        let status = if self.demo { FileStatus::Attached } else { FileStatus::Attaching };
         let files: Vec<(DraftAttachment, usize)> = forwarded
             .iter()
-            .map(|a| (DraftAttachment { id: self.next_stamp(), filename: a.filename.clone(), mime: a.mime.clone(), size: a.size, status: status.clone() }, a.index))
+            .map(|a| (DraftAttachment { id: self.next_stamp(), filename: a.filename.clone(), mime: a.mime.clone(), size: a.size, status: FileStatus::Attaching }, a.index))
             .collect();
         c.files = files.iter().map(|(f, _)| f.clone()).collect();
         let draft_id = c.draft_id;
         self.compose = Some(c);
-        if !files.is_empty() && !self.demo {
+        if !files.is_empty() {
             // The draft goes in the store first: its files are kept with it.
             self.save_compose(true);
             for (file, index) in &files {
@@ -2318,10 +2317,6 @@ impl App {
         let failures = self.pending_saves.iter().find(|p| p.id == id).map_or(0, |p| p.failures);
         self.pending_saves.retain(|p| p.id != id);
         self.pending_saves.push(PendingSave { id, rev, lifecycle, draft: draft.clone(), open, files_from, failures, retry_at: None });
-        if self.demo {
-            // No engine: kept for the session, for demo mode's Drafts to list.
-            self.demo_drafts.keep(id, draft.clone());
-        }
         self.send(save_command(id, draft, open, rev, lifecycle, files_from));
     }
 
@@ -2429,9 +2424,6 @@ impl App {
     /// The window is closing: everything not confirmed written is written now, before the
     /// process can exit ([`App::unsaved`]). The composer opens again on the next start.
     pub fn on_close(&mut self) {
-        if self.demo {
-            return;
-        }
         let engine = self.engine.take();
         let files = |op: &FileOp| -> Result<(), String> {
             let Some(engine) = &engine else { return Err("the mail database isn't open".into()) };
@@ -2564,7 +2556,6 @@ impl App {
         let key = (window > 0).then(|| self.next_stamp());
         if c.saved {
             self.send(Command::DiscardDraft { id: c.draft_id, undo: key });
-            self.demo_draft_gone(c.draft_id);
         }
         let Some(key) = key else {
             self.toast("Draft discarded", false);
@@ -2577,17 +2568,6 @@ impl App {
             self.toasts.remove(0);
         }
         tx.wake_after(std::time::Duration::from_secs_f64(window as f64 + 0.05));
-    }
-
-    /// A draft sent or discarded in demo mode leaves its Drafts (Undo saves it again).
-    fn demo_draft_gone(&mut self, id: i64) {
-        if !self.demo {
-            return;
-        }
-        self.demo_drafts.forget(id);
-        if self.view_role() == Some(Role::Drafts) {
-            self.request_list_as(false);
-        }
     }
 
     /// Undo for [`App::discard_compose`]: the composer comes back as it was, and is saved again
@@ -2612,12 +2592,6 @@ impl App {
     /// Opens a Drafts row in the composer. The engine answers with the draft
     /// ([`Event::DraftOpened`]).
     fn open_draft(&mut self, id: MessageId) {
-        if self.demo {
-            if let Some((id, draft)) = self.demo_drafts.of_row(id).or_else(|| crate::demo::draft_for(id).map(|d| (id, d))) {
-                self.show_draft(id, draft, DraftRev::default(), false, None);
-            }
-            return;
-        }
         self.send(Command::OpenDraft { id });
     }
 
@@ -2707,11 +2681,6 @@ impl App {
         }
         let (draft, draft_id, lifecycle) = (c.draft(), c.draft_id, c.lifecycle);
         self.compose = None;
-        if self.demo {
-            self.demo_draft_gone(draft_id);
-            self.toast("Sent (demo mode — nothing left your computer)", false);
-            return;
-        }
         // Kept until the engine confirms it queued the message (Event::Sent), or gives it back
         // (Event::SendFailed), and written as a draft if the window closes first.
         let rev = self.next_stamp();
@@ -2756,7 +2725,6 @@ impl App {
             return;
         }
         let ids: Vec<i64> = paths.iter().map(|_| self.next_stamp()).collect();
-        let max = self.compose_limit().max_file();
         let Some(c) = &mut self.compose else { return };
         c.minimized = false;
         c.drop_hover = false;
@@ -2766,36 +2734,9 @@ impl App {
         for (id, path) in ids.into_iter().zip(paths) {
             let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
             let file = DraftAttachment { id, mime: attach::type_for(&filename).to_owned(), filename, size: 0, status: FileStatus::Attaching };
-            if !self.demo {
-                self.file_ops.push(FileOp::Attach { draft, file: file.clone(), source: FileSource::Path(path.clone()) });
-            }
+            self.file_ops.push(FileOp::Attach { draft, file: file.clone(), source: FileSource::Path(path.clone()) });
             c.files.push(file);
             files.push((id, path));
-        }
-        if self.demo {
-            let at = self.clock + 0.8;
-            for (file, path) in files {
-                // Off the UI thread, even in demo mode: a disk can take its time.
-                let found = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let into = found.clone();
-                std::thread::spawn(move || {
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let r = match std::fs::metadata(&path) {
-                        Ok(m) if m.is_dir() => Err(format!("{name} is a folder: attach the files in it")),
-                        Ok(m) if m.len() as usize > max => Err(attach::too_big(&name, m.len() as usize, max)),
-                        Ok(m) => Ok(m.len()),
-                        Err(e) => Err(format!("Couldn't read {name}: {e}")),
-                    };
-                    if let Ok(mut f) = into.lock() {
-                        *f = Some(r);
-                    }
-                });
-                self.demo_reads.push(DemoRead { at, draft, file, found });
-            }
-            // Saved with its files, as the engine's path saves a draft before attaching: put
-            // away before they're read, it's still in Drafts, and they land there.
-            self.compose_edited();
-            return;
         }
         // The draft goes in the store first: a file is kept with its draft, never without one.
         if !c.saved {
@@ -2811,12 +2752,10 @@ impl App {
         c.files.remove(i);
         c.error = None;
         let draft = c.draft_id;
-        if !self.demo {
-            self.file_ops.retain(|op| !matches!(op, FileOp::Attach { file, .. } if file.id == id));
-            // Made again on close, harmlessly: no answer says it's done, so it's never dropped.
-            self.file_ops.push(FileOp::Detach { draft, file: id });
-            self.send(Command::DetachFile { draft, file: id });
-        }
+        self.file_ops.retain(|op| !matches!(op, FileOp::Attach { file, .. } if file.id == id));
+        // Made again on close, harmlessly: no answer says it's done, so it's never dropped.
+        self.file_ops.push(FileOp::Detach { draft, file: id });
+        self.send(Command::DetachFile { draft, file: id });
     }
 
     /// The composer (or one closed, waiting in an Undo) holding draft `draft`.
@@ -2860,39 +2799,6 @@ impl App {
         shown.extend(c.files.iter().filter(|f| adding.contains(&f.id) && !listed.contains(&f.id)).cloned());
         shown.sort_by_key(|f| f.id);
         c.files = shown;
-    }
-
-    /// Demo mode's pretend reads that are done: the file's size as its thread found it,
-    /// nothing stored.
-    fn finish_demo_reads(&mut self, clock: f64, tx: &mut Tx) -> bool {
-        let (done, waiting): (Vec<DemoRead>, Vec<DemoRead>) =
-            std::mem::take(&mut self.demo_reads).into_iter().partition(|r| r.at <= clock && r.found.lock().is_ok_and(|f| f.is_some()));
-        self.demo_reads = waiting;
-        if let Some(next) = self.demo_reads.iter().map(|r| r.at).reduce(f64::min) {
-            tx.wake_after(std::time::Duration::from_secs_f64((next - clock).max(0.02)));
-        }
-        let mut changed = false;
-        for r in done {
-            let Some(found) = r.found.lock().ok().and_then(|mut f| f.take()) else { continue };
-            let land = |f: &mut DraftAttachment| {
-                if f.status != FileStatus::Attaching {
-                    return false;
-                }
-                match &found {
-                    Ok(size) => (f.size, f.status) = (*size as usize, FileStatus::Attached),
-                    Err(why) => f.status = FileStatus::Failed(why.clone()),
-                }
-                true
-            };
-            if let Some(f) = self.compose_for(r.draft).and_then(|c| c.file_mut(r.file)) {
-                changed |= land(f);
-            }
-            // The draft as demo mode keeps it, whether a composer shows it or it was put away.
-            if let Some(f) = self.demo_drafts.file_mut(r.draft, r.file) {
-                changed |= land(f);
-            }
-        }
-        changed
     }
 
     // ── accounts ──
@@ -3153,10 +3059,10 @@ mod tests {
     #[test]
     fn remote_images_wait_for_the_reader_to_allow_them() {
         // Remote content is blocked by default (North Star); embedded pictures always show.
-        let mut app = App::new(true); // demo: settings.json is never written
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app(); // demo: settings.json is never written
         let id = app.list[0].id;
-        let mut thread = crate::demo::thread_for(id);
+        let mut thread = app.read_thread(id);
+        app.engine = None;
         let m = thread.last_mut().unwrap();
         m.summary.from.email = "News@Shop.example".into();
         m.body.as_mut().unwrap().doc = Some(std::sync::Arc::new(envoy_core::html::parse(
@@ -3173,7 +3079,7 @@ mod tests {
         assert_eq!(urls(&app), all);
         app.images_shown.clear();
         // "Always load from <sender>": saved in reading.imagesFrom. (Nothing open meanwhile:
-        // a changed image setting fetches at once, and demo mode fetches inline.)
+        // a changed image setting fetches at once.)
         let thread = std::mem::take(&mut app.thread);
         app.allow_sender("News@Shop.example");
         app.thread = thread;
@@ -3191,11 +3097,11 @@ mod tests {
 
     #[test]
     fn undo_puts_rows_back_only_into_the_list_they_left() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let search = |app: &mut App, q: &str| {
             app.applied_query = q.into();
             app.request_list();
+            app.settle();
         };
         // Archive the one result of a search.
         search(&mut app, "design");
@@ -3217,11 +3123,12 @@ mod tests {
 
     #[test]
     fn a_message_that_comes_back_empty_closes_and_isnt_marked_read() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let _ = app.settings.set("reading.markAsRead", serde_json::json!("delay"));
         let id = app.list.iter().find(|s| s.thread_unread).unwrap().id;
         app.open_message(id);
+        app.settle();
+        app.engine = None;
         assert!(app.mark_read_at.is_some());
         // The engine reloads the open message and finds nothing: it was moved or deleted
         // (say, undo came too late and the move went through).
@@ -3233,11 +3140,11 @@ mod tests {
 
     #[test]
     fn auto_mark_read_waits_for_the_message_to_load() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false; // threads come from the engine, later
+        let mut app = crate::demo::testing::app();
         let _ = app.settings.set("reading.markAsRead", serde_json::json!("immediately"));
         let id = app.list.iter().find(|s| s.thread_unread).unwrap().id;
+        let thread = app.read_thread(id);
+        app.engine = None;
         let unread = |app: &App| app.list.iter().find(|s| s.id == id).unwrap().thread_unread;
         let mut tx = Tx::default();
         // Opened (say, by a late Undo) but the engine finds nothing to show: not marked read.
@@ -3250,28 +3157,27 @@ mod tests {
         // Opened and loaded: marked read as usual, once.
         app.open_message(id);
         let req = app.thread_req;
-        app.apply(Event::Thread { req, id, messages: crate::demo::thread_for(id) }, &mut tx);
+        app.apply(Event::Thread { req, id, messages: thread }, &mut tx);
         assert!(!unread(&app), "marked read when it shows");
     }
 
     #[test]
     fn a_neighbour_read_ahead_opens_at_once() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false; // threads come from the engine
+        let mut app = crate::demo::testing::app();
         let mut tx = Tx::default();
-        let (first, second) = (app.list[0].id, app.list[1].id);
+        let (first, second, far) = (app.list[0].id, app.list[1].id, app.list[app.list.len() - 1].id);
+        let [one, two, last] = [first, second, far].map(|id| app.read_thread(id));
+        app.engine = None;
         app.open_message(first);
         let req = app.thread_req;
-        app.apply(Event::Thread { req, id: first, messages: crate::demo::thread_for(first) }, &mut tx);
+        app.apply(Event::Thread { req, id: first, messages: one }, &mut tx);
         // The engine reads the next row ahead, and j shows it at once, before the Open returns.
-        app.apply(Event::Prefetched { id: second, messages: crate::demo::thread_for(second) }, &mut tx);
+        app.apply(Event::Prefetched { id: second, messages: two.clone() }, &mut tx);
         app.step(1, &mut tx);
         assert_eq!((app.open, app.thread_for), (Some(second), Some(second)));
-        assert_eq!(app.thread, crate::demo::thread_for(second));
+        assert_eq!(app.thread, two);
         // Only the open row's neighbours are kept.
-        let far = app.list[app.list.len() - 1].id;
-        app.apply(Event::Prefetched { id: far, messages: crate::demo::thread_for(far) }, &mut tx);
+        app.apply(Event::Prefetched { id: far, messages: last }, &mut tx);
         assert!(!app.prefetched.contains_key(&far));
     }
 
@@ -3287,10 +3193,10 @@ mod tests {
 
     #[test]
     fn saving_in_the_drafts_view_refreshes_its_list() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         app.go(View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() });
-        app.demo = false;
+        app.settle();
+        app.engine = None;
         typed_and_saved(&mut app, "Dear Ana,");
         // The list on screen read again: whole, its changes animating, the open row kept.
         assert!(last_list_request(&app).contains("stream: false"), "{}", last_list_request(&app));
@@ -3298,9 +3204,7 @@ mod tests {
 
     #[test]
     fn a_refresh_keeps_the_whole_list_and_the_open_row() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false; // lists come from the engine
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         app.list = long_list(&app, 3000);
         app.open = Some(500);
@@ -3324,9 +3228,7 @@ mod tests {
 
     #[test]
     fn a_new_list_shows_its_first_page_and_j_waits_for_the_rest() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         app.list = long_list(&app, 3000);
         app.open = Some(500);
@@ -3356,9 +3258,7 @@ mod tests {
 
     #[test]
     fn undo_puts_same_second_rows_back_in_the_stores_order() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         // Same second: the store orders by id, newest first.
         let row = app.list[0].clone();
@@ -3374,9 +3274,7 @@ mod tests {
 
     #[test]
     fn j_at_the_end_of_a_first_page_waits_for_the_rest() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         let all = long_list(&app, 500);
         app.list = all.clone();
@@ -3407,10 +3305,10 @@ mod tests {
 
     #[test]
     fn undo_is_withdrawn_when_the_move_had_nothing_to_do() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         let first = app.list[0].id;
+        let whole = app.list.clone();
         app.archive(vec![first], &mut tx);
         let key = move_key(&app);
         // The engine found the message already moving (or already archived): nothing held.
@@ -3418,11 +3316,13 @@ mod tests {
         assert!(app.toasts.last().unwrap().undo.is_none(), "no Undo button for a move that did nothing");
         assert!(!app.undo_last(&mut tx), "and z has nothing to undo");
         // Nothing moved (say, it was already in All Mail), so the row the UI took away comes
-        // back: the list is reloaded (pump does this when apply asks for it).
+        // back: the list is reloaded (pump does this when apply asks for it), and the engine
+        // lists it where it still is.
         assert!(!app.list.iter().any(|s| s.id == first));
         let reload = app.apply(Event::Held { undo: key, ops: 0 }, &mut tx);
         assert!(reload, "a zero-op move reloads the list");
         app.reload();
+        app.apply(Event::List { req: app.list_req, items: whole, more: false }, &mut tx);
         assert!(app.list.iter().any(|s| s.id == first), "the row is back");
         // A move that did hold its ops keeps its Undo.
         let next = app.list[0].id;
@@ -3439,8 +3339,7 @@ mod tests {
 
     #[test]
     fn a_composers_title_is_its_subject_once_one_is_typed() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let title = |app: &App| app.compose.as_ref().unwrap().shown_title().to_owned();
         app.compose_new();
         assert_eq!(title(&app), "New message");
@@ -3462,8 +3361,7 @@ mod tests {
 
     #[test]
     fn the_draft_saves_when_typing_pauses_and_while_it_doesnt() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         app.compose_new();
         let dirty = |app: &App| app.compose.as_ref().unwrap().dirty;
@@ -3503,8 +3401,7 @@ mod tests {
 
     #[test]
     fn draft_saved_shows_only_once_the_engine_confirms() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let (id, rev) = typed_and_saved(&mut app, "Dear Ana,");
         assert!(!app.compose.as_ref().unwrap().shows_saved(), "handed over isn't saved");
         app.apply(Event::DraftSaved { id, rev }, &mut Tx::default());
@@ -3514,8 +3411,7 @@ mod tests {
 
     #[test]
     fn a_failed_save_says_so_and_is_tried_again() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let (id, rev) = typed_and_saved(&mut app, "Dear Ana,");
         app.apply(Event::DraftSaveFailed { id, rev, error: "disk full".into() }, &mut Tx::default());
         let c = app.compose.as_ref().unwrap();
@@ -3533,9 +3429,7 @@ mod tests {
 
     #[test]
     fn a_failed_save_isnt_retried_once_the_message_is_sent() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         let (id, rev) = typed_and_saved(&mut app, "Old text");
         app.apply(Event::DraftSaveFailed { id, rev, error: "disk full".into() }, &mut Tx::default());
         // Newer text is sent before the retry comes due.
@@ -3550,8 +3444,7 @@ mod tests {
 
     #[test]
     fn a_draft_that_cant_be_written_on_close_goes_to_the_recovery_file() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let (a, _) = typed_and_saved(&mut app, "Draft A");
         app.compose_new();
         type_into_body(&mut app, "Draft B");
@@ -3566,9 +3459,7 @@ mod tests {
 
     #[test]
     fn a_refused_save_carries_on_as_a_new_draft() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         // Say a too-late Undo put a discarded draft back in the composer after it was deleted.
         let (id, rev) = typed_and_saved(&mut app, "Typed after the undo");
         app.apply(Event::DraftSaveRefused { id, rev }, &mut Tx::default());
@@ -3582,8 +3473,7 @@ mod tests {
 
     #[test]
     fn a_write_refused_on_close_is_kept_as_a_new_draft() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let (a, _) = typed_and_saved(&mut app, "Draft A");
         let mut written = Vec::new();
         app.close_with(
@@ -3601,9 +3491,7 @@ mod tests {
 
     #[test]
     fn an_opened_draft_saves_in_its_lifecycle_and_after_its_last_save() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         // Back from an undone send: a later lifecycle, saved last by a clock far ahead.
         let back = Draft { account: "demo".into(), subject: "Back".into(), body: "Sent text".into(), ..Draft::default() };
         let far = chrono::Utc::now().timestamp_micros() + 3_600_000_000;
@@ -3618,9 +3506,7 @@ mod tests {
 
     #[test]
     fn closing_writes_everything_not_confirmed() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false; // sends go to the engine (there is none: nothing confirms)
+        let mut app = crate::demo::testing::detached();
         // A saved before B took the composer; the engine hasn't confirmed either save.
         let (a, a_rev) = typed_and_saved(&mut app, "Draft A");
         app.compose_new();
@@ -3652,9 +3538,7 @@ mod tests {
 
     #[test]
     fn a_send_that_fails_brings_the_message_back() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         let (id, _) = typed_and_saved(&mut app, "Hello");
         app.compose.as_mut().unwrap().to = TextEdit::new("ana@x.com");
         app.send_compose();
@@ -3668,8 +3552,7 @@ mod tests {
 
     #[test]
     fn a_discarded_composer_comes_back_with_undo() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         // Untouched: just closes.
         app.compose_new();
@@ -3690,8 +3573,7 @@ mod tests {
 
     #[test]
     fn opening_a_draft_puts_the_composer_away_in_drafts() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         app.compose_new();
         type_into_body(&mut app, "Unfinished");
         let first = app.compose.as_ref().unwrap().draft_id;
@@ -3706,15 +3588,36 @@ mod tests {
         assert!(app.compose.as_ref().unwrap().body.text.starts_with("More "));
     }
 
+    /// Drafts, as the engine lists it: the sample draft, and any written here.
     fn drafts_view(app: &mut App) -> Summary {
         app.go(View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() });
+        app.settle();
         app.list.first().expect("a sample draft").clone()
+    }
+
+    /// A folder of this test's own, for files to attach.
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = crate::test_home().join(format!("files-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The row of the draft with this subject, in the list on screen.
+    fn draft_row(app: &App, subject: &str) -> Option<MessageId> {
+        app.list.iter().find(|r| r.subject == subject).map(|r| r.id)
+    }
+
+    /// Opens a Drafts row; the engine answers with its draft, in the composer.
+    fn open_draft_row(app: &mut App, row: MessageId) -> &Compose {
+        app.open_message(row);
+        assert!(app.settle_until(|app| app.compose.is_some()), "the engine opens the draft");
+        app.compose.as_ref().unwrap()
     }
 
     #[test]
     fn deleting_a_drafts_row_discards_the_draft_with_undo() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let mut tx = Tx::default();
         let _ = app.settings.set("behavior.confirmDelete", serde_json::json!(true));
         let row = drafts_view(&mut app);
@@ -3724,6 +3627,8 @@ mod tests {
         assert!(!app.list.iter().any(|s| s.id == row.id));
         assert!(app.undo_last(&mut tx));
         assert!(app.list.iter().any(|s| s.id == row.id), "back");
+        app.settle();
+        assert!(app.list.iter().any(|s| s.id == row.id), "and the engine says so too");
         // Archive doesn't apply to drafts.
         let toasts = app.toasts.len();
         app.archive(vec![row.id], &mut tx);
@@ -3732,18 +3637,14 @@ mod tests {
 
     #[test]
     fn discarding_the_open_drafts_row_closes_the_composer_until_undo() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let mut tx = Tx::default();
         let row = drafts_view(&mut app);
-        app.open_message(row.id);
-        let id = app.compose.as_ref().unwrap().draft_id;
+        let id = open_draft_row(&mut app, row.id).draft_id;
         type_into_body(&mut app, "More: ");
         app.delete(vec![row.id], &mut tx);
-        let key = move_key(&app);
-        // The engine resolves the row to the composer's draft.
-        app.apply(Event::DraftDiscarded { id, undo: Some(key) }, &mut tx);
-        assert!(app.compose.is_none(), "the composer closes with its draft");
+        // The engine resolves the row to the composer's draft, which closes with it.
+        assert!(app.settle_until(|app| app.compose.is_none()), "the composer closes with its draft");
         assert!(app.undo_last(&mut tx));
         let c = app.compose.as_ref().expect("back");
         assert!(c.draft_id == id && c.body.text.starts_with("More: "), "as it was");
@@ -3751,8 +3652,7 @@ mod tests {
 
     #[test]
     fn a_server_draft_opens_with_its_files_or_as_an_unsaved_copy() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let files = vec![DraftAttachment { id: 0, filename: "plan.pdf".into(), mime: "application/pdf".into(), size: 10, ..Default::default() }];
         let formatted = Draft { account: "demo".into(), subject: "Plan".into(), attachments: files.clone(), ..Draft::default() };
         app.show_draft(5, formatted, DraftRev::default(), false, Some(DraftNotice::PlainText));
@@ -3770,8 +3670,7 @@ mod tests {
 
     #[test]
     fn the_draft_left_open_comes_back_minimized_unless_another_is_open() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let left = Draft { account: "demo".into(), subject: "Left open".into(), ..Draft::default() };
         app.apply(Event::DraftOpened { id: 5, draft: left.clone(), at: DraftRev::default(), restored: true, notice: None }, &mut Tx::default());
         let c = app.compose.as_ref().unwrap();
@@ -3785,120 +3684,106 @@ mod tests {
 
     #[test]
     fn a_drafts_row_opens_in_the_composer() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.go(View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() });
-        let row = app.list.first().expect("a sample draft").clone();
-        app.open_message(row.id);
-        assert_eq!(app.open, None, "not the reader");
-        let c = app.compose.as_ref().expect("the composer");
+        let mut app = crate::demo::testing::app();
+        let row = drafts_view(&mut app);
+        let c = open_draft_row(&mut app, row.id);
         assert_eq!(c.subject.text, row.subject);
         assert!(c.to.text.contains("jordan@northwind.dev"));
+        assert_eq!(c.files.iter().map(|f| (f.filename.as_str(), f.status.clone())).collect::<Vec<_>>(), [("train-times.pdf", FileStatus::Attached)], "with its file");
+        assert_eq!(app.open, None, "not the reader");
     }
 
     #[test]
-    fn demo_mode_lists_the_drafts_it_writes() {
-        // No store in demo mode: what it saves is kept for the session, and its Drafts lists it.
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+    fn drafts_written_in_demo_mode_are_listed_and_open_again() {
+        // Demo mode's drafts are the store's: listed beside the sample draft, opened again with
+        // their files, gone once discarded.
+        let mut app = crate::demo::testing::app();
+        let menu = test_dir("drafts-written").join("menu.pdf");
+        std::fs::write(&menu, b"tacos").unwrap();
         app.compose_new();
         let c = app.compose.as_mut().unwrap();
         (c.to, c.subject, c.body) = (TextEdit::new("Sam Ortiz <sam@ortiz.family>"), TextEdit::new("Lunch plans"), TextEdit::new("Tacos on Friday?"));
         let id = c.draft_id;
         app.compose_edited();
-        let t = app.clock + 1.0;
-        app.tick(t, &mut Tx::default());
-        app.tick(t + SAVE_WHEN_IDLE + 0.1, &mut Tx::default());
-        // Minimized, then Drafts: there, the newest, beside the sample draft.
+        app.attach_paths(vec![menu]);
+        assert!(app.settle_until(|app| app.compose.as_ref().is_some_and(|c| c.files.iter().all(|f| f.status == FileStatus::Attached))), "attached");
+        // Minimized, then Drafts: there, beside the sample draft.
         app.compose.as_mut().unwrap().minimized = true;
-        app.go(View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() });
-        let row = app.list.first().unwrap().clone();
-        assert_eq!((row.id, row.subject.as_str(), app.list.len()), (envoy_core::drafts::list_id(id), "Lunch plans", 2));
-        assert_eq!(row.to.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Sam Ortiz"]);
+        drafts_view(&mut app);
+        assert_eq!(app.list.len(), 2, "{:?}", app.list);
+        let row = draft_row(&app, "Lunch plans").expect("listed");
+        let listed = app.list.iter().find(|r| r.id == row).unwrap();
+        assert_eq!(listed.to.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Sam Ortiz"]);
         // Its row opens it: this composer, expanded.
-        app.open_message(row.id);
-        let c = app.compose.as_ref().unwrap();
+        let c = open_draft_row(&mut app, row);
         assert!(!c.minimized && c.draft_id == id);
-        // Put away for another, with a file: still listed, and opens again file and all.
-        app.compose.as_mut().unwrap().files.push(file_in(9, "menu.pdf", 1200));
-        app.compose_edited();
+        // Put away for another, it opens again, file and all.
         app.compose_new();
-        assert!(app.list.iter().any(|r| r.id == row.id && r.has_attachments), "{:?}", app.list);
         app.compose = None;
-        app.open_message(row.id);
-        let c = app.compose.as_ref().unwrap();
+        app.settle();
+        drafts_view(&mut app);
+        let row = draft_row(&app, "Lunch plans").expect("still listed");
+        let c = open_draft_row(&mut app, row);
         assert_eq!((c.draft_id, c.subject.text.as_str(), c.files.len()), (id, "Lunch plans", 1));
         // Discarded: gone from Drafts.
         app.discard_compose(&mut Tx::default());
+        app.settle();
+        drafts_view(&mut app);
         assert_eq!(app.list.len(), 1, "only the sample draft: {:?}", app.list);
     }
 
-    fn demo_drafts_view() -> View {
-        View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() }
-    }
-
     #[test]
-    fn a_demo_draft_put_away_while_its_files_are_read_gets_them() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        let dir = std::env::temp_dir().join(format!("envoy-demo-park-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn a_draft_put_away_while_its_files_are_read_gets_them() {
+        let mut app = crate::demo::testing::app();
+        let dir = test_dir("park");
         let (notes, gone) = (dir.join("notes.txt"), dir.join("missing.pdf"));
         std::fs::write(&notes, b"hello").unwrap();
         app.compose_new();
         let id = app.compose.as_ref().unwrap().draft_id;
+        app.compose.as_mut().unwrap().subject = TextEdit::new("Notes");
         app.attach_paths(vec![notes, gone]);
-        // Another composer before demo mode's 0.8 s reads finish: this one goes to Drafts, files
-        // and all, as they are.
+        // Another composer before the engine has read them: this one goes to Drafts, files and
+        // all, as they are.
         app.compose_new();
         assert_ne!(app.compose.as_ref().unwrap().draft_id, id);
-        let t = app.clock;
-        for i in 1..=50 {
-            app.tick(t + 1.0 + i as f64, &mut Tx::default());
-            if app.demo_reads.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(app.demo_reads.is_empty());
         app.compose = None;
-        app.go(demo_drafts_view());
-        app.open_message(envoy_core::drafts::list_id(id));
-        let c = app.compose.as_ref().expect("opened from Drafts");
+        app.settle();
+        drafts_view(&mut app);
+        let row = draft_row(&app, "Notes").expect("in Drafts");
+        let c = open_draft_row(&mut app, row);
         assert_eq!(c.draft_id, id);
         assert_eq!((c.files[0].status.clone(), c.files[0].size), (FileStatus::Attached, 5), "read while put away");
         assert!(matches!(&c.files[1].status, FileStatus::Failed(why) if why.contains("missing.pdf")), "{:?}", c.files[1].status);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn discarding_a_demo_draft_from_drafts_lasts_and_undo_brings_it_back() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+    fn discarding_a_draft_from_drafts_lasts_and_undo_brings_it_back() {
+        let mut app = crate::demo::testing::app();
         let mut tx = Tx::default();
         app.compose_new();
-        let c = app.compose.as_mut().unwrap();
-        c.subject = TextEdit::new("Lunch plans");
-        let row = envoy_core::drafts::list_id(c.draft_id);
+        app.compose.as_mut().unwrap().subject = TextEdit::new("Lunch plans");
         app.compose_edited();
         app.compose_new(); // puts it away in Drafts
         app.compose = None;
-        app.go(demo_drafts_view());
-        assert!(app.list.iter().any(|r| r.id == row));
+        app.settle();
+        drafts_view(&mut app);
+        let row = draft_row(&app, "Lunch plans").expect("listed");
         app.delete(vec![row], &mut tx);
-        assert!(!app.list.iter().any(|r| r.id == row), "off the list at once");
+        assert!(draft_row(&app, "Lunch plans").is_none(), "off the list at once");
         // Elsewhere and back: still gone.
         app.go_role(Role::Inbox);
-        app.go(demo_drafts_view());
-        assert!(!app.list.iter().any(|r| r.id == row), "discarded for good: {:?}", app.list);
+        app.settle();
+        drafts_view(&mut app);
+        assert!(draft_row(&app, "Lunch plans").is_none(), "discarded for good: {:?}", app.list);
         // Undo: back, and it stays back.
         assert!(app.undo_last(&mut tx));
-        assert!(app.list.iter().any(|r| r.id == row && r.subject == "Lunch plans"), "{:?}", app.list);
+        assert!(draft_row(&app, "Lunch plans").is_some(), "{:?}", app.list);
+        app.settle();
         app.go_role(Role::Inbox);
-        app.go(demo_drafts_view());
-        assert!(app.list.iter().any(|r| r.id == row), "{:?}", app.list);
-        app.open_message(row);
-        assert_eq!(app.compose.as_ref().map(|c| c.subject.text.as_str()), Some("Lunch plans"));
+        app.settle();
+        drafts_view(&mut app);
+        let row = draft_row(&app, "Lunch plans").expect("back for good");
+        assert_eq!(open_draft_row(&mut app, row).subject.text, "Lunch plans");
     }
 
     // ── attachments ──
@@ -3928,8 +3813,7 @@ mod tests {
 
     /// A composer of the engine's (not demo mode's), with `a.pdf` and `b.png` attached.
     fn composer_with_two_files(app: &mut App) -> i64 {
-        crate::demo::populate(app);
-        app.demo = false;
+        *app = crate::demo::testing::detached();
         app.compose_new();
         app.attach_paths(vec!["/files/a.pdf".into(), "/files/b.png".into()]);
         answer(app, 0, 1000);
@@ -3939,9 +3823,7 @@ mod tests {
 
     #[test]
     fn attached_files_show_at_once_with_ids_never_given_before() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         app.compose_new();
         app.attach_paths(vec!["/files/Q3 report.pdf".into(), "/files/photo.png".into()]);
         assert_eq!(files(&app), vec![("Q3 report.pdf".into(), FileStatus::Attaching), ("photo.png".into(), FileStatus::Attaching)], "shown at once, as on their way");
@@ -3964,9 +3846,7 @@ mod tests {
 
     #[test]
     fn a_draft_reopened_with_a_file_still_attaching_shows_it_and_hears_it_come_in() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         // Put away while a file was on its way, then opened again: the store still lists it.
         let pending = DraftAttachment { id: 9_000_000_000_000_000, filename: "slow.mov".into(), mime: "video/quicktime".into(), size: 0, status: FileStatus::Attaching };
         let draft = Draft { account: "demo".into(), subject: "Plan".into(), attachments: vec![pending.clone()], ..Draft::default() };
@@ -4080,9 +3960,7 @@ mod tests {
 
     #[test]
     fn a_message_its_server_wouldnt_take_comes_back_saying_why() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         let draft = Draft { account: "demo".into(), subject: "Big".into(), ..Draft::default() };
         let why = "Not sent: this message is 40.0 MB once encoded for sending, and its mail server takes at most 35.0 MB. Remove some attachments and send again.";
         app.apply(Event::DraftOpened { id: 5, draft, at: DraftRev::default(), restored: false, notice: Some(DraftNotice::NotSent(why.into())) }, &mut Tx::default());
@@ -4107,6 +3985,8 @@ mod tests {
     fn sending_waits_for_every_file_and_refuses_too_much() {
         let mut app = App::new(true);
         let draft = composer_with_two_files(&mut app);
+        // Before the server has said what it takes.
+        app.send_limits.clear();
         app.compose.as_mut().unwrap().to = TextEdit::new("ana@x.com");
         app.attach_paths(vec!["/files/slow.mov".into()]);
         app.send_compose();
@@ -4137,10 +4017,11 @@ mod tests {
 
     #[test]
     fn forwarding_takes_the_originals_files_and_pictures_along() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let id = app.list.iter().find(|m| m.has_attachments).expect("a demo message with a file").id;
         app.open_message(id);
+        app.settle();
+        app.engine = None;
         let mut original = app.thread.iter().rev().find(|m| m.body.as_ref().is_some_and(|b| !b.attachments.is_empty())).unwrap().clone();
         // A picture shown inside it too.
         let picture = envoy_core::model::Attachment { index: 1, filename: "image-2.png".into(), mime: "image/png".into(), size: 900 };
@@ -4149,13 +4030,9 @@ mod tests {
         app.thread[at] = original.clone();
         let mut names: Vec<String> = original.body.as_ref().unwrap().attachments.iter().map(|a| a.filename.clone()).collect();
         names.push("image-2.png".into());
-        // Demo mode: they're there at once.
+        // Fetched into the draft by the engine, which is saved first.
         app.compose_reply(Some(original.summary.id), false, true);
         assert_eq!(app.compose.as_ref().unwrap().draft().attachments.iter().map(|a| a.filename.clone()).collect::<Vec<_>>(), names);
-        // With the engine: fetched into the draft, which is saved first.
-        app.demo = false;
-        app.compose = None;
-        app.compose_reply(Some(original.summary.id), false, true);
         assert!(files(&app).iter().all(|(_, s)| *s == FileStatus::Attaching));
         let fwd = sent_commands(&app, "AttachForwarded");
         assert!(fwd.len() == 1 && fwd[0].contains(&format!("message: {}", original.summary.id)) && fwd[0].contains("image-2.png"), "{fwd:?}");
@@ -4190,31 +4067,22 @@ mod tests {
     }
 
     #[test]
-    fn demo_mode_reads_file_sizes_off_the_ui_thread() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+    fn demo_mode_attaches_files_as_the_app_does() {
+        // The engine reads them in, off the UI thread, into the draft in the store: each chip
+        // says what it found.
+        let mut app = crate::demo::testing::app();
         app.compose_new();
-        let dir = std::env::temp_dir().join(format!("envoy-demo-attach-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("sizes");
         let (small, big) = (dir.join("notes.txt"), dir.join("video.mov"));
         std::fs::write(&small, b"hello").unwrap();
-        std::fs::File::create(&big).unwrap().set_len(attach::LIMIT as u64 + 1).unwrap();
+        std::fs::File::create(&big).unwrap().set_len(100 << 20).unwrap();
         app.attach_paths(vec![small, dir.clone(), big]);
         assert!(files(&app).iter().all(|f| f.1 == FileStatus::Attaching));
-        // Its threads are quick; the chips wait their moment, then say what they found.
-        let t = app.clock;
-        for i in 1..=50 {
-            app.tick(t + 1.0 + i as f64, &mut Tx::default());
-            if app.demo_reads.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        assert!(app.settle_until(|app| app.compose.as_ref().is_some_and(|c| c.files.iter().all(|f| f.status != FileStatus::Attaching))), "{:?}", files(&app));
         let c = app.compose.as_ref().unwrap();
         assert_eq!((c.files[0].status.clone(), c.files[0].size), (FileStatus::Attached, 5));
-        assert!(matches!(&c.files[1].status, FileStatus::Failed(why) if why.contains("is a folder")));
-        assert!(matches!(&c.files[2].status, FileStatus::Failed(why) if why.contains("more than a message can carry")));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(&c.files[1].status, FileStatus::Failed(why) if why.contains("is a folder")), "{:?}", c.files[1].status);
+        assert!(matches!(&c.files[2].status, FileStatus::Failed(why) if why.contains("more than a message can carry")), "{:?}", c.files[2].status);
     }
 
     fn press(app: &mut App, key: rune::Key, mods: Mods) -> bool {
@@ -4250,8 +4118,7 @@ mod tests {
 
     #[test]
     fn the_keyboard_selects_rows_and_one_undo_takes_the_whole_batch_back() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let all = ids(&app.list);
         app.open_message(all[0]);
         // x on the open row, then shift+j twice.
@@ -4301,15 +4168,15 @@ mod tests {
     fn selecting_holds_off_marking_the_hidden_message_read() {
         let unread = |app: &App, id| app.list.iter().find(|s| s.id == id).unwrap().thread_unread;
         // "After a delay": the timer is running when a selection hides the reader.
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false; // the conversation comes from the engine
+        let mut app = crate::demo::testing::app();
         let _ = app.settings.set("reading.markAsRead", serde_json::json!("delay"));
         let mut tx = Tx::default();
         let id = app.list.iter().find(|s| s.thread_unread).unwrap().id;
+        let thread = app.read_thread(id);
+        app.engine = None;
         app.open_message(id);
         let req = app.thread_req;
-        app.apply(Event::Thread { req, id, messages: crate::demo::thread_for(id) }, &mut tx);
+        app.apply(Event::Thread { req, id, messages: thread.clone() }, &mut tx);
         assert!(app.mark_read_at.is_some());
         let other = app.list.iter().find(|s| s.id != id).unwrap().id;
         app.toggle_selected(other);
@@ -4324,14 +4191,11 @@ mod tests {
         assert!(!unread(&app, id), "read once shown for the delay");
 
         // "Immediately": the conversation arrives while rows are selected.
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
-        let id = app.list.iter().find(|s| s.thread_unread).unwrap().id;
+        let mut app = crate::demo::testing::detached();
         app.open_message(id);
         assert!(key(&mut app, "x"), "selects the open row");
         let req = app.thread_req;
-        app.apply(Event::Thread { req, id, messages: crate::demo::thread_for(id) }, &mut tx);
+        app.apply(Event::Thread { req, id, messages: thread }, &mut tx);
         app.tick(app.clock + 30.0, &mut tx);
         assert!(unread(&app, id), "not read: the reader shows the selection");
         assert!(key(&mut app, "x"), "unselected: the reader shows it again");
@@ -4340,8 +4204,7 @@ mod tests {
 
     #[test]
     fn escape_and_select_all() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         app.open_message(app.list[2].id);
         assert!(key(&mut app, "x"));
         assert!(press(&mut app, rune::Key::Escape, Mods::default()));
@@ -4357,8 +4220,7 @@ mod tests {
 
     #[test]
     fn read_star_and_spam_keys_apply_to_the_whole_selection() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let all = ids(&app.list);
         // Two unread rows and a read, starred one.
         for id in &all[..3] {
@@ -4386,8 +4248,7 @@ mod tests {
 
     #[test]
     fn spam_from_spam_is_not_spam() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let mut row = app.list[0].clone();
         row.mailbox = "[Gmail]/Spam".into();
         app.list = vec![row.clone()];
@@ -4399,9 +4260,7 @@ mod tests {
 
     #[test]
     fn the_selection_follows_the_list_by_id_and_ends_with_the_view() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         app.list = long_list(&app, 10);
         for id in [2, 3, 5] {
@@ -4427,9 +4286,9 @@ mod tests {
 
     #[test]
     fn shift_and_mod_clicks_select_and_a_plain_click_opens() {
-        let mut app = App::new(true);
-        let _ = app.settings.set("inbox.split", serde_json::json!(false)); // the whole inbox
-        crate::demo::populate(&mut app);
+        // The whole inbox.
+        let mut app = crate::demo::testing::with(|app| drop(app.settings.set("inbox.split", serde_json::json!(false))));
+        app.engine = None;
         let mut tx = Tx::default();
         let all = ids(&app.list);
         app.open_message(all[1]);
@@ -4450,13 +4309,14 @@ mod tests {
 
     #[test]
     fn the_sidebar_counts_follow_reads_moves_and_undo() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let mut tx = Tx::default();
         let (unread, total) = inbox_counts(&app);
-        // Opening an unread conversation marks it read (demo: at once).
+        // Opening an unread conversation marks it read, once it shows.
         let first = app.list.iter().find(|s| s.thread_unread).unwrap().id;
         app.open_message(first);
+        app.settle();
+        app.engine = None;
         assert_eq!(inbox_counts(&app), (unread - 1, total), "as the list header says");
         // Archiving an unread conversation takes it, and its messages, off the inbox.
         let row = app.list.iter().find(|s| s.thread_unread).unwrap().clone();
@@ -4476,9 +4336,7 @@ mod tests {
 
     #[test]
     fn a_list_read_before_a_change_doesnt_undo_it_on_screen() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         app.list = long_list(&app, 5);
         // A sync asked for the list; before it comes, row 2 is archived.
@@ -4526,8 +4384,7 @@ mod tests {
 
     #[test]
     fn move_to_offers_what_every_selected_account_has() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         let (mine, theirs) = two_accounts(&mut app);
         // One Gmail message in the inbox: everywhere but the inbox, its labels included, and the
@@ -4552,8 +4409,7 @@ mod tests {
 
     #[test]
     fn a_picker_for_a_huge_selection_is_built_in_linear_time() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         // 40 000 selected rows, 300 folders.
         app.list = long_list(&app, 40_000);
         let folder = |i: usize| Mailbox { account: "demo".into(), name: format!("Folder {i}"), display: format!("Folder {i}"), role: Role::Other, unread: 0, total: 0, depth: 0, selectable: true, wake: None };
@@ -4573,8 +4429,7 @@ mod tests {
 
     #[test]
     fn picker_options_follow_the_targets_and_the_folders() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let first = app.list[0].id;
         let names = |app: &App, which| app.picker_options(which, &[first]).0.into_iter().map(|o| o.label).collect::<Vec<_>>();
         assert_eq!(names(&app, Picker::Label), ["Receipts", "Travel", "Work"]);
@@ -4592,8 +4447,7 @@ mod tests {
 
     #[test]
     fn labels_are_gmail_copies_with_undo() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         let (mine, theirs) = two_accounts(&mut app);
         // Not Gmail: no labels, and a word on what to do instead.
@@ -4637,8 +4491,7 @@ mod tests {
 
     #[test]
     fn b_snoozes_the_open_message_with_undo() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         let all = ids(&app.list);
         app.open_message(all[0]);
@@ -4665,8 +4518,7 @@ mod tests {
 
     #[test]
     fn a_typed_time_is_offered_first_and_nonsense_is_said_to_be() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         app.snooze_picker.search = TextEdit::new("in 3 days");
         let first = app.snooze_options().remove(0);
         assert!(first.id.starts_with("typed:") && !first.disabled && first.detail == "in 3 days", "{first:?}");
@@ -4677,9 +4529,15 @@ mod tests {
 
     #[test]
     fn a_selection_snoozes_together_and_drafts_never() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let mut tx = Tx::default();
+        let drafts = View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() };
+        app.go(drafts.clone());
+        app.settle();
+        let draft_rows = app.list.clone();
+        app.go(View::Role { account: None, role: Role::Inbox });
+        app.settle();
+        app.engine = None;
         let all = ids(&app.list);
         app.toggle_selected(all[1]);
         app.toggle_selected(all[2]);
@@ -4688,8 +4546,8 @@ mod tests {
         assert_eq!(sent_since(&app, from, "Snooze").len(), 1);
         assert!(app.toasts.iter().any(|t| t.text.starts_with("Snoozed 2 until ")));
         // Drafts aren't snoozed.
-        app.view = View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() };
-        app.list = crate::demo::list_for(&app.view);
+        app.view = drafts;
+        app.list = draft_rows;
         app.open = app.list.first().map(|s| s.id);
         let from = app.sent.borrow().len();
         assert!(key(&mut app, "b"));
@@ -4700,11 +4558,11 @@ mod tests {
 
     #[test]
     fn the_snoozed_view_says_when_each_wakes_and_unsnoozes() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let mut tx = Tx::default();
         assert!(app.has_snoozed(Some("demo")));
         app.go(View::Role { account: Some("demo".into()), role: Role::Snoozed });
+        app.settle();
         assert_eq!(app.view_title(), "Snoozed");
         let wakes: Vec<i64> = app.list.iter().map(|s| app.wake_of(&s.account, &s.mailbox).unwrap()).collect();
         assert!(wakes.len() == 2 && wakes[0] <= wakes[1], "soonest first: {wakes:?}");
@@ -4717,16 +4575,13 @@ mod tests {
 
     #[test]
     fn in_snoozed_each_row_is_one_message_acted_on_alone() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false; // to see the list asked for
+        let mut app = crate::demo::testing::app();
         let mut tx = Tx::default();
         let from = app.sent.borrow().len();
         app.go(View::Role { account: Some("demo".into()), role: Role::Snoozed });
         assert!(sent_since(&app, from, "List").iter().all(|c| c.contains("conversations: false")), "{:?}", sent_since(&app, from, "List"));
-        app.demo = true;
-        app.go(View::Role { account: Some("demo".into()), role: Role::Inbox });
-        app.go(View::Role { account: Some("demo".into()), role: Role::Snoozed });
+        app.settle();
+        app.engine = None;
         let (first, second) = (app.list[0].id, app.list[1].id);
         let from = app.sent.borrow().len();
         app.unsnooze(vec![first], &mut tx);
@@ -4738,8 +4593,7 @@ mod tests {
 
     #[test]
     fn what_the_server_snoozed_itself_isnt_moved_from_here() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         app.mailboxes.get_mut("demo").unwrap().push(Mailbox { account: "demo".into(), name: "Snoozed by server".into(), display: "Snoozed".into(), role: Role::Snoozed, unread: 0, total: 1, depth: 0, selectable: true, wake: None });
         let id = app.list[0].id;
@@ -4754,8 +4608,7 @@ mod tests {
 
     #[test]
     fn going_to_another_folder_leaves_a_read_woken_message_dealt_with() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let first = app.list[0].id;
         app.list[0].flags |= flags::WOKEN;
         app.open_message(first);
@@ -4765,9 +4618,11 @@ mod tests {
         let unpinned = sent_since(&app, from, "SetFlags");
         assert!(unpinned.iter().any(|c| c.contains(&format!("ids: [{first}], add: 0, remove: {}", flags::WOKEN))), "{unpinned:?}");
         // Its row gone from the list already (a search, say): the reader's conversation says.
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let first = app.list[0].id;
         app.open_message(first);
+        app.settle();
+        app.engine = None;
         for m in app.thread.iter_mut() {
             m.summary.flags |= flags::WOKEN | flags::SEEN;
         }
@@ -4779,10 +4634,9 @@ mod tests {
 
     #[test]
     fn a_message_back_from_a_snooze_is_unpinned_once_read_and_left() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let all = ids(&app.list);
-        // Back from a snooze, unread: opened (the demo marks it read), then left by j.
+        // Back from a snooze, unread: opened (and read), then left by j.
         app.list[0].flags |= flags::WOKEN;
         app.open_message(all[0]);
         let from = app.sent.borrow().len();

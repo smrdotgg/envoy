@@ -153,8 +153,26 @@ mod tests {
 
     /// Rows 1..=n, top to bottom.
     fn list(n: i64) -> Vec<Summary> {
-        let row = crate::demo::list_for(&envoy_core::model::View::Starred { account: None }).remove(0);
-        (1..=n).map(|id| Summary { id, ..row.clone() }).collect()
+        let from = envoy_core::model::Address { name: "Maya Chen".into(), email: "maya@northwind.dev".into() };
+        let row = Summary {
+            id: 0,
+            account: "demo".into(),
+            mailbox: "INBOX".into(),
+            uid: 1,
+            thread: String::new(),
+            subject: "Design review moved to Thursday".into(),
+            from,
+            to: Vec::new(),
+            date: 0,
+            flags: 0,
+            preview: String::new(),
+            has_attachments: false,
+            thread_count: 1,
+            participants: String::new(),
+            thread_unread: false,
+            category: Default::default(),
+        };
+        (1..=n).map(|id| Summary { id, thread: format!("t{id}"), ..row.clone() }).collect()
     }
 
     #[test]

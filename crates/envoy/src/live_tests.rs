@@ -1,7 +1,7 @@
 //! The app on the real engine: [`Engine`] on a cache of its own (no account it can reach, so
 //! no worker and no server), the app's commands carried out as in the shipped app and its
-//! events applied as `poll` applies them. Demo mode makes its lists up from samples on every
-//! navigation; these tests say what the app does with a real store behind it.
+//! events applied as `poll` applies them, on a store filled exactly as each test needs it
+//! (demo mode runs the same engine against a server of its own: demo_tests.rs).
 
 use std::time::{Duration, Instant};
 
@@ -142,7 +142,7 @@ fn inbox_seed(st: &Store) -> (MessageId, MessageId, MessageId) {
 }
 
 /// Finding: opening an unread conversation, then going to another tab and back, showed it
-/// unread again (demo mode makes the list up again from its samples). With the store behind
+/// unread again (demo mode made the list up again from its samples). With the store behind
 /// it, read is read: the row and the tab's count say so after any round of tabs.
 #[test]
 fn read_stays_read_across_tabs() {

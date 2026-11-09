@@ -9,8 +9,8 @@ use crate::app::App;
 const SIZE: (f32, f32) = (1280.0, 820.0);
 
 fn window(theme: &str) -> Runtime<App> {
-    let mut app = App::new(true); // demo: settings.json is never written
-    crate::demo::populate(&mut app);
+    // Demo mode, its engine and all: settings.json is never written.
+    let mut app = crate::demo::testing::app();
     let _ = app.settings.set("appearance.theme", serde_json::json!(theme));
     let mut rt = Runtime::new(app, crate::view, SIZE, Env::new(theme == "dark", 2.0));
     rt.on_key = Some(crate::on_key);

@@ -1,6 +1,6 @@
 {"events": [
   {"t": 0.2, "type": "tap", "key": "mb:demo:[Gmail]/Drafts"},
-  {"t": 0.6, "type": "tap", "key": "m14"},
+  {"t": 0.6, "type": "tap", "key": "m7"},
   {"t": 1.0, "type": "type", "text": "Quick note: "},
   {"t": 2.4, "type": "tap", "key": "compose-discard"},
   {"t": 3.2, "type": "key", "name": "z"}

@@ -445,10 +445,11 @@ fn message_card(s: &App, t: &Theme, m: &ThreadMessage, is_last: bool, width: Opt
     let expanded = s.expanded.contains(&id) || s.thread.len() == 1;
     let date = fmt::full_date(sm.date);
     let to_line = {
-        let mut names: Vec<String> = sm.to.iter().map(|a| a.display().to_owned()).collect();
-        if let Some(b) = &m.body {
-            names.extend(b.cc.iter().map(|a| a.display().to_owned()));
-        }
+        // The summary's recipients are To and Cc both (the store keeps them together); the body's
+        // Cc adds only whoever they lack. Each person once.
+        let cc = m.body.as_ref().map_or(&[][..], |b| b.cc.as_slice());
+        let mut seen = std::collections::HashSet::new();
+        let mut names: Vec<String> = sm.to.iter().chain(cc).filter(|a| seen.insert(a.email.to_lowercase())).map(|a| a.display().to_owned()).collect();
         if names.len() > 4 {
             let more = names.len() - 3;
             names.truncate(3);
@@ -608,7 +609,8 @@ mod tests {
     /// What the newest message of the first conversation is, for [`reader_at`].
     #[derive(Clone)]
     enum Body {
-        /// The demo's own (Markdown).
+        /// The demo's own, as Markdown (its HTML's layout left out: the reader shows the Markdown
+        /// made of it then).
         Demo,
         Html(std::sync::Arc<envoy_core::html::Doc>),
         /// Plain text, with a link longer than a narrow reader's line (it breaks at its slashes).
@@ -618,12 +620,12 @@ mod tests {
     /// The app with its first conversation open, its newest message's body `body`, the list as
     /// wide as leaves the reader `width` points.
     fn reader_at(width: f32, body: Body) -> Runtime<App> {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         crate::scene_open(&mut app);
+        app.engine = None;
         let b = app.thread.last_mut().unwrap().body.as_mut().unwrap();
         match body {
-            Body::Demo => {}
+            Body::Demo => b.doc = None,
             Body::Html(doc) => b.doc = Some(doc),
             Body::Plain => {
                 (b.doc, b.markdown) = (None, None);
@@ -675,9 +677,9 @@ mod tests {
     fn the_reply_buttons_are_named_while_they_fit() {
         let named = |rt: &Runtime<App>| ["Reply", "Reply all", "Forward"].iter().all(|n| rt.elements().iter().any(|e| e.text.as_deref() == Some(*n)));
         let opened = {
-            let mut app = App::new(true);
-            crate::demo::populate(&mut app);
+            let mut app = crate::demo::testing::app();
             crate::scene_open(&mut app);
+            app.engine = None;
             let mut rt = Runtime::new(app, crate::view, (1280.0, 820.0), Env::new(false, 1.0));
             rt.frame(0.0);
             rt.frame(0.0);
@@ -701,11 +703,11 @@ mod tests {
         // was built at a guessed width, laid out, then built again at the real one.
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../envoy-core/tests/fixtures/html/mjml-newsletter.html")).unwrap();
         let doc = std::sync::Arc::new(envoy_core::html::parse(&src));
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         crate::scene_open(&mut app);
         let next = app.list[1].id;
-        let mut thread = crate::demo::thread_for(next);
+        let mut thread = app.read_thread(next);
+        app.engine = None;
         thread.last_mut().unwrap().body.as_mut().unwrap().doc = Some(doc);
         let mut rt = Runtime::new(app, crate::view, (1280.0, 900.0), Env::new(false, 1.0));
         rt.frame(0.0);
@@ -726,14 +728,27 @@ mod tests {
     }
 
     #[test]
+    fn a_message_names_each_recipient_once() {
+        // The store keeps To and Cc together as a message's recipients: the body's Cc mustn't
+        // name them again. Maya's newest copies Jordan in.
+        let mut app = crate::demo::testing::app();
+        crate::scene_open(&mut app);
+        app.engine = None;
+        let mut rt = Runtime::new(app, crate::view, (1280.0, 900.0), Env::new(false, 1.0));
+        rt.frame(0.0);
+        let lines: Vec<String> = rt.elements().iter().filter_map(|e| e.text.clone()).filter(|t| t.starts_with("to ")).collect();
+        assert!(lines.iter().any(|l| l == "to You, Jordan Lee"), "{lines:?}");
+    }
+
+    #[test]
     fn message_bodies_are_fitted_to_the_reader_they_are_in() {
         // The width the reader hands the renderer is the body's own, as laid out, so mail that
         // asks for 760 points of minimum width in a narrow reader still ends at its edge.
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../envoy-core/tests/fixtures/html/foundation-hero.html")).unwrap();
         for window in [1120.0, 1280.0, 1700.0] {
-            let mut app = App::new(true);
-            crate::demo::populate(&mut app);
+            let mut app = crate::demo::testing::app();
             crate::scene_open(&mut app);
+            app.engine = None;
             let m = app.thread.last_mut().unwrap();
             m.body.as_mut().unwrap().doc = Some(std::sync::Arc::new(envoy_core::html::parse(&src)));
             let id = m.summary.id;

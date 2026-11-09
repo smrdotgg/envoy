@@ -122,7 +122,6 @@ impl App {
     pub fn recipients_edited(&mut self, f: Recipients) {
         self.compose_edited();
         let req = self.next_stamp() as u64;
-        let demo = self.demo;
         let Some(c) = &mut self.compose else { return };
         let typed = c.typed(f);
         let s = &mut c.suggest;
@@ -143,11 +142,7 @@ impl App {
         let active = s.items.get(s.active).map(|a| a.email.clone());
         s.items.retain(|a| contacts::matches(&words, &contacts::terms(&a.name, &a.email)));
         s.active = active.and_then(|e| s.items.iter().position(|a| a.email == e)).unwrap_or(0);
-        if demo {
-            self.contacts_arrived(req, crate::demo::suggest(&typed));
-        } else {
-            self.send(Command::Contacts { req, typed });
-        }
+        self.send(Command::Contacts { req, typed });
     }
 
     /// The people for lookup `req` ([`envoy_core::engine::Event::Contacts`]): shown if it's
@@ -224,11 +219,9 @@ mod tests {
         Address { name: name.into(), email: email.into() }
     }
 
-    /// A composer, To focused, with the engine's commands recorded (not demo mode).
+    /// A composer, To focused, its engine's commands recorded and not answered.
     fn app() -> App {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
+        let mut app = crate::demo::testing::detached();
         app.compose_new();
         app
     }
@@ -435,10 +428,11 @@ mod tests {
 
     #[test]
     fn demo_mode_suggests_from_its_sample_mail() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        // The store's own suggestions, from the people in the sample mail.
+        let mut app = crate::demo::testing::app();
         app.compose_new();
         type_in(&mut app, Recipients::To, "j");
+        assert!(app.settle_until(|app| !shown(app, Recipients::To).is_empty()));
         assert_eq!(shown(&app, Recipients::To)[0], "jordan@northwind.dev");
         assert!(!shown(&app, Recipients::To).iter().any(|e| e == "you@gmail.com"));
     }
