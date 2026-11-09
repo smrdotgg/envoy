@@ -235,14 +235,19 @@ pub fn too_big(e: &anyhow::Error) -> Option<&TooBig> {
     e.chain().find_map(|c| c.downcast_ref())
 }
 
+/// How long a send may take, up to the server taking the message (QUIT comes after, on its
+/// own clock: [`bye`]).
+const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Sends `raw`. `learned` gets the largest message the server says it takes, as soon as it
 /// says (kept for the next message whether this one goes or not); a message over it isn't
-/// sent at all ([`TooBig`]).
+/// sent at all ([`TooBig`]). Ok exactly when the server took the message.
 pub async fn send(account: &Account, cred: &Credential, from: &str, to: &[String], raw: &[u8], learned: &mut Option<u64>) -> Result<()> {
-    send_with(account, cred, from, to, raw, learned, crate::imap::insecure_tls()).await
+    send_with(account, cred, from, to, raw, learned, crate::imap::insecure_tls(), SEND_BUDGET).await
 }
 
-async fn send_with(account: &Account, cred: &Credential, from: &str, to: &[String], raw: &[u8], learned: &mut Option<u64>, insecure: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn send_with(account: &Account, cred: &Credential, from: &str, to: &[String], raw: &[u8], learned: &mut Option<u64>, insecure: bool, budget: std::time::Duration) -> Result<()> {
     let (creds, mech) = match cred {
         Credential::Password(p) => (Credentials::new(account.login().to_owned(), p.clone()), vec![Mechanism::Plain, Mechanism::Login]),
         Credential::OAuth(t) => (Credentials::new(account.login().to_owned(), t.clone()), vec![Mechanism::Xoauth2]),
@@ -264,10 +269,13 @@ async fn send_with(account: &Account, cred: &Credential, from: &str, to: &[Strin
             let refused = e.status().is_some_and(|c| c.to_string() == "552") || e.to_string().contains("5.3.4");
             return Err(if refused { anyhow::Error::new(TooBig { size: raw.len(), limit: size }) } else { e.into() });
         }
-        bye(&mut conn).await;
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>(conn)
     };
-    tokio::time::timeout(std::time::Duration::from_secs(120), work).await.map_err(|_| anyhow!("SMTP send timed out"))?.context("SMTP send failed")
+    let mut conn = tokio::time::timeout(budget, work).await.map_err(|_| anyhow!("SMTP send timed out"))?.context("SMTP send failed")?;
+    // Taken: sent, whatever QUIT does, however little of the budget is left. A message the
+    // server took that was reported failed would go again.
+    bye(&mut conn).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -408,6 +416,11 @@ mod tests {
     /// certificate): its EHLO says `ehlo`, it answers the message's end with `end`, and QUIT
     /// only if `bye` (otherwise it never answers it). Returns its port, and the commands it got.
     async fn fake_server(ehlo: &'static str, end: &'static str, bye: bool) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+        fake_server_slow(ehlo, end, bye, std::time::Duration::ZERO).await
+    }
+
+    /// [`fake_server`], taking `end_after` to answer the message's end.
+    async fn fake_server_slow(ehlo: &'static str, end: &'static str, bye: bool, end_after: std::time::Duration) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -439,6 +452,7 @@ mod tests {
                 if data {
                     if line == ".\r\n" {
                         data = false;
+                        tokio::time::sleep(end_after).await;
                         conn.get_mut().write_all(end.as_bytes()).await.unwrap();
                     }
                     continue;
@@ -471,8 +485,12 @@ mod tests {
     const BIG: &[u8] = b"From: me@x.com\r\nTo: you@x.com\r\nSubject: Big\r\n\r\nMore than ten bytes.\r\n";
 
     async fn send_to(port: u16, learned: &mut Option<u64>) -> Result<()> {
+        send_within(port, learned, SEND_BUDGET).await
+    }
+
+    async fn send_within(port: u16, learned: &mut Option<u64>, budget: std::time::Duration) -> Result<()> {
         let local = Account { smtp_host: "127.0.0.1".into(), smtp_port: port, ..account() };
-        send_with(&local, &Credential::Password("pw".into()), "me@x.com", &["you@x.com".into()], BIG, learned, true).await
+        send_with(&local, &Credential::Password("pw".into()), "me@x.com", &["you@x.com".into()], BIG, learned, true, budget).await
     }
 
     #[tokio::test]
@@ -511,6 +529,17 @@ mod tests {
         // Sent: it went, whatever QUIT does (a send reported failed would go again).
         let (port, _server) = fake_server("250-localhost\r\n250 AUTH PLAIN LOGIN\r\n", "250 OK\r\n", false).await;
         tokio::time::timeout(quick, send_to(port, &mut None)).await.expect("told at once").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_message_taken_as_the_budget_runs_out_is_sent_whatever_quit_does() {
+        // Taken with under a second of the budget left, then QUIT never answered: QUIT has its
+        // own few seconds, after the budget, so the send is reported as what it was.
+        let budget = std::time::Duration::from_secs(3);
+        let (port, _server) = fake_server_slow("250-localhost\r\n250 AUTH PLAIN LOGIN\r\n", "250 OK\r\n", false, std::time::Duration::from_millis(2200)).await;
+        let started = std::time::Instant::now();
+        send_within(port, &mut None, budget).await.expect("taken, so sent");
+        assert!(started.elapsed() > budget, "QUIT ran past the budget, and that changed nothing");
     }
 
     #[tokio::test]
