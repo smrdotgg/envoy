@@ -85,7 +85,9 @@ CREATE TABLE IF NOT EXISTS ops (
     last_error TEXT,
     not_before INTEGER NOT NULL DEFAULT 0,
     batch INTEGER NOT NULL DEFAULT 0,
-    claimed INTEGER NOT NULL DEFAULT 0
+    claimed INTEGER NOT NULL DEFAULT 0,
+    uidvalidity INTEGER NOT NULL DEFAULT 0,
+    message_id TEXT NOT NULL DEFAULT ''
 );
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM fts WHERE rowid = old.id;
@@ -172,7 +174,28 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("drafts", "upload_gen", "ALTER TABLE drafts ADD COLUMN upload_gen INTEGER NOT NULL DEFAULT 0"),
     // Bumped by send and Undo send: a write made before can't touch what came after.
     ("drafts", "lifecycle", "ALTER TABLE drafts ADD COLUMN lifecycle INTEGER NOT NULL DEFAULT 0"),
+    // Which generation of its mailbox (UIDVALIDITY) a UID-based op's UID is from, and its
+    // message's Message-ID, to find it again in another. Ops queued before take their
+    // mailbox's generation as cached now (the one their UIDs are from: a new one empties the
+    // cache) and the Message-ID of the message their UID names there.
+    ("ops", "uidvalidity", OPS_GENERATION),
 ];
+
+/// [`MIGRATIONS`]'s step that records each queued op's generation ([`At`]).
+const OPS_GENERATION: &str = "
+BEGIN;
+ALTER TABLE ops ADD COLUMN uidvalidity INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE ops ADD COLUMN message_id TEXT NOT NULL DEFAULT '';
+UPDATE ops SET
+    uidvalidity = COALESCE((SELECT m.uidvalidity FROM mailboxes m WHERE m.account = ops.account AND m.name = json_extract(ops.op, '$.mailbox')), 0),
+    message_id = COALESCE((SELECT x.message_id FROM messages x WHERE x.account = ops.account AND x.mailbox = json_extract(ops.op, '$.mailbox') AND x.uid = json_extract(ops.op, '$.uid')), '')
+  WHERE json_extract(op, '$.kind') IN ('setFlags', 'move', 'copy', 'expunge');
+UPDATE ops SET
+    uidvalidity = COALESCE((SELECT m.uidvalidity FROM mailboxes m WHERE m.account = ops.account AND m.name = json_extract(ops.op, '$.reply_of[0]')), 0),
+    message_id = COALESCE((SELECT x.message_id FROM messages x WHERE x.account = ops.account AND x.mailbox = json_extract(ops.op, '$.reply_of[0]') AND x.uid = json_extract(ops.op, '$.reply_of[1]')), '')
+  WHERE json_extract(op, '$.kind') = 'send' AND json_extract(op, '$.reply_of') IS NOT NULL;
+COMMIT;
+";
 
 /// Indexes and triggers on migrated columns (they must exist first).
 ///
@@ -224,10 +247,12 @@ CREATE TABLE ops_new (
     last_error TEXT,
     not_before INTEGER NOT NULL DEFAULT 0,
     batch INTEGER NOT NULL DEFAULT 0,
-    claimed INTEGER NOT NULL DEFAULT 0
+    claimed INTEGER NOT NULL DEFAULT 0,
+    uidvalidity INTEGER NOT NULL DEFAULT 0,
+    message_id TEXT NOT NULL DEFAULT ''
 );
-INSERT INTO ops_new (id, account, op, attempts, last_error, not_before, batch, claimed)
-    SELECT id, account, op, attempts, last_error, not_before, batch, claimed FROM ops;
+INSERT INTO ops_new (id, account, op, attempts, last_error, not_before, batch, claimed, uidvalidity, message_id)
+    SELECT id, account, op, attempts, last_error, not_before, batch, claimed, uidvalidity, message_id FROM ops;
 DROP TABLE ops;
 ALTER TABLE ops_new RENAME TO ops;
 COMMIT;
@@ -441,6 +466,42 @@ pub struct QueuedOp {
     pub id: i64,
     pub op: Op,
     pub attempts: u32,
+    /// Where its UID is from, for an op that names a message by UID.
+    pub at: At,
+}
+
+/// Which generation of its mailbox a queued op's UID belongs to: the mailbox's UIDVALIDITY
+/// when it was queued (0: not known), and its message's Message-ID (empty: not known). A UID
+/// names a message only within its generation; in another (the mailbox recreated, or reset by
+/// the server) it may name a different one, or none, and the message is found again, if at
+/// all, by its Message-ID.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct At {
+    pub validity: u32,
+    pub message_id: String,
+}
+
+impl Op {
+    /// The mailbox and UID it acts on, if it names a message by UID (a send, the message it
+    /// replies to).
+    pub fn located(&self) -> Option<(&str, u32)> {
+        match self {
+            Op::SetFlags { mailbox, uid, .. } | Op::Move { mailbox, uid, .. } | Op::Copy { mailbox, uid, .. } | Op::Expunge { mailbox, uid } => Some((mailbox, *uid)),
+            Op::Send { reply_of: Some((mailbox, uid)), .. } => Some((mailbox, *uid)),
+            _ => None,
+        }
+    }
+
+    /// The same op, for the message at `uid` instead (found again in a new generation).
+    pub fn at_uid(&self, to: u32) -> Option<Op> {
+        let mut op = self.clone();
+        match &mut op {
+            Op::SetFlags { uid, .. } | Op::Move { uid, .. } | Op::Copy { uid, .. } | Op::Expunge { uid, .. } => *uid = to,
+            Op::Send { reply_of: Some((_, uid)), .. } => *uid = to,
+            _ => return None,
+        }
+        Some(op)
+    }
 }
 
 pub struct Store {
@@ -959,6 +1020,36 @@ impl Store {
         Ok(true)
     }
 
+    /// The messages of a mailbox hidden while they wait for an op (a move): `(op, Message-ID)`.
+    /// Read before a new generation empties the mailbox's cache, to hide them again in it
+    /// ([`Store::rehide`]).
+    pub fn held_messages(&self, account: &str, mailbox: &str) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT held_op, message_id FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0 AND message_id != ''")?;
+        let rows = stmt.query_map(params![account, mailbox], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// After a new generation of the mailbox has been downloaded, hides again each message that
+    /// was waiting for an op in the old one (`held`, from [`Store::held_messages`]), found by its
+    /// Message-ID: an archived message doesn't come back while its move waits. One the
+    /// Message-ID doesn't find exactly once stays as it shows; its op finds out on replay.
+    pub fn rehide(&self, account: &str, mailbox: &str, held: &[(i64, String)]) -> Result<()> {
+        self.transaction(|st| {
+            for (op, message_id) in held {
+                let ids: Vec<MessageId> = st
+                    .conn
+                    .prepare_cached("SELECT id FROM messages WHERE account = ?1 AND mailbox = ?2 AND message_id = ?3 AND held_op = 0 LIMIT 2")?
+                    .query_map(params![account, mailbox, message_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let still_queued: bool = st.conn.query_row("SELECT EXISTS (SELECT 1 FROM ops WHERE id = ?1)", params![op], |r| r.get(0))?;
+                if let ([id], true) = (ids.as_slice(), still_queued) {
+                    st.hide_local(*id, *op)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// The other messages of `id`'s conversation that live in the same account (for actions on
     /// a whole conversation), newest first.
     pub fn thread_ids(&self, id: MessageId, view_mailbox_only: bool) -> Result<Vec<MessageId>> {
@@ -1146,13 +1237,40 @@ impl Store {
     // ── ops ──
 
     pub fn enqueue(&self, account: &str, op: &Op) -> Result<i64> {
-        self.conn.execute("INSERT INTO ops (account, op) VALUES (?1, ?2)", params![account, json(op)])?;
-        Ok(self.conn.last_insert_rowid())
+        self.enqueue_with(account, op, 0, 0)
     }
 
     pub fn enqueue_at(&self, account: &str, op: &Op, not_before: i64) -> Result<i64> {
-        self.conn.execute("INSERT INTO ops (account, op, not_before) VALUES (?1, ?2, ?3)", params![account, json(op), not_before])?;
+        self.enqueue_with(account, op, not_before, 0)
+    }
+
+    /// Queues `op`, recording the generation its UID is from ([`At`]): its mailbox's
+    /// UIDVALIDITY as cached, and the Message-ID of the cached message the UID names. Queue a
+    /// UID-based op before deleting its message here, so its Message-ID is still known.
+    fn enqueue_with(&self, account: &str, op: &Op, not_before: i64, batch: i64) -> Result<i64> {
+        let at = match op.located() {
+            Some((mailbox, uid)) => At {
+                validity: self.uidvalidity(account, mailbox)?,
+                message_id: self
+                    .conn
+                    .query_row("SELECT message_id FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3", params![account, mailbox, uid], |r| r.get(0))
+                    .optional()?
+                    .unwrap_or_default(),
+            },
+            None => At::default(),
+        };
+        self.conn.execute(
+            "INSERT INTO ops (account, op, not_before, batch, uidvalidity, message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![account, json(op), not_before, batch, at.validity, at.message_id],
+        )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// An op's message, found again by its Message-ID in generation `validity` of its mailbox,
+    /// is at `op`'s UID now: the op is rewritten to act there.
+    pub fn relocate_op(&self, id: i64, op: &Op, validity: u32) -> Result<()> {
+        self.conn.execute("UPDATE ops SET op = ?2, uidvalidity = ?3 WHERE id = ?1", params![id, json(op), validity])?;
+        Ok(())
     }
 
     /// Due ops not taken for replay, oldest first. Read-only apart from dropping unreadable
@@ -1186,14 +1304,17 @@ impl Store {
 
     /// Call inside a transaction.
     fn due(&self, account: &str, now: i64) -> Result<Vec<QueuedOp>> {
-        let mut stmt = self.conn.prepare_cached("SELECT id, op, attempts FROM ops WHERE account = ?1 AND not_before <= ?2 AND claimed = 0 ORDER BY id")?;
-        let rows = stmt.query_map(params![account, now], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?)))?;
+        let mut stmt =
+            self.conn.prepare_cached("SELECT id, op, attempts, uidvalidity, message_id FROM ops WHERE account = ?1 AND not_before <= ?2 AND claimed = 0 ORDER BY id")?;
+        let rows = stmt.query_map(params![account, now], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?, At { validity: r.get(3)?, message_id: r.get(4)? }))
+        })?;
         let mut out = Vec::new();
         let mut unreadable = Vec::new();
         for row in rows {
-            let (id, op, attempts) = row?;
+            let (id, op, attempts, at) = row?;
             match serde_json::from_str(&op) {
-                Ok(op) => out.push(QueuedOp { id, op, attempts }),
+                Ok(op) => out.push(QueuedOp { id, op, attempts, at }),
                 Err(_) => unreadable.push(id),
             }
         }
@@ -1216,11 +1337,7 @@ impl Store {
     /// An op that can be undone: it waits until `not_before` and is tagged with the user
     /// action (`batch`) it belongs to, so [`Store::undo_batch`] can take the whole action back.
     pub fn enqueue_held(&self, account: &str, op: &Op, not_before: i64, batch: i64) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO ops (account, op, not_before, batch) VALUES (?1, ?2, ?3, ?4)",
-            params![account, json(op), not_before, batch],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        self.enqueue_with(account, op, not_before, batch)
     }
 
     /// The op reached the server. A message it was moving away now leaves the local copy too,
@@ -2322,6 +2439,46 @@ mod tests {
         drop(s);
         let s = Store::open(&db).unwrap();
         assert!(!s.upgrade_search(3).unwrap(), "nothing left to do after a restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ops_queued_before_the_upgrade_learn_their_generation() {
+        let dir = std::env::temp_dir().join(format!("envoy-store-generation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("mail.sqlite");
+        let reply = Op::Send { raw_b64: String::new(), from: "me@x.com".into(), to: vec!["you@x.com".into()], sent_mailbox: None, reply_of: Some(("INBOX".into(), 9)) };
+        let ops = [
+            Op::Move { mailbox: "INBOX".into(), uid: 9, dest: "Archive".into() },
+            reply,
+            // Its mailbox is gone: no generation to give it.
+            Op::SetFlags { mailbox: "Gone".into(), uid: 1, add: flags::SEEN, remove: 0 },
+            Op::SaveDraft { draft: 3 },
+        ];
+        {
+            let old = SCHEMA.replace(",\n    uidvalidity INTEGER NOT NULL DEFAULT 0,\n    message_id TEXT NOT NULL DEFAULT ''", "");
+            assert!(!old.contains("uidvalidity INTEGER NOT NULL DEFAULT 0,\n    message_id"), "set up a cache from before");
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(&old).unwrap();
+            conn.execute_batch(
+                "INSERT INTO mailboxes (account, name, display, role, uidvalidity) VALUES ('a', 'INBOX', 'Inbox', 'inbox', 7);
+                 INSERT INTO messages (account, mailbox, uid, message_id, thread) VALUES ('a', 'INBOX', 9, '<9@x>', '<9@x>');",
+            )
+            .unwrap();
+            for op in &ops {
+                conn.execute("INSERT INTO ops (account, op) VALUES ('a', ?1)", params![json(op)]).unwrap();
+            }
+        }
+        let s = Store::open(&db).unwrap();
+        let at: Vec<At> = s.ops("a", 0).unwrap().into_iter().map(|q| q.at).collect();
+        let known = At { validity: 7, message_id: "<9@x>".into() };
+        assert_eq!(at, [known.clone(), known, At::default(), At::default()]);
+        // Ops queued from now on record theirs.
+        let op = s.enqueue("a", &Op::Copy { mailbox: "INBOX".into(), uid: 9, dest: "Work".into() }).unwrap();
+        assert_eq!(s.ops("a", 0).unwrap().into_iter().find(|q| q.id == op).unwrap().at, At { validity: 7, message_id: "<9@x>".into() });
+        drop(s);
+        Store::open(&db).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
