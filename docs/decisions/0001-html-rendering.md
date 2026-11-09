@@ -56,15 +56,22 @@ A feasibility study of live child web views concluded against them:
   rules don't apply, and `min-width: 480px` desktop rules (MJML's column widths) do.
 - **Narrow panes are fitted when the tree is drawn** (`html_view`), at the width the reader
   has, read from its layout in 8-point steps: dragging the divider rebuilds the message's
-  elements when a step is crossed, never its tree. Nothing reaches past the reader. Fixed widths,
-  minimums, pictures and padding are capped at the room each box gets, as `max-width: 100%`
-  does in mail clients. A word longer than its line (a link) breaks. Table columns keep their
-  longest word while there's room for every column's. Fluid columns stack below 480 points (two
-  240-point columns, where MJML and Cerberus templates switch to one column), or when one would
-  be under 120. One thing is read from the phone rules: which table cells they make full-width
-  blocks (Cerberus's `.stack-column`, Foundation's `.columns`). Rows of those stack below the
-  same 480 points. `envoy`'s `html_view` tests lay every fixture out at 320, 520 and 900 points
-  and fail if any box or line of text reaches past the width or out of its box.
+  elements when a step is crossed, never its tree, and a message opening is built once, at
+  that width. Nothing reaches past the reader. Fixed widths, minimums, pictures and padding
+  are capped at the room each box gets, as `max-width: 100%` does in mail clients. A word
+  longer than its line (a link) breaks. A table's rows share one column grid (`html::Grid`):
+  each column's share of the table and its narrowest width (its cells' longest word, a small
+  fixed column's width, what a colspan needs beyond its columns'), so every row gets the same
+  column widths and cells line up down the table at any width. Fluid columns stack below 480
+  points (two 240-point columns, where MJML and Cerberus templates switch to one column), or
+  when one would be under 120. One thing is read from the phone rules: which table cells they
+  make blocks (Cerberus's `.stack-column`, Foundation's `.columns`), by the cell's display at
+  a phone's width, cascaded with the email's other rules and its `style=""` as a browser
+  would; a full width alone leaves a table cell in its row. Rows of such cells stack below the
+  same 480 points. `envoy`'s `html_view` tests lay every fixture out at 320, 520 and 900 points,
+  pictures hidden and loaded, colours adapted and original, and fail if any box (zero-wide ones
+  too) reaches past the width or out of its box, or any line of text (pictures' descriptions
+  and list markers included) past either edge of its own text box.
 - **`prefers-color-scheme: dark` rules are not applied.** "Original" (`reading.htmlColors`)
   draws mail as designed on a light page, where the light rules are the consistent ones. "Adapt"
   recolours mail to the theme by its own rules, the same way for every message; mixing in an
