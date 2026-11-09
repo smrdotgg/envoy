@@ -48,7 +48,8 @@ fn header(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
     let in_junk = s.mailboxes.get(&last.account).and_then(|m| m.iter().find(|m| m.name == last.mailbox)).is_some_and(|m| m.role == Role::Junk);
     let mailbox_label = s.mailboxes.get(&last.account).and_then(|m| m.iter().find(|m| m.name == last.mailbox)).map(|m| m.display.clone()).unwrap_or_default();
 
-    let mut tools = row().key("reader-tools").gap(2.0).center_y();
+    // On a second line in a reader too narrow for them all.
+    let mut tools = row().key("reader-tools").w_full().flex_wrap().gap(2.0).center_y();
     if s.settings.str("inbox.readingPane") == "off" {
         tools = tools.child(tool(t, &icons::BACK, "Back to list", "t-back", |s, _| s.close_message()));
     }
@@ -96,8 +97,10 @@ fn header(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
         )
         .child(tool(t, &icons::EXTERNAL, "Open original (.eml) in your mail viewer", "t-original", move |s, _| s.send(Command::OpenOriginal { id: last_id })));
 
-    let mut title_row = row().gap(10.0).items_start().w_full().child(
-        text(subject).font(rune::TextStyle::new(21.0, 600.0).lh(28.0)).color(k.c.text_base).wrap().selectable(true).grow(1.0).min_w(0.0),
+    // The chips beside the subject while it keeps room for a word or two, below it in a narrow
+    // reader (squeezed beside them, a word of it ran past its edge).
+    let mut title_row = row().gap(10.0).items_start().w_full().flex_wrap().child(
+        text(subject).font(rune::TextStyle::new(21.0, 600.0).lh(28.0)).color(k.c.text_base).wrap().selectable(true).grow(1.0).min_w(140.0),
     );
     if !mailbox_label.is_empty() {
         title_row = title_row.child(
@@ -365,6 +368,8 @@ fn attachments(mut out: El, t: &Theme, b: &envoy_core::model::Body, id: i64) -> 
                     .px(12.0)
                     .py(8.0)
                     .center_y()
+                    // Narrower than its name in a narrow reader: the name ends in "…".
+                    .shrink()
                     .radius(10.0)
                     .border(1.0, k.c.border_base)
                     .hover(k.c.hover)
@@ -376,7 +381,8 @@ fn attachments(mut out: El, t: &Theme, b: &envoy_core::model::Body, id: i64) -> 
                     .child(
                         col()
                             .gap(0.0)
-                            .child(text(a.filename.clone()).font(k.ty.text_small_medium).color(k.c.text_base).truncate().max_w(240.0))
+                            .shrink()
+                            .child(text(a.filename.clone()).font(k.ty.text_small_medium).color(k.c.text_base).truncate().max_w(240.0).min_w(0.0))
                             .child(text(fmt::size(a.size)).font(k.ty.text_xsmall).color(k.c.text_faint)),
                     )
                     .child(icon(&icons::DOWNLOAD, 14.0).color(k.c.icon_faint)),
@@ -385,6 +391,51 @@ fn attachments(mut out: El, t: &Theme, b: &envoy_core::model::Body, id: i64) -> 
         out = out.child(chips);
     }
     out
+}
+
+/// What the newest message's actions are: the label, icon and key of each, and what it does.
+type Reply = (&'static str, &'static rune::Icon, &'static str, fn(&mut App, i64));
+const REPLIES: [Reply; 3] = [
+    ("Reply", &icons::REPLY, "reply", |s, id| s.compose_reply(Some(id), false, false)),
+    ("Reply all", &icons::REPLY_ALL, "replyall", |s, id| s.compose_reply(Some(id), true, false)),
+    ("Forward", &icons::FORWARD, "forward", |s, id| s.compose_reply(Some(id), false, true)),
+];
+
+/// The gap between the reply bar's buttons.
+const REPLY_GAP: f32 = 8.0;
+
+/// How wide the reply bar is with its buttons named: each a Regular outline button (12 points
+/// of padding each side, a 16-point icon, 6 between it and the name), gaps between.
+fn named_replies_width(t: &Theme) -> f32 {
+    let name = |label: &str| rune::text::measure(label, &[], t.k.ty.ui_medium, None).0;
+    REPLIES.iter().map(|(label, ..)| 2.0 * 12.0 + 16.0 + 6.0 + name(label)).sum::<f32>() + REPLY_GAP * (REPLIES.len() - 1) as f32
+}
+
+/// Reply, Reply all and Forward under the newest message, as wide as its body (`width`, None
+/// before the first layout): named while that fits them side by side, icons alone (named in
+/// their tooltips and to assistive technology) in a narrower reader, and on a second line when
+/// even those don't fit. Nothing reaches past the reader's edge.
+fn reply_bar(t: &Theme, id: i64, width: Option<f32>) -> El {
+    let k = &t.k;
+    let named = width.is_none_or(|w| w >= named_replies_width(t));
+    let mut bar = row().key(format!("replybar-{id}")).w_full().flex_wrap().gaps(REPLY_GAP, REPLY_GAP).pl(50.0).pt(4.0);
+    for (label, ic, key, f) in REPLIES {
+        let button = if named {
+            Button::new(label).icon(ic).variant(ButtonVariant::Outline).control_size(ControlSize::Regular).on_press(move |s: &mut App| f(s, id)).build(k)
+        } else {
+            IconButton::new(ic)
+                .variant(IconButtonVariant::Ghost)
+                .control_size(ControlSize::Regular)
+                .label(label)
+                .help(label)
+                .on_press(move |s: &mut App| f(s, id))
+                .build(k)
+                // The named buttons' outline.
+                .box_shadow(rune::Shadow { spread: 1.0, color: k.c.border_muted, inset: true, ..rune::Shadow::default() })
+        };
+        bar = bar.child(button.key(format!("{key}-{id}")));
+    }
+    bar
 }
 
 fn message_card(s: &App, t: &Theme, m: &ThreadMessage, is_last: bool, width: Option<f32>) -> El {
@@ -435,7 +486,7 @@ fn message_card(s: &App, t: &Theme, m: &ThreadMessage, is_last: bool, width: Opt
                             el()
                         })
                         .child(el().grow(1.0))
-                        .child(text(date).font(k.ty.text_xsmall).color(k.c.text_faint)),
+                        .child(text(date).font(k.ty.text_xsmall).color(k.c.text_faint).truncate().min_w(0.0)),
                 )
                 .child(if expanded {
                     text(to_line).font(k.ty.text_xsmall).color(k.c.text_faint).truncate().w_full()
@@ -455,26 +506,8 @@ fn message_card(s: &App, t: &Theme, m: &ThreadMessage, is_last: bool, width: Opt
         .child(head);
     if expanded {
         card = card.child(row().w_full().pl(50.0).child(body_view(s, t, m, width)));
-        let reply_btn = |label: &str, ic: &'static rune::Icon, key: &str, f: fn(&mut App, i64)| {
-            Button::new(label)
-                .icon(ic)
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Regular)
-                .on_press(move |s: &mut App| f(s, id))
-                .build(k)
-                .key(format!("{key}-{id}"))
-        };
         if is_last {
-            card = card.child(
-                row()
-                    .key(format!("replybar-{id}"))
-                    .pl(50.0)
-                    .pt(4.0)
-                    .gap(8.0)
-                    .child(reply_btn("Reply", &icons::REPLY, "reply", |s, id| s.compose_reply(Some(id), false, false)))
-                    .child(reply_btn("Reply all", &icons::REPLY_ALL, "replyall", |s, id| s.compose_reply(Some(id), true, false)))
-                    .child(reply_btn("Forward", &icons::FORWARD, "forward", |s, id| s.compose_reply(Some(id), false, true))),
-            );
+            card = card.child(reply_bar(t, id, width));
         }
     } else {
         card = card.hover(k.c.hover);
@@ -569,6 +602,95 @@ mod tests {
             } else {
                 assert!(load[1] >= hidden[1] + hidden[3], "the actions move to a second line at {width} pt: {hidden:?} {load:?}");
             }
+        }
+    }
+
+    /// What the newest message of the first conversation is, for [`reader_at`].
+    #[derive(Clone)]
+    enum Body {
+        /// The demo's own (Markdown).
+        Demo,
+        Html(std::sync::Arc<envoy_core::html::Doc>),
+        /// Plain text, with a link longer than a narrow reader's line (it breaks at its slashes).
+        Plain,
+    }
+
+    /// The app with its first conversation open, its newest message's body `body`, the list as
+    /// wide as leaves the reader `width` points.
+    fn reader_at(width: f32, body: Body) -> Runtime<App> {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        crate::scene_open(&mut app);
+        let b = app.thread.last_mut().unwrap().body.as_mut().unwrap();
+        match body {
+            Body::Demo => {}
+            Body::Html(doc) => b.doc = Some(doc),
+            Body::Plain => {
+                (b.doc, b.markdown) = (None, None);
+                b.text = Some("The deck: https://figma.example/file/envoy-onboarding-walkthrough-final-v3?node-id=1234\n\nThanks!".into());
+            }
+        }
+        let mut rt = Runtime::new(app, crate::view, (1280.0, 900.0), Env::new(false, 1.0));
+        rt.frame(0.0);
+        let delta = pane(&rt)[2] - width;
+        // As dragging the divider does: at once, not animated.
+        rt.update(move |s, tx| {
+            s.list_width += delta;
+            tx.instant();
+        });
+        rt.frame(0.0);
+        rt.frame(0.0);
+        assert!((pane(&rt)[2] - width).abs() < 1.0, "the reader is {:?}, not {width} wide", pane(&rt));
+        rt
+    }
+
+    fn pane(rt: &Runtime<App>) -> [f32; 4] {
+        rt.elements().iter().find(|e| e.key.as_deref() == Some("reader-pane")).expect("the reader").rect
+    }
+
+    /// The reader dragged narrow (QA: about 300 points, and Forward was cut off at its edge):
+    /// nothing in it, its toolbar, the subject, the conversation, Reply / Reply all / Forward,
+    /// reaches past its edges, for Markdown, HTML and plain mail alike (the no-overflow guard).
+    #[test]
+    fn nothing_in_a_narrow_reader_reaches_past_it() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../envoy-core/tests/fixtures/html/mjml-newsletter.html")).unwrap();
+        let doc = std::sync::Arc::new(envoy_core::html::parse(&src));
+        let mut failures = Vec::new();
+        for (what, body) in [("Markdown", Body::Demo), ("HTML", Body::Html(doc)), ("plain", Body::Plain)] {
+            for width in [260.0, 280.0, 300.0, 340.0, 400.0, 520.0, 700.0] {
+                let rt = reader_at(width, body.clone());
+                let [x, _, w, _] = pane(&rt);
+                let (bad, _) = crate::html_view::fit_tests::overflow_between(&rt, x, x + w, "reader-pane");
+                if !bad.is_empty() {
+                    failures.push(format!("{what} at {width} pt: {}", bad.iter().take(4).cloned().collect::<Vec<_>>().join("; ")));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "past the reader's edge:\n{}", failures.join("\n"));
+    }
+
+    /// Reply, Reply all and Forward say their names in the reader as it opens (and wider), and
+    /// are icons alone, named in their tooltips, once those don't fit.
+    #[test]
+    fn the_reply_buttons_are_named_while_they_fit() {
+        let named = |rt: &Runtime<App>| ["Reply", "Reply all", "Forward"].iter().all(|n| rt.elements().iter().any(|e| e.text.as_deref() == Some(*n)));
+        let opened = {
+            let mut app = App::new(true);
+            crate::demo::populate(&mut app);
+            crate::scene_open(&mut app);
+            let mut rt = Runtime::new(app, crate::view, (1280.0, 820.0), Env::new(false, 1.0));
+            rt.frame(0.0);
+            rt.frame(0.0);
+            rt
+        };
+        assert!(named(&opened), "named at the default size");
+        assert!(named(&reader_at(520.0, Body::Demo)));
+        let narrow = reader_at(300.0, Body::Demo);
+        assert!(!named(&narrow), "icons alone at 300 points");
+        let id = narrow.state.thread.last().unwrap().summary.id;
+        for key in ["reply", "replyall", "forward"] {
+            let e = narrow.elements().iter().find(|e| e.key.as_deref() == Some(&format!("{key}-{id}"))).cloned().unwrap_or_else(|| panic!("{key}"));
+            assert!(e.rect[2] <= 24.5, "{key}: an icon button, {:?}", e.rect);
         }
     }
 

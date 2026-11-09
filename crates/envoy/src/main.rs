@@ -338,6 +338,12 @@ const SCENES: &[Scene] = &[
         s.list_width = 330.0;
         scene_open(s);
     }),
+    // The reader dragged narrow, about 300 points at the default size: Reply, Reply all and
+    // Forward as icons, the subject's chips below it.
+    ("reader-narrow", |s| {
+        s.list_width = 715.0;
+        scene_open(s);
+    }),
     ("split-empty", |s| {
         s.show_category(envoy_core::model::Category::Other);
         let ids: Vec<_> = s.list.iter().map(|m| m.id).collect();

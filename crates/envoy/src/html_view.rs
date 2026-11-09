@@ -632,7 +632,7 @@ pub fn render(cx: &Ctx, doc: &Doc) -> El {
 
 #[cfg(test)]
 #[path = "html_view_tests.rs"]
-mod fit_tests;
+pub(crate) mod fit_tests;
 
 #[cfg(test)]
 mod tests {

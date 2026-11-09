@@ -276,7 +276,7 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png -
 ```
 
 Run from the repository root (the attach script picks files in it), with a debug build: release
-builds leave headless runs out. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label snooze snooze-typed snoozed woken toast toast-compose counts split split-newsletters split-moved split-search split-narrow split-empty split-off settings-rules`.
+builds leave headless runs out. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label snooze snooze-typed snoozed woken toast toast-compose counts split split-newsletters split-moved split-search split-narrow split-empty split-off settings-rules reader-narrow`.
 
 HTML rendering is tested against the mail in `crates/envoy-core/tests/fixtures/html` (sources and
 licenses in its `LICENSES.md`).
