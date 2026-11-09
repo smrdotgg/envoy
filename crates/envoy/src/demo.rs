@@ -131,8 +131,9 @@ fn first(name: &str) -> &str {
     name.split_whitespace().next().unwrap_or(name)
 }
 
+/// The samples a view shows (snoozed ones are in wake order already, as Snoozed lists them).
 pub fn list_for(view: &View) -> Vec<Summary> {
-    let mut rows: Vec<Summary> = SAMPLES
+    SAMPLES
         .iter()
         .enumerate()
         .map(|(i, s)| summary(i, s))
@@ -145,11 +146,7 @@ pub fn list_for(view: &View) -> Vec<Summary> {
             View::Mailbox { mailbox, .. } => &m.mailbox == mailbox,
             _ => false,
         })
-        .collect();
-    if matches!(view, View::Role { role: Role::Snoozed, .. }) {
-        rows.sort_by_key(|m| envoy_core::snooze::wake_of(&m.mailbox));
-    }
-    rows
+        .collect()
 }
 
 /// The drafts written in demo mode, which has no store: kept for the session, so Drafts lists

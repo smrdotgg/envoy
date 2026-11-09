@@ -26,7 +26,7 @@
 //! This module is the part that needs no server: names, the parent's choice, the rules' times,
 //! and the times a user picks (presets, and typed ones like "fri 9am"), in their own time zone.
 
-use chrono::{DateTime, Datelike, MappedLocalTime, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, MappedLocalTime, NaiveDate, NaiveTime, TimeDelta, TimeZone, Timelike, Utc, Weekday};
 
 /// The parent of Envoy's buckets, literally (never translated: every client must agree on it).
 pub const PARENT: &str = "Snoozed";
@@ -45,7 +45,7 @@ pub const NEW_KEYWORD: &str = "$new";
 /// A wake time as a bucket's name: `20261110T0800Z` (UTC, to the minute; seconds dropped).
 pub fn stamp(wake: i64) -> String {
     let t = DateTime::<Utc>::from_timestamp(wake.div_euclid(60) * 60, 0).unwrap_or_default();
-    t.format("%Y%m%dT%H%MZ").to_string()
+    format!("{:04}{:02}{:02}T{:02}{:02}Z", t.year(), t.month(), t.day(), t.hour(), t.minute())
 }
 
 /// The time a bucket's last name part stands for, if it's exactly a [`stamp`].
@@ -55,7 +55,10 @@ pub fn parse_stamp(s: &str) -> Option<i64> {
     if !shaped {
         return None;
     }
-    NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%MZ").ok().map(|t| t.and_utc().timestamp())
+    let n = |r: std::ops::Range<usize>| s[r].parse::<u32>().ok();
+    let date = NaiveDate::from_ymd_opt(n(0..4)? as i32, n(4..6)?, n(6..8)?)?;
+    let time = NaiveTime::from_hms_opt(n(9..11)?, n(11..13)?, 0)?;
+    Some(date.and_time(time).and_utc().timestamp())
 }
 
 /// The bucket for `wake` under `parent`.
@@ -492,8 +495,14 @@ fn day_number(t: &str) -> Option<u32> {
     digits.parse().ok().filter(|d| (1..=31).contains(d))
 }
 
+/// `2026-12-03`.
 fn parse_iso_date(t: &str) -> Option<NaiveDate> {
-    (t.len() == 10).then(|| NaiveDate::parse_from_str(t, "%Y-%m-%d").ok()).flatten()
+    let b = t.as_bytes();
+    let shaped = b.len() == 10 && b[4] == b'-' && b[7] == b'-' && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    if !shaped {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(t[..4].parse().ok()?, t[5..7].parse().ok()?, t[8..].parse().ok()?)
 }
 
 /// A time of day ("9am", "9:30pm", "17:30", "9 pm"), and how many tokens it took (`next` is
@@ -532,7 +541,7 @@ fn clock(t: &str, next: Option<&str>) -> Option<(NaiveTime, usize)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use chrono::FixedOffset;
+    use chrono::{FixedOffset, NaiveDateTime};
 
     /// A zone with a clock change each way, like Central Europe in 2026: UTC+1, and UTC+2 from
     /// 29 March 02:00 (clocks jump to 03:00) to 25 October 03:00 (clocks go back to 02:00).

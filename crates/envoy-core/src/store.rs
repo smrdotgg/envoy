@@ -1883,13 +1883,12 @@ impl Store {
         Ok(crate::snooze::bucket(&parent, &delimiter, wake))
     }
 
-    /// The account's snooze buckets known here, `(name, wake time)`, soonest first.
+    /// The account's snooze buckets known here, `(name, wake time)`, by name: soonest first
+    /// under each parent.
     pub fn buckets(&self, account: &str) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare_cached("SELECT name FROM mailboxes WHERE account = ?1 AND role = 'snoozed'")?;
+        let mut stmt = self.conn.prepare_cached("SELECT name FROM mailboxes WHERE account = ?1 AND role = 'snoozed' ORDER BY name")?;
         let names = stmt.query_map(params![account], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut out: Vec<(String, i64)> = names.into_iter().filter_map(|n| crate::snooze::wake_of(&n).map(|w| (n, w))).collect();
-        out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(out)
+        Ok(names.into_iter().filter_map(|n| crate::snooze::wake_of(&n).map(|w| (n, w))).collect())
     }
 
     /// A bucket just made on the server: known here at once, for its wake and the Snoozed view.

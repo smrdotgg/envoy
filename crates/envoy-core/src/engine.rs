@@ -2676,7 +2676,10 @@ async fn run_located(shared: &Shared, account: &Account, runner: &mut impl OpRun
 /// `Envoy Snoozed` if the server won't have `Snoozed` (the op, and the account's choice, follow),
 /// and known here at once, for its wake and the Snoozed view; then the message moves in.
 async fn snooze_move(shared: &Shared, account: &Account, runner: &mut impl OpRunner, q: &mut QueuedOp) -> Result<()> {
-    let Op::Move { mailbox, uid, dest } = q.op.clone() else { return runner.run(&q.op, &q.at).await };
+    let (mailbox, uid, dest) = match &q.op {
+        Op::Move { mailbox, uid, dest } => (mailbox.clone(), *uid, dest.clone()),
+        _ => return runner.run(&q.op, &q.at).await,
+    };
     let (Some(wake), Some(parent)) = (snooze::wake_of(&dest), snooze::parent_of(&dest).map(str::to_owned)) else { return runner.run(&q.op, &q.at).await };
     if snooze::wakes_instead(wake, now()) {
         log::info!("{}: a snooze reached the server at its time ({dest}): woken instead", account.email);

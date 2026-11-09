@@ -20,18 +20,23 @@ fn tool(s: &App, t: &Theme, ic: &'static rune::Icon, label: &str, key: &str, key
     b.build(&t.k).key(key.to_owned())
 }
 
-/// Move to… or Label…: an icon button that opens a searchable list of `ids`' folders (or
-/// labels), also opened with `v` (`l`). Enter or a click moves (labels) what's selected, or the
-/// open message.
+/// Move to…, Label… or Snooze…: an icon button that opens a searchable list of `ids`' folders
+/// (or labels), also opened with `v` (`l`), or of times to snooze them until (`b`: ready-made
+/// ones, or one typed in its field, "fri 9am"; in Snoozed, a new time). Enter or a click moves
+/// (labels, snoozes) what's selected, or the open message.
 pub fn picker(s: &App, t: &Theme, which: Picker, ids: &[MessageId], layer: &mut Vec<El>) -> El {
     let k = &t.k;
+    let snoozed = s.view_role() == Some(Role::Snoozed);
     let (key, ic, label, keys) = match which {
         Picker::Move => ("move-picker", &icons::FOLDER_MOVE, "Move to…", "keys.moveTo"),
         Picker::Label => ("label-picker", &icons::LABEL, "Label…", "keys.label"),
+        Picker::Snooze if snoozed => ("snooze-picker", &icons::CLOCK, "Snooze until another time…", "keys.snooze"),
+        Picker::Snooze => ("snooze-picker", &icons::CLOCK, "Snooze…", "keys.snooze"),
     };
     let state = match which {
         Picker::Move => &s.move_picker,
         Picker::Label => &s.label_picker,
+        Picker::Snooze => &s.snooze_picker,
     };
     // Only built while it's open: the closed picker is just its button.
     let (options, note) = if state.open { s.picker_options(which, ids) } else { (Vec::new(), None) };
@@ -41,45 +46,23 @@ pub fn picker(s: &App, t: &Theme, which: Picker, ids: &[MessageId], layer: &mut 
         trigger = trigger.shortcut(shortcut);
     }
     let placeholder = match (&note, which) {
+        (_, Picker::Snooze) => "Snooze until\u{2026} (try \u{201c}fri 9am\u{201d})".to_owned(),
         (Some(note), _) => format!("{label} {}", note.to_lowercase()),
         (None, _) => label.to_owned(),
     };
     let empty = match which {
         Picker::Move => "No folder by that name",
         Picker::Label => "No label by that name",
+        Picker::Snooze => "Type a time, like \u{201c}tomorrow 5pm\u{201d}",
     };
     Combobox::new(key, state, &options, move |s: &mut App| s.picker_state(which))
         .label(label)
         .trigger(trigger.build(k).key(format!("t-{key}")))
         .search_placeholder(placeholder)
         .empty_message(empty)
-        .width(300.0)
+        .width(if which == Picker::Snooze { 340.0 } else { 300.0 })
         .max_height(320.0)
         .on_choose(move |s: &mut App, option: &str, tx: &mut Tx| s.pick(which, option, tx))
-        .build(k, layer)
-}
-
-/// Snooze…: an icon button that opens the times to snooze the targets until (also `b`):
-/// ready-made ones, or one typed in its field ("fri 9am"). In Snoozed it picks a new time.
-pub fn snooze_picker(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
-    let k = &t.k;
-    let label = if s.view_role() == Some(Role::Snoozed) { "Snooze until another time…" } else { "Snooze…" };
-    let state = &s.snooze_picker;
-    // Built only while it's open: the closed picker is just its button.
-    let options = if state.open { s.snooze_options() } else { Vec::new() };
-    let mut trigger = IconButton::new(&icons::CLOCK).variant(IconButtonVariant::GhostMuted).label(label).help(label).expanded(state.open);
-    let shortcut = key_label(&s.settings, "keys.snooze");
-    if !shortcut.is_empty() {
-        trigger = trigger.shortcut(shortcut);
-    }
-    Combobox::new("snooze-picker", state, &options, |s: &mut App| &mut s.snooze_picker)
-        .label(label)
-        .trigger(trigger.build(k).key("t-snooze-picker"))
-        .search_placeholder("Snooze until… (try \u{201c}fri 9am\u{201d})")
-        .empty_message("Type a time, like \u{201c}tomorrow 5pm\u{201d}")
-        .width(340.0)
-        .max_height(320.0)
-        .on_choose(|s: &mut App, option: &str, tx: &mut Tx| s.pick_snooze(option, tx))
         .build(k, layer)
 }
 
@@ -143,7 +126,7 @@ pub fn selection_bar(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
             "keys.star",
             move |s, _| s.set_starred(s.targets(), any_unstarred),
         ))
-        .child(snooze_picker(s, t, layer))
+        .child(picker(s, t, Picker::Snooze, &ids, layer))
         .child(picker(s, t, Picker::Move, &ids, layer))
         .children(s.all_gmail(&ids).then(|| picker(s, t, Picker::Label, &ids, layer)))
 }

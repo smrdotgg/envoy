@@ -399,11 +399,12 @@ pub enum Action {
     Snooze,
 }
 
-/// Which picker: Move to… (`v`) or Label… (`l`, Gmail).
+/// Which picker: Move to… (`v`), Label… (`l`, Gmail) or Snooze… (`b`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Picker {
     Move,
     Label,
+    Snooze,
 }
 
 /// A picker's options and the note on what it leaves out ([`App::picker_options`]), with what
@@ -1856,11 +1857,15 @@ impl App {
         match which {
             Picker::Move => &mut self.move_picker,
             Picker::Label => &mut self.label_picker,
+            Picker::Snooze => &mut self.snooze_picker,
         }
     }
 
-    /// Opens Move to… or Label… for the targets, its search field ready for typing.
+    /// Opens Move to…, Label… or Snooze… for the targets, its search field ready for typing.
     pub fn open_picker(&mut self, which: Picker) {
+        if which == Picker::Snooze {
+            return self.open_snooze_picker();
+        }
         let ids = self.targets();
         if ids.is_empty() {
             return;
@@ -1885,6 +1890,10 @@ impl App {
     /// Linear in the targets and the mailboxes, and built again only when either changes: the
     /// open picker asks every frame ([`App::picker_cache`]).
     pub fn picker_options(&self, which: Picker, ids: &[MessageId]) -> (Vec<ComboboxOption>, Option<String>) {
+        // Times, as of now and what's typed: nothing to keep.
+        if which == Picker::Snooze {
+            return (self.snooze_options(), None);
+        }
         // What the answer depends on: the picker, the targets, and the mailboxes (not their
         // counts). Checking that reads neither the list nor the rows.
         let mailboxes = self.mailboxes_fingerprint();
@@ -1993,6 +2002,7 @@ impl App {
                     self.label(ids, name.to_owned(), tx);
                 }
             }
+            (Picker::Snooze, o) => self.pick_snooze(o, tx),
         }
     }
 
@@ -3011,7 +3021,7 @@ impl App {
             }
             Action::MoveTo => self.open_picker(Picker::Move),
             Action::Label => self.open_picker(Picker::Label),
-            Action::Snooze => self.open_snooze_picker(),
+            Action::Snooze => self.open_picker(Picker::Snooze),
             Action::Search => {
                 self.screen = Screen::Mail;
                 self.search.focused = true;
