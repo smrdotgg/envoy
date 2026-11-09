@@ -267,6 +267,11 @@ impl Store {
         if hits.as_ref().is_some_and(|h| h.ids.is_empty()) {
             return Ok(Vec::new());
         }
+        // Snoozed goes by wake time, not date: its rows come in one piece, sorted at the end.
+        let snoozed = matches!(view, View::Role { role: Role::Snoozed, .. });
+        let page = if snoozed { 0 } else { page };
+        // Messages back from a snooze come first in the inbox, until they're dealt with.
+        let pinned = if query.is_empty() { self.pinned_boxes(view, &scope) } else { Vec::new() };
         let (limit, page) = (limit as usize, page as usize);
         let mut g = Grouper {
             conversations,
@@ -290,6 +295,16 @@ impl Store {
         let mut shown: Vec<Summary> = Vec::new();
         let mut done = 0;
         let mut stopped = false;
+        if !pinned.is_empty() {
+            let (sql, args) = pinned_sql(&pinned, &filter);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(args.iter()))?;
+            while let Some(r) = rows.next()? {
+                if let Took::Full = g.take(r, true)? {
+                    break;
+                }
+            }
+        }
         {
             let mut stmt = self.conn.prepare(&sql)?;
             let mut rows = stmt.query(params_from_iter(args.iter()))?;
@@ -317,7 +332,21 @@ impl Store {
         }
         let rest = self.read_full(&g.out[done..])?;
         shown.extend(rest);
+        if snoozed {
+            // Soonest to wake first; the server's own snoozes (no time in their name) last.
+            shown.sort_by_key(|s| (crate::snooze::wake_of(&s.mailbox).unwrap_or(i64::MAX), std::cmp::Reverse((s.date, s.id))));
+        }
         Ok(shown)
+    }
+
+    /// The mailboxes of `view` whose woken messages ([`flags::WOKEN`]) come first: the inbox's.
+    fn pinned_boxes(&self, view: &View, scope: &Scope) -> Vec<(String, String)> {
+        let Scope::Boxes(boxes) = scope else { return Vec::new() };
+        match view {
+            View::Role { role: Role::Inbox, .. } => boxes.clone(),
+            View::Mailbox { account, mailbox } if self.role_of(account, mailbox) == Role::Inbox => boxes.clone(),
+            _ => Vec::new(),
+        }
     }
 
     /// Counts the older messages of `g.out[from..]`'s conversations: messages the scan didn't
@@ -438,6 +467,22 @@ fn scan_sql(scope: &Scope, filter: &Filter, few: Option<&Hits>) -> (String, Vec<
     (sql, args)
 }
 
+/// The woken messages of `boxes`, newest first, by `messages_woken` (a handful of rows).
+fn pinned_sql(boxes: &[(String, String)], filter: &Filter) -> (String, Vec<SqlValue>) {
+    let mut args: Vec<SqlValue> = Vec::new();
+    let arms: Vec<String> = boxes
+        .iter()
+        .map(|(a, b)| {
+            args.push(a.clone().into());
+            args.push(b.clone().into());
+            args.extend(filter.args.iter().cloned());
+            // The planner, without statistics, would read the inbox's whole date index instead.
+            format!("SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_woken WHERE m.account = ? AND m.mailbox = ? AND m.flags & {} != 0 AND {}", flags::WOKEN, filter.sql())
+        })
+        .collect();
+    (format!("{} ORDER BY 5 DESC, 1 DESC", arms.join(" UNION ALL ")), args)
+}
+
 /// `[1,2,3]`, for `json_each`.
 fn ids_json(ids: &[i64]) -> String {
     let mut s = String::with_capacity(ids.len() * 7 + 2);
@@ -535,5 +580,15 @@ mod tests {
         // account in messages_by_category: quadratic over a download).
         let set = plan(&st, super::super::categories::SET_CATEGORY, &["a".to_owned().into(), "t".to_owned().into(), 1i64.into()]);
         assert!(set.iter().any(|p| p.contains("INDEX messages_thread (account=? AND thread=?)")), "{set:?}");
+    }
+
+    /// The inbox's woken messages are found by their own small index, not by reading the inbox.
+    #[test]
+    fn pinned_rows_are_read_by_their_own_index() {
+        let st = Store::memory();
+        let (sql, args) = pinned_sql(&[("a".to_owned(), "INBOX".to_owned()), ("b".to_owned(), "INBOX".to_owned())], &Filter::new(&Query::default()));
+        let mut stmt = st.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = stmt.query_map(params_from_iter(args.iter()), |r| r.get::<_, String>(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(plan.iter().filter(|p| p.contains("INDEX messages_woken")).count() == 2, "{plan:?}");
     }
 }

@@ -10,6 +10,10 @@ pub mod flags {
     pub const ANSWERED: u32 = 4;
     pub const DRAFT: u32 = 8;
     pub const DELETED: u32 = 16;
+    /// Back from a snooze, and not dealt with yet: pinned to the top of the inbox. The server's
+    /// `$new` keyword where it keeps keywords; elsewhere this computer's alone
+    /// ([`crate::snooze`]).
+    pub const WOKEN: u32 = 32;
 }
 
 /// What a mailbox is for, from IMAP SPECIAL-USE attributes (or well-known names).
@@ -24,6 +28,8 @@ pub enum Role {
     Junk,
     Trash,
     Important,
+    /// A snooze bucket ([`crate::snooze`]), its parent, or the server's own snoozed mailbox.
+    Snoozed,
     Other,
 }
 
@@ -39,6 +45,7 @@ impl Role {
             Role::Junk => "junk",
             Role::Trash => "trash",
             Role::Important => "important",
+            Role::Snoozed => "snoozed",
             Role::Other => "other",
         }
     }
@@ -54,6 +61,7 @@ impl Role {
             "junk" => Role::Junk,
             "trash" => Role::Trash,
             "important" => Role::Important,
+            "snoozed" => Role::Snoozed,
             _ => Role::Other,
         }
     }
@@ -69,6 +77,7 @@ impl Role {
             Role::Junk => "Spam",
             Role::Trash => "Trash",
             Role::Important => "Important",
+            Role::Snoozed => "Snoozed",
             Role::Other => "",
         }
     }
@@ -78,14 +87,15 @@ impl Role {
         match self {
             Role::Inbox => 0,
             Role::Flagged => 1,
-            Role::Important => 2,
-            Role::Sent => 3,
-            Role::Drafts => 4,
-            Role::Archive => 5,
-            Role::All => 6,
-            Role::Junk => 7,
-            Role::Trash => 8,
-            Role::Other => 9,
+            Role::Snoozed => 2,
+            Role::Important => 3,
+            Role::Sent => 4,
+            Role::Drafts => 5,
+            Role::Archive => 6,
+            Role::All => 7,
+            Role::Junk => 8,
+            Role::Trash => 9,
+            Role::Other => 10,
         }
     }
 }
