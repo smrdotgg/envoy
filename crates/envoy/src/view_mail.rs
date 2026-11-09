@@ -620,10 +620,16 @@ fn empty_list(s: &App, t: &Theme) -> El {
         .child(text(sub).font(k.ty.text_small).color(k.c.text_faint).wrap())
 }
 
+/// What a row of the list is: a conversation, or (outside conversation view, and in Drafts and
+/// Snoozed, which list each on its own: [`App::grouped`]) a message.
+fn row_noun(s: &App) -> &'static str {
+    if s.grouped() { "conversation" } else { "message" }
+}
+
 fn list_header(s: &App, t: &Theme) -> El {
     let k = &t.k;
     let unread = s.list.iter().filter(|m| m.thread_unread).count();
-    let noun = if s.conversations() { "conversation" } else { "message" };
+    let noun = row_noun(s);
     // While the rest of a long list is on its way (a frame or two), its counts are "at least".
     let more = if s.list_complete { "" } else { "+" };
     let n = s.list.len();
@@ -852,6 +858,20 @@ pub fn mail_screen(s: &App, t: &Theme, cx: &mut Cx<App>, layer: &mut Vec<El>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_list_header_counts_what_a_row_is() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        assert_eq!(row_noun(&app), "conversation");
+        for role in [Role::Snoozed, Role::Drafts] {
+            app.view = View::Role { account: Some("demo".into()), role };
+            assert_eq!(row_noun(&app), "message", "{role:?}: a message a row");
+        }
+        let _ = app.settings.set("inbox.conversationView", serde_json::json!(false));
+        app.view = View::Role { account: Some("demo".into()), role: Role::Inbox };
+        assert_eq!(row_noun(&app), "message");
+    }
 
     #[test]
     fn selecting_builds_again_only_the_rows_it_marks() {

@@ -294,8 +294,9 @@ impl Store {
         // Snoozed goes by wake time, not date, a message a row: each bucket in the scope's order.
         let snoozed = matches!(view, View::Role { role: Role::Snoozed, .. });
         let conversations = conversations && !snoozed;
-        // Messages back from a snooze come first in the inbox, until they're dealt with.
-        let pinned = if query.is_empty() { self.pinned_boxes(view, &scope) } else { Vec::new() };
+        // Messages back from a snooze come first in the inbox, and in their own tab of the split
+        // inbox (the filter keeps its category), until they're dealt with; a search goes by date.
+        let pinned = if query.is_search() { Vec::new() } else { self.pinned_boxes(view, &scope) };
         let (limit, page) = (limit as usize, page as usize);
         let mut g = Grouper {
             conversations,
@@ -645,12 +646,15 @@ mod tests {
         assert!(!plan(&st, &sql, &args).is_empty());
     }
 
-    /// The inbox's woken messages are found by their own small index, not by reading the inbox.
+    /// The inbox's woken messages are found by their own small index, not by reading the inbox:
+    /// in a tab of the split inbox too.
     #[test]
     fn pinned_rows_are_read_by_their_own_index() {
         let st = Store::memory();
-        let (sql, args) = pinned_sql(&[("a".to_owned(), "INBOX".to_owned()), ("b".to_owned(), "INBOX".to_owned())], &Filter::new(&Query::default()));
-        let plan = plan(&st, &sql, &args);
-        assert!(plan.iter().filter(|p| p.contains("INDEX messages_woken")).count() == 2, "{plan:?}");
+        for query in [Query::default(), Query::in_category(Category::Newsletters)] {
+            let (sql, args) = pinned_sql(&[("a".to_owned(), "INBOX".to_owned()), ("b".to_owned(), "INBOX".to_owned())], &Filter::new(&query));
+            let plan = plan(&st, &sql, &args);
+            assert!(plan.iter().filter(|p| p.contains("INDEX messages_woken")).count() == 2, "{query:?}: {plan:?}");
+        }
     }
 }

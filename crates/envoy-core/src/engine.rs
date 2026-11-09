@@ -1821,7 +1821,7 @@ fn spawn_worker(shared: Arc<Shared>, account: String) -> Worker {
 /// connect, its jobs fall back to the background loop, so nothing is lost.
 async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedReceiver<Job>, fallback: mpsc::UnboundedSender<Job>, notify: Arc<Notify>) {
     let mut session: Option<Session> = None;
-    let mut used = Used::now();
+    let mut used = Clocks::now();
     loop {
         let job = match &session {
             Some(_) => match tokio::time::timeout(Duration::from_secs(300), rx.recv()).await {
@@ -1852,7 +1852,7 @@ async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedRece
                 notify.notify_one();
             }
         }
-        used = Used::now();
+        used = Clocks::now();
     }
 }
 
@@ -1860,18 +1860,19 @@ async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedRece
 /// the next: long enough that one in use never is, short enough to beat NATs and sleep.
 const PROBE_AFTER: Duration = Duration::from_secs(60);
 
-/// When the foreground connection was last used, by both clocks: the monotonic one stands still
-/// while the computer sleeps (on macOS and Linux), the wall clock doesn't, so a connection that
-/// slept with the computer is probed however briefly it's been awake since.
+/// A moment by both clocks: the monotonic one stands still while the computer sleeps (on macOS
+/// and Linux), the wall clock doesn't. When the foreground connection was last used, so a
+/// connection that slept with the computer is probed however briefly it's been awake since;
+/// and a worker's last look at the time ([`clock_jumped`]).
 #[derive(Clone, Copy)]
-struct Used {
+struct Clocks {
     at: Instant,
     wall: std::time::SystemTime,
 }
 
-impl Used {
-    fn now() -> Used {
-        Used { at: Instant::now(), wall: std::time::SystemTime::now() }
+impl Clocks {
+    fn now() -> Clocks {
+        Clocks { at: Instant::now(), wall: std::time::SystemTime::now() }
     }
 
     /// How long since, by whichever clock says longer (a wall clock set back says nothing).
@@ -2803,19 +2804,6 @@ impl SnoozeClock {
 /// in that time before it's woken.
 const CLOCK_CHECK: Duration = Duration::from_secs(30);
 const CLOCK_JUMP: Duration = Duration::from_secs(10);
-
-/// Both clocks, read together ([`clock_jumped`]).
-#[derive(Clone, Copy)]
-struct Clocks {
-    at: Instant,
-    wall: std::time::SystemTime,
-}
-
-impl Clocks {
-    fn now() -> Clocks {
-        Clocks { at: Instant::now(), wall: std::time::SystemTime::now() }
-    }
-}
 
 /// The wall clock moved differently from the monotonic one between `before` and `after`: the
 /// computer slept (the monotonic clock stands still meanwhile, on macOS and Linux), or the
@@ -3859,10 +3847,10 @@ mod tests {
     #[test]
     fn idle_time_counts_the_computer_asleep() {
         // The monotonic clock stood still while asleep; the wall clock went on.
-        let slept = Used { at: Instant::now(), wall: std::time::SystemTime::now() - Duration::from_secs(3600) };
+        let slept = Clocks { at: Instant::now(), wall: std::time::SystemTime::now() - Duration::from_secs(3600) };
         assert!(slept.idle() >= Duration::from_secs(3600));
         // A wall clock set back doesn't hide the time that passed.
-        let set_back = Used { at: Instant::now() - Duration::from_secs(90), wall: std::time::SystemTime::now() + Duration::from_secs(3600) };
+        let set_back = Clocks { at: Instant::now() - Duration::from_secs(90), wall: std::time::SystemTime::now() + Duration::from_secs(3600) };
         assert!(set_back.idle() >= Duration::from_secs(90));
     }
 
@@ -5497,6 +5485,106 @@ mod tests {
         set_flags(&shared, vec![woken], 0, flags::WOKEN, false).unwrap();
         assert_eq!(shared.with_writer(|st| Ok(rows(st, "", false))).unwrap(), [newest, reply, middle, woken]);
         assert_eq!(queued(&shared), [Op::SetFlags { mailbox: "INBOX".into(), uid: 1, add: 0, remove: flags::WOKEN }], "and the server told");
+    }
+
+    /// Mail of each of the split inbox's categories, as `store::categories`' tests have it, to
+    /// "me@x.example".
+    fn kind(c: Category) -> &'static str {
+        match c {
+            Category::Important => "From: Sam <sam@ortiz.family>\r\nTo: me@x.example\r\nSubject: Dinner?",
+            Category::Other => "From: Bo <bo@northwind.dev>\r\nTo: team@northwind.dev\r\nCc: me@x.example\r\nSubject: Offsite agenda",
+            Category::Newsletters => "From: Northwind Weekly <hello@northwind.example>\r\nTo: me@x.example\r\nSubject: This week\r\nList-Unsubscribe: <https://northwind.example/u>",
+            Category::Notifications => "From: Jordan <notifications@github.com>\r\nTo: x/y <y@noreply.github.com>\r\nCc: me@x.example\r\nSubject: [x/y] PR #42\r\nList-ID: x/y <y.x.github.com>\r\nX-GitHub-Reason: review_requested",
+        }
+    }
+
+    /// A message of kind `c`, stored as a sync stores one (sorted as it lands), at hour `uid`.
+    fn sorted_message(st: &Store, mailbox: &str, uid: u32, c: Category, mid: &str, fl: u32) -> MessageId {
+        let raw = format!("{}\r\nMessage-ID: {mid}\r\nDate: Tue, 3 Mar 2026 {uid:02}:00:00 +0000\r\n\r\nhi\r\n", kind(c));
+        let p = crate::mime::parse(raw.as_bytes(), true).unwrap();
+        st.transaction(|st| st.upsert_header("a", mailbox, uid, fl, 10, 0, &p)).unwrap()
+    }
+
+    /// An inbox with one older woken conversation and one newer one in each category: `(woken,
+    /// newer)` per category, in [`Category::ALL`]'s order.
+    fn split_inbox_with_woken() -> (Store, Vec<(MessageId, MessageId)>) {
+        let st = snooze_setup(&[]);
+        st.set_classifier(crate::category::Classifier::new(vec![], ["me@x.example".to_owned()])).unwrap();
+        let mut pairs = Vec::new();
+        for (i, c) in (0u32..).zip(Category::ALL) {
+            let woken = sorted_message(&st, "INBOX", 1 + i, c, &format!("<woken{i}@x>"), flags::WOKEN);
+            let newer = sorted_message(&st, "INBOX", 10 + i, c, &format!("<newer{i}@x>"), 0);
+            pairs.push((woken, newer));
+        }
+        (st, pairs)
+    }
+
+    #[test]
+    fn a_woken_conversation_is_pinned_atop_its_own_tab_in_each_category() {
+        let (st, pairs) = split_inbox_with_woken();
+        let inbox = View::Role { account: None, role: Role::Inbox };
+        for (c, (woken, newer)) in Category::ALL.into_iter().zip(pairs) {
+            for conversations in [false, true] {
+                let rows = st.list(&inbox, &Query::in_category(c), conversations, 100, &HashSet::new()).unwrap();
+                assert_eq!(rows.iter().map(|s| s.id).collect::<Vec<_>>(), [woken, newer], "{c:?}: first, though older, and in no other tab");
+                assert!(rows.iter().all(|s| s.category == c), "{c:?}: {rows:?}");
+            }
+            // Streamed: the first page is the tab's top.
+            let mut first = Vec::new();
+            st.list_paged(&inbox, &Query::in_category(c), true, 100, &HashSet::new(), 1, &mut |p| first = p).unwrap();
+            assert_eq!(first.iter().map(|s| s.id).collect::<Vec<_>>(), [woken], "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_search_pins_nothing_category_included() {
+        let (st, pairs) = split_inbox_with_woken();
+        let inbox = View::Role { account: None, role: Role::Inbox };
+        let (woken, newer): (Vec<MessageId>, Vec<MessageId>) = pairs.into_iter().unzip();
+        let ids = |query: Query| st.list(&inbox, &query, false, 100, &HashSet::new()).unwrap().into_iter().map(|s| s.id).collect::<Vec<_>>();
+        // As the app asks while a search shows (no tab), and under a tab: by date either way.
+        for tab in [None, Some(Category::Important)] {
+            let search = |q: &str| ids(Query { tab, ..Query::parse(q) });
+            assert_eq!(search("from:sam"), [newer[0], woken[0]], "{tab:?}");
+            assert_eq!(search("dinner"), [newer[0], woken[0]], "{tab:?}");
+            assert_eq!(search("category:important"), [newer[0], woken[0]], "{tab:?}");
+            assert_eq!(search("category:n"), [newer[3], newer[2], woken[3], woken[2]], "{tab:?}");
+        }
+        let unread: Vec<MessageId> = newer.iter().rev().chain(woken.iter().rev()).copied().collect();
+        assert_eq!(ids(Query::parse("is:unread")), unread);
+        // The inbox as it is (the split off): every woken one first.
+        let whole: Vec<MessageId> = woken.iter().rev().chain(newer.iter().rev()).copied().collect();
+        assert_eq!(ids(Query::default()), whole);
+    }
+
+    #[test]
+    fn a_woken_message_is_sorted_like_any_other_as_it_comes_back() {
+        let wake = later();
+        let st = snooze_setup(&[wake]);
+        st.set_classifier(crate::category::Classifier::new(vec![], ["me@x.example".to_owned()])).unwrap();
+        let inbox = View::Role { account: None, role: Role::Inbox };
+        let tab = |c: Category| st.list(&inbox, &Query::in_category(c), true, 100, &HashSet::new()).unwrap().into_iter().map(|s| s.id).collect::<Vec<_>>();
+        let older = sorted_message(&st, "INBOX", 20, Category::Newsletters, "<older@x>", 0);
+        // Snoozed by another Envoy: this one never had it. Moved back with `$new`, it's stored
+        // in the inbox like any new mail, and sorted as it lands.
+        let back = sorted_message(&st, "INBOX", 2, Category::Newsletters, "<back@x>", flags::WOKEN);
+        assert_eq!(st.summary(back).unwrap().unwrap().category, Category::Newsletters);
+        assert_eq!(tab(Category::Newsletters), [back, older], "atop its own tab");
+        // Where the server can't keep `$new`: marked here as it's stored (as the sync does, in
+        // one transaction), sorted the same.
+        st.add_woken("a", &["<plain@x>".to_owned()], now()).unwrap();
+        let plain = st
+            .transaction(|st| {
+                let raw = format!("{}\r\nMessage-ID: <plain@x>\r\nDate: Tue, 3 Mar 2026 03:00:00 +0000\r\n\r\nhi\r\n", kind(Category::Notifications));
+                let id = st.upsert_header("a", "INBOX", 3, 0, 10, 0, &crate::mime::parse(raw.as_bytes(), true).unwrap())?;
+                st.apply_woken(id)?;
+                Ok(id)
+            })
+            .unwrap();
+        let s = st.summary(plain).unwrap().unwrap();
+        assert_eq!((s.category, s.flags & flags::WOKEN), (Category::Notifications, flags::WOKEN));
+        assert_eq!(tab(Category::Notifications), [plain]);
+        assert!(tab(Category::Important).is_empty(), "nothing woken lands in a tab not its own");
     }
 
     #[test]
