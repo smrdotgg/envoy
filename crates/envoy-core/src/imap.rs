@@ -210,6 +210,13 @@ pub fn failure(e: &anyhow::Error) -> Failure {
     }
 }
 
+/// The connection failed, rather than the server answering: lost, closed, timed out. A server's
+/// NO or BAD, a sign-in refused, or a request that can't succeed ([`Refused`]) is not.
+pub fn connection_trouble(e: &anyhow::Error) -> bool {
+    let answered = matches!(e.downcast_ref::<async_imap::error::Error>(), Some(async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_)));
+    !answered && !is_auth_error(e) && e.downcast_ref::<Refused>().is_none()
+}
+
 /// Decodes IMAP's modified UTF-7 mailbox names (`&AOk-t&AOk-` → `été`).
 pub fn decode_utf7(name: &str) -> String {
     use base64::Engine as _;
