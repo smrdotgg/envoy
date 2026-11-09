@@ -850,6 +850,14 @@ impl Store {
         Store::with(conn, false, false)
     }
 
+    /// Commits from here on aren't synced to disk: for a cache that's thrown away when the app
+    /// closes (demo mode's), whose writes then cost no waiting on the disk. An OS crash may lose
+    /// some of it, which doesn't matter there.
+    pub fn throwaway(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA synchronous = OFF")?;
+        Ok(())
+    }
+
     /// Copies the next `chunk` message ids' worth of an old cache's search index into
     /// `fts_next`, or swaps it in once it has everything ([`FTS_NEXT`]). False when there's
     /// nothing left to do. Each call is one short transaction, so the writer is free between.

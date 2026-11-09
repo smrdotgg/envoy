@@ -206,6 +206,9 @@ pub const FIRST_PAGE: u32 = 100;
 /// it to leave out the ones already in the message.
 pub const SUGGESTIONS: usize = 12;
 
+/// Why demo mode won't add an account.
+const DEMO_ACCOUNTS: &str = "Demo mode shows sample mail only, and never connects to anything. To add your account, start Envoy without --demo.";
+
 /// How many messages of an old cache [`Store::backfill_contacts`] counts at a time: the writer
 /// is held about 20 ms a chunk on envoy-bench's 100k-message cache (500 held it 33 ms), and the
 /// whole cache takes about 10 s, in the background.
@@ -235,14 +238,42 @@ impl Engine {
     /// Commands sent before it's open wait their turn. If the cache can't be opened, the engine
     /// reports an [`Event::Error`] and stops; later commands are dropped.
     pub fn start(waker: impl Fn() + Send + Sync + 'static, settings: Settings) -> Result<Engine> {
+        Engine::launch(Arc::new(waker), settings, None)
+    }
+
+    /// [`Engine::start`] for demo mode: the accounts are `server`'s, their mail is on it (an
+    /// IMAP server in this process, [`crate::demo`]), and the cache is `db`, filled from it
+    /// before the first command is answered. Nothing it does touches the network: sends go to
+    /// the same server ([`crate::demo::Server::deliver`]), and what only the network could do
+    /// (adding an account, remote pictures) is refused.
+    pub fn start_offline(waker: impl Fn() + Send + Sync + 'static, settings: Settings, server: Arc<crate::demo::Server>, db: PathBuf) -> Result<Engine> {
+        Engine::launch(Arc::new(waker), settings, Some((server, db)))
+    }
+
+    fn launch(waker: Waker, settings: Settings, demo: Option<(Arc<crate::demo::Server>, PathBuf)>) -> Result<Engine> {
         let (tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, rx) = std::sync::mpsc::channel();
-        let waker: Waker = Arc::new(waker);
         let writer = OpenedStore::default();
         let opened = writer.clone();
         std::thread::Builder::new().name("envoy-engine".into()).spawn(move || {
-            let db = paths::database_file();
+            let (db, demo) = match demo {
+                Some((server, db)) => {
+                    if let Some(dir) = db.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    (db, Some(server))
+                }
+                None => (paths::database_file(), None),
+            };
             let stores = Store::open(&db).and_then(|writer| Ok((writer, Store::open(&db)?)));
+            // Demo mode's cache goes as it closes: nothing in it is worth a wait on the disk.
+            let stores = stores.and_then(|(w, r)| {
+                if demo.is_some() {
+                    w.throwaway()?;
+                    r.throwaway()?;
+                }
+                Ok((w, r))
+            });
             let (writer, reader) = match stores {
                 Ok(s) => s,
                 Err(e) => {
@@ -260,7 +291,8 @@ impl Engine {
                 waker,
                 settings: RwLock::new(settings),
                 tokens: Mutex::new(HashMap::new()),
-                accounts: RwLock::new(accounts::load()),
+                accounts: RwLock::new(demo.as_ref().map_or_else(accounts::load, |s| s.accounts())),
+                demo,
                 watched: Mutex::new(None),
                 synced: Mutex::new(HashMap::new()),
                 undo_keys: Mutex::new(HashMap::new()),
@@ -323,6 +355,13 @@ impl Engine {
     pub fn drain(&self) -> Vec<Event> {
         self.rx.try_iter().collect()
     }
+
+    /// [`Engine::drain`], waiting up to `wait` for the first event if none is ready: for tests
+    /// and headless runs, which wait for the engine's answers. Never for a window's frame.
+    pub fn wait(&self, wait: Duration) -> Vec<Event> {
+        let Ok(first) = self.rx.recv_timeout(wait) else { return Vec::new() };
+        std::iter::once(first).chain(self.rx.try_iter()).collect()
+    }
 }
 
 struct Shared {
@@ -333,6 +372,8 @@ struct Shared {
     settings: RwLock<Settings>,
     tokens: Mutex<HashMap<String, (String, Instant)>>,
     accounts: RwLock<Vec<Account>>,
+    /// Demo mode's server, which every account's mail is on ([`Engine::start_offline`]).
+    demo: Option<Arc<crate::demo::Server>>,
     /// The view on screen, whose mailboxes ([`Store::watched_boxes`], resolved by each worker
     /// every round: Snoozed's buckets come and go) are synced with the inbox, and in between
     /// looked at for changes ([`changed_since_synced`]).
@@ -435,6 +476,20 @@ impl Shared {
         if let Ok(n) = self.with_writer(|st| st.pending_count()) {
             self.emit(Event::Pending(n));
         }
+    }
+
+    /// A logged-in IMAP connection to the account's server: the demo's own in demo mode.
+    async fn connect(&self, account: &Account) -> Result<Session> {
+        if let Some(server) = &self.demo {
+            return server.connect(account).await;
+        }
+        let cred = self.credential(account).await?;
+        imap::connect(account, &cred).await
+    }
+
+    /// What "Message sent" says.
+    fn sent_toast(&self) -> &'static str {
+        if self.demo.is_some() { "Sent (demo mode: nothing left your computer)" } else { "Message sent" }
     }
 
     /// A credential to log in with, refreshing an OAuth access token when it is near expiry.
@@ -555,6 +610,9 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
     drop_unprovable_ops(&shared);
     // Before any worker stores mail: it's sorted with the user's rules as it lands.
     update_classifier(&shared);
+    if shared.demo.is_some() {
+        seed(&shared).await;
+    }
     let mut workers: HashMap<String, Worker> = HashMap::new();
     let accounts = shared.accounts.read().map(|a| a.clone()).unwrap_or_default();
     shared.emit(Event::Accounts(accounts.clone()));
@@ -611,6 +669,41 @@ fn drop_unprovable_ops(shared: &Shared) {
         }
         Err(e) => log::error!("couldn't check the queued changes: {e:#}"),
     }
+}
+
+/// Demo mode: fills the cache from the demo's server as an account's first sync would, through
+/// the same code, before anything reads it: the folders a worker syncs by itself (the inbox,
+/// Sent, Drafts, Starred, Snoozed), headers and every body, and every folder's counts. The first
+/// list is whole, and the workers' first round finds nothing to change; other folders sync when
+/// they're opened, as they would.
+async fn seed(shared: &Arc<Shared>) {
+    let started = Instant::now();
+    let accounts = shared.accounts.read().map(|a| a.clone()).unwrap_or_default();
+    for account in &accounts {
+        if let Err(e) = seed_account(shared, account).await {
+            log::error!("{}: couldn't fill the demo's cache: {e:#}", account.email);
+        }
+    }
+    log::debug!("filled the demo's cache in {:?}", started.elapsed());
+}
+
+async fn seed_account(shared: &Arc<Shared>, account: &Account) -> Result<()> {
+    let id = &account.id;
+    let mut session = shared.connect(account).await?;
+    let listed = imap::list_mailboxes(&mut session).await?;
+    shared.with_writer(|st| store_listing(st, id, &listed))?;
+    let window = shared.setting_u32("sync.initialMessages").max(50);
+    for m in listed.iter().filter(|m| m.selectable) {
+        if matches!(m.role, Role::Inbox | Role::Sent | Role::Drafts | Role::Flagged | Role::Snoozed) {
+            let out = imap::sync_mailbox(&mut session, &shared.writer, id, &m.name, window, &|| {}).await?;
+            shared.synced(id, &m.name, out.contents);
+            let (validity, missing) = shared.with_writer(|st| Ok((st.uidvalidity(id, &m.name)?, st.missing_bodies(id, &m.name, window, u32::MAX)?)))?;
+            imap::fetch_bodies(&mut session, &shared.writer, id, &m.name, validity, &missing).await?;
+        }
+        let (unread, total) = imap::status(&mut session, &m.name).await?;
+        shared.with_writer(|st| st.set_counts(id, &m.name, unread, total))?;
+    }
+    session.logout().await
 }
 
 /// Gives an old cache's search index its prefix index ([`Store::upgrade_search`]), a few
@@ -992,6 +1085,8 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 }
             }
         }
+        Command::AddAccount { .. } if shared.demo.is_some() => shared.emit(Event::AccountFailed(DEMO_ACCOUNTS.into())),
+        Command::GoogleSignIn { .. } if shared.demo.is_some() => shared.emit(Event::GoogleFailed(DEMO_ACCOUNTS.into())),
         Command::AddAccount { account, secret } => {
             let shared2 = shared.clone();
             // Test the login before saving anything.
@@ -1041,11 +1136,17 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             if let Ok(mut w) = shared.wakers.lock() {
                 w.remove(&id);
             }
-            secrets::remove(&id);
+            // The demo's accounts are its server's: never in the keychain or accounts.json.
+            let demo = shared.demo.is_some();
+            if !demo {
+                secrets::remove(&id);
+            }
             let list = {
                 let mut accts = shared.accounts.write().map_err(|_| anyhow!("poisoned"))?;
                 accts.retain(|a| a.id != id);
-                accounts::save(&accts)?;
+                if !demo {
+                    accounts::save(&accts)?;
+                }
                 accts.clone()
             };
             shared.store_me();
@@ -1090,6 +1191,12 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
         }
         Command::FetchImage { url, message } => {
             let shared = shared.clone();
+            let embedded = url.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("cid:"));
+            if shared.demo.is_some() && !embedded {
+                // Nothing's fetched from anywhere in demo mode: a picture from the web stays out.
+                shared.emit(Event::ImageFailed { url });
+                return Ok(());
+            }
             let raw = if url.starts_with("cid:") { shared.with_writer(|st| st.raw(message)).ok().flatten() } else { None };
             tokio::spawn(async move {
                 let permit = IMAGE_SLOTS.acquire().await;
@@ -1754,6 +1861,7 @@ fn image_bytes(url: &str, raw: Option<&[u8]>) -> Result<Vec<u8>> {
         .user_agent("Mozilla/5.0 (compatible; Envoy mail)")
         .build()
         .into();
+    crate::net::allowed(url)?;
     let mut resp = agent.get(url).call()?;
     let bytes = resp.body_mut().with_config().limit(MAX_IMAGE_BYTES).read_to_vec()?;
     let _ = std::fs::create_dir_all(&dir);
@@ -1786,6 +1894,9 @@ pub fn open_browser(url: &str) -> std::io::Result<()> {
 async fn learn_server_size(shared: Arc<Shared>, id: String) {
     if shared.with_writer(|st| st.send_limit(&id)).ok().flatten().is_some() {
         return;
+    }
+    if shared.demo.is_some() {
+        return shared.learned_size(&id, Some(crate::demo::SEND_LIMIT));
     }
     let Some(account) = shared.account(&id) else { return };
     match smtp::server_size(&account).await {
@@ -1890,8 +2001,7 @@ impl Foreground for ImapForeground<'_> {
     type Session = Session;
 
     async fn connect(&mut self) -> Result<Session> {
-        let cred = self.shared.credential(self.account).await?;
-        imap::connect(self.account, &cred).await
+        self.shared.connect(self.account).await
     }
 
     async fn probe(&mut self, session: &mut Session) -> Result<()> {
@@ -2062,11 +2172,7 @@ async fn worker(shared: Arc<Shared>, id: String, mut jobs: mpsc::UnboundedReceiv
     loop {
         let Some(account) = shared.account(&id) else { return };
         shared.emit(Event::Sync { account: id.clone(), state: SyncState::Connecting });
-        let session = match shared.credential(&account).await {
-            Ok(cred) => imap::connect(&account, &cred).await,
-            Err(e) => Err(e),
-        };
-        let session = match session {
+        let session = match shared.connect(&account).await {
             Ok(s) => {
                 backoff = 2;
                 s
@@ -2451,6 +2557,11 @@ impl<T: imap::Io> OpRunner for ImapRunner<'_, T> {
         let (shared, account) = (self.shared, self.account);
         let Op::Send { raw_b64, from, to, .. } = op else { return Err(anyhow!("not a send")) };
         let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
+        if let Some(server) = &shared.demo {
+            server.deliver(account, &raw, to);
+            shared.learned_size(&account.id, Some(crate::demo::SEND_LIMIT));
+            return Ok(());
+        }
         let cred = shared.credential(account).await?;
         log::info!("{}: sending to {} recipient(s)", account.email, to.len());
         let mut size = None;
@@ -2515,7 +2626,7 @@ async fn deliver_and_file(shared: &Shared, account: &Account, runner: &mut impl 
         }
     }
     q.op = delivered;
-    shared.emit(Event::Toast("Message sent".into()));
+    shared.emit(Event::Toast(shared.sent_toast().into()));
     file_delivered(shared, account, runner, q).await
 }
 
@@ -3050,6 +3161,7 @@ mod tests {
             settings: RwLock::new(Settings::default()),
             tokens: Mutex::new(HashMap::new()),
             accounts: RwLock::new(vec![]),
+            demo: None,
             watched: Mutex::new(None),
             synced: Mutex::new(HashMap::new()),
             undo_keys: Default::default(),

@@ -58,6 +58,7 @@ fn random_string(n: usize) -> String {
 }
 
 fn token_request(form: &[(&str, &str)]) -> anyhow::Result<Tokens> {
+    crate::net::allowed(TOKEN_URL)?;
     let mut resp = agent().post(TOKEN_URL).send_form(form.iter().copied()).context("token request failed")?;
     let body: TokenResponse = resp.body_mut().read_json().context("unreadable token response")?;
     if let Some(e) = body.error {
@@ -87,6 +88,7 @@ pub fn authorize(client_id: &str, client_secret: &str, login_hint: Option<&str>,
     if client_id.trim().is_empty() {
         bail!("No Google OAuth client id. Create a Desktop app client in Google Cloud Console, or sign in with an app password.");
     }
+    crate::net::allowed(AUTH_URL)?;
     let listener = TcpListener::bind("127.0.0.1:0").context("couldn't open a local port for the sign-in redirect")?;
     let port = listener.local_addr()?.port();
     let redirect = format!("http://127.0.0.1:{port}");

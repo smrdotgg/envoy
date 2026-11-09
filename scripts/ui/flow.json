@@ -1,5 +1,5 @@
 {"events": [
-  {"t": 0.2, "type": "tap", "key": "m2"},
+  {"t": 0.2, "type": "tap", "key": "m13"},
   {"t": 0.6, "type": "key", "name": "j"},
   {"t": 0.9, "type": "key", "name": "s"},
   {"t": 1.2, "type": "key", "name": "e"},
