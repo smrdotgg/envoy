@@ -491,6 +491,8 @@ pub struct App {
     pub image_cache: Option<rune::ImageCache>,
     /// Files demo mode is pretending to read.
     pub demo_reads: Vec<DemoRead>,
+    /// Drafts written in demo mode, listed in its Drafts.
+    pub demo_drafts: crate::demo::Drafts,
     /// Changes to drafts' files the engine may not have made yet.
     pub file_ops: Vec<FileOp>,
     /// The largest message each account's SMTP server takes, as it said ([`Event::SendLimit`]).
@@ -585,6 +587,7 @@ impl App {
             images: HashMap::new(),
             image_cache: None,
             demo_reads: Vec::new(),
+            demo_drafts: Default::default(),
             file_ops: Vec::new(),
             send_limits: HashMap::new(),
             #[cfg(test)]
@@ -928,7 +931,7 @@ impl App {
         if self.demo {
             let q = envoy_core::store::Query::parse(&self.applied_query);
             let words: Vec<String> = q.text.iter().map(|w| w.to_lowercase()).collect();
-            self.list = crate::demo::list_for(&self.view)
+            self.list = crate::demo::list_with(&self.view, &self.demo_drafts)
                 .into_iter()
                 .filter(|m| {
                     let hay = format!("{} {} {} {}", m.subject, m.preview, m.from.name, m.from.email).to_lowercase();
@@ -969,7 +972,7 @@ impl App {
             self.selection.clear();
         }
         if self.demo {
-            self.list = crate::demo::list_for(&self.view);
+            self.list = crate::demo::list_with(&self.view, &self.demo_drafts);
             self.list_loaded = true;
         }
         self.request_list();
@@ -2039,6 +2042,10 @@ impl App {
         let failures = self.pending_saves.iter().find(|p| p.id == id).map_or(0, |p| p.failures);
         self.pending_saves.retain(|p| p.id != id);
         self.pending_saves.push(PendingSave { id, rev, lifecycle, draft: draft.clone(), open, files_from, failures, retry_at: None });
+        if self.demo {
+            // No engine: kept for the session, for demo mode's Drafts to list.
+            self.demo_drafts.keep(id, draft.clone());
+        }
         self.send(save_command(id, draft, open, rev, lifecycle, files_from));
     }
 
@@ -2281,6 +2288,7 @@ impl App {
         let key = (window > 0).then(|| self.next_stamp());
         if c.saved {
             self.send(Command::DiscardDraft { id: c.draft_id, undo: key });
+            self.demo_draft_gone(c.draft_id);
         }
         let Some(key) = key else {
             self.toast("Draft discarded", false);
@@ -2293,6 +2301,17 @@ impl App {
             self.toasts.remove(0);
         }
         tx.wake_after(std::time::Duration::from_secs_f64(window as f64 + 0.05));
+    }
+
+    /// A draft sent or discarded in demo mode leaves its Drafts (Undo saves it again).
+    fn demo_draft_gone(&mut self, id: i64) {
+        if !self.demo {
+            return;
+        }
+        self.demo_drafts.forget(id);
+        if self.view_role() == Some(Role::Drafts) {
+            self.request_list_as(false);
+        }
     }
 
     /// Undo for [`App::discard_compose`]: the composer comes back as it was, and is saved again
@@ -2318,7 +2337,7 @@ impl App {
     /// ([`Event::DraftOpened`]).
     fn open_draft(&mut self, id: MessageId) {
         if self.demo {
-            if let Some(draft) = crate::demo::draft_for(id) {
+            if let Some((id, draft)) = self.demo_drafts.of_row(id).or_else(|| crate::demo::draft_for(id).map(|d| (id, d))) {
                 self.show_draft(id, draft, DraftRev::default(), false, None);
             }
             return;
@@ -2413,6 +2432,7 @@ impl App {
         let (draft, draft_id, lifecycle) = (c.draft(), c.draft_id, c.lifecycle);
         self.compose = None;
         if self.demo {
+            self.demo_draft_gone(draft_id);
             self.toast("Sent (demo mode — nothing left your computer)", false);
             return;
         }
@@ -3452,6 +3472,43 @@ mod tests {
         let c = app.compose.as_ref().expect("the composer");
         assert_eq!(c.subject.text, row.subject);
         assert!(c.to.text.contains("jordan@northwind.dev"));
+    }
+
+    #[test]
+    fn demo_mode_lists_the_drafts_it_writes() {
+        // No store in demo mode: what it saves is kept for the session, and its Drafts lists it.
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.compose_new();
+        let c = app.compose.as_mut().unwrap();
+        (c.to, c.subject, c.body) = (TextEdit::new("Sam Ortiz <sam@ortiz.family>"), TextEdit::new("Lunch plans"), TextEdit::new("Tacos on Friday?"));
+        let id = c.draft_id;
+        app.compose_edited();
+        let t = app.clock + 1.0;
+        app.tick(t, &mut Tx::default());
+        app.tick(t + SAVE_WHEN_IDLE + 0.1, &mut Tx::default());
+        // Minimized, then Drafts: there, the newest, beside the sample draft.
+        app.compose.as_mut().unwrap().minimized = true;
+        app.go(View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() });
+        let row = app.list.first().unwrap().clone();
+        assert_eq!((row.id, row.subject.as_str(), app.list.len()), (envoy_core::drafts::list_id(id), "Lunch plans", 2));
+        assert_eq!(row.to.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Sam Ortiz"]);
+        // Its row opens it: this composer, expanded.
+        app.open_message(row.id);
+        let c = app.compose.as_ref().unwrap();
+        assert!(!c.minimized && c.draft_id == id);
+        // Put away for another, with a file: still listed, and opens again file and all.
+        app.compose.as_mut().unwrap().files.push(file_in(9, "menu.pdf", 1200));
+        app.compose_edited();
+        app.compose_new();
+        assert!(app.list.iter().any(|r| r.id == row.id && r.has_attachments), "{:?}", app.list);
+        app.compose = None;
+        app.open_message(row.id);
+        let c = app.compose.as_ref().unwrap();
+        assert_eq!((c.draft_id, c.subject.text.as_str(), c.files.len()), (id, "Lunch plans", 1));
+        // Discarded: gone from Drafts.
+        app.discard_compose(&mut Tx::default());
+        assert_eq!(app.list.len(), 1, "only the sample draft: {:?}", app.list);
     }
 
     // ── attachments ──
