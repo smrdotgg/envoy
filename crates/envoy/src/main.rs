@@ -13,6 +13,8 @@ mod demo;
 mod fmt;
 mod html_view;
 mod icons;
+#[cfg(test)]
+mod live_tests;
 mod reader;
 mod selection;
 mod theme;

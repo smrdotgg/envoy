@@ -235,13 +235,19 @@ impl Engine {
     /// Commands sent before it's open wait their turn. If the cache can't be opened, the engine
     /// reports an [`Event::Error`] and stops; later commands are dropped.
     pub fn start(waker: impl Fn() + Send + Sync + 'static, settings: Settings) -> Result<Engine> {
+        Engine::start_at(paths::database_file(), waker, settings)
+    }
+
+    /// [`Engine::start`] on the mail cache at `db`, not the data folder's: for tests and tools
+    /// that run the app's own code path on a cache of their own. The accounts are still the
+    /// data folder's.
+    pub fn start_at(db: std::path::PathBuf, waker: impl Fn() + Send + Sync + 'static, settings: Settings) -> Result<Engine> {
         let (tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, rx) = std::sync::mpsc::channel();
         let waker: Waker = Arc::new(waker);
         let writer = OpenedStore::default();
         let opened = writer.clone();
         std::thread::Builder::new().name("envoy-engine".into()).spawn(move || {
-            let db = paths::database_file();
             let stores = Store::open(&db).and_then(|writer| Ok((writer, Store::open(&db)?)));
             let (writer, reader) = match stores {
                 Ok(s) => s,
