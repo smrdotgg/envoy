@@ -81,6 +81,13 @@ struct Local {
     room: f32,
 }
 
+/// Text beside the message's own, a list's marker or a picture's description: not selected or
+/// copied with the message. The overflow guard measures text by its lines, which only
+/// selectable text exposes, so under test it's selectable too (selecting never changes layout).
+fn aside(e: El) -> El {
+    e.selectable(cfg!(test))
+}
+
 /// Left and right insets (padding or margins) fitted to `room`: as given, or shrunk in
 /// proportion to [`MAX_INSET`] of it.
 fn fit_sides(left: f32, right: f32, room: f32) -> (f32, f32) {
@@ -299,7 +306,7 @@ fn image(cx: &Ctx, img: &Img, l: Local) -> El {
             // The picture's description in its place, kept to the picture's width and the
             // room it has: two lines at most, ending in "…" when it's longer.
             let w = img.width.map_or(room, |w| w.max(48.0).min(room));
-            text(format!("[{}]", img.alt)).font(rune::TextStyle::new(12.0, 400.0).italic()).color(k.c.text_faint).wrap_anywhere().max_lines(2).max_w(w)
+            aside(text(format!("[{}]", img.alt)).font(rune::TextStyle::new(12.0, 400.0).italic()).color(k.c.text_faint).wrap_anywhere().max_lines(2).max_w(w))
         }
     };
     if let Some(h) = &img.href {
@@ -558,7 +565,7 @@ fn node(cx: &Ctx, n: &Node, l: Local) -> El {
                 let mut line = row().w_full().gap(8.0).items_start();
                 if *marker {
                     let bullet = if *ordered { format!("{}.", i + 1) } else { "•".to_owned() };
-                    line = line.child(text(bullet).font(rune::TextStyle::new(14.0, 400.0).lh(20.0)).color(l.ink));
+                    line = line.child(aside(text(bullet).font(rune::TextStyle::new(14.0, 400.0).lh(20.0)).color(l.ink)));
                 }
                 c = c.child(line.child(body));
             }
