@@ -53,8 +53,19 @@ jobs:
   # sync, IDLE, flags, moves and sends with their undo windows, drafts, and ops held across a
   # kill. Twice: against GreenMail as it is (UIDPLUS, MOVE, IDLE), then through a proxy that
   # takes UIDPLUS and MOVE away, for the fallbacks. GreenMail's log is in "Stop containers".
+  # On a debug build, and on a dist build linked like the shipped Linux binary: with lld's
+  # --icf=safe (crates/envoy/build.rs sets it for envoy's binary only, so the example gets it
+  # here), which folds identical functions, IMAP, SMTP and TLS code among them.
   e2e:
-    name: End to end (GreenMail)
+    name: End to end (GreenMail, ${{ matrix.profile }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: debug
+            build: cargo build -p envoy-core --example e2e --locked
+          - profile: dist
+            build: cargo rustc --profile dist -p envoy-core --example e2e --locked -- -Clink-arg=-Wl,--icf=safe
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -74,13 +85,25 @@ jobs:
       - name: Toolchain (rust-toolchain.toml)
         run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build -p envoy-core --example e2e --locked
+        with:
+          key: e2e-${{ matrix.profile }}
+      # As in budgets: either variable, even empty, replaces .cargo/config.toml's rustflags.
+      - name: No RUSTFLAGS (they'd drop -addrsig, and lld would fold nothing)
+        if: matrix.profile == 'dist'
+        run: |
+          for v in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS; do
+            if [ -n "${!v+set}" ]; then
+              echo "::error::$v is set (to '${!v}'). It replaces the rustflags in .cargo/config.toml, so -Cllvm-args=-addrsig is lost and lld's --icf=safe folds nothing: this would test a different binary from the one we ship. Unset it, or put the flags in .cargo/config.toml."
+              exit 1
+            fi
+          done
+      - name: Build (${{ matrix.profile }})
+        run: ${{ matrix.build }}
       # Each pass waits for GreenMail to answer, and empties its user's mailboxes first.
       - name: "Pass 1: GreenMail as it is (UIDPLUS, MOVE, IDLE)"
-        run: target/debug/examples/e2e full
+        run: target/${{ matrix.profile }}/examples/e2e full
       - name: "Pass 2: a server without UIDPLUS and MOVE"
-        run: target/debug/examples/e2e plain
+        run: target/${{ matrix.profile }}/examples/e2e plain
 
   # Latency budgets (docs/NORTH_STAR.md), against a generated 100k-message mailbox, on the
   # binary we ship (--profile dist). Measure once (tables in the job summary), then gate each
@@ -132,6 +155,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: dist
+      # Either variable, even empty, replaces the rustflags in .cargo/config.toml: on Linux that
+      # drops -Cllvm-args=-addrsig, lld's --icf=safe folds nothing, and the budgets would measure
+      # a bigger binary than the one we ship.
+      - name: No RUSTFLAGS (they'd drop .cargo/config.toml's -addrsig)
+        if: runner.os == 'Linux'
+        run: |
+          for v in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS; do
+            if [ -n "${!v+set}" ]; then
+              echo "::error::$v is set (to '${!v}'). It replaces the rustflags in .cargo/config.toml, so -Cllvm-args=-addrsig is lost and lld's --icf=safe folds nothing: the budgets would measure a different binary from the one we ship. Unset it, or put the flags in .cargo/config.toml."
+              exit 1
+            fi
+          done
       - name: Build what we ship (--profile dist)
         run: cargo build --profile dist -p envoy -p envoy-bench --locked
       - name: Generate a 100k-message mailbox
