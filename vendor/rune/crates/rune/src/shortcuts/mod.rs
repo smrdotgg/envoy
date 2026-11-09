@@ -70,6 +70,9 @@ type NativeBackend = Box<dyn Backend>;
 
 fn backend(wayland: bool, sink: Sink) -> Result<NativeBackend, ShortcutError> {
     let _ = wayland;
+    // Without the `global-shortcuts` feature no backend is built: registering fails as it does in
+    // a session that can't grab keys.
+    if !cfg!(feature = "global-shortcuts") { return Err(ShortcutError::Unsupported); }
     #[cfg(target_os = "macos")]
     return Ok(Box::new(macos::Native::new(sink)?));
     #[cfg(target_os = "windows")]
@@ -106,7 +109,8 @@ fn native_status(code: i64, conflict: i64) -> Result<(), ShortcutError> {
 impl<S: 'static> crate::App<S> {
     /// Register when the app starts, on the same thread and state as its windows.
     /// Errors are reported once to stderr and retained by `AppHandle::take_shortcut_errors`.
-    /// Headless scripts register virtually, without connecting to the desktop.
+    /// Headless scripts register virtually, without connecting to the desktop. Without the
+    /// `global-shortcuts` feature, a window's registrations fail with `Unsupported`.
     pub fn global_shortcut(self, accelerator: &str, handler: fn(&mut S, &mut crate::Tx)) -> Self {
         self.shared.shortcuts.pending(accelerator.parse(), Arc::new(handler));
         self

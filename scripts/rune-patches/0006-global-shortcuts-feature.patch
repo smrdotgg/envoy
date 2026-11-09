@@ -1,0 +1,49 @@
+diff --git a/vendor/rune/crates/rune/Cargo.toml b/vendor/rune/crates/rune/Cargo.toml
+index 678008e..74cdff4 100644
+--- a/vendor/rune/crates/rune/Cargo.toml
++++ b/vendor/rune/crates/rune/Cargo.toml
+@@ -5,7 +5,7 @@ edition.workspace = true
+ license.workspace = true
+ 
+ [features]
+-default = ["accessibility", "dbus", "embedded-fonts", "headless", "keycaps", "metal-backend", "ogg-audio", "svg"]
++default = ["accessibility", "dbus", "embedded-fonts", "global-shortcuts", "headless", "keycaps", "metal-backend", "ogg-audio", "svg"]
+ # On web, bundle Inter (Regular, Medium, SemiBold) and IBM Plex Mono as built-in fallback fonts.
+ # Disable when AppSpec::fonts supplies the app's own fonts to omit the bytes from the wasm.
+ # Native builds always bundle Inter.
+@@ -14,6 +14,11 @@ embedded-fonts = []
+ webgl = ["wgpu/webgl"]
+ # Headless benchmark instrumentation; ordinary builds contain no phase clocks.
+ frame-profile = ["dep:procwatch"]
++# System-wide shortcuts (`App::global_shortcut`, `AppHandle::register_shortcut`): the
++# GlobalShortcuts portal on Wayland (with `dbus`), key grabs on X11, `RegisterHotKey` on Windows,
++# Carbon hot keys on macOS. Off, none of those backends is built and a window's registrations
++# fail with `ShortcutError::Unsupported`; headless scripts still register virtually.
++global-shortcuts = []
+ # Headless runs in release builds (`--snap`, `--tree`, `--html`, `--script`, `--video`, `--strip`,
+ # `--desktop`...): an offscreen render loop with its recorder, script player, HTML export and
+ # motion lint, about 1 MB. Debug builds always have them. Off, a release build's headless flags
+diff --git a/vendor/rune/crates/rune/src/shortcuts/mod.rs b/vendor/rune/crates/rune/src/shortcuts/mod.rs
+index 8045e45..a1cb29e 100644
+--- a/vendor/rune/crates/rune/src/shortcuts/mod.rs
++++ b/vendor/rune/crates/rune/src/shortcuts/mod.rs
+@@ -70,6 +70,9 @@ type NativeBackend = Box<dyn Backend>;
+ 
+ fn backend(wayland: bool, sink: Sink) -> Result<NativeBackend, ShortcutError> {
+     let _ = wayland;
++    // Without the `global-shortcuts` feature no backend is built: registering fails as it does in
++    // a session that can't grab keys.
++    if !cfg!(feature = "global-shortcuts") { return Err(ShortcutError::Unsupported); }
+     #[cfg(target_os = "macos")]
+     return Ok(Box::new(macos::Native::new(sink)?));
+     #[cfg(target_os = "windows")]
+@@ -106,7 +109,8 @@ fn native_status(code: i64, conflict: i64) -> Result<(), ShortcutError> {
+ impl<S: 'static> crate::App<S> {
+     /// Register when the app starts, on the same thread and state as its windows.
+     /// Errors are reported once to stderr and retained by `AppHandle::take_shortcut_errors`.
+-    /// Headless scripts register virtually, without connecting to the desktop.
++    /// Headless scripts register virtually, without connecting to the desktop. Without the
++    /// `global-shortcuts` feature, a window's registrations fail with `Unsupported`.
+     pub fn global_shortcut(self, accelerator: &str, handler: fn(&mut S, &mut crate::Tx)) -> Self {
+         self.shared.shortcuts.pending(accelerator.parse(), Arc::new(handler));
+         self
