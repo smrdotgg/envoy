@@ -49,7 +49,7 @@ pub fn save_from(st: &Store, id: i64, draft: &Draft, open: bool, at: DraftRev, n
 pub fn save_new(st: &Store, draft: &Draft, open: bool, rev: i64, now: i64, files_from: Option<i64>) -> Result<i64> {
     st.transaction(|st| {
         let id = st.insert_new_draft(draft, open, rev, now)?;
-        st.take_files_from(files_from, id)?;
+        st.take_files_from(files_from, id, &draft.attachments)?;
         st.queue_draft_upload(&draft.account, id, if open { now + upload_delay(st.attached_size(id)?) } else { now })?;
         Ok(id)
     })

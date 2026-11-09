@@ -9,7 +9,7 @@ use serde_json::Value;
 use envoy_core::accounts::{Account, AuthKind};
 use envoy_core::attach;
 use envoy_core::engine::{Command, Engine, Event, MoveTarget};
-use envoy_core::model::{Draft, DraftAttachment, DraftNotice, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
+use envoy_core::model::{Draft, DraftAttachment, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use envoy_core::settings::Settings;
 use envoy_core::store::DraftRev;
 
@@ -149,6 +149,14 @@ impl Compose {
     fn file_mut(&mut self, id: i64) -> Option<&mut DraftAttachment> {
         self.files.iter_mut().find(|f| f.id == id)
     }
+}
+
+/// A change to a draft's files handed to the engine and not known to be done: made again, on
+/// the spot, if the window closes first ([`App::flush_files`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileOp {
+    Attach { draft: i64, file: DraftAttachment, source: FileSource },
+    Detach { draft: i64, file: i64 },
 }
 
 /// A file demo mode is pretending to read: attached at `at` (app clock), with what a thread of
@@ -433,6 +441,8 @@ pub struct App {
     pub image_cache: Option<rune::ImageCache>,
     /// Files demo mode is pretending to read.
     pub demo_reads: Vec<DemoRead>,
+    /// Changes to drafts' files the engine may not have made yet.
+    pub file_ops: Vec<FileOp>,
     /// The largest message each account's SMTP server takes, as it said ([`Event::SendLimit`]).
     pub send_limits: HashMap<String, u64>,
     /// What `send` was asked to send, for tests.
@@ -520,6 +530,7 @@ impl App {
             images: HashMap::new(),
             image_cache: None,
             demo_reads: Vec::new(),
+            file_ops: Vec::new(),
             send_limits: HashMap::new(),
             #[cfg(test)]
             sent: Default::default(),
@@ -708,7 +719,8 @@ impl App {
                 self.send_limits.insert(account, size);
             }
             Event::AttachFailed { draft, file, error } => self.attach_failed(draft, file, error),
-            Event::SendFailed { draft_id } => self.send_failed(draft_id),
+            Event::SendFailed { draft_id, error } => self.send_failed(draft_id, error),
+            Event::DraftFiles { draft, files } => self.draft_files(draft, files),
         }
         reload
     }
@@ -1497,6 +1509,9 @@ impl App {
         if !files.is_empty() && !self.demo {
             // The draft goes in the store first: its files are kept with it.
             self.save_compose(true);
+            for (file, index) in &files {
+                self.file_ops.push(FileOp::Attach { draft: draft_id, file: file.clone(), source: FileSource::Message { id: original, index: *index } });
+            }
             self.send(Command::AttachForwarded { draft: draft_id, message: original, files });
         }
     }
@@ -1631,8 +1646,8 @@ impl App {
     }
 
     /// A send couldn't be queued: the message goes back in the composer, from the copy kept
-    /// for that, and is saved again.
-    fn send_failed(&mut self, draft_id: Option<i64>) {
+    /// for that, saying why, and is saved again.
+    fn send_failed(&mut self, draft_id: Option<i64>, error: String) {
         let Some(id) = draft_id else { return };
         let Some(i) = self.pending_sends.iter().position(|p| p.id == id) else { return };
         let sent = self.pending_sends.remove(i);
@@ -1642,6 +1657,7 @@ impl App {
         {
             c.dirty = true;
             c.edits += 1;
+            c.error = Some(error);
         }
     }
 
@@ -1663,6 +1679,18 @@ impl App {
             return;
         }
         let engine = self.engine.take();
+        let files = |op: &FileOp| -> Result<(), String> {
+            let Some(engine) = &engine else { return Err("the mail database isn't open".into()) };
+            match op {
+                FileOp::Attach { draft, file, source } => engine.attach_now(*draft, &[(file.clone(), source.clone())]),
+                FileOp::Detach { draft, file } => engine.detach_now(*draft, *file),
+            }
+            .map_err(|e| format!("{e:#}"))
+        };
+        // Files added and taken off that the engine may not have got to, before the text (a
+        // draft written again as a new one takes its files along) and after (a draft only the
+        // text puts in the store).
+        self.flush_files(&files);
         self.close_with(
             |u| {
                 let Some(engine) = &engine else { return Err("the mail database isn't open".into()) };
@@ -1677,7 +1705,22 @@ impl App {
                 envoy_core::drafts::save_recovery(&envoy_core::drafts::recovery_dir(), &drafts).map_err(|e| format!("{e:#}"))
             },
         );
+        self.flush_files(&files);
+        self.file_ops.clear();
         self.engine = engine;
+    }
+
+    /// Makes again, through `apply`, every change to a draft's files handed to the engine and
+    /// not known to be done ([`App::file_ops`]): the engine, or the process, may stop before it
+    /// gets to them. Each is harmless made twice: an attach lists a file being attached (the
+    /// next start reads it in) unless its draft has it, or had it; taking off one that's off
+    /// changes nothing.
+    pub fn flush_files(&self, mut apply: impl FnMut(&FileOp) -> Result<(), String>) {
+        for op in &self.file_ops {
+            if let Err(e) = apply(op) {
+                eprintln!("couldn't keep a change to a draft's files ({e}): {op:?}");
+            }
+        }
     }
 
     /// [`App::on_close`]'s work: everything unsaved goes through `write` (false: the store
@@ -1840,6 +1883,7 @@ impl App {
         c.notice = notice.map(|n| match n {
             DraftNotice::PlainText => "This draft has formatting Envoy doesn't write: saving an edit keeps its text and attachments, not the formatting.".to_owned(),
             DraftNotice::Copy(why) => format!("Envoy can't edit this draft in place ({why}), so it stays in Drafts as it is. This is a copy, without its attachments: what you write is saved as a new draft."),
+            DraftNotice::NotSent(why) => why,
         });
         c.saved = !copy;
         c.minimized = restored;
@@ -1939,12 +1983,16 @@ impl App {
         c.drop_hover = false;
         c.error = None;
         let mut files = Vec::new();
+        let draft = c.draft_id;
         for (id, path) in ids.into_iter().zip(paths) {
             let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-            c.files.push(DraftAttachment { id, mime: attach::type_for(&filename).to_owned(), filename, size: 0, status: FileStatus::Attaching });
+            let file = DraftAttachment { id, mime: attach::type_for(&filename).to_owned(), filename, size: 0, status: FileStatus::Attaching };
+            if !self.demo {
+                self.file_ops.push(FileOp::Attach { draft, file: file.clone(), source: FileSource::Path(path.clone()) });
+            }
+            c.files.push(file);
             files.push((id, path));
         }
-        let draft = c.draft_id;
         if self.demo {
             let at = self.clock + 0.8;
             for (file, path) in files {
@@ -1982,6 +2030,15 @@ impl App {
         c.error = None;
         let draft = c.draft_id;
         if !self.demo {
+            self.file_ops.retain(|op| !matches!(op, FileOp::Attach { file, .. } if file.id == id));
+            self.file_ops.push(FileOp::Detach { draft, file: id });
+            // Made again on close, harmlessly: only the latest few are kept.
+            let detaches = self.file_ops.iter().filter(|op| matches!(op, FileOp::Detach { .. })).count();
+            if detaches > 64
+                && let Some(i) = self.file_ops.iter().position(|op| matches!(op, FileOp::Detach { .. }))
+            {
+                self.file_ops.remove(i);
+            }
             self.send(Command::DetachFile { draft, file: id });
         }
     }
@@ -2001,15 +2058,32 @@ impl App {
     /// A file of draft `draft` is in: its chip says so. (The store has it whether or not a
     /// composer shows the draft; one taken off here stays off.)
     fn file_attached(&mut self, draft: i64, file: DraftAttachment) {
+        self.file_ops.retain(|op| !matches!(op, FileOp::Attach { file: f, .. } if f.id == file.id));
         if let Some(f) = self.compose_for(draft).and_then(|c| c.file_mut(file.id)) {
             *f = file;
         }
     }
 
     fn attach_failed(&mut self, draft: i64, file: i64, error: String) {
+        self.file_ops.retain(|op| !matches!(op, FileOp::Attach { file: f, .. } if f.id == file));
         if let Some(f) = self.compose_for(draft).and_then(|c| c.file_mut(file)).filter(|f| f.status == FileStatus::Attaching) {
             f.status = FileStatus::Failed(error);
         }
+    }
+
+    /// Draft `draft`'s files as the store has them ([`Event::DraftFiles`]): the composer shows
+    /// them, and keeps files it's attaching that the engine hasn't listed yet, and leaves off
+    /// files it's taking off.
+    fn draft_files(&mut self, draft: i64, files: Vec<DraftAttachment>) {
+        let listed: HashSet<i64> = files.iter().map(|f| f.id).collect();
+        self.file_ops.retain(|op| !matches!(op, FileOp::Attach { file, .. } if listed.contains(&file.id)));
+        let adding: HashSet<i64> = self.file_ops.iter().filter_map(|op| if let FileOp::Attach { file, .. } = op { Some(file.id) } else { None }).collect();
+        let removing: HashSet<i64> = self.file_ops.iter().filter_map(|op| if let FileOp::Detach { file, .. } = op { Some(*file) } else { None }).collect();
+        let Some(c) = self.compose_for(draft) else { return };
+        let mut shown: Vec<DraftAttachment> = files.into_iter().filter(|f| !removing.contains(&f.id)).collect();
+        shown.extend(c.files.iter().filter(|f| adding.contains(&f.id) && !listed.contains(&f.id)).cloned());
+        shown.sort_by_key(|f| f.id);
+        c.files = shown;
     }
 
     /// Demo mode's pretend reads that are done: the file's size as its thread found it,
@@ -2744,10 +2818,11 @@ mod tests {
         app.compose.as_mut().unwrap().to = TextEdit::new("ana@x.com");
         app.send_compose();
         assert!(app.compose.is_none());
-        app.apply(Event::SendFailed { draft_id: Some(id) }, &mut Tx::default());
+        app.apply(Event::SendFailed { draft_id: Some(id), error: "Not sent: no.".into() }, &mut Tx::default());
         let c = app.compose.as_ref().expect("back in the composer");
         assert!(c.draft_id == id && c.body.text.starts_with("Hello") && c.to.text == "ana@x.com");
         assert!(c.dirty, "and saved again");
+        assert_eq!(c.error.as_deref(), Some("Not sent: no."), "saying why");
     }
 
     #[test]
@@ -2961,6 +3036,74 @@ mod tests {
         assert!(ids(&app)[1] > pending.id, "{:?}", ids(&app));
     }
 
+    /// What closing the window makes again, through [`App::flush_files`].
+    fn flushed(app: &App) -> Vec<FileOp> {
+        let mut made = Vec::new();
+        app.flush_files(|op| {
+            made.push(op.clone());
+            Ok(())
+        });
+        made
+    }
+
+    #[test]
+    fn closing_makes_the_file_changes_the_engine_may_not_have_got_to() {
+        let mut app = App::new(true);
+        let draft = composer_with_two_files(&mut app);
+        assert!(flushed(&app).is_empty(), "both in: nothing to make again");
+        let a = ids(&app)[0];
+        app.attach_paths(vec!["/files/late.pdf".into()]);
+        let late = app.compose.as_ref().unwrap().files[2].clone();
+        app.remove_file(a);
+        assert_eq!(flushed(&app), [FileOp::Attach { draft, file: late, source: FileSource::Path("/files/late.pdf".into()) }, FileOp::Detach { draft, file: a }]);
+        // In: no longer made again. (Taking off is: it has no answer, and is harmless twice.)
+        answer(&mut app, 1, 10);
+        assert_eq!(flushed(&app), [FileOp::Detach { draft, file: a }]);
+        // One taken off before it's in isn't attached on close.
+        app.attach_paths(vec!["/files/oops.pdf".into()]);
+        let oops = ids(&app)[2];
+        app.remove_file(oops);
+        assert_eq!(flushed(&app), [FileOp::Detach { draft, file: a }, FileOp::Detach { draft, file: oops }]);
+    }
+
+    #[test]
+    fn the_composer_shows_its_files_as_the_store_has_them() {
+        let mut app = App::new(true);
+        let draft = composer_with_two_files(&mut app);
+        let [a, b] = ids(&app)[..] else { panic!() };
+        app.attach_paths(vec!["/files/new.pdf".into()]);
+        let new = ids(&app)[2];
+        app.remove_file(b);
+        // The store, before the engine got to either, and with a file another window added.
+        let other = new + 1;
+        app.apply(Event::DraftFiles { draft, files: vec![file_in(a, "a.pdf", 1000), file_in(b, "b.png", 2000), file_in(other, "other.txt", 5)] }, &mut Tx::default());
+        assert_eq!(
+            files(&app),
+            vec![("a.pdf".into(), FileStatus::Attached), ("new.pdf".into(), FileStatus::Attaching), ("other.txt".into(), FileStatus::Attached)],
+            "the store's files, less one being taken off, and one on its way"
+        );
+        // A file shown on its way that's in by now (it came in under the id the draft had
+        // before): shown attached.
+        app.apply(Event::DraftFiles { draft, files: vec![file_in(a, "a.pdf", 1000), file_in(new, "new.pdf", 7)] }, &mut Tx::default());
+        assert_eq!(files(&app), vec![("a.pdf".into(), FileStatus::Attached), ("new.pdf".into(), FileStatus::Attached)]);
+        assert!(!app.file_ops.iter().any(|op| matches!(op, FileOp::Attach { .. })), "listed: nothing left to make on close");
+        // Another draft's files change nothing here.
+        app.apply(Event::DraftFiles { draft: draft + 1, files: Vec::new() }, &mut Tx::default());
+        assert_eq!(ids(&app), [a, new]);
+    }
+
+    #[test]
+    fn a_message_its_server_wouldnt_take_comes_back_saying_why() {
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        let draft = Draft { account: "demo".into(), subject: "Big".into(), ..Draft::default() };
+        let why = "Not sent: this message is 40.0 MB once encoded for sending, and its mail server takes at most 35.0 MB. Remove some attachments and send again.";
+        app.apply(Event::DraftOpened { id: 5, draft, at: DraftRev::default(), restored: false, notice: Some(DraftNotice::NotSent(why.into())) }, &mut Tx::default());
+        let c = app.compose.as_ref().expect("back in the composer");
+        assert_eq!((c.draft_id, c.notice.as_deref()), (5, Some(why)));
+    }
+
     #[test]
     fn a_file_taken_off_leaves_the_draft_in_the_store_too() {
         let mut app = App::new(true);
@@ -3031,6 +3174,10 @@ mod tests {
         let fwd = sent_commands(&app, "AttachForwarded");
         assert!(fwd.len() == 1 && fwd[0].contains(&format!("message: {}", original.summary.id)) && fwd[0].contains("image-2.png"), "{fwd:?}");
         assert!(app.compose.as_ref().unwrap().saved);
+        // Kept in mind until the engine says they're listed, in case the window closes first.
+        let from: Vec<FileSource> = app.file_ops.iter().filter_map(|op| if let FileOp::Attach { source, .. } = op { Some(source.clone()) } else { None }).collect();
+        assert_eq!(from.len(), names.len());
+        assert!(from.iter().all(|s| matches!(s, FileSource::Message { id, .. } if *id == original.summary.id)), "{from:?}");
         // A reply doesn't.
         app.compose = None;
         app.compose_reply(Some(original.summary.id), false, false);

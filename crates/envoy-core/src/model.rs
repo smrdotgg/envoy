@@ -267,6 +267,8 @@ pub enum DraftNotice {
     /// It can't be edited in place without losing something (`why`): the composer has an
     /// unsaved copy, saved as a new draft, and the original stays in Drafts as it is.
     Copy(String),
+    /// It was sent, and couldn't go (`why`: its server won't take it): back to be changed.
+    NotSent(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]

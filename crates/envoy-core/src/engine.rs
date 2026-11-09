@@ -121,7 +121,7 @@ pub enum Event {
     Sent { op: i64, undo_secs: u32, draft_id: Option<i64> },
     /// A send couldn't even be queued (an [`Event::Error`] says why): the composer should get
     /// draft `draft_id` back.
-    SendFailed { draft_id: Option<i64> },
+    SendFailed { draft_id: Option<i64>, error: String },
     /// Save `rev` of draft `id` is written to the local database ([`Command::SaveDraft`]).
     DraftSaved { id: i64, rev: i64 },
     /// Save `rev` of draft `id` couldn't be written: it isn't saved, and should be tried again.
@@ -129,6 +129,11 @@ pub enum Event {
     /// Save `rev` of draft `id` was refused: the draft moved on without it (gone for good, or
     /// sent, since it was made). It isn't saved, and a retry won't be: keep it as a new draft.
     DraftSaveRefused { id: i64, rev: i64 },
+    /// Draft `draft`'s files, all of them, as the store has them: after it took on another
+    /// draft's files, or when a send found the composer showing other files. File events are
+    /// sent in the order the store's changes happened, this too, so the composer can take it as
+    /// it comes.
+    DraftFiles { draft: i64, files: Vec<crate::model::DraftAttachment> },
     /// A file of draft `draft` is in: attached, saved and sent with it.
     FileAttached { draft: i64, file: crate::model::DraftAttachment },
     /// File `file` couldn't be attached to draft `draft`: `error` says why, to show.
@@ -251,6 +256,23 @@ impl Engine {
     pub fn keep_unsent_now(&self, id: i64, draft: &Draft, at: DraftRev) -> Result<bool> {
         let st = self.writer.lock()?;
         st.draft_unsent(id, draft, Some(at), now())
+    }
+
+    /// [`Command::AttachFiles`] and [`Command::AttachForwarded`]'s listing, on the calling
+    /// thread: for when the window closes before the engine got to them. The files are listed
+    /// with the draft, being attached, and the next start reads them in. An id the draft
+    /// already has changes nothing, so a listing the engine did make is left as it is.
+    pub fn attach_now(&self, draft: i64, files: &[(crate::model::DraftAttachment, FileSource)]) -> Result<()> {
+        let st = self.writer.lock()?;
+        st.attaching(draft, files)?;
+        Ok(())
+    }
+
+    /// [`Command::DetachFile`], on the calling thread (see [`Engine::attach_now`]).
+    pub fn detach_now(&self, draft: i64, file: i64) -> Result<()> {
+        let st = self.writer.lock()?;
+        st.remove_file(draft, file, now())?;
+        Ok(())
     }
 
     pub fn drain(&self) -> Vec<Event> {
@@ -410,11 +432,9 @@ fn reply(shared: &Arc<Shared>, reply: &Reply) -> Result<()> {
             let messages = shared.reader.lock().map_err(|_| anyhow!("store poisoned"))?.thread(id, conversations)?;
             shared.emit(Event::Thread { req, id, messages });
         }
-        Reply::Draft(id) => match open_draft(shared, id, now())? {
-            Opening::Ready(d, notice) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: false, notice }),
-            Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, at: DraftRev::default(), restored: false, notice: Some(DraftNotice::Copy(why)) }),
-            _ => {}
-        },
+        Reply::Draft(id) => {
+            open_draft(shared, id, now())?;
+        }
         Reply::Attach { message, ref files } => {
             let (shared, files) = (shared.clone(), files.clone());
             tokio::task::spawn_blocking(move || attach_forwarded(&shared, message, &files));
@@ -438,10 +458,15 @@ async fn run(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Command>) {
         Err(e) => log::error!("couldn't import the drafts in {}: {e:#}", drafts::recovery_dir().display()),
     }
     // What was being written when the app last closed (or crashed) goes back in the composer.
-    match shared.with_writer(|st| st.draft_to_restore()) {
-        Ok(Some(d)) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: true, notice: None }),
-        Ok(None) => {}
-        Err(e) => log::warn!("couldn't read drafts: {e:#}"),
+    // Sent as read, the store held meanwhile: no file event can come between (see [`open_draft`]).
+    let restored = shared.with_writer(|st| {
+        if let Some(d) = st.draft_to_restore()? {
+            shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: true, notice: None });
+        }
+        Ok(())
+    });
+    if let Err(e) = restored {
+        log::warn!("couldn't read drafts: {e:#}");
     }
     // What the accounts' servers said they take, for the composer.
     for (account, size) in shared.with_writer(|st| st.send_limits()).unwrap_or_default() {
@@ -569,28 +594,36 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
         Command::Send { draft, draft_id } => {
             if let Err(e) = queue_send(shared, workers, &draft, draft_id) {
                 // Not sent: kept as a draft here, and back in the composer, so nothing written is
-                // lost.
-                if let Some(id) = draft_id
-                    && let Err(e) = shared.with_writer(|st| st.draft_unsent(id, &draft, None, now()))
-                {
-                    log::warn!("couldn't keep an unsent draft: {e:#}");
+                // lost, with why, and its files as the store has them (what's wrong may be them).
+                let Some(id) = draft_id else { return Err(e) };
+                let kept = shared.with_writer(|st| {
+                    st.draft_unsent(id, &draft, None, now())?;
+                    shared.emit(Event::SendFailed { draft_id, error: format!("{e:#}") });
+                    shared.emit(Event::DraftFiles { draft: id, files: st.files_of(id)? });
+                    Ok(())
+                });
+                if let Err(e2) = kept {
+                    log::warn!("couldn't keep an unsent draft: {e2:#}");
+                    shared.emit(Event::SendFailed { draft_id, error: format!("{e:#}") });
                 }
-                shared.emit(Event::SendFailed { draft_id });
-                return Err(e);
             }
         }
         Command::UndoSend { op } => {
             // The draft comes back in the composer, the same one: Drafts doesn't get a second.
-            let (cancelled, back) = shared.with_writer(|st| {
-                st.transaction(|st| {
+            let back = shared.with_writer(|st| {
+                let (cancelled, back) = st.transaction(|st| {
                     let cancelled = st.cancel_send(op)?;
                     Ok((cancelled, if cancelled { st.unsend_draft(op, now())? } else { None }))
-                })
+                })?;
+                shared.emit(Event::Toast(if cancelled { "Sending undone".into() } else { "Too late — it was already sent".into() }));
+                // Sent as read, the store held (see [`open_draft`]).
+                Ok(back.map(|d| {
+                    let account = d.account.clone();
+                    shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: false, notice: None });
+                    account
+                }))
             })?;
-            shared.emit(Event::Toast(if cancelled { "Sending undone".into() } else { "Too late — it was already sent".into() }));
-            if let Some(d) = back {
-                let account = d.account.clone();
-                shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: false, notice: None });
+            if let Some(account) = back {
                 shared.emit(Event::Changed { account: account.clone() });
                 wake(workers, &account);
             }
@@ -635,8 +668,8 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
             }
         }
         Command::OpenDraft { id } => match open_draft(shared, id, now())? {
-            Opening::Ready(d, notice) => shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: false, notice }),
-            Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: *draft, at: DraftRev::default(), restored: false, notice: Some(DraftNotice::Copy(why)) }),
+            // Sent by open_draft.
+            Opening::Ready(..) | Opening::Copy(..) => {}
             Opening::Download { account, mailbox, uid } => poke(workers, &account, Job::Bodies { mailbox, uids: vec![uid], reply: Some(Reply::Draft(id)) }),
             // Sent or discarded meanwhile: the list catches up.
             Opening::Gone => shared.emit(Event::Changed { account: String::new() }),
@@ -831,7 +864,16 @@ fn export_in_background(shared: &Arc<Shared>, stem: String, ext: &'static str, b
 
 /// [`Command::SaveDraft`] and [`Command::SaveDraftFrom`]: saves, then says how it went.
 fn save_draft(shared: &Shared, workers: &HashMap<String, Worker>, id: i64, draft: &Draft, open: bool, at: DraftRev, files_from: Option<i64>) {
-    match shared.with_writer(|st| drafts::save_from(st, id, draft, open, at, now(), files_from)) {
+    let saved = shared.with_writer(|st| {
+        let saved = drafts::save_from(st, id, draft, open, at, now(), files_from)?;
+        // Carried on from another draft: its files, as they are now (one may have come in, or
+        // been lost, under the old id), the store held so nothing comes between.
+        if saved.is_some() && files_from.is_some() {
+            shared.emit(Event::DraftFiles { draft: id, files: st.files_of(id)? });
+        }
+        Ok(saved)
+    });
+    match saved {
         Ok(Some(queued)) => {
             // Only now is it saved: the app shows "Draft saved", and drops its own copy.
             shared.emit(Event::DraftSaved { id, rev: at.rev });
@@ -886,25 +928,31 @@ fn read_file_in(shared: &Shared, file: i64, path: &std::path::Path, max: usize) 
 
 /// File `file`'s bytes are read ([`Store::file_in`]): the drafts attaching it hear, and their
 /// uploads are planned.
+/// File events are sent with the store held, as the change is made: in the order the changes
+/// happened, whatever thread made them.
 fn file_in(shared: &Shared, file: i64, data: &[u8], mime: &str) {
-    match shared.with_writer(|st| st.file_in(file, data, mime, now())) {
-        Ok(done) => {
-            for (draft, f) in done {
-                if let Ok(Some(d)) = shared.with_writer(|st| st.draft(draft)) {
-                    shared.wake_account(&d.account);
-                }
-                shared.emit(Event::FileAttached { draft, file: f });
+    let done = shared.with_writer(|st| {
+        for (draft, f) in st.file_in(file, data, mime, now())? {
+            if let Some(d) = st.draft(draft)? {
+                shared.wake_account(&d.account);
             }
-            shared.emit_pending();
+            shared.emit(Event::FileAttached { draft, file: f });
         }
+        Ok(())
+    });
+    match done {
+        Ok(()) => shared.emit_pending(),
         Err(e) => file_failed(shared, file, &format!("Couldn't attach it ({e:#})")),
     }
 }
 
 fn file_failed(shared: &Shared, file: i64, error: &str) {
-    for draft in shared.with_writer(|st| st.file_failed(file, error)).unwrap_or_default() {
-        shared.emit(Event::AttachFailed { draft, file, error: error.to_owned() });
-    }
+    let _ = shared.with_writer(|st| {
+        for draft in st.file_failed(file, error)? {
+            shared.emit(Event::AttachFailed { draft, file, error: error.to_owned() });
+        }
+        Ok(())
+    });
 }
 
 /// Reads `(file id, index)` attachments of message `message` into the drafts attaching them:
@@ -1005,13 +1053,26 @@ fn discard_draft(shared: &Shared, workers: &HashMap<String, Worker>, id: i64, un
 /// composer's draft waiting alongside it (hidden from Drafts) until it's out.
 fn queue_send(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, draft: &Draft, draft_id: Option<i64>) -> Result<()> {
     let account = shared.account(&draft.account).ok_or_else(|| anyhow!("Choose an account to send from"))?;
-    // The draft's files, as the store has them: never sent without one it shows, nor before
-    // one is in.
-    let listed = match draft_id {
-        Some(d) => shared.with_writer(|st| st.files_of(d))?,
-        None if draft.attachments.is_empty() => Vec::new(),
+    // The draft's files, as the store has them, read at once with their bytes.
+    let (listed, files) = match draft_id {
+        Some(d) => shared.with_writer(|st| Ok((st.files_of(d)?, st.attached_files(d)?)))?,
+        None if draft.attachments.is_empty() => (Vec::new(), Vec::new()),
         None => return Err(anyhow!("The attached files aren't saved with this message")),
     };
+    // What goes is what the composer shows: the same files, or nothing goes (another window
+    // changed them, or they were lost), and the composer is told what's there.
+    let shown: HashSet<i64> = draft.attachments.iter().map(|f| f.id).collect();
+    let stored: HashSet<i64> = listed.iter().map(|f| f.id).collect();
+    if shown != stored {
+        let names = |files: &[crate::model::DraftAttachment], other: &HashSet<i64>| files.iter().filter(|f| !other.contains(&f.id)).map(|f| f.filename.as_str()).collect::<Vec<_>>().join(", ");
+        let (added, gone) = (names(&listed, &shown), names(&draft.attachments, &stored));
+        let what = match (added.is_empty(), gone.is_empty()) {
+            (false, true) => format!("added: {added}"),
+            (true, false) => format!("gone: {gone}"),
+            _ => format!("added: {added}; gone: {gone}"),
+        };
+        return Err(anyhow!("Not sent: its attachments changed ({what}). Check them and send again."));
+    }
     if let Some(f) = listed.iter().find(|f| f.status == FileStatus::Attaching) {
         return Err(anyhow!("Still attaching {}…", f.filename));
     }
@@ -1024,10 +1085,6 @@ fn queue_send(shared: &Arc<Shared>, workers: &HashMap<String, Worker>, draft: &D
     if let Some(why) = limit.over(&listed.iter().map(|f| f.size).collect::<Vec<_>>(), draft.body.len() + draft.subject.len()) {
         return Err(anyhow!(why));
     }
-    let files = match draft_id {
-        Some(d) if !listed.is_empty() => shared.with_writer(|st| st.attached_files(d))?,
-        _ => Vec::new(),
-    };
     let built = smtp::build(&account, draft, files)?;
     if let Some(why) = limit.refuses(built.raw.len()) {
         return Err(anyhow!(why));
@@ -1196,8 +1253,15 @@ fn open_draft(shared: &Shared, id: MessageId, now: i64) -> Result<Opening> {
                 },
             },
         };
-        if let Opening::Ready(d, _) = &opening {
-            st.set_draft_open(d.id, true)?;
+        // Sent as read, the store held meanwhile: a file event (sent the same way) can't come
+        // between, so the composer can take what follows as it comes.
+        match &opening {
+            Opening::Ready(d, notice) => {
+                st.set_draft_open(d.id, true)?;
+                shared.emit(Event::DraftOpened { id: d.id, draft: d.draft.clone(), at: d.at, restored: false, notice: notice.clone() });
+            }
+            Opening::Copy(draft, why) => shared.emit(Event::DraftOpened { id: 0, draft: (**draft).clone(), at: DraftRev::default(), restored: false, notice: Some(DraftNotice::Copy(why.clone())) }),
+            _ => {}
         }
         Ok(opening)
     })
@@ -1730,8 +1794,11 @@ impl OpRunner for ImapRunner<'_> {
                 let raw = base64::engine::general_purpose::STANDARD.decode(raw_b64)?;
                 let cred = shared.credential(account).await?;
                 log::info!("{}: sending to {} recipient(s)", account.email, to.len());
-                let size = smtp::send(account, &cred, from, to, &raw).await?;
+                let mut size = None;
+                let sent = smtp::send(account, &cred, from, to, &raw, &mut size).await;
+                // Kept whether it went or not: the next message is judged by it.
                 shared.learned_size(&account.id, size);
+                sent?;
                 log::info!("{}: sent", account.email);
                 shared.emit(Event::Toast("Message sent".into()));
                 // From here on the message is out; failures below must not resend it.
@@ -1784,6 +1851,21 @@ async fn replay_claimed(shared: &Arc<Shared>, account: &Account, runner: &mut im
                 let msg = format!("{e:#}");
                 let connection_lost = msg.contains("timed out") || msg.contains("connection") || msg.contains("Connection") || msg.contains("broken pipe");
                 let draft_op = matches!(q.op, Op::SaveDraft { .. } | Op::PurgeDraft { .. });
+                // A message too big for its server: no retry changes that. Off the queue, back
+                // in the composer, saying why.
+                if let (Op::Send { .. }, Some(too_big)) = (&q.op, smtp::too_big(&e)) {
+                    let why = too_big.to_string();
+                    shared.with_writer(|st| {
+                        if let Some(d) = st.send_bounced(q.id, now())? {
+                            shared.emit(Event::DraftOpened { id: d.id, draft: d.draft, at: d.at, restored: false, notice: Some(DraftNotice::NotSent(why.clone())) });
+                        }
+                        Ok(())
+                    })?;
+                    shared.emit(Event::Error(why));
+                    shared.emit(Event::Changed { account: account.id.clone() });
+                    any = true;
+                    continue;
+                }
                 // A message the server rejects for good (gone, no such mailbox) is dropped
                 // after a few tries; network trouble keeps it queued. Sends and drafts are
                 // never given up on: giving up would leave a draft off the server (its only
@@ -2005,6 +2087,8 @@ mod tests {
         /// The next purge goes through on the server, but its answer is lost (the connection
         /// drops).
         cut_off: bool,
+        /// Sends are refused as bigger than this ([`smtp::TooBig`]), which is learned.
+        too_big: Option<u64>,
     }
 
     impl FakeServer {
@@ -2022,6 +2106,7 @@ mod tests {
                 previous: vec![],
                 unsure: false,
                 cut_off: false,
+                too_big: None,
             }
         }
 
@@ -2041,8 +2126,17 @@ mod tests {
 
     impl OpRunner for FakeServer {
         fn run(&mut self, op: &Op) -> impl std::future::Future<Output = Result<()>> + Send {
-            self.ran.push(op.clone());
-            let r = self.on_the_wire();
+            let r = match (op, self.too_big) {
+                // Refused before a byte goes, the size learned, as smtp::send does.
+                (Op::Send { raw_b64, .. }, Some(limit)) => {
+                    self.shared.learned_size("a", Some(limit));
+                    Err(anyhow::Error::new(smtp::TooBig { size: raw_b64.len() * 3 / 4, limit: Some(limit) }))
+                }
+                _ => {
+                    self.ran.push(op.clone());
+                    self.on_the_wire()
+                }
+            };
             async move { r }
         }
 
@@ -2701,12 +2795,22 @@ mod tests {
         assert_eq!(server.drafts(), vec![(2, "hello, edited".to_owned())]);
     }
 
+    /// `draft` as the composer shows draft `id`: with the files the store has.
+    fn as_shown(shared: &Shared, id: i64, draft: Draft) -> Draft {
+        Draft { attachments: shared.with_writer(|st| st.files_of(id)).unwrap(), ..draft }
+    }
+
+    /// Sends draft `id` as `draft`, which must be refused: why, as the composer is told.
+    async fn refused(shared: &Arc<Shared>, rx: &std::sync::mpsc::Receiver<Event>, id: i64, draft: Draft) -> String {
+        handle(shared, &mut HashMap::new(), Command::Send { draft, draft_id: Some(id) }).await.unwrap();
+        rx.try_iter().find_map(|e| if let Event::SendFailed { draft_id: Some(i), error } = e { (i == id).then_some(error) } else { None }).expect("refused, the composer told")
+    }
+
     #[tokio::test]
     async fn a_send_that_cant_be_queued_goes_back_to_the_composer() {
         let (shared, rx) = drafts_engine();
         let unsendable = Draft { account: "removed".into(), ..draft("unsendable") };
-        assert!(handle(&shared, &mut HashMap::new(), Command::Send { draft: unsendable, draft_id: Some(9) }).await.is_err());
-        assert!(rx.try_iter().any(|e| matches!(e, Event::SendFailed { draft_id: Some(9) })), "the composer gets it back");
+        assert_eq!(refused(&shared, &rx, 9, unsendable).await, "Choose an account to send from", "the composer gets it back, saying why");
         let kept = shared.with_writer(|st| st.draft(9)).unwrap().unwrap();
         assert!(kept.visible && kept.draft.subject == "unsendable", "and it's kept as a draft meanwhile");
     }
@@ -2996,11 +3100,11 @@ mod tests {
         // In the draft, with the store, once attached: its upload carries them.
         assert_eq!(uploaded_files(&shared).await.into_iter().map(|(_, d)| d).collect::<Vec<_>>(), vec![PDF.to_vec(), b"\x89PNG\r\n\x1a\n".to_vec()], "the Drafts copy");
         // Not sent while a file it shows isn't attached; taken off, it goes, with every file.
-        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("plan"), draft_id: Some(7) }).await.unwrap_err();
-        assert_eq!(format!("{err}"), "gone.txt isn't attached: remove it, or attach it again");
+        let shown = as_shown(&shared, 7, draft("plan"));
+        assert_eq!(refused(&shared, &rx, 7, shown).await, "gone.txt isn't attached: remove it, or attach it again");
         handle(&shared, &mut HashMap::new(), Command::DetachFile { draft: 7, file: 2 }).await.unwrap();
         let mut server = FakeServer::new(&shared, |_: &Shared| {});
-        handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("plan"), draft_id: Some(7) }).await.unwrap();
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: as_shown(&shared, 7, draft("plan")), draft_id: Some(7) }).await.unwrap();
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(files_of(&sent_raw(&server)), vec![PDF.to_vec(), b"\x89PNG\r\n\x1a\n".to_vec()], "and the message: every file");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3108,7 +3212,7 @@ mod tests {
         handle(&shared, &mut HashMap::new(), Command::AttachForwarded { draft: 7, message: original, files: vec![(forwarded(4, "map.png"), 1)] }).await.unwrap();
         let files = attached(&wait_for(&rx, 1, |e| matches!(e, Event::FileAttached { .. } | Event::AttachFailed { .. })));
         assert_eq!(files, vec![crate::model::DraftAttachment { id: 4, filename: "map.png".into(), mime: "image/png".into(), size: 8, ..Default::default() }]);
-        handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("Fwd: The plan"), draft_id: Some(7) }).await.unwrap();
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: as_shown(&shared, 7, draft("Fwd: The plan")), draft_id: Some(7) }).await.unwrap();
         let mut server = FakeServer::new(&shared, |_: &Shared| {});
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(files_of(&sent_raw(&server)), vec![b"\x89PNG map".to_vec()]);
@@ -3194,15 +3298,14 @@ mod tests {
         let big = vec![7u8; crate::attach::LIMIT + 1];
         shared.with_writer(|st| st.attaching(7, &[(forwarded(1, "video.mov"), FileSource::Path("video.mov".into()))])).unwrap();
         shared.with_writer(|st| st.file_in(1, &big, "", now())).unwrap();
-        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("big"), draft_id: Some(7) }).await.unwrap_err();
-        assert!(format!("{err}").starts_with("Attachments total 25.0 MB, over the 25 MB limit"), "{err}");
-        assert!(rx.try_iter().any(|e| matches!(e, Event::SendFailed { draft_id: Some(7) })), "the composer gets it back");
+        let err = refused(&shared, &rx, 7, as_shown(&shared, 7, draft("big"))).await;
+        assert!(err.starts_with("Attachments total 25.0 MB, over the 25 MB limit"), "{err}");
         assert_eq!(shared.with_writer(|st| st.pending_count()).unwrap(), 1, "nothing queued but the draft's upload");
     }
 
     #[tokio::test]
     async fn a_message_too_big_for_its_server_is_refused_before_it_goes() {
-        let (shared, _rx) = drafts_engine();
+        let (shared, rx) = drafts_engine();
         type_draft(&shared, 7, 1, "big");
         let file = vec![7u8; 300_000];
         shared.with_writer(|st| st.attaching(7, &[(forwarded(1, "scan.pdf"), FileSource::Path("scan.pdf".into()))])).unwrap();
@@ -3213,17 +3316,97 @@ mod tests {
         let fits = (crate::attach::encoded_len(file.len()) + body) as u64;
         shared.with_writer(|st| st.set_send_limit("a", fits)).unwrap();
         assert_eq!(shared.limit("a").over(&[file.len()], body), None);
-        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("big"), draft_id: Some(7) }).await.unwrap_err();
-        assert!(format!("{err}").contains("once encoded for sending; your mail server takes at most"), "{err}");
+        let big = as_shown(&shared, 7, draft("big"));
+        let err = refused(&shared, &rx, 7, big.clone()).await;
+        assert!(err.contains("once encoded for sending; your mail server takes at most"), "{err}");
         // Smaller still: the composer's rule catches it too, with the same words the engine
         // refuses it with.
         shared.with_writer(|st| st.set_send_limit("a", 100_000)).unwrap();
         let said = shared.limit("a").over(&[file.len()], body).unwrap();
-        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("big"), draft_id: Some(7) }).await.unwrap_err();
-        assert_eq!(format!("{err}"), said);
+        assert_eq!(refused(&shared, &rx, 7, big.clone()).await, said);
         // Room enough: it goes.
         shared.with_writer(|st| st.set_send_limit("a", 35_882_577)).unwrap();
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: big, draft_id: Some(7) }).await.unwrap();
+        assert_eq!(queued_sends(&shared), 1);
+    }
+
+    fn queued_sends(shared: &Shared) -> usize {
+        shared.with_writer(|st| st.ops("a", i64::MAX)).unwrap().into_iter().filter(|q| matches!(q.op, Op::Send { .. })).count()
+    }
+
+    #[tokio::test]
+    async fn a_send_missing_a_file_its_composer_shows_is_refused() {
+        let (shared, rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "plan");
+        shared.with_writer(|st| st.attaching(7, &[(forwarded(500, "plan.pdf"), FileSource::Path("plan.pdf".into()))])).unwrap();
+        shared.with_writer(|st| st.file_in(500, PDF, "", now())).unwrap();
+        let shown = shared.with_writer(|st| st.draft(7)).unwrap().unwrap().draft;
+        // Discarded and purged before a refused save carried its text on as draft 8: the file
+        // went with it, while the composer still shows it.
+        shared.with_writer(|st| st.discard_draft(7, None)).unwrap();
+        handle(&shared, &mut HashMap::new(), Command::SaveDraftFrom { id: 8, draft: shown.clone(), open: true, rev: 2, lifecycle: 0, files_from: 7 }).await.unwrap();
+        let events: Vec<Event> = rx.try_iter().collect();
+        let told = events.iter().find_map(|e| if let Event::DraftFiles { draft: 8, files } = e { Some(files.clone()) } else { None }).expect("draft 8's files, as they are");
+        assert_eq!(told.iter().map(|f| (f.id, f.status.clone())).collect::<Vec<_>>(), [(500, FileStatus::Failed("Lost with the draft it was attached to: attach it again".into()))], "kept, saying why");
+        let err = refused(&shared, &rx, 8, shown).await;
+        assert_eq!(err, "plan.pdf isn't attached: remove it, or attach it again");
+        assert_eq!(queued_sends(&shared), 0, "never sent without a file it shows");
+    }
+
+    #[tokio::test]
+    async fn a_send_from_a_composer_that_never_saw_a_file_is_refused() {
+        let (shared, rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "plan");
+        let shown = shared.with_writer(|st| st.draft(7)).unwrap().unwrap().draft;
+        // Another window attaches a file to the same draft.
+        shared.with_writer(|st| st.attaching(7, &[(forwarded(500, "secret.pdf"), FileSource::Path("secret.pdf".into()))])).unwrap();
+        shared.with_writer(|st| st.file_in(500, PDF, "", now())).unwrap();
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: shown.clone(), draft_id: Some(7) }).await.unwrap();
+        assert_eq!(queued_sends(&shared), 0, "never sent with a file it doesn't show");
+        let events: Vec<Event> = rx.try_iter().collect();
+        let error = events.iter().find_map(|e| if let Event::SendFailed { draft_id: Some(7), error } = e { Some(error.clone()) } else { None });
+        assert_eq!(error.as_deref(), Some("Not sent: its attachments changed (added: secret.pdf). Check them and send again."));
+        // Then what's there, so the composer shows it: sent again, it goes.
+        let files = events.iter().find_map(|e| if let Event::DraftFiles { draft: 7, files } = e { Some(files.clone()) } else { None }).expect("the files as they are");
+        assert_eq!(files.iter().map(|f| f.id).collect::<Vec<_>>(), [500]);
+        handle(&shared, &mut HashMap::new(), Command::Send { draft: Draft { attachments: files, ..shown }, draft_id: Some(7) }).await.unwrap();
+        assert_eq!(queued_sends(&shared), 1);
+    }
+
+    #[tokio::test]
+    async fn a_carried_on_draft_hears_its_files_as_they_are() {
+        let (shared, rx) = drafts_engine();
+        type_draft(&shared, 7, 1, "plan");
+        shared.with_writer(|st| st.attaching(7, &[(forwarded(500, "slow.pdf"), FileSource::Path("slow.pdf".into()))])).unwrap();
+        let shown = shared.with_writer(|st| st.draft(7)).unwrap().unwrap().draft;
+        // The file comes in under draft 7 just before a refused save carries it on as draft 8:
+        // the composer, on 8 by then, must still hear it's attached.
+        shared.with_writer(|st| st.file_in(500, PDF, "", now())).unwrap();
+        handle(&shared, &mut HashMap::new(), Command::SaveDraftFrom { id: 8, draft: shown, open: true, rev: 2, lifecycle: 0, files_from: 7 }).await.unwrap();
+        let events: Vec<Event> = rx.try_iter().collect();
+        let told = events.iter().find_map(|e| if let Event::DraftFiles { draft: 8, files } = e { Some(files.clone()) } else { None });
+        assert_eq!(told.map(|f| f.into_iter().map(|f| (f.id, f.status)).collect::<Vec<_>>()), Some(vec![(500, FileStatus::Attached)]), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_message_its_server_wont_take_comes_back_and_isnt_tried_again() {
+        let (shared, rx) = drafts_engine();
+        shared.settings.write().unwrap().set("compose.undoSendSeconds", serde_json::json!(0)).unwrap();
+        type_draft(&shared, 7, 1, "big");
         handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("big"), draft_id: Some(7) }).await.unwrap();
+        // The server says, at send time, it takes less than that: before a byte of it goes.
+        let mut server = FakeServer::new(&shared, |_: &Shared| {});
+        server.too_big = Some(1000);
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert_eq!(queued_sends(&shared), 0, "off the queue: no retry changes it");
+        let events: Vec<Event> = rx.try_iter().collect();
+        let back = events.iter().find_map(|e| if let Event::DraftOpened { id: 7, notice: Some(DraftNotice::NotSent(why)), .. } = e { Some(why.clone()) } else { None });
+        assert!(back.as_deref().is_some_and(|w| w.starts_with("Not sent: this message is") && w.contains("takes at most 1000 B")), "back in the composer, saying why: {events:?}");
+        let d = shared.with_writer(|st| st.draft(7)).unwrap().unwrap();
+        assert!(d.visible && d.draft.subject == "big", "and in Drafts");
+        assert_eq!(shared.with_writer(|st| st.send_limit("a")).unwrap(), Some(1000), "what the server said is kept");
+        replay_with(&shared, &account("a"), &mut server).await.unwrap();
+        assert!(!server.ran.iter().any(|op| matches!(op, Op::Send { .. })), "never sent");
     }
 
     #[tokio::test]
@@ -3231,8 +3414,8 @@ mod tests {
         let (shared, _rx) = drafts_engine();
         type_draft(&shared, 7, 1, "x");
         shared.with_writer(|st| st.attaching(7, &[(forwarded(1, "slow.mov"), FileSource::Path("slow.mov".into()))])).unwrap();
-        let err = handle(&shared, &mut HashMap::new(), Command::Send { draft: draft("x"), draft_id: Some(7) }).await.unwrap_err();
-        assert_eq!(format!("{err}"), "Still attaching slow.mov…");
+        let (shared, rx) = (shared, _rx);
+        assert_eq!(refused(&shared, &rx, 7, as_shown(&shared, 7, draft("x"))).await, "Still attaching slow.mov…");
     }
 
     #[test]
