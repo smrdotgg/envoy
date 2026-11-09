@@ -1106,6 +1106,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "envoy-core",
+ "log",
  "open",
  "rune",
  "rune-kit",
