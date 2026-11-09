@@ -77,7 +77,7 @@ pub fn selection_bar(s: &App, t: &Theme, layer: &mut Vec<El>) -> El {
         .h(40.0)
         .gap(2.0)
         .center_y()
-        .child(tool(s, t, &icons::CLOSE, "Clear selection", "sel-clear", "keys.close", |s, _| s.selection.clear()))
+        .child(tool(s, t, &icons::CLOSE, "Clear selection", "sel-clear", "keys.close", |s, _| s.clear_selection()))
         .child(text(format!("{} selected", ids.len())).font(k.ty.ui_medium).color(k.c.text_base).pl(4.0).pr(6.0));
     if ids.len() < s.list.len() {
         let n = s.list.len();
