@@ -56,8 +56,12 @@ fn default_smtp_port() -> u16 {
 }
 
 impl Account {
+    /// Gmail, by its IMAP host exactly (whatever the case, with or without the root's dot): no
+    /// other server is taken for it, as snooze cleanup deletes folders on it.
     pub fn is_gmail(&self) -> bool {
-        self.imap_host.ends_with("gmail.com") || self.imap_host.ends_with("googlemail.com")
+        let host = self.imap_host.trim();
+        let host = host.strip_suffix('.').unwrap_or(host);
+        host.eq_ignore_ascii_case("imap.gmail.com") || host.eq_ignore_ascii_case("imap.googlemail.com")
     }
 
     pub fn login(&self) -> &str {
@@ -107,4 +111,25 @@ pub fn new_id(email: &str) -> String {
     let slug: String = email.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
     let n: u32 = rand::random::<u32>() % 10000;
     format!("{slug}-{n:04}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn on(host: &str) -> Account {
+        serde_json::from_value(serde_json::json!({ "id": "a", "email": "a@x.example", "auth": "password", "imapHost": host, "smtpHost": "" })).unwrap()
+    }
+
+    /// Gmail is told by its IMAP host exactly: what's decided on it includes deleting folders
+    /// (snooze cleanup), which only Gmail makes harmless.
+    #[test]
+    fn gmail_is_its_own_imap_hosts_only() {
+        for host in ["imap.gmail.com", "imap.googlemail.com", "IMAP.Gmail.COM", "imap.gmail.com.", " imap.gmail.com "] {
+            assert!(on(host).is_gmail(), "{host:?}");
+        }
+        for host in ["imap.notgmail.com", "notgmail.com", "gmail.com", "mail.gmail.com.evil.example", "imap.gmail.com.evil.example", "imap.mygooglemail.com", "imap.gmail.co", "imap.example.com", ""] {
+            assert!(!on(host).is_gmail(), "{host:?}");
+        }
+    }
 }
