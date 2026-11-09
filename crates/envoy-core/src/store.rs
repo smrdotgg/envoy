@@ -1019,34 +1019,37 @@ impl Store {
         Ok(true)
     }
 
-    /// The messages of a mailbox hidden while they wait for an op (a move): `(op, Message-ID)`.
-    /// Read before a new generation empties the mailbox's cache, to hide them again in it
-    /// ([`Store::rehide`]).
-    pub fn held_messages(&self, account: &str, mailbox: &str) -> Result<Vec<(i64, String)>> {
-        let mut stmt = self.conn.prepare_cached("SELECT held_op, message_id FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0 AND message_id != ''")?;
-        let rows = stmt.query_map(params![account, mailbox], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// After a new generation of the mailbox has been downloaded, hides again each message that
-    /// was waiting for an op in the old one (`held`, from [`Store::held_messages`]), found by its
-    /// Message-ID: an archived message doesn't come back while its move waits. One the
-    /// Message-ID doesn't find exactly once stays as it shows; its op finds out on replay.
-    pub fn rehide(&self, account: &str, mailbox: &str, held: &[(i64, String)]) -> Result<()> {
-        self.transaction(|st| {
-            for (op, message_id) in held {
-                let ids: Vec<MessageId> = st
-                    .conn
-                    .prepare_cached("SELECT id FROM messages WHERE account = ?1 AND mailbox = ?2 AND message_id = ?3 AND held_op = 0 LIMIT 2")?
-                    .query_map(params![account, mailbox, message_id], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?;
-                let still_queued: bool = st.conn.query_row("SELECT EXISTS (SELECT 1 FROM ops WHERE id = ?1)", params![op], |r| r.get(0))?;
-                if let ([id], true) = (ids.as_slice(), still_queued) {
-                    st.hide_local(*id, *op)?;
-                }
+    /// Hides the cached messages that queued moves and expunges are taking away but that show:
+    /// found by the Message-ID each op recorded, in the mailbox it acts in, when exactly one
+    /// such message shows. After a reset the new generation's copies are new rows, and this
+    /// hides them again under the same ops (so undo and replay still reach them); called as
+    /// each chunk of a download lands, in its transaction, it never matters where a download
+    /// was cut off, or that the identities lived in no sync's memory. Ops that already hide a
+    /// message are left alone. Returns how many it hid.
+    pub fn rehide_queued(&self, account: &str, mailbox: &str) -> Result<usize> {
+        let waiting: Vec<(i64, String)> = self
+            .conn
+            .prepare_cached(
+                "SELECT id, message_id FROM ops WHERE account = ?1 AND message_id != ''
+                   AND json_extract(op, '$.kind') IN ('move', 'expunge') AND json_extract(op, '$.mailbox') = ?2
+                   AND NOT EXISTS (SELECT 1 FROM messages WHERE held_op = ops.id AND held_op != 0)",
+            )?
+            .query_map(params![account, mailbox], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut hidden = 0;
+        for (op, message_id) in waiting {
+            let ids: Vec<MessageId> = self
+                .conn
+                .prepare_cached("SELECT id FROM messages WHERE account = ?1 AND mailbox = ?2 AND message_id = ?3 AND held_op = 0 LIMIT 2")?
+                .query_map(params![account, mailbox, message_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            if let [id] = ids.as_slice()
+                && self.hide_local(*id, op)?
+            {
+                hidden += 1;
             }
-            Ok(())
-        })
+        }
+        Ok(hidden)
     }
 
     /// The other messages of `id`'s conversation that live in the same account (for actions on
