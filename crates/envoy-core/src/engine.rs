@@ -267,6 +267,7 @@ impl Engine {
                 wakers: Mutex::new(HashMap::new()),
                 category_undo: Mutex::new(HashMap::new()),
                 recategorizing: Default::default(),
+                resync: Mutex::new(Vec::new()),
             });
             shared.store_me();
             let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("envoy-io").build() {
@@ -347,6 +348,9 @@ struct Shared {
     category_undo: Mutex<HashMap<i64, Vec<crate::store::Moved>>>,
     /// A pass sorting the whole cache again is running ([`recategorize`]).
     recategorizing: std::sync::atomic::AtomicBool,
+    /// Mailboxes, `(account, name)`, to sync on the account's next round: buckets snoozes just
+    /// went into, so Snoozed shows them without waiting for the next interval.
+    resync: Mutex<Vec<(String, String)>>,
 }
 
 impl Shared {
@@ -2126,6 +2130,16 @@ async fn session_loop(
         // Replay queued changes.
         log::debug!("{}: replaying ops", account.email);
         let ran_ops = replay_ops(shared, account, &mut session, caps).await?;
+        // Buckets snoozes just went into: synced this round.
+        if let Ok(mut resync) = shared.resync.lock() {
+            resync.retain(|(a, m)| {
+                let mine = *a == id;
+                if mine && !sync_boxes.contains(m) {
+                    sync_boxes.push(m.clone());
+                }
+                !mine
+            });
+        }
 
         let interval = Duration::from_secs(shared.setting_u32("sync.intervalSeconds").max(15) as u64);
         let full_due = last_full.is_none_or(|t| t.elapsed() >= interval);
@@ -2700,10 +2714,18 @@ async fn snooze_move(shared: &Shared, account: &Account, runner: &mut impl OpRun
         }
         Err(e) => return Err(e),
     }
-    if let Op::Move { dest, .. } = &q.op {
-        shared.with_writer(|st| st.add_bucket(&account.id, dest))?;
+    let Op::Move { dest, .. } = &q.op else { return runner.run(&q.op, &q.at).await };
+    let dest = dest.clone();
+    shared.with_writer(|st| st.add_bucket(&account.id, &dest))?;
+    shared.emit_mailboxes(&account.id);
+    runner.run(&q.op, &q.at).await?;
+    // Synced on this round, so Snoozed shows it there.
+    if let Ok(mut resync) = shared.resync.lock()
+        && !resync.iter().any(|(a, m)| *a == account.id && *m == dest)
+    {
+        resync.push((account.id.clone(), dest));
     }
-    runner.run(&q.op, &q.at).await
+    Ok(())
 }
 
 /// What the snooze cycle needs of the server: a seam, so it can be tested without one.
@@ -2948,6 +2970,7 @@ mod tests {
             wakers: Default::default(),
             category_undo: Default::default(),
             recategorizing: Default::default(),
+            resync: Default::default(),
         });
         (shared, rx)
     }
@@ -5082,6 +5105,7 @@ mod tests {
         replay_with(&shared, &account("a"), &mut server).await.unwrap();
         assert_eq!(server.buckets, [bucket_of(until)]);
         assert_eq!(server.ran, [Op::Move { mailbox: "INBOX".into(), uid: 1, dest: bucket_of(until) }]);
+        assert_eq!(*shared.resync.lock().unwrap(), [("a".to_owned(), bucket_of(until))], "synced next, so Snoozed shows it");
         shared
             .with_writer(|st| {
                 assert!(st.summary(a)?.is_none(), "moved for good");
