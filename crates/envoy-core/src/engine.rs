@@ -1597,6 +1597,7 @@ fn spawn_worker(shared: Arc<Shared>, account: String) -> Worker {
 /// connect, its jobs fall back to the background loop, so nothing is lost.
 async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedReceiver<Job>, fallback: mpsc::UnboundedSender<Job>, notify: Arc<Notify>) {
     let mut session: Option<Session> = None;
+    let mut used = Used::now();
     loop {
         let job = match &session {
             Some(_) => match tokio::time::timeout(Duration::from_secs(300), rx.recv()).await {
@@ -1616,9 +1617,9 @@ async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedRece
         };
         let Some(account) = shared.account(&id) else { return };
         // Said as it starts and as it ends: a job that stalls shows, not only one that fails.
-        let (what, started) = (job.what(), Instant::now());
+        let (what, started, idle) = (job.what(), Instant::now(), used.idle());
         log::debug!("{}: foreground: {what}", account.email);
-        match on_foreground(&mut ImapForeground { shared: &shared, account: &account }, &mut session, &job).await {
+        match on_foreground(&mut ImapForeground { shared: &shared, account: &account }, &mut session, idle, &job).await {
             Ok(()) => log::debug!("{}: foreground: {what}: done in {:?}", account.email, started.elapsed()),
             Err(e) => {
                 log::warn!("{}: a foreground {} failed after {:?}: left to the background connection", account_tag(&account.id), job.kind(), started.elapsed());
@@ -1627,6 +1628,31 @@ async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedRece
                 notify.notify_one();
             }
         }
+        used = Used::now();
+    }
+}
+
+/// A foreground connection left this long since its last job is [`Foreground::probe`]d before
+/// the next: long enough that one in use never is, short enough to beat NATs and sleep.
+const PROBE_AFTER: Duration = Duration::from_secs(60);
+
+/// When the foreground connection was last used, by both clocks: the monotonic one stands still
+/// while the computer sleeps (on macOS and Linux), the wall clock doesn't, so a connection that
+/// slept with the computer is probed however briefly it's been awake since.
+#[derive(Clone, Copy)]
+struct Used {
+    at: Instant,
+    wall: std::time::SystemTime,
+}
+
+impl Used {
+    fn now() -> Used {
+        Used { at: Instant::now(), wall: std::time::SystemTime::now() }
+    }
+
+    /// How long since, by whichever clock says longer (a wall clock set back says nothing).
+    fn idle(&self) -> Duration {
+        self.at.elapsed().max(self.wall.elapsed().unwrap_or_default())
     }
 }
 
@@ -1634,6 +1660,8 @@ async fn foreground(shared: Arc<Shared>, id: String, mut rx: mpsc::UnboundedRece
 trait Foreground {
     type Session: Send;
     fn connect(&mut self) -> impl std::future::Future<Output = Result<Self::Session>> + Send;
+    /// Whether the connection still answers, found out in seconds ([`imap::probe`]).
+    fn probe(&mut self, session: &mut Self::Session) -> impl std::future::Future<Output = Result<()>> + Send;
     fn run(&mut self, session: &mut Self::Session, job: &Job) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
@@ -1650,6 +1678,10 @@ impl Foreground for ImapForeground<'_> {
         imap::connect(self.account, &cred).await
     }
 
+    async fn probe(&mut self, session: &mut Session) -> Result<()> {
+        imap::probe(session).await
+    }
+
     async fn run(&mut self, session: &mut Session, job: &Job) -> Result<()> {
         foreground_job(self.shared, self.account, session, job).await
     }
@@ -1657,11 +1689,21 @@ impl Foreground for ImapForeground<'_> {
 
 /// Runs `job` on the foreground connection `session`, opening one if there is none; leaves in
 /// `session` what the next job can use. A connection left open since an earlier job may have
-/// been dropped meanwhile without a word (servers and NATs close idle connections early,
-/// GreenMail after 30 s): when the job fails on one for want of a connection, it runs once more
-/// on a fresh one, rather than wait behind the background connection's work. An error means it
-/// didn't run here: the caller hands it to the background connection.
-async fn on_foreground<F: Foreground>(fg: &mut F, session: &mut Option<F::Session>, job: &Job) -> Result<()> {
+/// been dropped meanwhile (servers and NATs close idle connections early, GreenMail after
+/// 30 s). Dropped without a word (the computer slept, a NAT forgot it), it never answers, and
+/// the job would wait out the command's 30 s: one `idle` past [`PROBE_AFTER`] is probed first,
+/// and replaced at once if it doesn't answer within seconds. Closed by the server, the job
+/// fails on it for want of a connection, and runs once more on a fresh one, rather than wait
+/// behind the background connection's work. An error means it didn't run here: the caller
+/// hands it to the background connection.
+async fn on_foreground<F: Foreground>(fg: &mut F, session: &mut Option<F::Session>, idle: Duration, job: &Job) -> Result<()> {
+    if idle > PROBE_AFTER
+        && let Some(s) = session.as_mut()
+        && let Err(e) = fg.probe(s).await
+    {
+        log::info!("the foreground connection didn't answer after {}s idle ({e:#}): opening a new one", idle.as_secs());
+        *session = None;
+    }
     let fresh = session.is_none();
     let s = match session {
         Some(s) => s,
@@ -3129,8 +3171,8 @@ mod tests {
     }
 
     /// A foreground connection whose sessions are numbered as they're opened. `stale`: sessions
-    /// below it were dropped by the server (jobs on them fail as a lost connection would);
-    /// `refuse`: the server answers jobs with NO; `offline`: connecting fails.
+    /// below it were dropped by the server (jobs and probes on them fail as a lost connection
+    /// would); `refuse`: the server answers jobs with NO; `offline`: connecting fails.
     #[derive(Default)]
     struct FakeForeground {
         opened: u32,
@@ -3138,6 +3180,7 @@ mod tests {
         refuse: bool,
         offline: bool,
         ran_on: Vec<u32>,
+        probed: Vec<u32>,
     }
 
     impl Foreground for FakeForeground {
@@ -3147,6 +3190,14 @@ mod tests {
             anyhow::ensure!(!self.offline, "Couldn't reach imap.x.com:993");
             self.opened += 1;
             Ok(self.opened)
+        }
+
+        async fn probe(&mut self, session: &mut u32) -> Result<()> {
+            self.probed.push(*session);
+            if *session < self.stale {
+                return Err(anyhow::Error::new(imap::Lost("NOOP: timed out".into())));
+            }
+            Ok(())
         }
 
         async fn run(&mut self, session: &mut u32, _: &Job) -> Result<()> {
@@ -3167,23 +3218,103 @@ mod tests {
         // which is kept for the next.
         let mut fg = FakeForeground { opened: 1, stale: 2, ..Default::default() };
         let mut session = Some(1);
-        on_foreground(&mut fg, &mut session, &Job::Sync).await.unwrap();
+        on_foreground(&mut fg, &mut session, RECENT, &Job::Sync).await.unwrap();
         assert_eq!((fg.ran_on.as_slice(), session), (&[1, 2][..], Some(2)));
         // Once only: a job that fails on a fresh connection goes to the background one.
         let mut fg = FakeForeground { stale: 9, ..Default::default() };
         let mut session = None;
-        assert!(on_foreground(&mut fg, &mut session, &Job::Sync).await.is_err());
+        assert!(on_foreground(&mut fg, &mut session, RECENT, &Job::Sync).await.is_err());
         assert_eq!((fg.ran_on.as_slice(), session), (&[1][..], None));
         // A server that answers NO isn't a lost connection: no second try.
         let mut fg = FakeForeground { opened: 1, refuse: true, ..Default::default() };
         let mut session = Some(1);
-        assert!(on_foreground(&mut fg, &mut session, &Job::Sync).await.is_err());
+        assert!(on_foreground(&mut fg, &mut session, RECENT, &Job::Sync).await.is_err());
         assert_eq!((fg.ran_on.as_slice(), fg.opened, session), (&[1][..], 1, None));
         // Offline: the dropped connection can't be replaced either.
         let mut fg = FakeForeground { opened: 1, stale: 2, offline: true, ..Default::default() };
         let mut session = Some(1);
-        assert!(on_foreground(&mut fg, &mut session, &Job::Sync).await.is_err());
+        assert!(on_foreground(&mut fg, &mut session, RECENT, &Job::Sync).await.is_err());
         assert_eq!(session, None);
+    }
+
+    /// Since a foreground connection's last job: recently, and long enough to probe it first.
+    const RECENT: Duration = Duration::from_secs(5);
+    const LONG: Duration = Duration::from_secs(61);
+
+    #[tokio::test]
+    async fn only_a_foreground_connection_left_idle_is_probed() {
+        // In use a moment ago: no probe, the job goes straight on.
+        let mut fg = FakeForeground { opened: 1, ..Default::default() };
+        let mut session = Some(1);
+        on_foreground(&mut fg, &mut session, RECENT, &Job::Sync).await.unwrap();
+        assert_eq!((fg.probed.as_slice(), fg.ran_on.as_slice()), (&[][..], &[1][..]));
+        // Idle a while, and still answering: probed, then used.
+        let mut fg = FakeForeground { opened: 1, ..Default::default() };
+        let mut session = Some(1);
+        on_foreground(&mut fg, &mut session, LONG, &Job::Sync).await.unwrap();
+        assert_eq!((fg.probed.as_slice(), fg.ran_on.as_slice(), session), (&[1][..], &[1][..], Some(1)));
+        // Idle a while and silent: the job never runs on it, only on a new one, which is kept.
+        let mut fg = FakeForeground { opened: 1, stale: 2, ..Default::default() };
+        let mut session = Some(1);
+        on_foreground(&mut fg, &mut session, LONG, &Job::Sync).await.unwrap();
+        assert_eq!((fg.probed.as_slice(), fg.ran_on.as_slice(), session), (&[1][..], &[2][..], Some(2)));
+        // No connection yet: nothing to probe.
+        let mut fg = FakeForeground::default();
+        let mut session = None;
+        on_foreground(&mut fg, &mut session, LONG, &Job::Sync).await.unwrap();
+        assert_eq!((fg.probed.as_slice(), session), (&[][..], Some(1)));
+    }
+
+    #[test]
+    fn idle_time_counts_the_computer_asleep() {
+        // The monotonic clock stood still while asleep; the wall clock went on.
+        let slept = Used { at: Instant::now(), wall: std::time::SystemTime::now() - Duration::from_secs(3600) };
+        assert!(slept.idle() >= Duration::from_secs(3600));
+        // A wall clock set back doesn't hide the time that passed.
+        let set_back = Used { at: Instant::now() - Duration::from_secs(90), wall: std::time::SystemTime::now() + Duration::from_secs(3600) };
+        assert!(set_back.idle() >= Duration::from_secs(90));
+    }
+
+    /// The foreground's connections as the wire has them: each a session with the fake server,
+    /// the first answering nothing at all once logged in (dropped without a word), the rest
+    /// answering a SELECT. A job is a SELECT.
+    struct WireForeground {
+        opened: usize,
+        logs: Vec<imap::fake::Log>,
+    }
+
+    impl Foreground for WireForeground {
+        type Session = imap::Connection<tokio::io::DuplexStream>;
+
+        async fn connect(&mut self) -> Result<Self::Session> {
+            let dead = self.opened == 0;
+            self.opened += 1;
+            let (s, log) = imap::fake::session(move |_| Some(if dead { imap::fake::SILENT.to_owned() } else { imap::fake::selected(7, 10) })).await;
+            self.logs.push(log);
+            Ok(s)
+        }
+
+        async fn probe(&mut self, session: &mut Self::Session) -> Result<()> {
+            imap::probe(session).await
+        }
+
+        async fn run(&mut self, session: &mut Self::Session, _: &Job) -> Result<()> {
+            imap::select(session, "INBOX").await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silently_dead_foreground_connection_is_replaced_in_seconds() {
+        let mut fg = WireForeground { opened: 0, logs: Vec::new() };
+        let mut session = Some(fg.connect().await.unwrap());
+        let t = Instant::now();
+        on_foreground(&mut fg, &mut session, LONG, &Job::Sync).await.unwrap();
+        // Done on a new connection in the probe's few seconds, not the SELECT's 30.
+        assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
+        assert_eq!(fg.opened, 2);
+        let commands = |i: usize| fg.logs[i].lock().unwrap().iter().filter(|c| !c.starts_with("LOGIN")).cloned().collect::<Vec<_>>();
+        assert_eq!((commands(0), commands(1)), (vec!["NOOP".to_owned()], vec!["SELECT \"INBOX\"".to_owned()]));
+        assert!(session.is_some(), "the new connection is kept for the next job");
     }
 
     // ── drafts ──

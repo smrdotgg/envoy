@@ -83,7 +83,12 @@ pub(super) async fn run(session: &mut Connection<impl Io>, command: &str, what: 
 
 /// Runs a command whose answer is just its tagged OK (STORE, UID EXPUNGE, COPY, MOVE).
 pub(super) async fn ok(session: &mut Connection<impl Io>, command: &str, what: &str) -> Result<()> {
-    run(session, command, what, COMMAND_TIMEOUT, |_| {}).await
+    ok_within(session, command, what, COMMAND_TIMEOUT).await
+}
+
+/// [`ok`], within `limit`.
+pub(super) async fn ok_within(session: &mut Connection<impl Io>, command: &str, what: &str, limit: Duration) -> Result<()> {
+    run(session, command, what, limit, |_| {}).await
 }
 
 /// What a finished SELECT said.
