@@ -898,10 +898,13 @@ async fn message_ids_of(session: &mut Connection<impl Io>, set: &str) -> Result<
     Ok(fetched.iter().filter_map(|f| f.header.as_deref().and_then(|h| mime::parse(h, true))).map(|p| p.message_id).filter(|m| !m.is_empty()).collect())
 }
 
-/// Deletes snooze bucket `bucket` if the server says it's empty right now (and unsubscribes
-/// it). The caller has checked it's a day past its time ([`snooze::may_delete`]). True when
-/// it's gone, deleted here or found gone already.
+/// Deletes snooze bucket `bucket` if the server says it's empty right before (and unsubscribes
+/// it). Only for Gmail, where DELETE removes a label and never mail, and a week past the bucket's
+/// time ([`snooze::may_delete`]): the caller sees to both. True when it's gone, deleted here or
+/// found gone already.
 pub async fn cleanup_bucket(session: &mut Connection<impl Io>, bucket: &str, inbox: &str) -> Result<bool> {
+    // Never the selected mailbox; selected first, so the STATUS is right before the DELETE.
+    wire::select(session, inbox).await?;
     let messages = match wire::status(session, bucket).await {
         Ok(told) => told.messages,
         Err(e) if is_lost(&e) => return Err(e),
@@ -912,8 +915,6 @@ pub async fn cleanup_bucket(session: &mut Connection<impl Io>, bucket: &str, inb
     if messages != 0 {
         return Ok(false);
     }
-    // Never the selected mailbox.
-    wire::select(session, inbox).await?;
     match wire::ok(session, &format!("DELETE {}", quoted(bucket)), "DELETE").await {
         Ok(()) => {}
         Err(e) if is_lost(&e) => return Err(e),
@@ -2138,17 +2139,28 @@ mod tests {
         };
         let (mut s, log) = fake::session(status(0)).await;
         assert!(cleanup_bucket(&mut s, BUCKET, "INBOX").await.unwrap());
-        assert_eq!(commands(&log), [format!("STATUS \"{BUCKET}\" (MESSAGES UNSEEN)"), "SELECT \"INBOX\"".into(), format!("DELETE \"{BUCKET}\""), format!("UNSUBSCRIBE \"{BUCKET}\"")]);
+        // The STATUS is right before the DELETE: nothing else between them.
+        assert_eq!(commands(&log), ["SELECT \"INBOX\"".to_owned(), format!("STATUS \"{BUCKET}\" (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)"), format!("DELETE \"{BUCKET}\""), format!("UNSUBSCRIBE \"{BUCKET}\"")]);
         let (mut s, log) = fake::session(status(1)).await;
         assert!(!cleanup_bucket(&mut s, BUCKET, "INBOX").await.unwrap());
         assert!(!commands(&log).iter().any(|c| c.starts_with("DELETE")));
         // Gone already: nothing to delete.
-        let (mut s, log) = fake::session(|c: &str| c.starts_with("STATUS").then(|| "TAG NO [NONEXISTENT] no such mailbox\r\n".to_owned())).await;
+        let (mut s, log) = fake::session(|c: &str| match c {
+            c if c.starts_with("SELECT") => Some(fake::selected(7, 10)),
+            c if c.starts_with("STATUS") => Some("TAG NO [NONEXISTENT] no such mailbox\r\n".to_owned()),
+            _ => None,
+        })
+        .await;
         assert!(cleanup_bucket(&mut s, BUCKET, "INBOX").await.unwrap());
         assert!(!commands(&log).iter().any(|c| c.starts_with("DELETE")));
         // A STATUS cut short deletes nothing.
         for how in BREAKS.into_iter().filter(|h| !matches!(h, Breaks::No | Breaks::Bad)) {
-            let (mut s, log) = fake::session(move |c: &str| c.starts_with("STATUS").then(|| broken(&format!("* STATUS \"{BUCKET}\" (MESSAGES 0 UNSEEN 0)\r\n"), how))).await;
+            let (mut s, log) = fake::session(move |c: &str| match c {
+                c if c.starts_with("SELECT") => Some(fake::selected(7, 10)),
+                c if c.starts_with("STATUS") => Some(broken(&format!("* STATUS \"{BUCKET}\" (MESSAGES 0 UNSEEN 0)\r\n"), how)),
+                _ => None,
+            })
+            .await;
             assert!(cleanup_bucket(&mut s, BUCKET, "INBOX").await.is_err());
             assert!(!commands(&log).iter().any(|c| c.starts_with("DELETE")), "{how:?}");
         }

@@ -197,6 +197,13 @@ CREATE TABLE IF NOT EXISTS snooze_parents (
     delimiter TEXT NOT NULL,
     native TEXT NOT NULL DEFAULT ''
 );
+-- Snooze buckets woken and past the time a late message could arrive: left alone from then on
+-- (on Gmail, deleted a week on if empty; elsewhere never: snooze.rs).
+CREATE TABLE IF NOT EXISTS snooze_done (
+    account TEXT NOT NULL,
+    name TEXT NOT NULL,
+    PRIMARY KEY (account, name)
+);
 -- Messages this Envoy woke from a snooze, by Message-ID: pinned when they land in the inbox,
 -- for servers that can't keep `$new` (snooze.rs). Forgotten once dealt with, or after a while.
 CREATE TABLE IF NOT EXISTS woken (
@@ -501,6 +508,16 @@ fn migrate(conn: &Connection) -> Result<()> {
 
 fn has_table(conn: &Connection, name: &str) -> Result<bool> {
     Ok(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", params![name], |r| r.get::<_, i64>(0))? > 0)
+}
+
+/// One of an account's snooze buckets ([`Store::buckets`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bucket {
+    pub name: String,
+    /// When its messages wake, Unix seconds.
+    pub wake: i64,
+    /// Woken, and past the time a late message could arrive: left alone.
+    pub done: bool,
 }
 
 /// What counts as an account's snooze bucket: a stamp under either parent, by its delimiter,
@@ -1847,6 +1864,7 @@ impl Store {
         self.conn.execute("DELETE FROM category_overrides WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM snooze_parents WHERE account = ?1", params![account])?;
         self.conn.execute("DELETE FROM woken WHERE account = ?1", params![account])?;
+        self.conn.execute("DELETE FROM snooze_done WHERE account = ?1", params![account])?;
         Ok(())
     }
 
@@ -1924,13 +1942,29 @@ impl Store {
         Ok(crate::snooze::bucket(&parent, &delimiter, wake))
     }
 
-    /// The account's snooze buckets known here, `(name, wake time)`, by name: soonest first
-    /// under each parent.
-    pub fn buckets(&self, account: &str) -> Result<Vec<(String, i64)>> {
+    /// The account's snooze buckets known here, by name: soonest first under each parent.
+    pub fn buckets(&self, account: &str) -> Result<Vec<Bucket>> {
         let layout = self.bucket_layout(account)?;
-        let mut stmt = self.conn.prepare_cached("SELECT name FROM mailboxes WHERE account = ?1 AND role = 'snoozed' ORDER BY name")?;
-        let names = stmt.query_map(params![account], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(names.into_iter().filter_map(|n| layout.wake(&n).map(|(_, w)| (n.clone(), w))).collect())
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.name, d.name IS NOT NULL FROM mailboxes m LEFT JOIN snooze_done d ON d.account = m.account AND d.name = m.name
+              WHERE m.account = ?1 AND m.role = 'snoozed' ORDER BY m.name",
+        )?;
+        let rows = stmt.query_map(params![account], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter_map(|(name, done)| layout.wake(&name).map(|(_, wake)| (wake, done)).map(|(wake, done)| Bucket { name, wake, done })).collect())
+    }
+
+    /// Forgets what's known of buckets the account no longer has.
+    pub fn forget_gone_buckets(&self, account: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM snooze_done WHERE account = ?1 AND name NOT IN (SELECT name FROM mailboxes WHERE account = ?1)", params![account])?;
+        Ok(())
+    }
+
+    /// Records that bucket `name` is done with (woken, and past the time a late message could
+    /// arrive), or isn't after all.
+    pub fn set_bucket_done(&self, account: &str, name: &str, done: bool) -> Result<()> {
+        let sql = if done { "INSERT OR IGNORE INTO snooze_done (account, name) VALUES (?1, ?2)" } else { "DELETE FROM snooze_done WHERE account = ?1 AND name = ?2" };
+        self.conn.execute(sql, params![account, name])?;
+        Ok(())
     }
 
     /// A bucket just made on the server: known here at once, for its wake and the Snoozed view.
@@ -1948,6 +1982,7 @@ impl Store {
     pub fn forget_mailbox(&self, account: &str, name: &str) -> Result<()> {
         self.clear_mailbox(account, name)?;
         self.conn.execute("DELETE FROM mailboxes WHERE account = ?1 AND name = ?2", params![account, name])?;
+        self.conn.execute("DELETE FROM snooze_done WHERE account = ?1 AND name = ?2", params![account, name])?;
         Ok(())
     }
 

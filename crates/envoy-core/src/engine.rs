@@ -17,7 +17,7 @@ use crate::accounts::{self, Account, AuthKind};
 use crate::imap::{self, Credential, Session};
 use crate::model::{Category, Draft, DraftNotice, FileSource, FileStatus, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
 use crate::settings::Settings;
-use crate::store::{At, DraftRev, LocalDraft, Op, QueuedOp, Query, ReplyOf, Store};
+use crate::store::{At, Bucket, DraftRev, LocalDraft, Op, QueuedOp, Query, ReplyOf, Store};
 use crate::{drafts, oauth, paths, secrets, smtp, snooze};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -970,11 +970,12 @@ async fn handle(shared: &Arc<Shared>, workers: &mut HashMap<String, Worker>, cmd
                 let accts: Vec<String> = shared.accounts.read().map(|a| a.iter().map(|a| a.id.clone()).collect()).unwrap_or_default();
                 Ok(match &view {
                     View::Mailbox { account, mailbox } => vec![(account.clone(), mailbox.clone())],
-                    // Every bucket, of every account in the view.
+                    // Every bucket not done with (and the server's own), of every account in the view.
                     View::Role { account, role: Role::Snoozed } => {
                         let mut boxes = Vec::new();
                         for a in accts.iter().filter(|a| account.as_ref().is_none_or(|x| x == *a)) {
-                            boxes.extend(st.mailboxes(a)?.into_iter().filter(|m| m.role == Role::Snoozed && m.selectable).map(|m| (a.clone(), m.name)));
+                            let done: HashSet<String> = st.buckets(a)?.into_iter().filter(|b| b.done).map(|b| b.name).collect();
+                            boxes.extend(st.mailboxes(a)?.into_iter().filter(|m| m.role == Role::Snoozed && m.selectable && !done.contains(&m.name)).map(|m| (a.clone(), m.name)));
                         }
                         boxes
                     }
@@ -2156,7 +2157,7 @@ async fn session_loop(
 
         // Snoozes whose time has come go back to the inbox, by every Envoy that's running; old
         // empty buckets go. The buckets woken are synced, so their cached copies empty too.
-        let snoozed = snooze_cycle(shared, account, &mut ImapSnooze { session: &mut session, caps }, snoozes, caps.moves, now()).await?;
+        let snoozed = snooze_cycle(shared, account, &mut ImapSnooze { session: &mut session, caps }, snoozes, caps.moves, account.is_gmail(), now()).await?;
         if !snoozed.woke.is_empty() {
             inbox_dirty = true;
             changed = true;
@@ -2227,7 +2228,9 @@ async fn session_loop(
         }
         inbox_dirty = false;
         if full_due {
-            for m in mailboxes.iter().filter(|m| m.selectable) {
+            // Buckets done with are empty and left alone: not counted.
+            let done: HashSet<String> = shared.with_writer(|st| st.buckets(&id))?.into_iter().filter(|b| b.done).map(|b| b.name).collect();
+            for m in mailboxes.iter().filter(|m| m.selectable && !done.contains(&m.name)) {
                 match imap::status(&mut session, &m.name).await {
                     Ok((unread, total)) => shared.with_writer(|st| st.set_counts(&id, &m.name, unread, total))?,
                     Err(e) if imap::is_lost(&e) => return Err(e),
@@ -2333,7 +2336,8 @@ fn store_listing(st: &Store, account: &str, listed: &[imap::ListedMailbox]) -> R
     // Where snoozes go, decided from the whole list, as every Envoy decides it.
     let parent = imap::snooze_parent(listed);
     st.set_snooze_parent(account, &parent.name, &parent.delimiter, parent.native.as_deref().unwrap_or(""))?;
-    st.retain_mailboxes(account, &listed.iter().map(|m| m.name.clone()).collect::<Vec<_>>())
+    st.retain_mailboxes(account, &listed.iter().map(|m| m.name.clone()).collect::<Vec<_>>())?;
+    st.forget_gone_buckets(account)
 }
 
 fn display_of(mailboxes: &[Mailbox], name: &str) -> String {
@@ -2758,9 +2762,12 @@ impl SnoozeServer for ImapSnooze<'_> {
     }
 }
 
-/// How often old empty buckets are looked for, and a woken bucket looked into again (a message
-/// a far-off Envoy, its clock behind, put there late).
+/// How often old empty buckets are looked for (on Gmail), and a woken bucket looked into again
+/// while a late message could still come (a far-off Envoy's, its clock behind).
 const SNOOZE_RECHECK: i64 = 600;
+/// How long after its time a bucket could still get a late message. Woken past that, it's done
+/// with: left alone from then on, across restarts ([`Bucket::done`]).
+const STRAGGLERS: i64 = 3600;
 /// A wake the server refused is tried again after this long.
 const WAKE_RETRY: i64 = 60;
 /// Woken messages are pinned as they land for this long at most.
@@ -2784,9 +2791,9 @@ impl SnoozeClock {
         self.not_before.get(bucket).map_or(at, |t| at.max(*t))
     }
 
-    /// The first time any of `buckets` (`(name, wake)`) is due here.
-    fn next(&mut self, buckets: &[(String, i64)], moves: bool) -> Option<i64> {
-        buckets.iter().map(|(b, w)| self.due_at(b, *w, moves)).min()
+    /// The first time any of `buckets` (not done with) is due here.
+    fn next(&mut self, buckets: &[Bucket], moves: bool) -> Option<i64> {
+        buckets.iter().filter(|b| !b.done).map(|b| self.due_at(&b.name, b.wake, moves)).min()
     }
 }
 
@@ -2797,18 +2804,20 @@ struct SnoozeCycle {
     deleted: Vec<String>,
 }
 
-/// One round of the account's snoozes at `now`: every ten minutes, buckets a day past their
-/// time that the server says are empty are deleted; then each bucket whose time has come here
-/// ([`SnoozeClock::due_at`]) is woken into the inbox, and its messages remembered as woken.
-/// A lost connection ends the round (the worker connects again and catches up); a refusal is
+/// One round of the account's snoozes at `now`. Each bucket whose time has come here
+/// ([`SnoozeClock::due_at`]) is woken into the inbox, and its messages remembered as woken; past
+/// [`STRAGGLERS`] it's then done with, else looked into again in ten minutes. On Gmail
+/// (`gmail`), every ten minutes, done buckets a week past their time that the server says are
+/// empty are deleted (one found not empty is woken again); nowhere else is a bucket deleted. A
+/// lost connection ends the round (the worker connects again and catches up); a refusal is
 /// tried again in a minute.
-async fn snooze_cycle(shared: &Shared, account: &Account, server: &mut impl SnoozeServer, clock: &mut SnoozeClock, moves: bool, now: i64) -> Result<SnoozeCycle> {
+async fn snooze_cycle(shared: &Shared, account: &Account, server: &mut impl SnoozeServer, clock: &mut SnoozeClock, moves: bool, gmail: bool, now: i64) -> Result<SnoozeCycle> {
     let (inbox, buckets) = shared.with_writer(|st| Ok((st.mailbox_for_role(&account.id, Role::Inbox)?, st.buckets(&account.id)?)))?;
     let mut done = SnoozeCycle::default();
     let Some(inbox) = inbox else { return Ok(done) };
     if clock.last_cleanup.is_none_or(|t| now - t >= SNOOZE_RECHECK) {
         clock.last_cleanup = Some(now);
-        for (bucket, _) in buckets.iter().filter(|(_, wake)| snooze::old_enough(*wake, now)) {
+        for bucket in buckets.iter().filter(|b| gmail && b.done && snooze::old_enough(b.wake, now)).map(|b| &b.name) {
             match server.cleanup(bucket, &inbox).await {
                 Ok(true) => {
                     log::info!("{}: deleted the empty snooze bucket {bucket}", account.email);
@@ -2817,20 +2826,25 @@ async fn snooze_cycle(shared: &Shared, account: &Account, server: &mut impl Snoo
                     clock.jitter.remove(bucket);
                     done.deleted.push(bucket.clone());
                 }
-                Ok(false) => {}
+                // A message came after all: woken next round.
+                Ok(false) => shared.with_writer(|st| st.set_bucket_done(&account.id, bucket, false))?,
                 Err(e) if imap::is_lost(&e) => return Err(e),
                 Err(e) => log::warn!("{}: couldn't clean up {bucket}: {e:#}", account.email),
             }
         }
         shared.with_writer(|st| st.prune_woken(now - KEEP_WOKEN))?;
     }
-    for (bucket, wake) in buckets.iter().filter(|(b, _)| !done.deleted.contains(b)) {
+    for Bucket { name: bucket, wake, .. } in buckets.iter().filter(|b| !b.done && !done.deleted.contains(&b.name)) {
         if now < clock.due_at(bucket, *wake, moves) {
             continue;
         }
         match server.wake(bucket, &inbox).await {
             Ok(woken) => {
-                clock.not_before.insert(bucket.clone(), now + SNOOZE_RECHECK);
+                if now >= wake + STRAGGLERS {
+                    shared.with_writer(|st| st.set_bucket_done(&account.id, bucket, true))?;
+                } else {
+                    clock.not_before.insert(bucket.clone(), now + SNOOZE_RECHECK);
+                }
                 if woken.moved > 0 {
                     log::info!("{}: woke {} snoozed message(s) from {bucket}", account.email, woken.moved);
                     shared.with_writer(|st| st.add_woken(&account.id, &woken.message_ids, now))?;
@@ -5116,7 +5130,7 @@ mod tests {
         shared
             .with_writer(|st| {
                 assert!(st.summary(a)?.is_none(), "moved for good");
-                assert_eq!(st.buckets("a")?, [(bucket_of(until), until)], "its bucket known here at once, for its wake");
+                assert_eq!(st.buckets("a")?, [Bucket { name: bucket_of(until), wake: until, done: false }], "its bucket known here at once, for its wake");
                 assert!(st.ops("a", i64::MAX)?.is_empty());
                 Ok(())
             })
@@ -5225,7 +5239,7 @@ mod tests {
         assert_eq!(st.snooze_parent("a").unwrap().0, "Snoozed", "a native mailbox by another name leaves the parent be");
         let wakes: Vec<(String, Option<i64>)> = st.mailboxes("a").unwrap().into_iter().filter(|m| m.role == Role::Snoozed).map(|m| (m.name, m.wake)).collect();
         assert_eq!(wakes, [("Snoozed.20261112T0800Z".to_owned(), None), (native.to_owned(), None), ("Snoozed/20261111T0800Z".to_owned(), Some(1_794_384_000))]);
-        assert_eq!(st.buckets("a").unwrap(), [("Snoozed/20261111T0800Z".to_owned(), 1_794_384_000)]);
+        assert_eq!(st.buckets("a").unwrap(), [Bucket { name: "Snoozed/20261111T0800Z".into(), wake: 1_794_384_000, done: false }]);
         assert_eq!(st.bucket_of("a", native).unwrap(), None, "never moved into, never woken");
     }
 
@@ -5276,18 +5290,18 @@ mod tests {
         server.boxes.insert(bucket_of(past), vec!["<1@x>", "<2@x>"]);
         server.boxes.insert(bucket_of(soon), vec!["<3@x>"]);
         let mut clock = SnoozeClock::default();
-        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, t).await.unwrap();
+        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t).await.unwrap();
         assert_eq!(done.woke, [bucket_of(past)], "the one due, caught up on");
         assert_eq!(server.inbox, ["<1@x>", "<2@x>"]);
         assert!(shared.with_writer(|st| st.has_woken("a")).unwrap(), "remembered, to pin as they land");
         // The next round asks nothing of a bucket just woken; the other waits for its time.
-        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, t + 1).await.unwrap();
+        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t + 1).await.unwrap();
         assert!(done.woke.is_empty() && server.woken.len() == 1, "{:?}", server.woken);
         let buckets = shared.with_writer(|st| st.buckets("a")).unwrap();
         assert_eq!(clock.next(&buckets, true), Some(soon), "the worker waits until then");
-        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, soon - 1).await.unwrap();
+        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, soon - 1).await.unwrap();
         assert!(!server.woken.contains(&bucket_of(soon)), "a second early");
-        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, soon).await.unwrap();
+        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, soon).await.unwrap();
         assert_eq!(done.woke, [bucket_of(soon)]);
         assert_eq!(server.inbox, ["<1@x>", "<2@x>", "<3@x>"]);
     }
@@ -5305,10 +5319,10 @@ mod tests {
         let mut server = Buckets::default();
         server.boxes.insert(bucket_of(t), vec!["<1@x>"]);
         if at > t {
-            snooze_cycle(&shared, &account("a"), &mut server, &mut clock, false, at - 1).await.unwrap();
+            snooze_cycle(&shared, &account("a"), &mut server, &mut clock, false, false, at - 1).await.unwrap();
             assert!(server.woken.is_empty(), "not before its jitter");
         }
-        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, false, at).await.unwrap();
+        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, false, false, at).await.unwrap();
         assert_eq!(server.woken, [bucket_of(t)]);
     }
 
@@ -5319,35 +5333,78 @@ mod tests {
         let mut server = Buckets { refuse: true, ..Buckets::default() };
         server.boxes.insert(bucket_of(t - 60), vec!["<1@x>"]);
         let mut clock = SnoozeClock::default();
-        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, t).await.unwrap();
+        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t).await.unwrap();
         let buckets = shared.with_writer(|st| st.buckets("a")).unwrap();
         assert_eq!(clock.next(&buckets, true), Some(t + WAKE_RETRY), "no busy loop on a refusal");
         server.lost = true;
-        assert!(snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, t + WAKE_RETRY).await.is_err());
+        assert!(snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t + WAKE_RETRY).await.is_err());
     }
 
     #[tokio::test]
-    async fn only_empty_buckets_a_day_past_their_time_are_deleted() {
+    async fn buckets_are_never_deleted_on_a_server_whose_delete_takes_their_mail() {
+        // On a generic IMAP server DELETE takes what's in the mailbox, and another Envoy may
+        // be moving a message in between a STATUS and the DELETE: buckets stay, empty.
         let t = 1_800_000_000;
-        let (gone, full, young) = (t - snooze::KEEP_EMPTY - 60, t - snooze::KEEP_EMPTY - 120, t - snooze::KEEP_EMPTY + 3600);
-        let (shared, _rx) = engine_with(snooze_setup(&[gone, full, young]));
+        let old = t - 30 * 86_400;
+        let (shared, _rx) = engine_with(snooze_setup(&[old]));
+        let mut server = Buckets::default();
+        let mut clock = SnoozeClock::default();
+        for later in [0, SNOOZE_RECHECK, 86_400] {
+            let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t + later).await.unwrap();
+            assert!(done.deleted.is_empty());
+        }
+        assert!(server.cleaned.is_empty(), "never even asked: {:?}", server.cleaned);
+        assert_eq!(shared.with_writer(|st| st.buckets("a")).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn on_gmail_empty_buckets_go_only_a_week_past_their_time() {
+        // On Gmail a DELETE removes a label, never mail: buckets a week past their time go,
+        // once woken and found empty right before.
+        let t = 1_800_000_000;
+        let (week, full, days) = (t - snooze::KEEP_EMPTY - 60, t - snooze::KEEP_EMPTY - 120, t - 6 * 86_400);
+        let (shared, _rx) = engine_with(snooze_setup(&[week, full, days]));
         let mut server = Buckets::default();
         server.boxes.insert(bucket_of(full), vec!["<late@x>"]);
         let mut clock = SnoozeClock::default();
-        // Not woken yet (the app was off for a day): woken in the same round, not deleted.
-        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, t).await.unwrap();
-        assert_eq!(done.deleted, [bucket_of(gone)]);
-        let mut cleaned = server.cleaned.clone();
-        cleaned.sort();
-        assert_eq!(cleaned, [bucket_of(full), bucket_of(gone)], "a young one isn't even asked about");
-        assert!(done.woke.contains(&bucket_of(full)));
-        let left: Vec<String> = shared.with_writer(|st| st.buckets("a")).unwrap().into_iter().map(|(b, _)| b).collect();
-        assert_eq!(left, [bucket_of(full), bucket_of(young)]);
-        // Looked for again only every ten minutes.
-        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, t + 60).await.unwrap();
-        assert_eq!(server.cleaned.len(), 2);
-        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, t + SNOOZE_RECHECK).await.unwrap();
-        assert_eq!(done.deleted, [bucket_of(full)], "emptied by its wake, then deleted");
+        // Not woken yet (the app was off for a week): woken first, not deleted in the same round.
+        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, true, t).await.unwrap();
+        assert!(done.deleted.is_empty() && done.woke == [bucket_of(full)], "{done:?}");
+        // Ten minutes on: the two a week old, empty now, go; six days old stays.
+        let done = snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, true, t + SNOOZE_RECHECK).await.unwrap();
+        let mut deleted = done.deleted.clone();
+        deleted.sort();
+        assert_eq!(deleted, [bucket_of(full), bucket_of(week)]);
+        assert!(!server.cleaned.contains(&bucket_of(days)), "six days isn't a week");
+        let left: Vec<String> = shared.with_writer(|st| st.buckets("a")).unwrap().into_iter().map(|b| b.name).collect();
+        assert_eq!(left, [bucket_of(days)]);
+    }
+
+    #[tokio::test]
+    async fn a_bucket_woken_and_past_its_stragglers_is_left_alone_across_restarts() {
+        let t = 1_800_000_000;
+        let (recent, old) = (t - 600, t - 2 * 3600);
+        let (shared, _rx) = engine_with(snooze_setup(&[recent, old]));
+        let mut server = Buckets::default();
+        server.boxes.insert(bucket_of(recent), vec!["<1@x>"]);
+        server.boxes.insert(bucket_of(old), vec!["<2@x>"]);
+        let mut clock = SnoozeClock::default();
+        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t).await.unwrap();
+        let asked = |server: &Buckets, b: i64| server.woken.iter().filter(|w| **w == bucket_of(b)).count();
+        assert_eq!((asked(&server, recent), asked(&server, old)), (1, 1));
+        // Within its first hour a bucket is looked into again every ten minutes (a message a far
+        // Envoy, its clock behind, put there late); past it, never again.
+        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t + SNOOZE_RECHECK).await.unwrap();
+        assert_eq!((asked(&server, recent), asked(&server, old)), (2, 1));
+        snooze_cycle(&shared, &account("a"), &mut server, &mut clock, true, false, t + 3600).await.unwrap();
+        assert_eq!(asked(&server, recent), 3);
+        // Envoy starts again: neither is looked into, and nothing waits on them.
+        let mut restarted = SnoozeClock::default();
+        snooze_cycle(&shared, &account("a"), &mut server, &mut restarted, true, false, t + 4000).await.unwrap();
+        assert_eq!(server.woken.len(), 4, "{:?}", server.woken);
+        let buckets = shared.with_writer(|st| st.buckets("a")).unwrap();
+        assert!(buckets.iter().all(|b| b.done));
+        assert_eq!(restarted.next(&buckets, true), None);
     }
 
     #[test]

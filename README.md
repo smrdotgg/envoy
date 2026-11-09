@@ -177,8 +177,9 @@ row brings it back now.
 folder named for when it wakes, under `Snoozed`: `Snoozed/20261110T0800Z` (UTC, to the minute);
 on Gmail, a label. Other mail apps show them as folders or labels, and every Envoy you run sees
 the same snoozes. Any Envoy that's running at the time brings a message back (and one that
-wasn't catches up when it starts); nothing happens while none is. An empty folder goes a day
-after its time. If your server already keeps a `Snoozed` folder of its own (or won't let Envoy
+wasn't catches up when it starts); nothing happens while none is. On Gmail an empty label goes a
+week after its time; other servers keep the empty folders (deleting a folder there deletes what's
+in it, and another Envoy could be moving a message in), which Envoy then leaves alone. If your server already keeps a `Snoozed` folder of its own (or won't let Envoy
 make one), Envoy's go under `Envoy Snoozed` instead, and the server's own snoozes are shown in
 Snoozed but left to it. Snoozes made in Gmail's web app aren't visible over IMAP, so Envoy doesn't
 show them.
@@ -287,7 +288,7 @@ put) and a two-message move under one undo key, delete forever, sending with und
 edited, sent, undone, discarded), moves and a send held across a kill and a restart, and snoozes
 (undone inside the window with the server untouched; let go into its `Snoozed/…` folder, made and
 subscribed; one whose time came first woken in place; a folder left past its time woken on the
-next check, unread and pinned; an old empty one deleted; unsnoozed from Snoozed). It runs
+next check, unread and pinned; old empty ones kept (only Gmail's are deleted); unsnoozed from Snoozed). It runs
 twice: against GreenMail as it is (UIDPLUS, MOVE, IDLE), then through a proxy that takes UIDPLUS
 and MOVE away, so the fallbacks run too, and fails if Envoy sends a command that server lacks,
 or one that would expunge mail it didn't delete. To run it locally (the second pass needs

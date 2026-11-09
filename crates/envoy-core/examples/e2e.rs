@@ -625,8 +625,9 @@ fn scenario(pass: Pass) {
 /// Snoozing and waking against the server: a snooze undone inside its window never reaches it;
 /// one let go lands in its bucket (made and subscribed), gone from the inbox; one whose time
 /// comes before it reaches the server wakes where it is instead; a bucket another Envoy left
-/// past its time wakes on the next check, unread and pinned here; an empty one a day old goes;
-/// and Unsnooze from the Snoozed view brings a message back.
+/// past its time wakes on the next check, unread and pinned here; an empty one, however old, is
+/// never deleted (only Gmail's are, whose DELETE takes no mail); and Unsnooze from the Snoozed
+/// view brings a message back.
 fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) {
     deliver(user, "Snooze me", "Fay <fay@localhost>", "Later, please.", |b| b.message_id(Some("<snooze-1@localhost>".into())));
     deliver(user, "Snooze me back", "Fay <fay@localhost>", "Too soon to snooze.", |b| b.message_id(Some("<snooze-2@localhost>".into())));
@@ -683,8 +684,8 @@ fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) 
     println!("✓ a snooze whose time came first: left in the inbox, unread and pinned, no bucket made");
 
     // A bucket another Envoy left past its time wakes on the next check (Check mail reads the
-    // folders again): back in the inbox, unread, pinned atop it here. One a day old and empty
-    // goes; one younger stays.
+    // folders again): back in the inbox, unread, pinned atop it here. An old empty one stays: on
+    // a server like this one DELETE would take a message another Envoy moved in meanwhile.
     let past = snooze::bucket("Snoozed", &delimiter, (epoch() as i64 - 2 * 3600) / 60 * 60);
     let old = snooze::bucket("Snoozed", &delimiter, (epoch() as i64 - 3 * 86_400) / 60 * 60);
     probe.create(&past);
@@ -706,9 +707,10 @@ fn snoozes(d: &mut Driver, probe: &Probe, pass: Pass, user: &str, inbox: &View) 
         // COPY, then flagged \Deleted, never expunged without UIDPLUS.
         Pass::Plain => assert_eq!(probe.deleted(&past), ["Back from a snooze"]),
     }
-    d.until("the old empty bucket deleted", 20, |_| (!probe.names().contains(&old)).then_some(()));
-    assert!(probe.names().contains(&past), "a bucket not a day past its time stays");
-    println!("✓ a bucket past its time woke on the next check, pinned here; an old empty one was deleted");
+    // The round that woke it has looked at every bucket by now.
+    let names = probe.names();
+    assert!(names.contains(&old) && names.contains(&past), "buckets are never deleted off Gmail");
+    println!("✓ a bucket past its time woke on the next check, pinned here; old empty ones stay");
 
     // Unsnooze from Snoozed: back in the inbox now.
     let snoozed = View::Role { account: Some(ACCOUNT.into()), role: Role::Snoozed };
