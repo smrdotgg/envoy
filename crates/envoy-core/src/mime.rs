@@ -389,10 +389,11 @@ fn tidy_markdown(md: &str) -> String {
     fixed.trim().to_owned()
 }
 
-/// A message's HTML made safe to open in a browser ([`crate::html::export`]): scripts,
-/// handlers, refreshes, frames and forms removed, a strict Content-Security-Policy, no
-/// referrer, remote pictures only with `remote_images`, and the message's own (`cid:`)
-/// pictures embedded as `data:` URIs read from `raw`.
+/// A message's HTML made safe to open in a browser ([`crate::html::export`]): rewritten from an
+/// allowlist of elements and attributes and checked by parsing it back, under a strict
+/// Content-Security-Policy, with remote pictures only with `remote_images` (and only those
+/// Envoy would fetch: no tracking pixels), and the message's own (`cid:`) pictures embedded as
+/// `data:` URIs read from `raw`.
 pub fn browser_html(html: &str, raw: Option<&[u8]>, remote_images: bool) -> String {
     use base64::Engine as _;
     let msg = raw.and_then(|r| MessageParser::default().parse(r));
@@ -401,10 +402,10 @@ pub fn browser_html(html: &str, raw: Option<&[u8]>, remote_images: bool) -> Stri
         let want = cid.get(4..)?.trim().trim_matches(|c| c == '<' || c == '>');
         let part = msg.as_ref()?.parts.iter().find(|p| p.content_id().is_some_and(|id| id.trim_matches(|c| c == '<' || c == '>') == want))?;
         let bytes = part.contents();
-        // Pictures only (the format read from the bytes, not the part's claimed type), and
-        // not without end.
+        // Pictures browsers draw only (the format read from the bytes, not the part's claimed
+        // type; the export keeps no other `data:` type), and not without end.
         let mime = image::guess_format(bytes).ok()?.to_mime_type();
-        if !mime.starts_with("image/") || bytes.len() > budget {
+        if !matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp") || bytes.len() > budget {
             return None;
         }
         budget -= bytes.len();
