@@ -35,6 +35,10 @@ const LIGHT_COLS: &str = "m.id, m.account, m.thread, m.message_id, m.date, m.fla
 /// A query whose words match at most this many messages is driven from its matches.
 const FEW_HITS: usize = 4000;
 
+/// Up to this many mailboxes are scanned one ordered index each, merged; more (SQLite takes at
+/// most 500 parts of a compound query) go through one query, sorted.
+const MERGED_BOXES: usize = 32;
+
 /// Which messages a view covers.
 pub(super) enum Scope {
     /// These mailboxes, `(account, name)`.
@@ -238,6 +242,26 @@ impl Store {
     pub(super) fn scope(&self, view: &View) -> Result<Scope> {
         Ok(match view {
             View::Mailbox { account, mailbox } => Scope::Boxes(vec![(account.clone(), mailbox.clone())]),
+            // Every bucket not done with (and the server's own snoozed mailbox), soonest to
+            // wake first: the order Snoozed lists them in.
+            View::Role { account, role: Role::Snoozed } => {
+                let mut stmt = self.conn.prepare_cached(
+                    "SELECT account, name FROM mailboxes m WHERE role = 'snoozed' AND selectable = 1 AND (?1 IS NULL OR account = ?1)
+                       AND NOT EXISTS (SELECT 1 FROM snooze_done d WHERE d.account = m.account AND d.name = m.name) ORDER BY account, name",
+                )?;
+                let boxes: Vec<(String, String)> = stmt.query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+                let mut layout: Option<(String, super::BucketLayout)> = None;
+                let mut keyed: Vec<(i64, (String, String))> = Vec::with_capacity(boxes.len());
+                for (a, name) in boxes {
+                    if layout.as_ref().is_none_or(|(of, _)| *of != a) {
+                        layout = Some((a.clone(), self.bucket_layout(&a)?));
+                    }
+                    let wake = layout.as_ref().and_then(|(_, l)| l.wake(&name)).map_or(i64::MAX, |(_, w)| w);
+                    keyed.push((wake, (a, name)));
+                }
+                keyed.sort_by_key(|(wake, _)| *wake);
+                Scope::Boxes(keyed.into_iter().map(|(_, b)| b).collect())
+            }
             View::Role { account, role } => {
                 let mut stmt = self.conn.prepare_cached("SELECT account, name FROM mailboxes WHERE role = ?1 AND (?2 IS NULL OR account = ?2) ORDER BY account, name")?;
                 let boxes = stmt.query_map(rusqlite::params![role.as_str(), account], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
@@ -276,9 +300,9 @@ impl Store {
         if hits.as_ref().is_some_and(|h| h.ids.is_empty()) {
             return Ok(Vec::new());
         }
-        // Snoozed goes by wake time, not date: its rows come in one piece, sorted at the end.
+        // Snoozed goes by wake time, not date, a message a row: each bucket in the scope's order.
         let snoozed = matches!(view, View::Role { role: Role::Snoozed, .. });
-        let page = if snoozed { 0 } else { page };
+        let conversations = conversations && !snoozed;
         // Messages back from a snooze come first in the inbox, until they're dealt with.
         let pinned = if query.is_empty() { self.pinned_boxes(view, &scope) } else { Vec::new() };
         let (limit, page) = (limit as usize, page as usize);
@@ -308,6 +332,21 @@ impl Store {
         }
         passes.push((sql, args));
         let mut stopped = false;
+        if let (true, Scope::Boxes(boxes)) = (snoozed, &scope) {
+            // One statement, run for each bucket in turn: its shape doesn't grow with them.
+            let mut stmt = self.conn.prepare(&box_sql(&filter))?;
+            'boxes: for (a, b) in boxes {
+                let args: Vec<SqlValue> = [SqlValue::from(a.clone()), SqlValue::from(b.clone())].into_iter().chain(filter.args.iter().cloned()).collect();
+                let mut rows = stmt.query(params_from_iter(args.iter()))?;
+                while let Some(r) = rows.next()? {
+                    if self.take_paged(&mut g, r, &mut pages, &scope, &filter)? {
+                        stopped = true;
+                        break 'boxes;
+                    }
+                }
+            }
+            passes.clear();
+        }
         'passes: for (sql, args) in passes {
             let mut stmt = self.conn.prepare(&sql)?;
             let mut rows = stmt.query(params_from_iter(args.iter()))?;
@@ -326,15 +365,6 @@ impl Store {
         }
         let rest = self.read_full(&g.out[done..])?;
         shown.extend(rest);
-        if snoozed {
-            // Soonest to wake first (then newest first); the server's own snoozes (no time in
-            // their name) last. Sorted by small keys, then the rows put in their order.
-            let wake = |s: &Summary| self.bucket_of(&s.account, &s.mailbox).ok().flatten().map_or(i64::MAX, |(_, w)| w);
-            let mut keys: Vec<(i64, i64, i64, usize)> = shown.iter().enumerate().map(|(i, s)| (wake(s), -s.date, -s.id, i)).collect();
-            keys.sort_unstable();
-            let mut rows: Vec<Option<Summary>> = shown.into_iter().map(Some).collect();
-            shown = keys.into_iter().filter_map(|(.., i)| rows[i].take()).collect();
-        }
         Ok(shown)
     }
 
@@ -443,6 +473,12 @@ fn scan_sql(scope: &Scope, filter: &Filter, few: Option<&Hits>) -> (String, Vec<
             let within = scope_sql(scope, &mut args);
             format!("SELECT {LIGHT_COLS} FROM messages m WHERE m.id IN (SELECT value FROM json_each(?)) AND {} AND {within} ORDER BY {ORDER}", filter.sql())
         }
+        (Scope::Boxes(boxes), None) if boxes.len() > MERGED_BOXES => {
+            // Many mailboxes: one query whatever their number (its rows sorted).
+            args.extend(filter.args.iter().cloned());
+            let within = scope_sql(scope, &mut args);
+            format!("SELECT {LIGHT_COLS} FROM messages m WHERE {} AND {within} ORDER BY {ORDER}", filter.sql())
+        }
         (Scope::Boxes(boxes), None) => {
             // One ordered index scan per mailbox; SQLite merges them by date. With categories,
             // one per mailbox and category, each a range of `messages_by_category` in the same
@@ -511,19 +547,19 @@ fn ids_json(ids: &[i64]) -> String {
     s
 }
 
-/// The scope as a condition on `m`, its arguments appended to `args`.
+/// A Snoozed bucket's rows, newest first: run for each bucket, `(account, mailbox)` then the
+/// filter's arguments.
+fn box_sql(filter: &Filter) -> String {
+    format!("SELECT {LIGHT_COLS} FROM messages m INDEXED BY messages_by_date WHERE m.account = ? AND m.mailbox = ? AND {} ORDER BY {ORDER}", filter.sql())
+}
+
+/// The scope as a condition on `m`, its arguments appended to `args`: one, however many
+/// mailboxes.
 fn scope_sql(scope: &Scope, args: &mut Vec<SqlValue>) -> String {
     match scope {
         Scope::Boxes(boxes) => {
-            let parts: Vec<&str> = boxes
-                .iter()
-                .map(|(a, b)| {
-                    args.push(a.clone().into());
-                    args.push(b.clone().into());
-                    "(m.account = ? AND m.mailbox = ?)"
-                })
-                .collect();
-            format!("({})", parts.join(" OR "))
+            args.push(SqlValue::from(serde_json::to_string(boxes).unwrap_or_else(|_| "[]".into())));
+            "(m.account, m.mailbox) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))".to_owned()
         }
         Scope::Starred(account) => {
             let mut s = format!(
@@ -596,13 +632,32 @@ mod tests {
         assert!(set.iter().any(|p| p.contains("INDEX messages_thread (account=? AND thread=?)")), "{set:?}");
     }
 
+    /// A Snoozed bucket is read by its date index; many mailboxes are one query of one scope
+    /// parameter, not a part (or a term) each.
+    #[test]
+    fn query_shapes_dont_grow_with_the_mailboxes() {
+        let st = Store::memory();
+        let filter = Filter::new(&Query::default());
+        let one = plan(&st, &box_sql(&filter), &[SqlValue::from("a".to_owned()), SqlValue::from("Snoozed/20261110T0800Z".to_owned())]);
+        assert!(one.iter().any(|p| p.contains("COVERING INDEX messages_by_date (account=? AND mailbox=?)")) && !one.iter().any(|p| p.contains("TEMP B-TREE")), "{one:?}");
+        let boxes: Vec<(String, String)> = (0..600).map(|i| ("a".to_owned(), format!("Snoozed/{i}"))).collect();
+        let scope = Scope::Boxes(boxes);
+        let (sql, args) = scan_sql(&scope, &filter, None);
+        assert_eq!(args.len(), 1, "one scope parameter");
+        assert!(!sql.contains("UNION"), "{sql}");
+        assert!(!plan(&st, &sql, &args).is_empty());
+        let hits = Hits::new((1..100).collect());
+        let (sql, args) = scan_sql(&scope, &filter, Some(&hits));
+        assert_eq!(args.len(), 2);
+        assert!(!plan(&st, &sql, &args).is_empty());
+    }
+
     /// The inbox's woken messages are found by their own small index, not by reading the inbox.
     #[test]
     fn pinned_rows_are_read_by_their_own_index() {
         let st = Store::memory();
         let (sql, args) = pinned_sql(&[("a".to_owned(), "INBOX".to_owned()), ("b".to_owned(), "INBOX".to_owned())], &Filter::new(&Query::default()));
-        let mut stmt = st.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        let plan: Vec<String> = stmt.query_map(params_from_iter(args.iter()), |r| r.get::<_, String>(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let plan = plan(&st, &sql, &args);
         assert!(plan.iter().filter(|p| p.contains("INDEX messages_woken")).count() == 2, "{plan:?}");
     }
 }

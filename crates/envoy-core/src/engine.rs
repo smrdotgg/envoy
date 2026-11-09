@@ -5479,6 +5479,36 @@ mod tests {
     }
 
     #[test]
+    fn the_snoozed_view_is_a_message_a_row_soonest_first_before_any_limit() {
+        let (a, b, c) = (later(), later() + 3600, later() + 7200);
+        let st = snooze_setup(&[a, b, c]);
+        // A conversation snoozed in two parts, to different times; the latest bucket holds the
+        // newest mail.
+        let first = message(&st, &bucket_of(a), 1, "<1@x>", "", 0);
+        let reply = message(&st, &bucket_of(b), 4, "<4@x>", "<1@x>", 0);
+        message(&st, &bucket_of(c), 8, "<8@x>", "", 0);
+        message(&st, &bucket_of(c), 9, "<9@x>", "", 0);
+        let view = View::Role { account: None, role: Role::Snoozed };
+        let rows: Vec<MessageId> = st.list(&view, &Query::default(), true, 2, &HashSet::new()).unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(rows, [first, reply], "each message its own row, by wake time, then the limit");
+    }
+
+    #[test]
+    fn the_snoozed_view_lists_hundreds_of_buckets() {
+        let wakes: Vec<i64> = (0..600).map(|i| later() + i * 60).collect();
+        let st = snooze_setup(&wakes);
+        for w in wakes.iter().rev() {
+            message(&st, &bucket_of(*w), 1, &format!("<{w}@x>"), "", 0);
+        }
+        let view = View::Role { account: None, role: Role::Snoozed };
+        let rows = st.list(&view, &Query::default(), false, 3000, &HashSet::new()).unwrap();
+        let order: Vec<String> = rows.iter().map(|s| s.mailbox.clone()).collect();
+        assert_eq!(order, wakes.iter().map(|w| bucket_of(*w)).collect::<Vec<_>>());
+        // Searched too.
+        assert_eq!(st.list(&view, &Query::parse("from:ana"), false, 3000, &HashSet::new()).unwrap().len(), 600);
+    }
+
+    #[test]
     fn the_snoozed_view_lists_every_bucket_soonest_first() {
         let (soon, late) = (later(), later() + 86_400);
         let st = snooze_setup(&[late, soon]);
@@ -5488,10 +5518,10 @@ mod tests {
         let view = View::Role { account: None, role: Role::Snoozed };
         let rows: Vec<MessageId> = st.list(&view, &Query::default(), false, 100, &HashSet::new()).unwrap().into_iter().map(|s| s.id).collect();
         assert_eq!(rows, [newer_but_sooner, also_sooner, older_but_later]);
-        // Streamed or not, the same order: it comes in one piece.
+        // Streamed, the same order: the first page is its top.
         let mut first = Vec::new();
         let paged = st.list_paged(&view, &Query::default(), false, 100, &HashSet::new(), 1, &mut |p| first = p).unwrap();
-        assert!(first.is_empty());
+        assert_eq!(first.into_iter().map(|s| s.id).collect::<Vec<_>>(), rows[..1]);
         assert_eq!(paged.into_iter().map(|s| s.id).collect::<Vec<_>>(), rows);
     }
 }
