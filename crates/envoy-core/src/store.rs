@@ -327,13 +327,16 @@ END;
 COMMIT;
 ";
 
-/// The server's counts minus messages waiting for a move, and messages flagged \Deleted (see
-/// [`Store::set_counts`]). Runs under the writer lock after every STATUS, so the subqueries
-/// must not scan the mailbox: they read only the few held or flagged rows, from
-/// messages_held_box and messages_deleted_box.
+/// The server's counts minus messages waiting for a move, and messages flagged \Deleted, with
+/// read and unread marks the server hasn't been told yet (see [`Store::set_counts`]). Runs
+/// under the writer lock after every STATUS, so the subqueries must not scan the mailbox: they
+/// read only the few held or flagged rows, from messages_held_box and messages_deleted_box,
+/// and the queue (what's waiting for the server: a handful of rows).
 const SET_COUNTS: &str = "UPDATE mailboxes SET
     unread = MAX(0, ?3 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0 AND flags & 1 = 0)
-                       - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND flags & 16 != 0 AND held_op = 0 AND flags & 1 = 0)),
+                       - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND flags & 16 != 0 AND held_op = 0 AND flags & 1 = 0)
+                       - (SELECT COUNT(*) FROM ops WHERE account = ?1 AND json_extract(op, '$.kind') = 'setFlags' AND json_extract(op, '$.mailbox') = ?2 AND json_extract(op, '$.add') & 1 != 0)
+                       + (SELECT COUNT(*) FROM ops WHERE account = ?1 AND json_extract(op, '$.kind') = 'setFlags' AND json_extract(op, '$.mailbox') = ?2 AND json_extract(op, '$.remove') & 1 != 0)),
     total = MAX(0, ?4 - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND held_op != 0)
                      - (SELECT COUNT(*) FROM messages WHERE account = ?1 AND mailbox = ?2 AND flags & 16 != 0 AND held_op = 0))
  WHERE account = ?1 AND name = ?2";
@@ -627,7 +630,10 @@ impl Store {
     /// Applies the server's counts. Messages waiting for a move to replay are still on the
     /// server, so they're in its counts, but they've already left this mailbox locally (and
     /// undo adds them back): they're taken out here so nothing is counted twice. So are the
-    /// messages known to be flagged \Deleted, which STATUS counts but Envoy doesn't show.
+    /// messages known to be flagged \Deleted, which STATUS counts but Envoy doesn't show. And a
+    /// message marked read (or unread) here whose mark is still queued counts as it shows here,
+    /// not as the server last heard: a STATUS that lands before the mark would put the unread
+    /// badge back up.
     pub fn set_counts(&self, account: &str, name: &str, unread: u32, total: u32) -> Result<()> {
         self.conn.execute(SET_COUNTS, params![account, name, unread, total])?;
         Ok(())
@@ -2019,6 +2025,31 @@ mod tests {
     fn counts(s: &Store) -> (u32, u32) {
         let m = s.mailboxes("a").unwrap().into_iter().find(|m| m.name == "INBOX").unwrap();
         (m.unread, m.total)
+    }
+
+    #[test]
+    fn server_counts_count_queued_read_marks_as_they_show_here() {
+        let s = Store::memory();
+        s.upsert_mailbox("a", "INBOX", "Inbox", Role::Inbox, "/", true).unwrap();
+        let read_here = Op::SetFlags { mailbox: "INBOX".into(), uid: 1, add: flags::SEEN, remove: 0 };
+        let starred_here = Op::SetFlags { mailbox: "INBOX".into(), uid: 2, add: flags::FLAGGED, remove: 0 };
+        let unread_here = Op::SetFlags { mailbox: "INBOX".into(), uid: 3, add: 0, remove: flags::SEEN };
+        let elsewhere = Op::SetFlags { mailbox: "Work".into(), uid: 1, add: flags::SEEN, remove: 0 };
+        let read = s.enqueue("a", &read_here).unwrap();
+        for op in [&starred_here, &elsewhere] {
+            s.enqueue("a", op).unwrap();
+        }
+        // The server hasn't heard of the read mark yet: 3 unread there, 2 here.
+        s.set_counts("a", "INBOX", 3, 10).unwrap();
+        assert_eq!(counts(&s), (2, 10), "a STATUS before the mark replays doesn't undo it");
+        let unread = s.enqueue("a", &unread_here).unwrap();
+        s.set_counts("a", "INBOX", 3, 10).unwrap();
+        assert_eq!(counts(&s), (3, 10), "one read here, one unread here");
+        // Both reached the server: its count is the truth.
+        s.op_done(read).unwrap();
+        s.op_done(unread).unwrap();
+        s.set_counts("a", "INBOX", 3, 10).unwrap();
+        assert_eq!(counts(&s), (3, 10));
     }
 
     #[test]
