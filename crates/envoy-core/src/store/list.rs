@@ -333,8 +333,12 @@ impl Store {
         let rest = self.read_full(&g.out[done..])?;
         shown.extend(rest);
         if snoozed {
-            // Soonest to wake first; the server's own snoozes (no time in their name) last.
-            shown.sort_by_key(|s| (crate::snooze::wake_of(&s.mailbox).unwrap_or(i64::MAX), std::cmp::Reverse((s.date, s.id))));
+            // Soonest to wake first (then newest first); the server's own snoozes (no time in
+            // their name) last. Sorted by small keys, then the rows put in their order.
+            let mut keys: Vec<(i64, i64, i64, usize)> = shown.iter().enumerate().map(|(i, s)| (crate::snooze::wake_of(&s.mailbox).unwrap_or(i64::MAX), -s.date, -s.id, i)).collect();
+            keys.sort_unstable();
+            let mut rows: Vec<Option<Summary>> = shown.into_iter().map(Some).collect();
+            shown = keys.into_iter().filter_map(|(.., i)| rows[i].take()).collect();
         }
         Ok(shown)
     }

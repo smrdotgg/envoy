@@ -1,6 +1,6 @@
 //! Formatting helpers: dates, sizes, names.
 
-use chrono::{Datelike, Local, TimeZone};
+use chrono::{Datelike, Local, TimeZone, Timelike};
 
 pub fn list_date(ts: i64, format: &str) -> String {
     let Some(d) = Local.timestamp_opt(ts, 0).single() else { return String::new() };
@@ -47,20 +47,21 @@ pub fn snooze_until(ts: i64) -> String {
 }
 
 /// [`snooze_until`] as of `now`, in `now`'s zone.
-fn snooze_until_at<Tz: TimeZone>(ts: i64, now: &chrono::DateTime<Tz>) -> String
-where
-    Tz::Offset: std::fmt::Display,
-{
+fn snooze_until_at<Tz: TimeZone>(ts: i64, now: &chrono::DateTime<Tz>) -> String {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let Some(d) = now.timezone().timestamp_opt(ts, 0).single() else { return String::new() };
     let days = (d.date_naive() - now.date_naive()).num_days();
+    let (day, time) = (DAYS[d.weekday().num_days_from_monday() as usize], format!("{:02}:{:02}", d.hour(), d.minute()));
+    let month = MONTHS[d.month0() as usize];
     if days == 0 {
-        d.format("%H:%M today").to_string()
+        format!("{time} today")
     } else if (1..7).contains(&days) {
-        d.format("%a %H:%M").to_string()
+        format!("{day} {time}")
     } else if d.year() == now.year() {
-        d.format("%a %-d %b, %H:%M").to_string()
+        format!("{day} {} {month}, {time}", d.day())
     } else {
-        d.format("%a %-d %b %Y, %H:%M").to_string()
+        format!("{day} {} {month} {}, {time}", d.day(), d.year())
     }
 }
 

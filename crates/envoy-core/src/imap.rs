@@ -900,20 +900,23 @@ pub async fn wake_bucket(session: &mut Connection<impl Io>, caps: Caps, bucket: 
 /// After a wake by COPY: each of `message_ids` found more than once in `inbox` keeps its first
 /// copy, and the others made since `before` (UIDNEXT before the copy) are deleted.
 async fn dedupe_copies(session: &mut Connection<impl Io>, caps: Caps, inbox: &str, before: u32, message_ids: &[String]) -> Result<()> {
-    let mut wanted: Vec<&str> = message_ids.iter().map(String::as_str).filter(|m| !m.is_empty()).collect();
-    wanted.sort_unstable();
-    wanted.dedup();
+    let mut wanted: Vec<&str> = Vec::new();
+    for m in message_ids.iter().filter(|m| !m.is_empty()) {
+        if !wanted.contains(&m.as_str()) {
+            wanted.push(m);
+        }
+    }
     if wanted.is_empty() {
         return Ok(());
     }
     wire::select(session, inbox).await?;
     let mut extra = Vec::new();
     for message_id in wanted {
-        let mut found = uids_with_message_id(session, message_id).await?;
-        found.sort_unstable();
-        extra.extend(found.into_iter().skip(1).filter(|u| *u >= before));
+        let found = uids_with_message_id(session, message_id).await?;
+        // The first copy stays, wherever it came from.
+        let first = found.iter().copied().min().unwrap_or(0);
+        extra.extend(found.into_iter().filter(|u| *u != first && *u >= before));
     }
-    extra.sort_unstable();
     if !extra.is_empty() {
         log::info!("{} woken message(s) were copied to {inbox} twice (another Envoy woke them at the same time): the extra copies go", extra.len());
     }
@@ -1669,7 +1672,7 @@ mod tests {
             c => inbox_server(c),
         })
         .await;
-        let e = wire::run(&mut s, "NOOP", "NOOP", Duration::from_millis(200), |_| {}).await.unwrap_err();
+        let e = wire::run(&mut s, "NOOP", "NOOP", Duration::from_millis(200), &mut |_| {}).await.unwrap_err();
         assert!(e.downcast_ref::<Lost>().is_some(), "{e:#}");
         let e = select(&mut s, "INBOX").await.unwrap_err();
         assert!(e.downcast_ref::<Lost>().is_some(), "{e:#}");

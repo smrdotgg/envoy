@@ -49,36 +49,48 @@ pub(super) fn refused(status: &Status, code: &impl std::fmt::Debug, info: &impl 
 /// whose exchange here doesn't finish is poisoned. Every failure but the server's refusal is
 /// [`Lost`]: a write that fails, the connection closing (inside a literal too: async-imap's
 /// "bytes remaining in stream"), a garbled answer, a BYE, the time limit.
-pub(super) async fn run(session: &mut Connection<impl Io>, command: &str, what: &str, limit: Duration, mut each: impl FnMut(&Response<'_>) + Send) -> Result<()> {
-    session.usable()?;
-    let lost = |why: String| anyhow::Error::new(Lost(format!("{what}: {why}")));
-    let inner = &mut session.inner;
-    let exchange = async {
-        let tag = inner.run_command(command).await.map_err(|e| lost(e.to_string()))?;
-        loop {
-            let Some(next) = inner.read_response().await else {
-                return Err(lost("the connection closed before the server finished".into()));
-            };
-            let response = next.map_err(|e| lost(e.to_string()))?;
-            match response.parsed() {
-                Response::Done { tag: t, status, code, information } if *t == tag => {
-                    return match status {
-                        Status::Ok => Ok(()),
-                        Status::No | Status::Bad => Err(refused(status, code, information)),
-                        other => Err(lost(format!("the server ended with {other:?}"))),
-                    };
+///
+/// One body for every command, boxed: every IMAP command Envoy sends goes through here, and an
+/// exchange is network-bound, so it's built once rather than copied into each command's code
+/// (docs/NORTH_STAR.md's binary budget).
+pub(super) fn run<'a, T: Io>(
+    session: &'a mut Connection<T>,
+    command: &'a str,
+    what: &'a str,
+    limit: Duration,
+    each: &'a mut (dyn FnMut(&Response<'_>) + Send),
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        session.usable()?;
+        let lost = |why: String| anyhow::Error::new(Lost(format!("{what}: {why}")));
+        let inner = &mut session.inner;
+        let exchange = async {
+            let tag = inner.run_command(command).await.map_err(|e| lost(e.to_string()))?;
+            loop {
+                let Some(next) = inner.read_response().await else {
+                    return Err(lost("the connection closed before the server finished".into()));
+                };
+                let response = next.map_err(|e| lost(e.to_string()))?;
+                match response.parsed() {
+                    Response::Done { tag: t, status, code, information } if *t == tag => {
+                        return match status {
+                            Status::Ok => Ok(()),
+                            Status::No | Status::Bad => Err(refused(status, code, information)),
+                            other => Err(lost(format!("the server ended with {other:?}"))),
+                        };
+                    }
+                    Response::Data { status: Status::Bye, information, .. } => {
+                        return Err(lost(format!("the server said BYE ({})", information.as_deref().unwrap_or(""))));
+                    }
+                    // An earlier command's end (one that timed out, say): not this answer's.
+                    Response::Done { .. } => {}
+                    other => each(other),
                 }
-                Response::Data { status: Status::Bye, information, .. } => {
-                    return Err(lost(format!("the server said BYE ({})", information.as_deref().unwrap_or(""))));
-                }
-                // An earlier command's end (one that timed out, say): not this answer's.
-                Response::Done { .. } => {}
-                other => each(other),
             }
-        }
-    };
-    let r = tokio::time::timeout(limit, exchange).await.unwrap_or_else(|_| Err(lost("timed out".into())));
-    session.finished(r)
+        };
+        let r = tokio::time::timeout(limit, exchange).await.unwrap_or_else(|_| Err(lost("timed out".into())));
+        session.finished(r)
+    })
 }
 
 /// Runs a command whose answer is just its tagged OK (STORE, UID EXPUNGE, COPY, MOVE).
@@ -88,7 +100,7 @@ pub(super) async fn ok(session: &mut Connection<impl Io>, command: &str, what: &
 
 /// [`ok`], within `limit`.
 pub(super) async fn ok_within(session: &mut Connection<impl Io>, command: &str, what: &str, limit: Duration) -> Result<()> {
-    run(session, command, what, limit, |_| {}).await
+    run(session, command, what, limit, &mut |_| {}).await
 }
 
 /// What a finished SELECT said.
@@ -108,7 +120,7 @@ pub(super) struct Selected {
 /// three): an answer without one of them, even finished, isn't trusted to describe the mailbox.
 pub(super) async fn select(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Selected> {
     let (mut flags, mut exists, mut uid_validity, mut uid_next, mut expunged, mut keywords) = (false, None, None, None, false, false);
-    run(session, &format!("SELECT {}", quoted(mailbox)), "SELECT", COMMAND_TIMEOUT, |r| match r {
+    run(session, &format!("SELECT {}", quoted(mailbox)), "SELECT", COMMAND_TIMEOUT, &mut |r: &Response<'_>| match r {
         Response::MailboxData(MailboxDatum::Flags(_)) => flags = true,
         Response::MailboxData(MailboxDatum::Exists(n)) => exists = Some(*n),
         Response::Data { status: Status::Ok, code: Some(ResponseCode::UidValidity(v)), .. } => uid_validity = Some(*v),
@@ -140,7 +152,7 @@ pub(super) struct Told {
 /// read as zero), its UIDNEXT and UIDVALIDITY.
 pub(super) async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Told> {
     let (mut unseen, mut messages, mut uid_next, mut uid_validity) = (None, None, None, None);
-    run(session, &format!("STATUS {} (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)", quoted(mailbox)), "STATUS", COMMAND_TIMEOUT, |r| {
+    run(session, &format!("STATUS {} (MESSAGES UNSEEN UIDNEXT UIDVALIDITY)", quoted(mailbox)), "STATUS", COMMAND_TIMEOUT, &mut |r: &Response<'_>| {
         if let Response::MailboxData(MailboxDatum::Status { mailbox: m, status }) = r
             && (m.as_ref() == mailbox || (m.eq_ignore_ascii_case("INBOX") && mailbox.eq_ignore_ascii_case("INBOX")))
         {
@@ -165,7 +177,7 @@ pub(super) async fn status(session: &mut Connection<impl Io>, mailbox: &str) -> 
 /// `mailbox`'s UIDNEXT, if a finished STATUS said it.
 pub(super) async fn uid_next(session: &mut Connection<impl Io>, mailbox: &str) -> Result<Option<u32>> {
     let mut next = None;
-    run(session, &format!("STATUS {} (UIDNEXT)", quoted(mailbox)), "STATUS", COMMAND_TIMEOUT, |r| {
+    run(session, &format!("STATUS {} (UIDNEXT)", quoted(mailbox)), "STATUS", COMMAND_TIMEOUT, &mut |r: &Response<'_>| {
         if let Response::MailboxData(MailboxDatum::Status { mailbox: m, status }) = r
             && (m.as_ref() == mailbox || (m.eq_ignore_ascii_case("INBOX") && mailbox.eq_ignore_ascii_case("INBOX")))
         {
@@ -184,7 +196,7 @@ pub(super) async fn uid_next(session: &mut Connection<impl Io>, mailbox: &str) -
 /// exist (`\NonExistent`) aside. For names without LIST's wildcards (`*`, `%`).
 pub(super) async fn listed(session: &mut Connection<impl Io>, name: &str) -> Result<bool> {
     let mut found = false;
-    run(session, &format!("LIST \"\" {}", quoted(name)), "LIST", COMMAND_TIMEOUT, |r| {
+    run(session, &format!("LIST \"\" {}", quoted(name)), "LIST", COMMAND_TIMEOUT, &mut |r: &Response<'_>| {
         if let Response::MailboxData(MailboxDatum::List { name_attributes, name: n, .. }) = r
             && n.as_ref() == name
             && !name_attributes.iter().any(|a| matches!(a, NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent")))
@@ -222,7 +234,7 @@ pub(super) enum Attribute {
 /// Every mailbox (`LIST "" "*"`).
 pub(super) async fn list(session: &mut Connection<impl Io>) -> Result<Vec<Listed>> {
     let mut listed = Vec::new();
-    run(session, "LIST \"\" \"*\"", "LIST", COMMAND_TIMEOUT, |r| {
+    run(session, "LIST \"\" \"*\"", "LIST", COMMAND_TIMEOUT, &mut |r: &Response<'_>| {
         if let Response::MailboxData(MailboxDatum::List { name_attributes, delimiter, name }) = r {
             listed.push(Listed {
                 name: name.to_string(),
@@ -289,7 +301,7 @@ impl Fetched {
 pub(super) async fn fetch(session: &mut Connection<impl Io>, uid: bool, set: &str, query: &str, what: &str) -> Result<Vec<Fetched>> {
     let command = format!("{}FETCH {set} {query}", if uid { "UID " } else { "" });
     let mut fetched = Vec::new();
-    run(session, &command, what, FETCH_TIMEOUT, |r| {
+    run(session, &command, what, FETCH_TIMEOUT, &mut |r: &Response<'_>| {
         if let Response::Fetch(_, attributes) = r {
             fetched.push(Fetched::of(attributes));
         }
@@ -329,7 +341,7 @@ pub(super) async fn uid_flags(session: &mut Connection<impl Io>, lo: u32, hi: u3
 /// UID SEARCH: the UIDs a finished search found.
 pub(super) async fn uid_search(session: &mut Connection<impl Io>, query: &str) -> Result<HashSet<u32>> {
     let mut found = HashSet::new();
-    run(session, &format!("UID SEARCH {query}"), "SEARCH", COMMAND_TIMEOUT, |r| {
+    run(session, &format!("UID SEARCH {query}"), "SEARCH", COMMAND_TIMEOUT, &mut |r: &Response<'_>| {
         if let Response::MailboxData(MailboxDatum::Search(uids)) = r {
             found.extend(uids.iter().copied());
         }
@@ -342,7 +354,7 @@ pub(super) async fn uid_search(session: &mut Connection<impl Io>, query: &str) -
 pub(super) async fn capabilities(session: &mut Connection<impl Io>) -> Result<HashSet<String>> {
     use async_imap::imap_proto::Capability;
     let mut names = HashSet::new();
-    run(session, "CAPABILITY", "CAPABILITY", COMMAND_TIMEOUT, |r| {
+    run(session, "CAPABILITY", "CAPABILITY", COMMAND_TIMEOUT, &mut |r: &Response<'_>| {
         if let Response::Capabilities(caps) = r {
             names.extend(caps.iter().map(|c| match c {
                 Capability::Imap4rev1 => "IMAP4REV1".to_owned(),
