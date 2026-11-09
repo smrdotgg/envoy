@@ -111,23 +111,24 @@ fn avatar(name: &str, email: &str, t: &Theme) -> El {
         .child(text(fmt::initial(name)).font(rune::TextStyle::new(16.0, 600.0)).color(Color::WHITE))
 }
 
-/// What a message body's width is short of the cards column's: the column's padding, the
-/// card's, and the avatar's indent (`reader`, `message_card`). Borders take no room.
+/// What a message body's width is short of the reading pane's: the cards column's padding,
+/// the card's, and the avatar's indent (`reader`, `message_card`). Borders take no room.
 const BODY_INSET: f32 = 2.0 * 20.0 + 2.0 * 20.0 + 50.0;
 
 /// The steps, in points, a message's width is read in: dragging the divider re-fits it (its
 /// elements rebuild, never its tree) when a step is crossed, not on every frame.
 const WIDTH_STEP: f32 = 8.0;
 
-/// The width the reader gives message bodies, read from the cards column in steps of
-/// [`WIDTH_STEP`] (rounded down, so what's fitted to it fits); None before it's laid out. The
-/// view re-runs only when a step is crossed. The cards column is there before a message
-/// opens from another, so opening one lays it out once, at the right width.
+/// The width the reader gives message bodies, read from the reading pane in steps of
+/// [`WIDTH_STEP`] (rounded down, so what's fitted to it fits); None only before the first
+/// layout. The view re-runs only when a step is crossed. Read on every view run, whatever the
+/// pane shows: Rune keeps a layout rect only for the keys the last run read, and a
+/// conversation that arrives after a spinner must find the width there, to be built once.
 fn body_width() -> Option<f32> {
-    rune::memo::layout_with("cards", |r| ((r[2] - BODY_INSET) / WIDTH_STEP).floor() as i32).map(|n| (n as f32 * WIDTH_STEP).max(0.0))
+    rune::memo::layout_with("reader-pane", |r| ((r[2] - BODY_INSET) / WIDTH_STEP).floor() as i32).map(|n| (n as f32 * WIDTH_STEP).max(0.0))
 }
 
-fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
+fn body_view(s: &App, t: &Theme, m: &ThreadMessage, width: Option<f32>) -> El {
     let k = &t.k;
     let id = m.summary.id;
     let max_w = s.settings.f32("reading.maxWidth");
@@ -153,7 +154,7 @@ fn body_view(s: &App, t: &Theme, m: &ThreadMessage) -> El {
             load_images: remote,
             copy_links: s.settings.bool("behavior.copyLinks"),
             max_w,
-            width: body_width().unwrap_or(max_w + 32.0),
+            width: width.unwrap_or(max_w + 32.0),
         };
         let ready = doc.images.iter().filter(|u| matches!(s.images.get(*u), Some(crate::app::ImageState::Ready(_)))).count();
         let version = (t.dark, cx.adapt, cx.load_images, cx.copy_links, max_w as u32, cx.width as u32, ready, std::sync::Arc::as_ptr(doc) as usize);
@@ -345,7 +346,7 @@ fn attachments(mut out: El, t: &Theme, b: &envoy_core::model::Body, id: i64) -> 
     out
 }
 
-fn message_card(s: &App, t: &Theme, m: &ThreadMessage, is_last: bool) -> El {
+fn message_card(s: &App, t: &Theme, m: &ThreadMessage, is_last: bool, width: Option<f32>) -> El {
     let k = &t.k;
     let sm = &m.summary;
     let id = sm.id;
@@ -412,7 +413,7 @@ fn message_card(s: &App, t: &Theme, m: &ThreadMessage, is_last: bool) -> El {
         .border(1.0, k.c.border_muted)
         .child(head);
     if expanded {
-        card = card.child(row().w_full().pl(50.0).child(body_view(s, t, m)));
+        card = card.child(row().w_full().pl(50.0).child(body_view(s, t, m, width)));
         let reply_btn = |label: &str, ic: &'static rune::Icon, key: &str, f: fn(&mut App, i64)| {
             Button::new(label)
                 .icon(ic)
@@ -440,7 +441,15 @@ fn message_card(s: &App, t: &Theme, m: &ThreadMessage, is_last: bool) -> El {
     card
 }
 
-pub fn reader(s: &App, t: &Theme, _cx: &mut Cx<App>, layer: &mut Vec<El>) -> El {
+/// The reading pane, in a column that's there whatever it shows (nothing selected, a
+/// conversation loading, one open), so the width message bodies get ([`body_width`]) is known
+/// before a conversation arrives: opening one builds its message once, at that width.
+pub fn reader(s: &App, t: &Theme, cx: &mut Cx<App>, layer: &mut Vec<El>) -> El {
+    let width = body_width();
+    col().key("reader-pane").w_full().h_full().min_h(0.0).child(pane(s, t, cx, layer, width))
+}
+
+fn pane(s: &App, t: &Theme, _cx: &mut Cx<App>, layer: &mut Vec<El>, width: Option<f32>) -> El {
     let k = &t.k;
     if !s.selection.is_empty() {
         return crate::triage::selection_panel(s, t, layer);
@@ -477,7 +486,7 @@ pub fn reader(s: &App, t: &Theme, _cx: &mut Cx<App>, layer: &mut Vec<El>) -> El 
             }
             continue;
         }
-        cards = cards.child(message_card(s, t, m, i + 1 == n));
+        cards = cards.child(message_card(s, t, m, i + 1 == n, width));
     }
     let is_sent_view = matches!(&s.view, View::Role { role: Role::Sent, .. });
     let _ = is_sent_view;
@@ -523,6 +532,37 @@ mod tests {
     }
 
     #[test]
+    fn a_message_opening_after_its_conversation_loads_is_built_once() {
+        // Opening a message clears the conversation (a spinner shows) until the engine sends
+        // it. The cards column the width was read from went with it, so the message arriving
+        // was built at a guessed width, laid out, then built again at the real one.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../envoy-core/tests/fixtures/html/mjml-newsletter.html")).unwrap();
+        let doc = std::sync::Arc::new(envoy_core::html::parse(&src));
+        let mut app = App::new(true);
+        crate::demo::populate(&mut app);
+        crate::scene_open(&mut app);
+        let next = app.list[1].id;
+        let mut thread = crate::demo::thread_for(next);
+        thread.last_mut().unwrap().body.as_mut().unwrap().doc = Some(doc);
+        let mut rt = Runtime::new(app, crate::view, (1280.0, 900.0), Env::new(false, 1.0));
+        rt.frame(0.0);
+        rt.update(move |s, _| {
+            s.open = Some(next);
+            s.thread.clear();
+            s.thread_for = None;
+        });
+        rt.frame(0.0);
+        crate::html_view::RENDERS.with(|r| r.set(0));
+        rt.update(move |s, _| {
+            s.expanded = thread.iter().map(|m| m.summary.id).collect();
+            s.thread = thread;
+            s.thread_for = Some(next);
+        });
+        rt.frame(0.0);
+        assert_eq!(crate::html_view::RENDERS.with(|r| r.get()), 1, "built once, at the pane's width");
+    }
+
+    #[test]
     fn message_bodies_are_fitted_to_the_reader_they_are_in() {
         // The width the reader hands the renderer is the body's own, as laid out, so mail that
         // asks for 760 points of minimum width in a narrow reader still ends at its edge.
@@ -540,6 +580,7 @@ mod tests {
             let els = rt.elements();
             let rect = |key: &str| els.iter().find(|e| e.key.as_deref() == Some(key)).unwrap_or_else(|| panic!("{key} at {window}")).rect;
             let (cards, body) = (rect("cards"), rect(&format!("body-{id}")));
+            assert_eq!(rect("reader-pane")[2], cards[2], "the pane the width is read from is as wide as the cards");
             let max_w = crate::app::App::new(true).settings.f32("reading.maxWidth");
             assert!((cards[2] - super::BODY_INSET).min(max_w + 32.0) - body[2] < 0.5 && body[2] <= cards[2] - super::BODY_INSET + 0.5, "at {window}: cards {cards:?}, body {body:?}");
             let right = body[0] + body[2];

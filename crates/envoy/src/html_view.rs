@@ -606,7 +606,15 @@ fn node(cx: &Ctx, n: &Node, l: Local) -> El {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`render`] ran: a message opening should build its elements once.
+    pub static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn render(cx: &Ctx, doc: &Doc) -> El {
+    #[cfg(test)]
+    RENDERS.with(|r| r.set(r.get() + 1));
     let original = !cx.adapt;
     let ink = if original { srgb8(0x22, 0x22, 0x22) } else { cx.t.k.c.text_base };
     let l = Local { on_color: false, tight: false, ink, under: doc.background, room: cx.content_width() };
