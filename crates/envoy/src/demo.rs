@@ -1,76 +1,31 @@
-//! Sample mail for `--demo` and for headless screenshots: the whole UI without an account.
+//! Demo mode (`--demo`, `ENVOY_DEMO=1`): the real app, engine and store, on sample mail kept by
+//! an IMAP server in this process (`envoy_core::demo`). The engine fills its cache from it as a
+//! first sync would, and every action goes the way it does with a real account: queued, sent to
+//! that server, synced back. Nothing leaves the computer: no connection is ever opened
+//! (`envoy_core::net`), and the demo's files (its cache, settings, drafts kept at close) go in a
+//! folder of its own, deleted as it closes.
+
+use std::sync::Arc;
 
 use envoy_core::accounts::{Account, AuthKind};
-use envoy_core::model::{Address, Attachment, Body, Category, Draft, DraftAttachment, Mailbox, MessageId, Role, Summary, SyncState, ThreadMessage, View, flags};
+use envoy_core::demo::{Mail, Server};
+use envoy_core::engine::Engine;
+use envoy_core::model::flags;
 
 use crate::app::App;
 
-const ACCOUNT: &str = "demo";
-
-fn addr(name: &str, email: &str) -> Address {
-    Address { name: name.into(), email: email.into() }
-}
-
-struct Sample {
-    from: (&'static str, &'static str),
-    subject: &'static str,
-    preview: &'static str,
-    hours_ago: i64,
-    unread: bool,
-    starred: bool,
-    count: u32,
-    attach: bool,
-    mailbox: &'static str,
-    /// Where the split inbox puts it (envoy-core works this out from real mail's headers).
-    category: Category,
-}
-
-const SAMPLES: &[Sample] = &[
-    Sample { from: ("Maya Chen", "maya@northwind.dev"), subject: "Design review moved to Thursday", preview: "Hey! Quick heads up — the room was double-booked so I moved us to Thursday 2pm. I also added the new onboarding flows to the deck.", hours_ago: 1, unread: true, starred: false, count: 3, attach: true, mailbox: "INBOX", category: Category::Important },
-    Sample { from: ("GitHub", "notifications@github.com"), subject: "[envoy] Pull request #42: Faster thread loading", preview: "jordan-lee requested your review on this pull request. Loads conversations from the local cache before the network round trip.", hours_ago: 2, unread: true, starred: false, count: 1, attach: false, mailbox: "INBOX", category: Category::Notifications },
-    Sample { from: ("Lufthansa", "booking@lufthansa.com"), subject: "Your booking confirmation: SFO → MUC", preview: "Thank you for booking with us. Your e-ticket and itinerary are attached. Check-in opens 23 hours before departure.", hours_ago: 5, unread: false, starred: true, count: 1, attach: true, mailbox: "INBOX", category: Category::Notifications },
-    Sample { from: ("Sam Ortiz", "sam@ortiz.family"), subject: "Dinner Saturday?", preview: "We're doing tacos at our place around 7. Bring the kids if you want — Leo keeps asking when he can show off his new bike.", hours_ago: 9, unread: true, starred: false, count: 4, attach: false, mailbox: "INBOX", category: Category::Important },
-    Sample { from: ("Linear", "updates@linear.app"), subject: "Weekly digest: 12 issues closed", preview: "Here's what your team shipped this week. ENG-311 Offline queue retries, ENG-298 Search operators, ENG-305 Compact density.", hours_ago: 26, unread: false, starred: false, count: 1, attach: false, mailbox: "INBOX", category: Category::Newsletters },
-    Sample { from: ("Priya Patel", "priya@acme.co"), subject: "Re: Q3 roadmap draft", preview: "Thanks for pulling this together. I left comments on the sync section — I think we can drop the second milestone if push works.", hours_ago: 30, unread: false, starred: true, count: 6, attach: false, mailbox: "INBOX", category: Category::Important },
-    Sample { from: ("Stripe", "receipts@stripe.com"), subject: "Your receipt from Fly.io #2291-4410", preview: "Amount paid $23.40. Date paid Mar 2, 2026. Payment method Visa ending 4242.", hours_ago: 50, unread: false, starred: false, count: 1, attach: true, mailbox: "INBOX", category: Category::Notifications },
-    Sample { from: ("Alex Kim", "alex.kim@gmail.com"), subject: "photos from the trip!!", preview: "Finally uploaded everything. The one of you on the ridge at sunrise is ridiculous. Album link inside.", hours_ago: 76, unread: false, starred: false, count: 2, attach: false, mailbox: "INBOX", category: Category::Important },
-    Sample { from: ("The Browser Company", "hello@thebrowser.company"), subject: "What we've been building", preview: "A short note from the team on what's next, and a few things we learned along the way.", hours_ago: 120, unread: false, starred: false, count: 1, attach: false, mailbox: "INBOX", category: Category::Newsletters },
-    Sample { from: ("Dr. Rivera's Office", "frontdesk@riveradental.com"), subject: "Appointment reminder", preview: "This is a reminder of your appointment on Monday, March 9 at 10:30 AM. Reply C to confirm.", hours_ago: 150, unread: false, starred: false, count: 1, attach: false, mailbox: "INBOX", category: Category::Notifications },
-    Sample { from: ("Hacker Newsletter", "kale@hackernewsletter.com"), subject: "Hacker Newsletter #712", preview: "The best articles from Hacker News this week: native UI is back, SQLite in production, and a love letter to IMAP.", hours_ago: 200, unread: false, starred: false, count: 1, attach: false, mailbox: "INBOX", category: Category::Newsletters },
-    Sample { from: ("Jordan Lee", "jordan@northwind.dev"), subject: "Offsite agenda", preview: "Draft agenda for the offsite. Day one is planning, day two is hack day. Let me know what's missing.", hours_ago: 260, unread: false, starred: false, count: 2, attach: true, mailbox: "INBOX", category: Category::Other },
-    Sample { from: ("You", "you@gmail.com"), subject: "Re: Design review moved to Thursday", preview: "Thursday works. I'll bring the prototype on my laptop.", hours_ago: 0, unread: false, starred: false, count: 1, attach: false, mailbox: "[Gmail]/Sent Mail", category: Category::Important },
-    Sample { from: ("You", "you@gmail.com"), subject: "Offsite travel plan", preview: "Thinking we take the 8:10 train on Thursday and share a car from the station. Could you check whether the hotel does early check-in?", hours_ago: 3, unread: false, starred: false, count: 1, attach: true, mailbox: DRAFTS, category: Category::Important },
-    Sample { from: ("City Library", "notices@library.example"), subject: "Your hold is ready for pickup", preview: "The book you reserved is waiting at the front desk until Friday.", hours_ago: 20, unread: false, starred: false, count: 1, attach: false, mailbox: SNOOZED_TOMORROW, category: Category::Notifications },
-    Sample { from: ("Nora Blake", "nora@blake.studio"), subject: "Invoice #118 — due next month", preview: "Attached is the invoice for March. No rush, it's due on the 30th.", hours_ago: 48, unread: false, starred: false, count: 1, attach: true, mailbox: SNOOZED_NEXT_WEEK, category: Category::Important },
-];
-
-/// Stand-ins for snooze buckets, whose names hold their (moving) wake times ([`mailbox_of`]).
-const SNOOZED_TOMORROW: &str = "snoozed:tomorrow";
-const SNOOZED_NEXT_WEEK: &str = "snoozed:nextweek";
-
-/// When a sample snoozed until a preset wakes, from now.
-fn wake_of(sample: &str) -> Option<i64> {
-    let preset = sample.strip_prefix("snoozed:")?;
-    Some(envoy_core::snooze::presets(&chrono::Local::now()).into_iter().find(|p| p.id == preset).map_or(now() + 86_400, |p| p.at))
-}
-
-/// A sample's mailbox: a snooze bucket for its preset's time, or as it says.
-fn mailbox_of(sample: &str) -> String {
-    wake_of(sample).map_or_else(|| sample.to_owned(), |at| envoy_core::snooze::bucket("Snoozed", "/", at))
-}
-
-const DRAFTS: &str = "[Gmail]/Drafts";
-/// Senders whose mail is bulk (lists, newsletters, notifications): suggested last.
-const BULK: &[&str] = &["notifications@github.com", "updates@linear.app", "receipts@stripe.com", "booking@lufthansa.com", "hello@thebrowser.company", "kale@hackernewsletter.com"];
-const DRAFT_TO: (&str, &str) = ("Jordan Lee", "jordan@northwind.dev");
+/// The demo account's id.
+pub const ACCOUNT: &str = "demo";
+const ME: (&str, &str) = ("You", "you@gmail.com");
 
 pub fn account() -> Account {
     Account {
         id: ACCOUNT.into(),
-        email: "you@gmail.com".into(),
-        display_name: "You".into(),
+        email: ME.1.into(),
+        display_name: ME.0.into(),
         auth: AuthKind::Password,
-        username: "you@gmail.com".into(),
+        username: ME.1.into(),
+        // Gmail's, so it's a Gmail account (labels, snoozes as labels): its server is the demo's.
         imap_host: "imap.gmail.com".into(),
         imap_port: 993,
         smtp_host: "smtp.gmail.com".into(),
@@ -82,298 +37,460 @@ pub fn account() -> Account {
     }
 }
 
-fn mailbox(name: &str, display: &str, role: Role, unread: u32) -> Mailbox {
-    Mailbox { account: ACCOUNT.into(), name: name.into(), display: display.into(), role, unread, total: 100, depth: 0, selectable: true, wake: None }
+/// The account's folders, as Gmail has them. Listed in the order they're first synced: Sent
+/// first, so the people you've written to are known as the inbox is sorted, and the inbox last,
+/// so a conversation's newest copy (Gmail keeps one in each of its labels) is the inbox's.
+const FOLDERS: &[(&str, &str)] = &[
+    ("[Gmail]/Sent Mail", "\\Sent"),
+    ("[Gmail]/Starred", "\\Flagged"),
+    ("[Gmail]/Important", "\\Important"),
+    ("[Gmail]/Drafts", "\\Drafts"),
+    ("[Gmail]/All Mail", "\\All"),
+    ("[Gmail]/Spam", "\\Junk"),
+    ("[Gmail]/Trash", "\\Trash"),
+    ("Snoozed", ""),
+    ("Receipts", ""),
+    ("Travel", ""),
+    ("Work", ""),
+    ("INBOX", ""),
+];
+
+pub const DRAFTS: &str = "[Gmail]/Drafts";
+
+/// Who's who in the sample mail.
+const MAYA: (&str, &str) = ("Maya Chen", "maya@northwind.dev");
+const JORDAN: (&str, &str) = ("Jordan Lee", "jordan@northwind.dev");
+const SAM: (&str, &str) = ("Sam Ortiz", "sam@ortiz.family");
+const PRIYA: (&str, &str) = ("Priya Patel", "priya@acme.co");
+const ALEX: (&str, &str) = ("Alex Kim", "alex.kim@gmail.com");
+const NORA: (&str, &str) = ("Nora Blake", "nora@blake.studio");
+
+/// What kind of sender: what its mail's headers say.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// A person, writing to you.
+    Person,
+    /// A person writing to a group you're copied on.
+    Group,
+    /// A newsletter: unsubscribe link, list.
+    Newsletter(&'static str),
+    /// GitHub's notifications.
+    GitHub,
+    /// Sent by a machine (`Auto-Submitted`).
+    Automated,
+    /// A receipt or booking, by its sender or subject.
+    Receipt,
 }
 
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+struct Sample {
+    from: (&'static str, &'static str),
+    kind: Kind,
+    subject: &'static str,
+    /// The newest message's first paragraph.
+    text: &'static str,
+    hours_ago: i64,
+    unread: bool,
+    starred: bool,
+    /// Who wrote the messages before the newest, oldest first: true for you (in Sent).
+    earlier: &'static [bool],
+    attachment: Option<(&'static str, &'static str, usize)>,
+    /// Where the conversation is, besides All Mail.
+    folders: &'static [&'static str],
 }
 
-fn summary(i: usize, s: &Sample) -> Summary {
-    let mut fl = 0;
-    if !s.unread {
-        fl |= flags::SEEN;
-    }
-    if s.starred {
-        fl |= flags::FLAGGED;
-    }
-    let draft = s.mailbox == DRAFTS;
-    if draft {
-        fl |= flags::DRAFT;
-    }
-    let participants = match s.count {
-        1 => String::new(),
-        2 => format!("{}, me", first(s.from.0)),
-        _ => format!("{}, me, Jordan", first(s.from.0)),
-    };
-    Summary {
-        id: i as MessageId + 1,
-        account: ACCOUNT.into(),
-        mailbox: mailbox_of(s.mailbox),
-        uid: i as u32 + 1,
-        thread: format!("t{i}"),
-        subject: s.subject.into(),
-        from: addr(s.from.0, s.from.1),
-        to: vec![if draft { addr(DRAFT_TO.0, DRAFT_TO.1) } else { addr("You", "you@gmail.com") }],
-        date: now() - s.hours_ago * 3600 - 600,
-        flags: fl,
-        preview: s.preview.into(),
-        has_attachments: s.attach,
-        thread_count: s.count,
-        participants,
-        thread_unread: s.unread,
-        category: s.category,
+const INBOX: &[&str] = &["INBOX"];
+
+const SAMPLES: &[Sample] = &[
+    Sample {
+        from: MAYA,
+        kind: Kind::Person,
+        subject: "Design review moved to Thursday",
+        text: "Hey! Quick heads up — the room was double-booked so I moved us to Thursday 2pm. I also added the new onboarding flows to the deck.",
+        hours_ago: 1,
+        unread: true,
+        starred: false,
+        earlier: &[false, true],
+        attachment: Some(("onboarding-v3.pdf", "application/pdf", 96_211)),
+        folders: &["INBOX", "[Gmail]/Important"],
+    },
+    Sample {
+        from: ("GitHub", "notifications@github.com"),
+        kind: Kind::GitHub,
+        subject: "[envoy] Pull request #42: Faster thread loading",
+        text: "jordan-lee requested your review on this pull request. Loads conversations from the local cache before the network round trip.",
+        hours_ago: 2,
+        unread: true,
+        starred: false,
+        earlier: &[],
+        attachment: None,
+        folders: INBOX,
+    },
+    Sample {
+        from: ("Lufthansa", "booking@lufthansa.com"),
+        kind: Kind::Receipt,
+        subject: "Your booking confirmation: SFO → MUC",
+        text: "Thank you for booking with us. Your e-ticket and itinerary are attached. Check-in opens 23 hours before departure.",
+        hours_ago: 5,
+        unread: false,
+        starred: true,
+        earlier: &[],
+        attachment: Some(("e-ticket-SFO-MUC.pdf", "application/pdf", 58_880)),
+        folders: &["INBOX", "Travel"],
+    },
+    Sample {
+        from: SAM,
+        kind: Kind::Person,
+        subject: "Dinner Saturday?",
+        text: "We're doing tacos at our place around 7. Bring the kids if you want — Leo keeps asking when he can show off his new bike.",
+        hours_ago: 9,
+        unread: true,
+        starred: false,
+        earlier: &[false, true],
+        attachment: None,
+        folders: INBOX,
+    },
+    Sample {
+        from: ("Linear", "updates@linear.app"),
+        kind: Kind::Newsletter("linear.app"),
+        subject: "Weekly digest: 12 issues closed",
+        text: "Here's what your team shipped this week. ENG-311 Offline queue retries, ENG-298 Search operators, ENG-305 Compact density.",
+        hours_ago: 26,
+        unread: false,
+        starred: false,
+        earlier: &[],
+        attachment: None,
+        folders: INBOX,
+    },
+    Sample {
+        from: PRIYA,
+        kind: Kind::Person,
+        subject: "Re: Q3 roadmap draft",
+        text: "Thanks for pulling this together. I left comments on the sync section — I think we can drop the second milestone if push works.",
+        hours_ago: 30,
+        unread: false,
+        starred: true,
+        earlier: &[true, false, true, false],
+        attachment: None,
+        folders: &["INBOX", "Work"],
+    },
+    Sample {
+        from: ("Stripe", "receipts@stripe.com"),
+        kind: Kind::Receipt,
+        subject: "Your receipt from Fly.io #2291-4410",
+        text: "Amount paid $23.40. Date paid Mar 2, 2026. Payment method Visa ending 4242.",
+        hours_ago: 50,
+        unread: false,
+        starred: false,
+        earlier: &[],
+        attachment: Some(("receipt-2291-4410.pdf", "application/pdf", 38_912)),
+        folders: &["INBOX", "Receipts"],
+    },
+    Sample {
+        from: ALEX,
+        kind: Kind::Person,
+        subject: "photos from the trip!!",
+        text: "Finally uploaded everything. The one of you on the ridge at sunrise is ridiculous. Album link inside.",
+        hours_ago: 76,
+        unread: false,
+        starred: false,
+        earlier: &[false],
+        attachment: None,
+        folders: INBOX,
+    },
+    Sample {
+        from: ("The Browser Company", "hello@thebrowser.company"),
+        kind: Kind::Newsletter("thebrowser.company"),
+        subject: "What we've been building",
+        text: "A short note from the team on what's next, and a few things we learned along the way.",
+        hours_ago: 120,
+        unread: false,
+        starred: false,
+        earlier: &[],
+        attachment: None,
+        folders: INBOX,
+    },
+    Sample {
+        from: ("Dr. Rivera's Office", "frontdesk@riveradental.com"),
+        kind: Kind::Automated,
+        subject: "Appointment reminder",
+        text: "This is a reminder of your appointment on Monday, March 9 at 10:30 AM. Reply C to confirm.",
+        hours_ago: 150,
+        unread: false,
+        starred: false,
+        earlier: &[],
+        attachment: None,
+        folders: INBOX,
+    },
+    Sample {
+        from: ("Hacker Newsletter", "kale@hackernewsletter.com"),
+        kind: Kind::Newsletter("hackernewsletter.com"),
+        subject: "Hacker Newsletter #712",
+        text: "The best articles from Hacker News this week: native UI is back, SQLite in production, and a love letter to IMAP.",
+        hours_ago: 200,
+        unread: false,
+        starred: false,
+        earlier: &[],
+        attachment: None,
+        folders: INBOX,
+    },
+    Sample {
+        from: JORDAN,
+        kind: Kind::Group,
+        subject: "Offsite agenda",
+        text: "Draft agenda for the offsite. Day one is planning, day two is hack day. Let me know what's missing.",
+        hours_ago: 260,
+        unread: false,
+        starred: false,
+        earlier: &[false],
+        attachment: Some(("offsite-agenda.pdf", "application/pdf", 46_256)),
+        folders: INBOX,
+    },
+    // Archived.
+    Sample {
+        from: ("Fly.io", "billing@fly.io"),
+        kind: Kind::Receipt,
+        subject: "Your invoice for February",
+        text: "Your invoice for February is ready. Total due: $21.10, charged to Visa ending 4242.",
+        hours_ago: 24 * 9,
+        unread: false,
+        starred: false,
+        earlier: &[],
+        attachment: None,
+        folders: &["Receipts"],
+    },
+    Sample {
+        from: ("Free Cruise Center", "winner@cruise-prizes.example"),
+        kind: Kind::Person,
+        subject: "You've been selected for a FREE cruise!!!",
+        text: "Congratulations! Claim your all-inclusive Caribbean cruise today. Offer ends at midnight.",
+        hours_ago: 40,
+        unread: true,
+        starred: false,
+        earlier: &[],
+        attachment: None,
+        folders: &["[Gmail]/Spam"],
+    },
+    // Snoozed: Snoozed's buckets, for when they wake ([`SNOOZED`]).
+    Sample {
+        from: ("City Library", "notices@library.example"),
+        kind: Kind::Automated,
+        subject: "Your hold is ready for pickup",
+        text: "The book you reserved is waiting at the front desk until Friday.",
+        hours_ago: 20,
+        unread: false,
+        starred: false,
+        earlier: &[],
+        attachment: None,
+        folders: &["snoozed:tomorrow"],
+    },
+    Sample {
+        from: NORA,
+        kind: Kind::Person,
+        subject: "Invoice #118 — due next month",
+        text: "Attached is the invoice for March. No rush, it's due on the 30th.",
+        hours_ago: 48,
+        unread: false,
+        starred: false,
+        earlier: &[],
+        attachment: Some(("invoice-118.pdf", "application/pdf", 64_512)),
+        folders: &["snoozed:nextweek"],
+    },
+];
+
+/// The newest message of the first conversation, in Markdown-ish HTML, for the reader.
+const DESIGN_HTML: &str = "<p>Hey!</p><p>Quick heads up — the room was double-booked so I moved us to <b>Thursday at 2pm</b>. Same Zoom link if you're remote.</p><p>I also added the new onboarding flows to the deck:</p><ul><li>Welcome screen with account picker</li><li>Gmail app-password walkthrough</li><li>First sync progress (with the <i>download ahead</i> setting)</li></ul><p>The prototype is here: <a href=\"https://figma.com/file/envoy-onboarding\">figma.com/file/envoy-onboarding</a></p><p>Thanks,<br>Maya</p>";
+
+/// A draft waiting in Drafts.
+const DRAFT: (&str, &str, &str) = (
+    "Offsite travel plan",
+    "Hi Jordan,\n\nThinking we take the 8:10 train on Thursday and share a car from the station. Could you check whether the hotel does early check-in?\n\nThanks!",
+    "train-times.pdf",
+);
+
+/// The sample draft as the composer has it, without its file.
+pub fn draft() -> envoy_core::model::Draft {
+    envoy_core::model::Draft { account: ACCOUNT.into(), to: format!("{} <{}>", JORDAN.0, JORDAN.1), subject: DRAFT.0.into(), body: DRAFT.1.into(), ..Default::default() }
+}
+
+/// A snoozed sample's folder: the bucket for its preset's time, from now.
+fn folder_of(name: &str, now: &chrono::DateTime<chrono::Local>) -> String {
+    match name.strip_prefix("snoozed:") {
+        Some(preset) => {
+            let at = envoy_core::snooze::presets(now).into_iter().find(|p| p.id == preset).map_or(now.timestamp() + 86_400, |p| p.at);
+            envoy_core::snooze::bucket(envoy_core::snooze::PARENT, "/", at)
+        }
+        None => name.to_owned(),
     }
 }
 
-fn first(name: &str) -> &str {
+fn person(p: (&str, &str)) -> (String, String) {
+    (p.0.to_owned(), p.1.to_owned())
+}
+
+fn first_name(name: &str) -> &str {
     name.split_whitespace().next().unwrap_or(name)
 }
 
-/// The samples a view shows (snoozed ones are in wake order already, as Snoozed lists them).
-pub fn list_for(view: &View) -> Vec<Summary> {
-    SAMPLES
-        .iter()
-        .enumerate()
-        .map(|(i, s)| summary(i, s))
-        .filter(|m| match view {
-            View::Role { role: Role::Inbox, .. } => m.mailbox == "INBOX",
-            View::Role { role: Role::Sent, .. } => m.mailbox.contains("Sent"),
-            View::Role { role: Role::Drafts, .. } => m.mailbox == DRAFTS,
-            View::Role { role: Role::Snoozed, .. } => m.mailbox.starts_with("Snoozed/"),
-            View::Role { role: Role::Flagged, .. } | View::Starred { .. } => m.flagged(),
-            View::Mailbox { mailbox, .. } => &m.mailbox == mailbox,
-            _ => false,
-        })
-        .collect()
-}
-
-/// The drafts written in demo mode, which has no store: kept for the session, so Drafts lists
-/// them as it lists local drafts (`envoy_core::drafts::merge`) and they open again from there.
-#[derive(Default)]
-pub struct Drafts(Vec<Kept>);
-
-/// A demo draft: its id, content, and when it was last saved (Unix seconds).
-pub type Kept = (i64, Draft, i64);
-
-impl Drafts {
-    /// Takes out the drafts these Drafts rows stand for (discarded from the list), for Undo to
-    /// [`Self::put_back`].
-    pub fn take_rows(&mut self, rows: &[MessageId]) -> Vec<Kept> {
-        let ids: Vec<i64> = rows.iter().map(|r| envoy_core::drafts::draft_of_list_id(*r).unwrap_or(*r)).collect();
-        let (taken, kept) = std::mem::take(&mut self.0).into_iter().partition(|d| ids.contains(&d.0));
-        self.0 = kept;
-        taken
-    }
-
-    pub fn put_back(&mut self, drafts: Vec<Kept>) {
-        for d in drafts {
-            self.forget(d.0);
-            self.0.push(d);
-        }
-    }
-
-    /// File `file` of draft `draft`, as kept.
-    pub fn file_mut(&mut self, draft: i64, file: i64) -> Option<&mut envoy_core::model::DraftAttachment> {
-        self.0.iter_mut().find(|d| d.0 == draft)?.1.attachments.iter_mut().find(|f| f.id == file)
-    }
-
-    /// Keeps draft `id` as it is now.
-    pub fn keep(&mut self, id: i64, draft: Draft) {
-        self.forget(id);
-        self.0.push((id, draft, now()));
-    }
-
-    pub fn forget(&mut self, id: i64) {
-        self.0.retain(|d| d.0 != id);
-    }
-
-    /// The draft a Drafts row stands for: a sample's row once it's edited, else a new one's.
-    pub fn of_row(&self, row: MessageId) -> Option<(i64, Draft)> {
-        let id = envoy_core::drafts::draft_of_list_id(row).unwrap_or(row);
-        self.0.iter().find(|d| d.0 == id).map(|d| (d.0, d.1.clone()))
-    }
-}
-
-/// [`list_for`], with the drafts written this session in Drafts: a sample draft as last edited,
-/// a new one added (with an id of `envoy_core::drafts::list_id`'s). Newest first.
-pub fn list_with(view: &View, drafts: &Drafts) -> Vec<Summary> {
-    let mut list = list_for(view);
-    let in_drafts = match view {
-        View::Role { role, .. } => *role == Role::Drafts,
-        View::Mailbox { mailbox, .. } => mailbox == DRAFTS,
-        _ => false,
-    };
-    if !in_drafts {
-        return list;
-    }
-    for (id, d, updated) in &drafts.0 {
-        let at = list.iter().position(|m| m.id == *id);
-        let row = match at {
-            Some(i) => &mut list[i],
-            None => {
-                // The sample draft's row (from you, in Drafts, read), as this draft's.
-                let (i, sample) = SAMPLES.iter().enumerate().find(|(_, s)| s.mailbox == DRAFTS).expect("a sample draft");
-                list.push(Summary { id: envoy_core::drafts::list_id(*id), uid: 0, thread: format!("draft:{id}"), ..summary(i, sample) });
-                list.last_mut().expect("just pushed")
-            }
-        };
-        row.subject = d.subject.clone();
-        // As far as it parses: it may be half typed.
-        row.to = match envoy_core::smtp::parse_recipients(&d.to) {
-            Ok(to) => to.into_iter().map(|m| addr(m.name.as_deref().unwrap_or_default(), m.email.as_ref())).collect(),
-            Err(_) => vec![addr("", d.to.trim())],
-        };
-        row.preview = envoy_core::mime::preview(Some(&d.body), None);
-        row.date = *updated;
-        row.has_attachments = !d.attachments.is_empty();
-    }
-    list.sort_by_key(|r| std::cmp::Reverse((r.date, r.id)));
-    list
-}
-
-/// The unread conversations per category of a view's sample mail, as the engine counts them for
-/// the split inbox's tabs ([`Category::code`] order).
-pub fn category_counts(view: &View) -> [u32; 4] {
-    let mut counts = [0; 4];
-    for m in list_for(view).iter().filter(|m| m.thread_unread) {
-        counts[m.category.code() as usize] += 1;
-    }
-    counts
-}
-
-/// Why sample mail is in its tab, as envoy-core would say of real mail like it.
-pub fn why(c: Category) -> &'static str {
-    match c {
-        Category::Important => "Sent directly to you",
-        Category::Other => "You're copied, or it went to a group",
-        Category::Newsletters => "Has an unsubscribe link",
-        Category::Notifications => "From a notifications address",
-    }
-}
-
-/// A sample draft, as it opens in the composer.
-pub fn draft_for(id: MessageId) -> Option<Draft> {
-    let s = SAMPLES.get(usize::try_from(id - 1).ok()?).filter(|s| s.mailbox == DRAFTS)?;
-    Some(Draft {
-        account: ACCOUNT.into(),
-        to: format!("{} <{}>", DRAFT_TO.0, DRAFT_TO.1),
-        subject: s.subject.into(),
-        body: format!("Hi Jordan,\n\n{}\n\nThanks!", s.preview),
-        attachments: vec![DraftAttachment { id: 0, filename: "train-times.pdf".into(), mime: "application/pdf".into(), size: 182_400, ..Default::default() }],
-        ..Draft::default()
-    })
-}
-
-const DESIGN_MD: &str = "Hey!\n\nQuick heads up — the room was double-booked so I moved us to **Thursday at 2pm**. Same Zoom link if you're remote.\n\nI also added the new onboarding flows to the deck:\n\n- Welcome screen with account picker\n- Gmail app-password walkthrough\n- First sync progress (with the *download ahead* setting)\n\nThe prototype is here: [figma.com/file/envoy-onboarding](https://figma.com/file/envoy-onboarding)\n\nThanks,\\\nMaya";
-
-pub fn thread_for(id: MessageId) -> Vec<ThreadMessage> {
-    let i = (id - 1) as usize;
-    let Some(s) = SAMPLES.get(i) else { return vec![] };
-    let base = summary(i, s);
-    let mut out = Vec::new();
-    let n = s.count.max(1) as i64;
-    for j in 0..n {
-        let last = j == n - 1;
-        let mut m = base.clone();
-        m.id = id * 100 + j;
-        m.date = base.date - (n - 1 - j) * 5400;
-        m.thread_count = 1;
-        let mine = j % 2 == 1;
-        if mine {
-            m.from = addr("You", "you@gmail.com");
-            m.to = vec![base.from.clone()];
-            m.preview = "Sounds good — I'll take a look this afternoon.".into();
-        } else if !last {
-            m.preview = "Sharing an early version so we can talk it through before the review.".into();
-        }
-        if !last {
-            m.flags |= flags::SEEN;
-        }
-        let html_path = std::env::var("ENVOY_DEMO_HTML").ok().filter(|_| last && i == 0);
-        let (text, markdown) = if html_path.is_some() {
-            (None, None)
-        } else if last && i == 0 {
-            (None, Some(DESIGN_MD.to_owned()))
-        } else if last {
-            (Some(format!("{}\n\nSee you soon,\n{}\n\nOn Tue, You wrote:\n> Earlier message, quoted.", s.preview, first(s.from.0))), None)
-        } else {
-            (Some(format!("{}\n\nBest,\n{}", m.preview, if mine { "You" } else { first(s.from.0) })), None)
-        };
-        let attachments = if last && s.attach {
-            vec![Attachment { index: 0, filename: if i == 2 { "e-ticket-SFO-MUC.pdf".into() } else { "onboarding-v3.fig".into() }, mime: "application/pdf".into(), size: 482_113 }]
-        } else {
-            vec![]
-        };
-        out.push(ThreadMessage {
-            body: Some(Body {
-                id: m.id,
-                message_id: format!("<{}@demo>", m.id),
-                references: String::new(),
-                cc: if last && s.count > 2 { vec![addr("Jordan Lee", "jordan@northwind.dev")] } else { vec![] },
-                reply_to: vec![],
-                text,
-                doc: html_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map(|h| std::sync::Arc::new(envoy_core::html::parse(&h))),
+/// The demo's server, with the sample mail on it, dated from `now`.
+pub fn server(now: chrono::DateTime<chrono::Local>) -> Server {
+    let server = Server::new();
+    let me = account();
+    server.add_account(me, FOLDERS);
+    let html = std::env::var("ENVOY_DEMO_HTML").ok().and_then(|p| std::fs::read_to_string(p).ok());
+    for (i, s) in SAMPLES.iter().enumerate() {
+        let newest = now.timestamp() - s.hours_ago * 3600 - 600;
+        let folders: Vec<String> = s.folders.iter().map(|f| folder_of(f, &now)).collect();
+        let n = s.earlier.len() as i64;
+        let mut refs: Vec<String> = Vec::new();
+        let base = s.subject.strip_prefix("Re: ").unwrap_or(s.subject);
+        // The conversation, oldest first: the newest is theirs, and yours are in Sent.
+        for (j, &mine) in s.earlier.iter().chain([&false]).enumerate() {
+            let last = j as i64 == n;
+            let date = newest - (n - j as i64) * 5400;
+            let (from, to) = if mine { (person(ME), vec![person(s.from)]) } else { (person(s.from), vec![person(ME)]) };
+            // To a group you're copied on; Maya copies Jordan in (your replies are to her alone).
+            let (to, cc) = match s.kind {
+                Kind::Group => (vec![("Northwind team".into(), "team@northwind.dev".into())], vec![person(ME)]),
+                _ if !mine && s.from == MAYA => (to, vec![person(JORDAN)]),
+                _ => (to, Vec::new()),
+            };
+            let subject = match j {
+                _ if last => s.subject.to_owned(),
+                0 => base.to_owned(),
+                _ => format!("Re: {base}"),
+            };
+            // People sign with their first name; companies and machines with all of theirs.
+            let signed = if matches!(s.kind, Kind::Person | Kind::Group) { first_name(s.from.0) } else { s.from.0 };
+            let text = if last {
+                format!("{}\n\nSee you soon,\n{signed}", s.text)
+            } else if mine {
+                "Sounds good — I'll take a look this afternoon.\n\nYou".to_owned()
+            } else {
+                format!("Sharing an early version so we can talk it through before the review.\n\nBest,\n{}", first_name(s.from.0))
+            };
+            let mut mail = Mail {
+                from,
+                to,
+                cc,
+                subject,
+                date,
+                message_id: format!("s{i}.{j}@demo.envoy"),
+                references: refs.clone(),
+                headers: headers(s.kind),
+                text: Some(text),
                 html: None,
-                markdown,
-                attachments,
-                inline: vec![],
-            }),
-            summary: m,
-        });
-    }
-    out
-}
-
-pub fn populate(app: &mut App) {
-    app.accounts = vec![account()];
-    app.mailboxes.insert(
-        ACCOUNT.into(),
-        vec![
-            mailbox("INBOX", "Inbox", Role::Inbox, 3),
-            mailbox("[Gmail]/Starred", "Starred", Role::Flagged, 0),
-            mailbox("[Gmail]/Important", "Important", Role::Important, 1),
-            mailbox("[Gmail]/Sent Mail", "Sent", Role::Sent, 0),
-            mailbox("[Gmail]/Drafts", "Drafts", Role::Drafts, 0),
-            mailbox("[Gmail]/All Mail", "All Mail", Role::All, 0),
-            mailbox("[Gmail]/Spam", "Spam", Role::Junk, 0),
-            mailbox("[Gmail]/Trash", "Trash", Role::Trash, 0),
-            mailbox("Snoozed", "Snoozed", Role::Snoozed, 0),
-            Mailbox { wake: wake_of(SNOOZED_TOMORROW), ..mailbox(&mailbox_of(SNOOZED_TOMORROW), "Snoozed", Role::Snoozed, 0) },
-            Mailbox { wake: wake_of(SNOOZED_NEXT_WEEK), ..mailbox(&mailbox_of(SNOOZED_NEXT_WEEK), "Snoozed", Role::Snoozed, 0) },
-            Mailbox { depth: 0, ..mailbox("Receipts", "Receipts", Role::Other, 0) },
-            Mailbox { depth: 0, ..mailbox("Travel", "Travel", Role::Other, 1) },
-            Mailbox { depth: 0, ..mailbox("Work", "Work", Role::Other, 0) },
-        ],
-    );
-    app.sync.insert(ACCOUNT.into(), SyncState::Idle);
-    app.view = View::Role { account: Some(ACCOUNT.into()), role: Role::Inbox };
-    // As the app asks for it: the split inbox's tab, with every tab's count.
-    app.request_list();
-}
-
-/// Recipient suggestions from the sample mail, ranked as the store ranks a real cache's
-/// (`envoy_core::contacts`): you've written in each conversation you replied to (every other
-/// message of its thread), and Jordan is copied on the longer ones.
-pub fn suggest(typed: &str) -> Vec<Address> {
-    use envoy_core::contacts::{self, Candidate, Stats, source};
-    let now = now();
-    let words = contacts::query_words(typed);
-    let mut candidates = Vec::new();
-    for s in SAMPLES.iter().filter(|s| s.mailbox == "INBOX") {
-        let at = now - s.hours_ago * 3600 - 600;
-        let bulk = BULK.contains(&s.from.1);
-        let yours = if bulk { 0 } else { s.count / 2 };
-        let stats = Stats { sent: yours, sent_at: at, got: if bulk { 0 } else { s.count - yours }, cc: 0, bulk: bulk as u32, seen_at: at };
-        candidates.push(Candidate { email: s.from.1.into(), name: s.from.0.into(), name_rank: (source::THEIRS, at), stats });
-        if s.count > 2 {
-            candidates.push(Candidate { email: DRAFT_TO.1.into(), name: DRAFT_TO.0.into(), name_rank: (source::COPIED, at), stats: Stats { cc: 1, seen_at: at, ..Stats::default() } });
+                attachment: if last { s.attachment.map(|(n, m, z)| (n.into(), m.into(), z)) } else { None },
+            };
+            if last && i == 0 {
+                mail.html = Some(html.clone().unwrap_or_else(|| DESIGN_HTML.to_owned()));
+                if html.is_some() {
+                    mail.text = None;
+                }
+            }
+            refs.push(mail.message_id.clone());
+            let raw = mail.rfc822();
+            let mut fl = if last && s.unread { 0 } else { flags::SEEN };
+            if last && s.starred {
+                fl |= flags::FLAGGED;
+            }
+            if mine {
+                server.add_mail(ACCOUNT, &["[Gmail]/Sent Mail"], raw, flags::SEEN, date);
+            } else {
+                let folders: Vec<&str> = folders.iter().map(String::as_str).collect();
+                server.add_mail(ACCOUNT, &folders, raw, fl, date);
+            }
         }
     }
-    // What the store's index gives: every row of each address one of whose rows matches.
-    let found: Vec<String> = candidates.iter().filter(|c| contacts::matches(&words, &contacts::terms(&c.name, &c.email))).map(|c| c.email.clone()).collect();
-    candidates.retain(|c| found.contains(&c.email));
-    let me = [account().email].into();
-    contacts::rank(candidates, &words, &me, now, envoy_core::engine::SUGGESTIONS)
+    let (subject, body, file) = DRAFT;
+    let draft = Mail {
+        from: person(ME),
+        to: vec![person(JORDAN)],
+        subject: subject.into(),
+        date: now.timestamp() - 3 * 3600,
+        message_id: "draft.1@demo.envoy".into(),
+        text: Some(body.into()),
+        attachment: Some((file.into(), "application/pdf".into(), 24_400)),
+        ..Mail::default()
+    };
+    server.add_mail(ACCOUNT, &[DRAFTS], draft.rfc822(), flags::SEEN | flags::DRAFT, draft.date);
+    server
+}
+
+fn headers(kind: Kind) -> Vec<(String, String)> {
+    let h = |pairs: &[(&str, &str)]| pairs.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())).collect();
+    match kind {
+        Kind::Person | Kind::Group | Kind::Receipt => Vec::new(),
+        Kind::Newsletter(list) => h(&[("List-Id", &format!("<news.{list}>")), ("List-Unsubscribe", &format!("<https://{list}/unsubscribe>"))]),
+        Kind::GitHub => h(&[("List-Id", "envoy <envoy.example.github.com>"), ("X-GitHub-Reason", "review_requested"), ("List-Unsubscribe", "<https://github.com/notifications/unsubscribe>")]),
+        Kind::Automated => h(&[("Auto-Submitted", "auto-generated")]),
+    }
+}
+
+/// Puts a sample message in a snooze bucket whose time came `ago` seconds before `now`: the
+/// engine wakes it on its next check, back atop the inbox. For the `woken` scene.
+pub fn snoozed_till(server: &Server, now: i64, ago: i64) {
+    let at = now - ago;
+    let mail = Mail {
+        from: person(("Kiko Tanaka", "kiko@tanaka.example")),
+        to: vec![person(ME)],
+        subject: "Can you send the slides before Friday?".into(),
+        date: at - 86_400,
+        message_id: "woken.1@demo.envoy".into(),
+        text: Some("No rush, but I'd love to look them over before the call.\n\nKiko".into()),
+        ..Mail::default()
+    };
+    server.add_mail(ACCOUNT, &[&envoy_core::snooze::bucket(envoy_core::snooze::PARENT, "/", at)], mail.rfc822(), flags::SEEN, mail.date);
+}
+
+/// Starts the app's engine on the demo's server (filled with the samples, dated from now), its
+/// cache in a folder of its own: the real engine, all of it, offline.
+pub fn start(app: &mut App, wake: impl Fn() + Send + Sync + 'static) -> Result<(), String> {
+    let server = Arc::new(server(chrono::Local::now()));
+    let engine = Engine::start_offline(wake, app.settings.clone(), server.clone(), database()).map_err(|e| format!("{e:#}"))?;
+    app.engine = Some(engine);
+    app.demo_server = Some(server);
+    Ok(())
+}
+
+/// A cache of the demo's own, never used before: each demo starts from the samples.
+fn database() -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = envoy_core::paths::data_dir().join(format!("demo-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("mail.sqlite")
+}
+
+#[cfg(test)]
+pub mod testing {
+    use envoy_core::engine::Command;
+
+    use crate::app::App;
+
+    /// An app on demo mode's engine, its inbox listed: the real engine and store, on the sample
+    /// mail, as `--demo` opens.
+    pub fn app() -> App {
+        with(|_| {})
+    }
+
+    /// [`app`], `change`d before its engine starts (settings, say).
+    pub fn with(change: impl FnOnce(&mut App)) -> App {
+        let mut app = App::new(true);
+        change(&mut app);
+        super::start(&mut app, || {}).expect("the demo's engine starts");
+        let view = app.view.clone();
+        app.request_list();
+        app.send(Command::Watch { view });
+        assert!(app.settle(), "the demo's engine answers");
+        app
+    }
+
+    /// [`app`], its engine let go: what's asked of it is only recorded (`App::sent`), and nothing
+    /// answers, so a test can answer as the engine would.
+    pub fn detached() -> App {
+        let mut app = app();
+        app.engine = None;
+        app
+    }
 }

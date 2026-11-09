@@ -212,32 +212,43 @@ mod tests {
 
     #[test]
     fn the_inbox_opens_on_important_and_the_number_keys_switch_tabs() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        // Demo mode's sample mail, sorted by the real classifier as the engine stored it.
+        let mut app = crate::demo::testing::app();
         assert!(app.split_applies());
         assert_eq!(app.list_category(), Some(Category::Important));
         assert!(!app.list.is_empty() && categories(&app).iter().all(|c| *c == Category::Important));
-        // Every tab's unread count, nothing hidden without one.
-        let unread = |app: &App, c: Category| crate::demo::list_for(&app.view).iter().filter(|m| m.category == c && m.thread_unread).count() as u32;
-        for c in Category::ALL {
-            assert_eq!(app.category_count(c), unread(&app, c), "{c:?}");
-        }
-        assert!(app.category_count(Category::Notifications) > 0);
-        // An opened conversation says why it's in its tab.
-        app.open_message(app.list[0].id);
-        assert_eq!(app.explained.as_ref().map(|e| (e.0, e.1)), Some((app.list[0].id, Category::Important)));
-        for (k, c) in [("3", Category::Newsletters), ("4", Category::Notifications), ("2", Category::Other), ("1", Category::Important)] {
+        let subjects = |app: &App| app.list.iter().map(|m| m.subject.clone()).collect::<Vec<_>>();
+        assert_eq!(subjects(&app), ["Design review moved to Thursday", "Dinner Saturday?", "Re: Q3 roadmap draft", "photos from the trip!!"]);
+        // Every tab's unread count, nothing hidden without one: what each tab lists unread.
+        let mut unread = [0; 4];
+        for (k, c) in [("1", Category::Important), ("2", Category::Other), ("3", Category::Newsletters), ("4", Category::Notifications)] {
             assert!(key(&mut app, k, Mods::default()), "{k}");
+            app.settle();
             assert_eq!(app.list_category(), Some(c));
-            assert!(categories(&app).iter().all(|x| *x == c), "{k}: {:?}", categories(&app));
+            assert!(!app.list.is_empty() && categories(&app).iter().all(|x| *x == c), "{k}: {:?}", categories(&app));
+            unread[c.code() as usize] = app.list.iter().filter(|m| m.thread_unread).count() as u32;
         }
+        assert_eq!(Category::ALL.map(|c| unread[c.code() as usize]), [2, 0, 0, 1], "Maya's and Sam's, none, none, GitHub's");
+        for c in Category::ALL {
+            assert_eq!(app.category_count(c), unread[c.code() as usize], "{c:?}");
+        }
+        // An opened conversation says why it's in its tab.
+        assert!(key(&mut app, "1", Mods::default()));
+        app.settle();
+        let first = app.list[0].id;
+        app.open_message(first);
+        assert!(app.settle_until(|app| app.explained.is_some()));
+        assert_eq!(app.explained.as_ref().map(|e| (e.0, e.1, e.2.as_str())), Some((first, Category::Important, "From someone you've written to")));
         // A search looks in every category, and a tab key brings the tabs back.
+        app.close_message();
         app.applied_query = "receipt".into();
         app.request_list();
+        app.settle();
         assert_eq!(app.list_category(), None);
         assert_eq!(categories(&app), [Category::Notifications], "found outside the tab");
         app.applied_query = "category:news".into();
         app.request_list();
+        app.settle();
         assert!(!app.list.is_empty() && categories(&app).iter().all(|c| *c == Category::Newsletters));
         assert!(key(&mut app, "3", Mods::default()));
         assert_eq!((app.applied_query.as_str(), app.list_category()), ("", Some(Category::Newsletters)));
@@ -246,17 +257,19 @@ mod tests {
         assert!(!key(&mut app, "2", Mods::default()));
         app.set_setting("inbox.split", serde_json::json!(false));
         app.go_role(Role::Inbox);
+        app.settle();
         assert_eq!(app.list_category(), None);
-        assert_eq!(app.list.len(), crate::demo::list_for(&app.view).len());
+        assert_eq!(app.list.len(), 12, "the whole inbox: {:?}", subjects(&app));
         assert!(!key(&mut app, "2", Mods::default()));
     }
 
     #[test]
     fn a_correction_moves_the_conversation_adds_a_rule_and_one_undo_takes_both_back() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::app();
         let mut tx = Tx::default();
         assert!(key(&mut app, "3", Mods::default()));
+        app.settle();
+        app.engine = None;
         let row = app.list[0].clone();
         app.open_message(row.id);
         let before = app.list.len();
@@ -286,8 +299,7 @@ mod tests {
 
     #[test]
     fn corrections_wait_for_a_target_and_never_fire_while_typing() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let from = app.sent.borrow().len();
         assert!(!key(&mut app, "2", alt()), "nothing open or selected");
         // A selection: one correction for all of them, mail of yours making no rule.
@@ -312,8 +324,7 @@ mod tests {
     /// an edit made meanwhile (settings.json reloaded), nothing else is lost.
     #[test]
     fn undo_reverses_only_its_own_rule_change() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         let rule = |from: &str, c: &str| serde_json::json!({ "from": from, "category": c });
         let id_of = |app: &App, email: &str| app.list.iter().find(|m| m.from.email == email).unwrap().id;
@@ -348,9 +359,7 @@ mod tests {
     /// The tabs show while a search does, so their counts are asked for with its list too.
     #[test]
     fn the_tabs_counts_are_asked_for_while_searching_too() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false; // lists come from the engine
+        let mut app = crate::demo::testing::detached();
         let last_list = |app: &App| app.sent.borrow().iter().rev().find(|c| c.starts_with("List")).cloned().unwrap();
         app.applied_query = "dinner".into();
         app.request_list();
@@ -367,9 +376,7 @@ mod tests {
     /// dropped rather than put back on the tabs.
     #[test]
     fn counts_for_an_older_list_are_dropped() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
-        app.demo = false; // lists come from the engine
+        let mut app = crate::demo::testing::detached();
         let mut tx = Tx::default();
         let view = app.view.clone();
         app.request_list();
@@ -383,8 +390,7 @@ mod tests {
 
     #[test]
     fn move_to_offers_the_categories_in_a_split_inbox() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let first = app.list[0].id;
         let ids = |app: &App| app.picker_options(crate::app::Picker::Move, &[first]).0.into_iter().map(|o| o.id).collect::<Vec<_>>();
         let with = ids(&app);

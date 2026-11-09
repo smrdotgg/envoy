@@ -10,7 +10,7 @@ every decision is judged against. MIT licensed.
 ## Try it
 
 ```sh
-# Sample mail, no account, nothing sent anywhere:
+# Sample mail, no account, nothing sent anywhere (the real app, offline):
 cargo run --release -p envoy -- --demo
 
 # The real thing:
@@ -274,7 +274,16 @@ ENVOY_DEMO=1 target/debug/envoy --script scripts/ui/select.json --snap out.png -
 ```
 
 Run from the repository root (the attach script picks files in it), with a debug build: release
-builds leave headless runs out. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label snooze snooze-typed snoozed woken toast toast-compose counts split split-newsletters split-moved split-search split-narrow split-empty split-off settings-rules`.
+builds leave headless runs out.
+
+**Demo mode** (`--demo`, `ENVOY_DEMO=1`) is the whole app, engine and store included, on sample
+mail kept by an IMAP server inside the process (`crates/envoy-core/src/demo.rs`): the cache is
+filled from it as a first sync would, and moves, labels, flags, drafts, sends and snoozes go to it
+through the op queue and come back by sync, as with a real account. Sends are filed in Sent (and
+mail to the demo's own address arrives in its inbox); nothing ever opens a connection (every way
+out is refused in demo mode, and a test checks no socket is opened), and its files (cache,
+settings) go in a folder of its own, deleted when it closes. The scripts tap list rows by message
+id (`m9` is the first conversation), as the demo's cache numbers them. Scenes: `open light dark compact bottom compose forward compose-suggest light-compose settings settings-keys accounts add welcome sent drafts draft draft-notice html html-dark select select-off picker picker-select label snooze snooze-typed snoozed woken toast toast-compose counts split split-newsletters split-moved split-search split-narrow split-empty split-off settings-rules`.
 
 HTML rendering is tested against the mail in `crates/envoy-core/tests/fixtures/html` (sources and
 licenses in its `LICENSES.md`).

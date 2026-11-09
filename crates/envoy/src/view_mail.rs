@@ -582,9 +582,27 @@ fn server_total(s: &App) -> Option<(u32, String)> {
 
 fn empty_list(s: &App, t: &Theme) -> El {
     let k = &t.k;
-    let downloading = s.applied_query.is_empty() && s.list_loaded && !s.demo;
-    let pending = if downloading { server_total(s) } else { None };
+    let (title, sub, busy) = empty_text(s);
+    col()
+        .key("empty-list")
+        .w_full()
+        .h_full()
+        .center()
+        .gap(8.0)
+        .padding(24.0)
+        .child(if busy { Spinner::new().build(k) } else { icon(&icons::INBOX, 36.0).color(k.c.icon_faint) })
+        .child(text(title).font(k.ty.body_medium).color(k.c.text_muted))
+        .child(text(sub).font(k.ty.text_small).color(k.c.text_faint).wrap())
+}
+
+/// What an empty list says (a title, a line under it), and whether mail is on its way.
+fn empty_text(s: &App) -> (String, String, bool) {
     let syncing = s.sync.values().any(|st| matches!(st, SyncState::Connecting | SyncState::Syncing(_)));
+    // Mail the server has that isn't here yet: not once the view has listed some (its last row
+    // went), and in a tab of the split inbox only while mail is coming (the inbox's count is
+    // every tab's, and this one may well have none).
+    let downloading = s.applied_query.is_empty() && s.list_loaded && !s.list_had_rows && (s.list_category().is_none() || syncing);
+    let pending = if downloading { server_total(s) } else { None };
     let (title, sub): (String, String) = if !s.list_loaded {
         ("Loading…".into(), String::new())
     } else if let Some((n, name)) = &pending {
@@ -608,16 +626,7 @@ fn empty_list(s: &App, t: &Theme) -> El {
         ("Nothing here".into(), String::new())
     };
     let busy = pending.is_some() || (syncing && s.applied_query.is_empty());
-    col()
-        .key("empty-list")
-        .w_full()
-        .h_full()
-        .center()
-        .gap(8.0)
-        .padding(24.0)
-        .child(if busy { Spinner::new().build(k) } else { icon(&icons::INBOX, 36.0).color(k.c.icon_faint) })
-        .child(text(title).font(k.ty.body_medium).color(k.c.text_muted))
-        .child(text(sub).font(k.ty.text_small).color(k.c.text_faint).wrap())
+    (title, sub, busy)
 }
 
 /// What a row of the list is: a conversation, or (outside conversation view, and in Drafts and
@@ -861,8 +870,7 @@ mod tests {
 
     #[test]
     fn the_list_header_counts_what_a_row_is() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         assert_eq!(row_noun(&app), "conversation");
         for role in [Role::Snoozed, Role::Drafts] {
             app.view = View::Role { account: Some("demo".into()), role };
@@ -875,9 +883,9 @@ mod tests {
 
     #[test]
     fn selecting_builds_again_only_the_rows_it_marks() {
-        let mut app = App::new(true);
-        let _ = app.settings.set("inbox.split", serde_json::json!(false)); // the whole inbox
-        crate::demo::populate(&mut app);
+        // The whole inbox.
+        let mut app = crate::demo::testing::with(|app| drop(app.settings.set("inbox.split", serde_json::json!(false))));
+        app.engine = None;
         let all: Vec<MessageId> = app.list.iter().map(|m| m.id).collect();
         app.open_message(all[0]);
         let marks = |app: &App| all.iter().map(|id| row_marks(app, *id)).collect::<Vec<_>>();
@@ -909,9 +917,49 @@ mod tests {
     }
 
     #[test]
+    fn an_emptied_tab_is_caught_up_not_downloading() {
+        // Demo mode's Other tab, its one conversation archived: the inbox still has mail on the
+        // server, in the other tabs, and this one's done.
+        let mut app = crate::demo::testing::app();
+        app.show_category(envoy_core::model::Category::Other);
+        app.settle();
+        let ids: Vec<MessageId> = app.list.iter().map(|m| m.id).collect();
+        assert_eq!(ids.len(), 1, "Jordan's");
+        app.archive(ids, &mut Tx::default());
+        app.settle();
+        assert!(app.list.is_empty());
+        let (title, sub, busy) = empty_text(&app);
+        assert_eq!((title.as_str(), busy), ("All caught up", false), "{sub}");
+        assert!(sub.starts_with("Nothing in Other. Unread: 2 in Important"), "{sub}");
+        // Opened while mail is still coming, it may be on its way.
+        app.list_had_rows = false;
+        app.sync.insert("demo".into(), SyncState::Syncing("Inbox".into()));
+        assert!(empty_text(&app).0.starts_with("Downloading"));
+    }
+
+    #[test]
+    fn a_folder_whose_last_row_went_is_empty_not_downloading() {
+        // The only draft discarded: its copy is still on the server for the undo window, and
+        // Drafts says it's empty, not that it's downloading.
+        let mut app = crate::demo::testing::app();
+        app.go(View::Mailbox { account: "demo".into(), mailbox: crate::demo::DRAFTS.into() });
+        app.settle();
+        let ids: Vec<MessageId> = app.list.iter().map(|m| m.id).collect();
+        assert_eq!(ids.len(), 1, "the sample draft");
+        app.delete(ids, &mut Tx::default());
+        app.settle();
+        assert!(app.list.is_empty());
+        let (title, _, busy) = empty_text(&app);
+        assert_eq!((title.as_str(), busy), ("Nothing here", false));
+        // A folder opened before its mail is here: on its way.
+        app.go(View::Mailbox { account: "demo".into(), mailbox: "Work".into() });
+        app.list_loaded = true;
+        assert!(empty_text(&app).0.starts_with("Downloading Work"), "{:?}", empty_text(&app));
+    }
+
+    #[test]
     fn rows_are_built_again_when_the_view_changes_how_they_show() {
-        let mut app = App::new(true);
-        crate::demo::populate(&mut app);
+        let mut app = crate::demo::testing::detached();
         let t = crate::theme::build(&app.settings, true);
         app.view = View::Starred { account: None };
         let starred = rows_env(&app, &t);

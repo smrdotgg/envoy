@@ -10,6 +10,8 @@ mod bench;
 mod categories;
 mod compose;
 mod demo;
+#[cfg(test)]
+mod demo_tests;
 mod fmt;
 mod html_view;
 mod icons;
@@ -64,29 +66,35 @@ static WAKER: std::sync::OnceLock<Waker> = std::sync::OnceLock::new();
 /// Starts the engine and asks for the first list at the top of `main`, so the cache opens and
 /// the list is read on the engine's thread while the OS and the GPU bring the window up: the
 /// first frame shows the list when it's in by then (it usually is), instead of a frame later.
+/// Demo mode first puts its files in a folder of their own, and goes offline for good.
 fn start_early() {
-    if is_demo() {
-        return;
+    let demo = is_demo();
+    if demo {
+        if !envoy_core::demo::isolate() {
+            log::warn!("demo mode's files couldn't be kept apart from yours");
+        }
+        envoy_core::net::go_offline();
     }
-    let mut app = App::new(false);
+    let mut app = App::new(demo);
     start_engine(&mut app);
     EARLY.with(|e| *e.borrow_mut() = Some(app));
 }
 
+/// Starts the engine (on the demo's in-process server in demo mode), and asks for the list.
 fn start_engine(s: &mut App) {
     let wake = || {
         if let Some(w) = WAKER.get() {
             w();
         }
     };
-    match Engine::start(wake, s.settings.clone()) {
-        Ok(engine) => {
-            s.engine = Some(engine);
+    let started = if s.demo { demo::start(s, wake) } else { Engine::start(wake, s.settings.clone()).map(|e| s.engine = Some(e)).map_err(|e| format!("{e:#}")) };
+    match started {
+        Ok(()) => {
             let view = s.view.clone();
             s.request_list();
             s.send(Command::Watch { view });
         }
-        Err(e) => s.toast(format!("Couldn't open the mail cache: {e:#}"), true),
+        Err(e) => s.toast(format!("Couldn't open the mail cache: {e}"), true),
     }
 }
 
@@ -94,19 +102,11 @@ fn init() -> App {
     if let Some(app) = EARLY.with(|e| e.borrow_mut().take()) {
         return app;
     }
-    let demo = is_demo();
-    let mut app = App::new(demo);
-    if demo {
-        demo::populate(&mut app);
-    }
-    app
+    App::new(is_demo())
 }
 
 fn setup(s: &mut App, waker: Waker) {
     s.image_cache = Some(rune::ImageCache::new(waker.clone()));
-    if s.demo {
-        return;
-    }
     let _ = WAKER.set(waker);
     if s.engine.is_none() {
         start_engine(s);
@@ -169,12 +169,13 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
     rune_kit::root(body.fill(t.page), layer)
 }
 
+/// The first conversation of the inbox (its Important tab) open, every message of it shown.
+/// Scenes run on demo mode's engine: each waits for it ([`App::settle`]) before it's drawn.
 fn scene_open(s: &mut App) {
-    if let Some((id, category)) = s.list.first().map(|m| (m.id, m.category)) {
-        s.open = Some(id);
-        s.explained = Some((id, category, demo::why(category).into()));
-        s.thread = demo::thread_for(id);
-        s.thread_for = Some(id);
+    s.settle();
+    if let Some(id) = s.list.first().map(|m| m.id) {
+        s.open_message(id);
+        s.settle();
         for m in &s.thread {
             s.expanded.insert(m.summary.id);
         }
@@ -191,6 +192,13 @@ fn scene_html(s: &mut App, theme: &str) {
     if let Some(m) = s.thread.last() {
         s.expanded.insert(m.summary.id);
     }
+}
+
+/// The demo account's `role` (Sent, Snoozed…), as its sidebar row opens it.
+fn scene_view(s: &mut App, role: Role) {
+    s.settle();
+    s.go(View::Role { account: Some(demo::ACCOUNT.into()), role });
+    s.settle();
 }
 
 type Scene = (&'static str, fn(&mut App));
@@ -225,6 +233,7 @@ const SCENES: &[Scene] = &[
     ("forward", |s| {
         scene_open(s);
         s.compose_reply(None, false, true);
+        s.settle();
     }),
     ("compose-suggest", |s| {
         // Recipient suggestions for "l" in a new message's To field.
@@ -234,28 +243,35 @@ const SCENES: &[Scene] = &[
             c.to.insert("l");
         }
         s.recipients_edited(app::Recipients::To);
+        s.settle_until(|s| s.compose.as_ref().is_some_and(|c| !c.suggest.items.is_empty()));
     }),
-    ("settings", |s| s.screen = Screen::Settings),
+    ("settings", |s| {
+        s.settle();
+        s.screen = Screen::Settings;
+    }),
     ("settings-keys", |s| {
+        s.settle();
         s.screen = Screen::Settings;
         s.settings_ui.category = Some(6);
     }),
     ("accounts", |s| {
+        s.settle();
         s.screen = Screen::Settings;
         s.settings_ui.accounts = true;
     }),
-    ("add", |s| s.screen = Screen::AddAccount),
+    ("add", |s| {
+        s.settle();
+        s.screen = Screen::AddAccount;
+    }),
     ("welcome", |s| {
+        s.settle();
         s.accounts.clear();
         s.mailboxes.clear();
         s.screen = Screen::AddAccount;
     }),
     ("html", |s| scene_html(s, "light")),
     ("html-dark", |s| scene_html(s, "dark")),
-    ("sent", |s| {
-        s.view = View::Role { account: Some("demo".into()), role: Role::Sent };
-        s.list = demo::list_for(&s.view);
-    }),
+    ("sent", |s| scene_view(s, Role::Sent)),
     ("select", scene_select),
     ("select-off", |s| {
         let _ = s.settings.set("inbox.readingPane", serde_json::json!("off"));
@@ -282,21 +298,23 @@ const SCENES: &[Scene] = &[
         s.open_snooze_picker();
         s.snooze_picker.search = rune::TextEdit::new("fri 9am");
     }),
-    ("snoozed", |s| {
-        s.view = View::Role { account: Some("demo".into()), role: Role::Snoozed };
-        s.list = demo::list_for(&s.view);
-    }),
+    ("snoozed", |s| scene_view(s, Role::Snoozed)),
     ("woken", |s| {
-        // Back from a snooze: atop the inbox (its own tab of it), marked, until it's dealt with.
-        s.list[3].flags |= envoy_core::model::flags::WOKEN;
-        let back = s.list.remove(3);
-        s.list.insert(0, back);
+        // Back from a snooze: a message whose time came while Envoy was closed, woken on the
+        // next check, atop the inbox (its own tab of it), marked, until it's dealt with.
+        s.settle();
+        if let Some(server) = s.demo_server.clone() {
+            demo::snoozed_till(&server, chrono::Utc::now().timestamp(), 600);
+        }
+        s.send(Command::SyncNow);
+        s.settle_until(|s| s.list.first().is_some_and(|m| m.flags & envoy_core::model::flags::WOKEN != 0));
     }),
     ("toast", |s| {
         // The second conversation archived: its notice, with Undo, under the list and reader.
         scene_open(s);
         let id = s.list[1].id;
         s.archive(vec![id], &mut Tx::default());
+        s.settle();
         s.toast("Couldn't reach imap.gmail.com: the network is down", true);
     }),
     ("toast-compose", |s| {
@@ -304,50 +322,63 @@ const SCENES: &[Scene] = &[
         s.compose_reply(None, false, false);
         let id = s.list[1].id;
         s.archive(vec![id], &mut Tx::default());
+        s.settle();
     }),
     ("counts", |s| {
         // Two unread conversations opened (and so read): the sidebar's Inbox count follows.
+        s.settle();
         let unread: Vec<_> = s.list.iter().filter(|m| m.thread_unread).map(|m| m.id).take(2).collect();
         for id in unread {
             s.open_message(id);
+            s.settle();
         }
     }),
     ("drafts", scene_drafts),
     // The split inbox: the Important tab, the first conversation open, every tab's count.
     ("split", scene_open),
     ("split-newsletters", |s| {
+        s.settle();
         s.show_category(envoy_core::model::Category::Newsletters);
         scene_open(s);
     }),
     // A newsletter moved to Important (alt+1): off the tab, a rule for its sender, Undo.
     ("split-moved", |s| {
+        s.settle();
         s.show_category(envoy_core::model::Category::Newsletters);
         scene_open(s);
         let ids = s.targets();
         s.move_to_category(ids, envoy_core::model::Category::Important, &mut Tx::default());
+        s.settle();
     }),
     // A search looks in every tab; each result says which it's in.
     ("split-search", |s| {
+        s.settle();
         s.applied_query = "the".into();
         s.search = rune::TextEdit::new("the");
         s.request_list();
+        s.settle();
     }),
     ("split-narrow", |s| {
         s.list_width = 330.0;
         scene_open(s);
     }),
     ("split-empty", |s| {
+        s.settle();
         s.show_category(envoy_core::model::Category::Other);
+        s.settle();
         let ids: Vec<_> = s.list.iter().map(|m| m.id).collect();
         s.archive(ids, &mut Tx::default());
+        s.settle();
         s.toasts.clear();
     }),
     ("split-off", |s| {
         let _ = s.settings.set("inbox.split", serde_json::json!(false));
+        s.settle();
         s.request_list();
         scene_open(s);
     }),
     ("settings-rules", |s| {
+        s.settle();
         let _ = s.settings.set("inbox.rules", serde_json::json!([{ "from": "*@github.com", "category": "notifications" }, { "list": "rust-lang.org", "category": "newsletters" }, { "from": "maya@northwind.dev", "category": "important" }]));
         s.screen = Screen::Settings;
         s.settings_ui.category = Some(1);
@@ -356,15 +387,13 @@ const SCENES: &[Scene] = &[
         scene_drafts(s);
         if let Some(id) = s.list.first().map(|m| m.id) {
             s.open_message(id);
+            s.settle_until(|s| s.compose.is_some());
         }
     }),
     ("draft-notice", |s| {
         scene_drafts(s);
-        if let Some(d) = s.list.first().and_then(|m| demo::draft_for(m.id)) {
-            // A copy comes without the original's files.
-            let copy = envoy_core::model::Draft { attachments: vec![], ..d };
-            s.show_draft(0, copy, Default::default(), false, Some(envoy_core::model::DraftNotice::Copy("it's signed or encrypted".into())));
-        }
+        // A draft Envoy can't edit in place opens as a copy, without the original's files.
+        s.show_draft(0, demo::draft(), Default::default(), false, Some(envoy_core::model::DraftNotice::Copy("it's signed or encrypted".into())));
     }),
 ];
 
@@ -379,8 +408,9 @@ fn scene_select(s: &mut App) {
 }
 
 fn scene_drafts(s: &mut App) {
-    s.view = View::Mailbox { account: "demo".into(), mailbox: "[Gmail]/Drafts".into() };
-    s.list = demo::list_for(&s.view);
+    s.settle();
+    s.go(View::Mailbox { account: demo::ACCOUNT.into(), mailbox: demo::DRAFTS.into() });
+    s.settle();
 }
 
 fn main() {
@@ -397,6 +427,13 @@ fn main() {
         ..AppSpec::new("Envoy", (1280.0, 820.0), init, view)
     };
     let chrome = Chrome { full_size_content: true, traffic_lights: Some((16.0, 25.0)), drag_regions: true };
-    // Closing writes the composer's unsaved edits before the process can exit.
-    bench::attach(rune::App::new(spec).chrome(chrome).on_close(|s, _| s.on_close())).run();
+    // Closing writes the composer's unsaved edits before the process can exit; demo mode's
+    // folder then goes.
+    bench::attach(rune::App::new(spec).chrome(chrome).on_close(|s, _| {
+        s.on_close();
+        if s.demo {
+            envoy_core::demo::clean_up();
+        }
+    }))
+    .run();
 }
