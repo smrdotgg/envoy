@@ -165,7 +165,7 @@ impl Writer<'_> {
     /// A `url()` argument as it'll be written in `url('…')`, or None for `none`.
     fn css_picture(&mut self, raw: &str) -> Option<String> {
         let v = browser_url(raw);
-        if v.is_empty() || v.contains(|c: char| c.is_ascii_whitespace() || matches!(c, '\'' | '"' | '\\' | '(' | ')' | '<')) {
+        if !css_url_chars_ok(&v) {
             return None;
         }
         if scheme(&v).as_deref() == Some("cid") {
@@ -173,7 +173,7 @@ impl Writer<'_> {
                 return None;
             }
             self.css_inlined += 1;
-            return (self.inline)(&v).filter(|d| data_picture(d) && !d.contains(|c: char| c.is_ascii_whitespace() || matches!(c, '\'' | '\\' | '<')));
+            return (self.inline)(&v).filter(|d| data_picture(d) && css_url_chars_ok(d));
         }
         self.rules.picture_ok(&v).then_some(v)
     }
@@ -183,6 +183,20 @@ impl Writer<'_> {
 /// (the sender is allowed, or the user chose to load them); `inline` turns a `cid:` URL into a
 /// `data:` URI, or None.
 pub fn export(html: &str, remote_images: bool, inline: &mut dyn FnMut(&str) -> Option<String>) -> String {
+    export_report(html, remote_images, inline).html
+}
+
+/// What [`export_report`] wrote, and whether it's the copy it meant to write.
+#[derive(Debug)]
+pub struct Exported {
+    pub html: String,
+    /// The copy failed its check (or sanitizing panicked): `html` is the message's text in a
+    /// `<pre>` (or empty).
+    pub fell_back: bool,
+}
+
+/// [`export`], saying whether it fell back to the message's text.
+pub fn export_report(html: &str, remote_images: bool, inline: &mut dyn FnMut(&str) -> Option<String>) -> Exported {
     // `inline` is the caller's; nothing of it is left half-changed by a panic in here.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (out, rules) = written(html, remote_images, inline);
@@ -190,7 +204,7 @@ pub fn export(html: &str, remote_images: bool, inline: &mut dyn FnMut(&str) -> O
     }))
     .unwrap_or_else(|_| {
         log::warn!("html: sanitizing a message for the browser panicked");
-        String::new()
+        Exported { html: String::new(), fell_back: true }
     })
 }
 
@@ -209,12 +223,12 @@ fn written(html: &str, remote: bool, inline: &mut dyn FnMut(&str) -> Option<Stri
 }
 
 /// `out` if it passes [`check`]; otherwise the message's text in a `<pre>`.
-fn finish(out: String, rules: &Rules, text: impl FnOnce() -> String) -> String {
+fn finish(out: String, rules: &Rules, text: impl FnOnce() -> String) -> Exported {
     match check(&out, rules) {
-        Ok(()) => out,
+        Ok(()) => Exported { html: out, fell_back: false },
         Err(why) => {
             log::warn!("html: the browser copy failed its check ({why}); writing the message's text instead");
-            plain_copy(&text())
+            Exported { html: plain_copy(&text()), fell_back: true }
         }
     }
 }
@@ -428,6 +442,13 @@ fn data_picture(v: &str) -> bool {
         .any(|p| v.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)) && matches!(v.as_bytes().get(p.len()), Some(b';' | b',')))
 }
 
+/// Whether a URL may stand inside `url('…')` as written: not empty, and nothing that could end
+/// the string or the function early, or change how it's read (whitespace, quotes, backslashes,
+/// parentheses, `<`). The writer and the check use this one rule.
+fn css_url_chars_ok(v: &str) -> bool {
+    !v.is_empty() && !v.contains(|c: char| c.is_ascii_whitespace() || matches!(c, '\'' | '"' | '\\' | '(' | ')' | '<'))
+}
+
 fn ident_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80
 }
@@ -471,7 +492,9 @@ fn push_escape(out: &mut String, s: &str) -> usize {
 /// - `url()`s keep only pictures that may load ([`Writer::css_picture`]), written as
 ///   `url('…')`; the rest become `none`.
 /// - Functions that load from bare strings ([`LOADERS`]) and function names written with
-///   escapes (`\75rl(`) get a space before their parenthesis, so they're no longer functions.
+///   escapes (`\75rl(`, `ur\6C(`) get an empty comment before their parenthesis, so they're no
+///   longer functions. (Not a space: a hex escape takes the whitespace after it, so `ur\6C (`
+///   still reads `url(`.)
 /// - Comments are emptied (`/**/` still separates what it separated), and `(` and `<` inside
 ///   strings are written as escapes (the same string), so `url(` appears only as a real,
 ///   checked function.
@@ -520,7 +543,7 @@ fn css(src: &str, w: &mut Writer) -> String {
                 let name = ident.map(|(s, escaped)| (s, escaped, out[s..].to_ascii_lowercase()));
                 ident = None;
                 match name {
-                    Some((_, true, _)) => out.push_str(" ("),
+                    Some((_, true, _)) => out.push_str("/**/("),
                     Some((s, false, n)) if n == "url" => {
                         out.truncate(s);
                         let (end, arg) = url_arg(&src, i + 1);
@@ -535,7 +558,7 @@ fn css(src: &str, w: &mut Writer) -> String {
                         i = end;
                         continue;
                     }
-                    Some((_, false, n)) if LOADERS.contains(&n.as_str()) => out.push_str(" ("),
+                    Some((_, false, n)) if LOADERS.contains(&n.as_str()) => out.push_str("/**/("),
                     _ => out.push('('),
                 }
                 i += 1;
@@ -641,12 +664,19 @@ fn check(out: &str, rules: &Rules) -> Result<(), String> {
     let metas = metas(rules.remote);
     let is_meta = |attrs: &[html5ever::Attribute], m: &[(&str, String)]| attrs.len() == m.len() && m.iter().all(|(k, v)| attrs.iter().any(|a| a.name.ns.is_empty() && &*a.name.local == *k && &*a.value == v.as_str()));
     let mut seen_metas = 0;
+    let mut doctypes = 0;
     let mut heads = 0;
     let mut stack: Vec<(Handle, bool)> = vec![(dom.document.clone(), false)];
     while let Some((n, in_style)) = stack.pop() {
         let mut style = false;
         match &n.data {
-            NodeData::Document | NodeData::Doctype { .. } => {}
+            NodeData::Document => {}
+            NodeData::Doctype { name, public_id, system_id } => {
+                if &**name != "html" || !public_id.is_empty() || !system_id.is_empty() {
+                    return Err(format!("<!DOCTYPE {name} \"{public_id}\" \"{system_id}\">"));
+                }
+                doctypes += 1;
+            }
             NodeData::Comment { .. } => return Err("a comment".into()),
             NodeData::ProcessingInstruction { .. } => return Err("a processing instruction".into()),
             NodeData::Text { contents } => {
@@ -721,8 +751,11 @@ fn check(out: &str, rules: &Rules) -> Result<(), String> {
         }
         stack.extend(n.children.borrow().iter().map(|c| (c.clone(), style)));
     }
+    if doctypes != 1 {
+        return Err("no <!DOCTYPE html>".into());
+    }
     if heads != 1 || seen_metas != metas.len() {
-        return Err("no policy".into());
+        return Err("the policy isn't there exactly once".into());
     }
     Ok(())
 }
@@ -740,7 +773,8 @@ fn css_ok(css: &str, rules: &Rules) -> Result<(), String> {
             k -= 1;
         }
         let name = css[k..p].to_ascii_lowercase();
-        // `\75rl(`, or `\75 rl(` (a hex escape ends at one space).
+        // `\75rl(`, `\75 rl(` or `ur\6C (`: a hex escape takes one whitespace after it, so a
+        // name can end in an escape right before `(`.
         let escaped = (k > 0 && b[k - 1] == b'\\') || {
             let mut m = k;
             if m > 0 && css_space(b[m - 1]) {
@@ -750,7 +784,7 @@ fn css_ok(css: &str, rules: &Rules) -> Result<(), String> {
             while m > 0 && digits_end - m < 6 && b[m - 1].is_ascii_hexdigit() {
                 m -= 1;
             }
-            m < digits_end && m > 0 && b[m - 1] == b'\\' && !name.is_empty()
+            m < digits_end && m > 0 && b[m - 1] == b'\\'
         };
         if escaped {
             return Err(format!("an escaped function name before `(` at {p}"));
@@ -761,7 +795,7 @@ fn css_ok(css: &str, rules: &Rules) -> Result<(), String> {
         if name == "url" {
             let rest = &css[p + 1..];
             let url = rest.strip_prefix('\'').and_then(|r| r.find("')").map(|e| &r[..e])).ok_or("an unquoted url()")?;
-            if url.contains('\'') || !rules.picture_ok(url) {
+            if !css_url_chars_ok(url) || !rules.picture_ok(url) {
                 return Err(format!("url('{url}')"));
             }
         }
@@ -904,6 +938,7 @@ mod tests {
               .d { background-image: image-set("https://t.example/x.png" 1x) } .e { background: \75rl(https://t.example/esc) } .f { background: u\72l(https://t.example/esc2) }
               /* url(https://t.example/comment) */ .g::after { content: "url(https://t.example/str)" } @import url(https://t.example/a.css);
               .h { background: url('data:image/gif;base64,R0lGOD==') } .i { background: url(data:text/html,<b>) }
+              .j { background: ur\6C(https://t.example/hex) } .k { background: image-se\74 ("https://t.example/k" 1x) } .l { background: \75 \72 \6C (https://t.example/l) }
             </style><div class="b"><p>Hero</p></div><div style="background:url(&quot;cid:logo@x&quot;) no-repeat"><p>Inline</p></div>
             <div style="background-image:url(https://t.example/empty-box)"></div>"#;
         for remote in [false, true] {
@@ -915,8 +950,10 @@ mod tests {
             for bad in ["url('https://t.example", "url(https://t.example", "url(&#39;https://t.example", "file:", "image-set(", "text/html", "cid:", "comment"] {
                 assert!(!out.contains(bad), "{bad} survived (remote {remote}):\n{out}");
             }
-            assert!(out.contains(r#"image-set ("https://t.example/x.png" 1x)"#), "a string can't load once it isn't an argument: {out}");
-            assert!(out.contains(r"\75rl (") && out.contains(r"u\72l ("), "escaped names stop being functions: {out}");
+            assert!(out.contains(r#"image-set/**/("https://t.example/x.png" 1x)"#), "a string can't load once it isn't an argument: {out}");
+            assert!(out.contains(r"\75rl/**/(") && out.contains(r"u\72l/**/("), "escaped names stop being functions: {out}");
+            // A name ending in a hex escape: `ur\6C (` (a space) would still read `url(`.
+            assert!(out.contains(r"ur\6C/**/(https") && out.contains(r"image-se\74 /**/(") && out.contains(r"\75 \72 \6C /**/(https"), "{out}");
             assert!(out.contains(r#"content: "url\28 https://t.example/str)""#) && out.contains("@import none;"), "{out}");
             assert!(out.contains("background: none }") && out.contains("background-image:none"), "{out}");
             // The hero is in a box with content, so Envoy fetches it when allowed.
@@ -990,9 +1027,150 @@ mod tests {
         let rules = Rules { remote: false, fetched: HashSet::new() };
         for bad in ["\u{FEFF}<!DOCTYPE html><svg><p>x</p></svg>", "<!DOCTYPE html><p>no mark</p>", "\u{FEFF}<p><!-- c --></p>", "\u{FEFF}<html><head></head><body><img src=https://t.example/p.gif></body></html>"] {
             assert!(check(bad, &rules).is_err(), "{bad}");
-            let out = finish(bad.to_owned(), &rules, || "Hello <b>&".into());
+            let Exported { html: out, fell_back } = finish(bad.to_owned(), &rules, || "Hello <b>&".into());
+            assert!(fell_back);
             assert!(out.contains("<pre style=\"white-space: pre-wrap\">Hello &lt;b&gt;&amp;</pre>"), "{out}");
             assert_eq!(check(&out, &rules), Ok(()), "the text copy passes the check too");
+        }
+    }
+
+    /// A copy that passes the check: the policy, then `head`; `body` as the body.
+    fn page(remote: bool, head: &str, body: &str) -> String {
+        let mut out = String::from("\u{FEFF}<!DOCTYPE html>\n<html><head>");
+        push_metas(&mut out, remote);
+        out.push_str(head);
+        out.push_str("</head><body>");
+        out.push_str(body);
+        out.push_str("</body></html>\n");
+        out
+    }
+
+    fn rules(remote: bool) -> Rules {
+        Rules { remote, fetched: ["https://img.example/ok.png".to_owned()].into() }
+    }
+
+    #[track_caller]
+    fn rejects(out: &str, remote: bool, why: &str) {
+        match check(out, &rules(remote)) {
+            Ok(()) => panic!("accepted:\n{out}"),
+            Err(e) => assert!(e.contains(why), "rejected for {e:?}, not {why:?}:\n{out}"),
+        }
+    }
+
+    #[test]
+    fn the_check_accepts_what_the_writer_writes() {
+        let body = r##"<p class="x" style="color:red;background:url('data:image/png;base64,AA')">t</p><a href="https://e.x/" rel="noopener noreferrer">l</a><a href="#top" rel="noopener noreferrer">t</a>
+            <img src="https://img.example/ok.png" alt="a"><table background="data:image/gif;base64,R0"><tbody><tr><td nowrap="" background="https://img.example/ok.png">c</td></tr></tbody></table>"##;
+        assert_eq!(check(&page(true, "<title>T</title><style>p{background:url('https://img.example/ok.png')} a/**/(x) \\3C  (</style>", body), &rules(true)), Ok(()));
+    }
+
+    #[test]
+    fn the_check_rejects_a_missing_mark_or_doctype() {
+        let ok = page(false, "", "<p>x</p>");
+        rejects(&ok[3..], false, "no byte-order mark");
+        rejects(&ok.replace("<!DOCTYPE html>\n", ""), false, "no <!DOCTYPE html>");
+        rejects(&ok.replace("<!DOCTYPE html>", r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">"#), false, "<!DOCTYPE html \"-//W3C");
+        rejects(&ok.replace("<!DOCTYPE html>", r#"<!DOCTYPE html SYSTEM "about:legacy-compat">"#), false, "about:legacy-compat");
+        rejects(&ok.replace("<!DOCTYPE html>", "<!DOCTYPE svg>"), false, "<!DOCTYPE svg");
+    }
+
+    #[test]
+    fn the_check_rejects_comments_and_controls() {
+        rejects(&page(false, "", "<p>x<!-- c --></p>"), false, "a comment");
+        rejects(&page(false, "", "<?php echo 1 ?>"), false, "a comment");
+        rejects(&page(false, "", "<p>a\u{1}b</p>"), false, "a control character in text");
+        rejects(&page(false, "", "<p title=\"a\u{1b}b\">x</p>"), false, "a control character in <p title>");
+    }
+
+    #[test]
+    fn the_check_rejects_elements_off_the_list() {
+        for (body, why) in [("<form>x</form>", "<form>"), ("<script>x</script>", "<script>"), ("<x-card>x</x-card>", "<x-card>"), ("<button>x</button>", "<button>"), ("<xmp>x</xmp>", "<xmp>"), ("<svg></svg>", "<svg> outside HTML"), ("<math><mi>x</mi></math>", "outside HTML")] {
+            rejects(&page(false, "", body), false, why);
+        }
+    }
+
+    #[test]
+    fn the_check_rejects_attributes_off_the_list() {
+        for (body, why) in [(r#"<p onclick="x()">x</p>"#, "<p onclick="), (r#"<p data-x="1">x</p>"#, "<p data-x="), (r#"<p nowrap>x</p>"#, "<p nowrap="), (r#"<img srcset="a.png 2x">"#, "<img srcset="), (r#"<p rel="x">x</p>"#, "<p rel=")] {
+            rejects(&page(false, "", body), false, why);
+        }
+    }
+
+    #[test]
+    fn the_check_rejects_bad_urls_in_each_url_attribute() {
+        let a = |href: &str| format!(r#"<a href="{href}" rel="noopener noreferrer">l</a>"#);
+        for href in ["javascript:alert(1)", "//evil.example/", "/etc/passwd", "file:///etc/passwd", "x.html"] {
+            rejects(&page(true, "", &a(href)), true, "<a href=");
+        }
+        for (src, remote) in [("https://t.example/p.gif", true), ("https://img.example/ok.png", false), ("data:image/svg+xml,x", true), ("cid:a@b", true), ("relative.png", true)] {
+            rejects(&page(remote, "", &format!(r#"<img src="{src}">"#)), remote, "<img src=");
+        }
+        rejects(&page(true, "", r#"<table background="https://t.example/b.png"><tbody><tr><td>c</td></tr></tbody></table>"#), true, "<table background=");
+        rejects(&page(true, "", r#"<table><tbody><tr><td background="file:///x">c</td></tr></tbody></table>"#), true, "<td background=");
+        rejects(&page(true, "", r#"<table><tbody><tr><th background="javascript:x">c</th></tr></tbody></table>"#), true, "<th background=");
+        rejects(&page(true, "", "x").replacen("<body>", r#"<body background="https://t.example/body.png">"#, 1), true, "<body background=");
+    }
+
+    #[test]
+    fn the_check_rejects_links_without_their_rel() {
+        rejects(&page(false, "", r#"<a href="https://e.x/">l</a>"#), false, "a link without rel");
+        rejects(&page(false, "", r#"<a href="https://e.x/" rel="opener">l</a>"#), false, r#"<a rel="opener">"#);
+    }
+
+    #[test]
+    fn the_check_rejects_metas_out_of_place() {
+        rejects(&page(false, r#"<meta http-equiv="refresh" content="0">"#, "x"), false, "a <meta> of its own");
+        // The policy for remote images, checked as if they weren't allowed.
+        rejects(&page(true, "", "x"), false, "the policy isn't first in <head>");
+        // Not first.
+        let mut late = String::from("\u{FEFF}<!DOCTYPE html>\n<html><head><title>T</title>");
+        push_metas(&mut late, false);
+        late.push_str("</head><body>x</body></html>");
+        rejects(&late, false, "the policy isn't first in <head>");
+        // Twice, or one of them missing.
+        let mut twice = String::new();
+        push_metas(&mut twice, false);
+        rejects(&page(false, &twice, "x"), false, "the policy isn't there exactly once");
+        rejects(&page(false, "", "x").replacen(r#"<meta name="referrer" content="no-referrer">"#, "", 1), false, "the policy isn't first in <head>");
+        rejects(&page(false, "", r#"<meta name="referrer" content="no-referrer">"#), false, "the policy isn't there exactly once");
+    }
+
+    #[test]
+    fn the_check_rejects_css_breaking_each_rule() {
+        let img = "data:image/png;base64,";
+        let cases = [
+            (r#"a::after{content:"<"}"#.to_owned(), "a `<`"),
+            (format!("p{{background:url({img}AA)}}"), "an unquoted url()"),
+            ("p{background:url('https://t.example/x.png')}".to_owned(), "url('https://t.example/x.png')"),
+            ("p{background:url('file:///x')}".to_owned(), "url('file:///x')"),
+            // One character rule with the writer: nothing in a URL that could end or change it.
+            (format!(r"p{{background:url('{img}A\A')}}"), "url('"),
+            (format!("p{{background:url('{img} AA')}}"), "url('"),
+            (format!("p{{background:url('{img}A\tA')}}"), "url('"),
+            (format!(r#"p{{background:url('{img}A"A')}}"#), "url('"),
+            (format!("p{{background:url('{img}A(A')}}"), "url('"),
+            (format!("p{{background:url('{img}A)A')}}"), "url('"),
+            ("p{background:url('')}".to_owned(), "url('"),
+            (r#"p{background:image-set("https://t.example/x" 1x)}"#.to_owned(), "image-set()"),
+            (r#"p{background:-webkit-image-set("https://t.example/x" 1x)}"#.to_owned(), "-webkit-image-set()"),
+            (r#"p{background:image("https://t.example/x")}"#.to_owned(), "image()"),
+            (r#"p{background:src("https://t.example/x")}"#.to_owned(), "src()"),
+            // Escaped function names, a trailing space-terminated escape included.
+            (r"p{background:\75rl(https://t.example/x)}".to_owned(), "an escaped function name"),
+            (r"p{background:u\72l(https://t.example/x)}".to_owned(), "an escaped function name"),
+            (r"p{background:ur\6C (https://t.example/x)}".to_owned(), "an escaped function name"),
+            (r#"p{background:image-se\74 ("https://t.example/x" 1x)}"#.to_owned(), "an escaped function name"),
+            (r"p{background:\75 \72 \6C (https://t.example/x)}".to_owned(), "an escaped function name"),
+        ];
+        for (css, why) in &cases {
+            rejects(&page(true, &format!("<style>{css}</style>"), "x"), true, why);
+        }
+        // The same rules hold in `style=""` (where `<` is written `&lt;`).
+        for (css, why) in &cases {
+            let attr = css.split_once('{').map_or(css.as_str(), |(_, d)| d.trim_end_matches('}'));
+            let mut escaped = String::new();
+            push_attr(&mut escaped, attr);
+            rejects(&page(true, "", &format!(r#"<p style="{escaped}">x</p>"#)), true, why);
         }
     }
 
